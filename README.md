@@ -7,7 +7,7 @@ and the analytic nuclear gradient.
 Importing a module monkey-patches one GPU4PySCF entry point in place.  Anything
 a module does not cover falls through to GPU4PySCF's own code, so a patched run
 computes the same quantity as an unpatched one — measured at **8.2e-12 Eh** on
-the energy and **2.8e-12** per gradient component over the suites in `tests/`.
+the energy and **2.9e-12** per gradient component over the suites in `tests/`.
 
 On one A100-SXM4-40GB, GPU4PySCF 1.8.1, B3LYP-D3(BJ)/6-31G\*, level-3 grids:
 
@@ -15,8 +15,8 @@ On one A100-SXM4-40GB, GPU4PySCF 1.8.1, B3LYP-D3(BJ)/6-31G\*, level-3 grids:
 |---|---|---|---|
 | 284-atom cluster, SCF | 121.6 s | **57.2 s** | **2.13x** |
 | 284-atom cluster, gradient | 19.5 s | **12.3 s** | **1.58x** |
-| 545-atom cluster, one SCF cycle's work | 9.62 s | **3.25 s** | **2.96x** |
-| 545-atom cluster, gradient | 48.8 s | **31.2 s** | **1.57x** |
+| 545-atom cluster, one SCF cycle's work | 9.62 s | **3.23 s** | **2.98x** |
+| 545-atom cluster, gradient | 48.8 s | **30.6 s** | **1.60x** |
 
 `docs/UPGRADE_1.8.1.md` has the full tables, the build-by-build breakdown, the
 correctness suites, and what is *not* worth optimising (about a third of that

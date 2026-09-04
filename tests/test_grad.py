@@ -13,6 +13,9 @@ import sys, time
 import numpy as np
 import electrolites
 electrolites.patch('fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh')
+# the module objects too: this test flips the patches on and off inside one
+# process, so it needs the replacements as well as the originals
+from electrolites import fastejk, fastgrad, fastgradh, fastxcgrad
 from pyscf import gto
 import cupy as cp
 from gpu4pyscf import dft, scf

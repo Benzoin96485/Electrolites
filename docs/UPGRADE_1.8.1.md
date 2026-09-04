@@ -255,11 +255,11 @@ gradient), one process at a time on an otherwise idle node:
 
 | fixed density | `PfPMT` stock | `PfPMT` ported | | `HcgC` stock | `HcgC` ported | |
 |---|---|---|---|---|---|---|
-| `get_k` | 2.022 s | **0.372 s** | **5.44x** | 4.665 s | **1.198 s** | **3.89x** |
-| `nr_rks` (the XC build) | 0.920 s | **0.305 s** | 3.02x | 3.311 s | **0.831 s** | **3.98x** |
-| `get_j` | 0.451 s | **0.328 s** | 1.38x | 1.574 s | **1.189 s** | 1.32x |
-| **`get_veff`** (one cycle's work) | **3.375 s** | **1.012 s** | **3.33x** | **9.618 s** | **3.247 s** | **2.96x** |
-| **gradient** | **16.711 s** | **10.244 s** | **1.63x** | **48.810 s** | **31.155 s** | **1.57x** |
+| `get_k` | 2.022 s | **0.372 s** | **5.44x** | 4.665 s | **1.193 s** | **3.91x** |
+| `nr_rks` (the XC build) | 0.920 s | **0.305 s** | 3.02x | 3.311 s | **0.828 s** | **4.00x** |
+| `get_j` | 0.451 s | **0.328 s** | 1.38x | 1.574 s | **1.187 s** | 1.33x |
+| **`get_veff`** (one cycle's work) | **3.375 s** | **1.012 s** | **3.33x** | **9.618 s** | **3.226 s** | **2.98x** |
+| **gradient** | **16.711 s** | **10.244 s** | **1.63x** | **48.810 s** | **30.585 s** | **1.60x** |
 
 Three things follow, and the first is the most useful result of this round.
 
@@ -296,16 +296,16 @@ a large ill-conditioned system -- **fixed density, build by build**.  One
 
 | `HcgC`, 545 atoms, 4170 AO | GPU4PySCF 1.8.1 | ported | speedup |
 |---|---|---|---|
-| `get_k` | 4.665 s | **1.198 s** | **3.89x** |
-| `nr_rks` (the XC build) | 3.311 s | **0.831 s** | **3.98x** |
-| `get_j` | 1.574 s | **1.189 s** | **1.32x** |
-| **`get_veff`** (one SCF cycle's work) | **9.618 s** | **3.247 s** | **2.96x** |
-| **gradient** | **48.810 s** | **31.155 s** | **1.57x** |
+| `get_k` | 4.665 s | **1.193 s** | **3.91x** |
+| `nr_rks` (the XC build) | 3.311 s | **0.828 s** | **4.00x** |
+| `get_j` | 1.574 s | **1.187 s** | **1.33x** |
+| **`get_veff`** (one SCF cycle's work) | **9.618 s** | **3.226 s** | **2.98x** |
+| **gradient** | **48.810 s** | **30.585 s** | **1.60x** |
 
 The three builds sum to 9.55 s of the 9.618 s, so nothing material hides
 outside them.  Two readings: the gradient speedup is the same on both sizes
-(1.57x here, 1.58x on `PfPMT`), while the SCF side is *better* on the larger
-system (2.96x against 2.13x of `PfPMT` wall clock) because K is 48.5 % of a
+(1.60x here, 1.58x on `PfPMT`), while the SCF side is *better* on the larger
+system (2.98x against 2.13x of `PfPMT` wall clock) because K is 48.5 % of a
 stock `HcgC` cycle.  And **`get_j` at 1.32x is now the weakest link** -- which
 is exactly where catalogue item **A2** points, the four high-`lij+lkl` `md_j`
 classes that 1.8.1 still leaves on its general kernel.
