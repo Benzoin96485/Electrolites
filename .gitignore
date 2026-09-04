@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# device code is built at run time and cached outside the tree
+*.so
+*.ptx
+*.cubin
+
+# benchmark and profiling output
+*.log
+*.nsys-rep
+*.sqlite
+results/

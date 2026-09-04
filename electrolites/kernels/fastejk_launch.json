@@ -1,0 +1,652 @@
+{
+ "0000": {
+  "g_size": 4,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_0000",
+  "nroots": 1,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "1000": {
+  "g_size": 6,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_1000",
+  "nroots": 2,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "1010": {
+  "g_size": 9,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_1010",
+  "nroots": 2,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "1011": {
+  "g_size": 18,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_1011",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "1100": {
+  "g_size": 12,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_1100",
+  "nroots": 2,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "1110": {
+  "g_size": 18,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_1110",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "1111": {
+  "g_size": 36,
+  "gout_stride": 3,
+  "minblocks": 1,
+  "name": "ejk_1111",
+  "nroots": 3,
+  "nsq": 32,
+  "shm_fixed": 4160,
+  "style": "shm"
+ },
+ "2000": {
+  "g_size": 8,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_2000",
+  "nroots": 2,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "2010": {
+  "g_size": 12,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_2010",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "2011": {
+  "g_size": 24,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_2011",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "2020": {
+  "g_size": 16,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_2020",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "2021": {
+  "g_size": 32,
+  "gout_stride": 2,
+  "minblocks": 1,
+  "name": "ejk_2021",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 3776,
+  "style": "shm"
+ },
+ "2022": {
+  "g_size": 48,
+  "gout_stride": 6,
+  "minblocks": 1,
+  "name": "ejk_2022",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 5312,
+  "style": "shm"
+ },
+ "2100": {
+  "g_size": 16,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_2100",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "2110": {
+  "g_size": 24,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_2110",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "2111": {
+  "g_size": 48,
+  "gout_stride": 3,
+  "minblocks": 1,
+  "name": "ejk_2111",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 5440,
+  "style": "shm"
+ },
+ "2120": {
+  "g_size": 32,
+  "gout_stride": 3,
+  "minblocks": 1,
+  "name": "ejk_2120",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 3904,
+  "style": "shm"
+ },
+ "2121": {
+  "g_size": 64,
+  "gout_stride": 6,
+  "minblocks": 1,
+  "name": "ejk_2121",
+  "nroots": 4,
+  "nsq": 16,
+  "shm_fixed": 3488,
+  "style": "shm"
+ },
+ "2122": {
+  "g_size": 96,
+  "gout_stride": 18,
+  "minblocks": 1,
+  "name": "ejk_2122",
+  "nroots": 5,
+  "nsq": 8,
+  "shm_fixed": 2528,
+  "style": "shm"
+ },
+ "2200": {
+  "g_size": 24,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_2200",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "2210": {
+  "g_size": 36,
+  "gout_stride": 2,
+  "minblocks": 1,
+  "name": "ejk_2210",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 4416,
+  "style": "shm"
+ },
+ "2211": {
+  "g_size": 72,
+  "gout_stride": 6,
+  "minblocks": 1,
+  "name": "ejk_2211",
+  "nroots": 4,
+  "nsq": 16,
+  "shm_fixed": 3936,
+  "style": "shm"
+ },
+ "2220": {
+  "g_size": 48,
+  "gout_stride": 6,
+  "minblocks": 1,
+  "name": "ejk_2220",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 5568,
+  "style": "shm"
+ },
+ "2221": {
+  "g_size": 96,
+  "gout_stride": 12,
+  "minblocks": 1,
+  "name": "ejk_2221",
+  "nroots": 5,
+  "nsq": 16,
+  "shm_fixed": 5120,
+  "style": "shm"
+ },
+ "2222": {
+  "g_size": 144,
+  "gout_stride": 36,
+  "minblocks": 1,
+  "name": "ejk_2222",
+  "nroots": 5,
+  "nsq": 4,
+  "shm_fixed": 1856,
+  "style": "shm"
+ },
+ "3000": {
+  "g_size": 10,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_3000",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "3010": {
+  "g_size": 15,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_3010",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "3011": {
+  "g_size": 30,
+  "gout_stride": 3,
+  "minblocks": 1,
+  "name": "ejk_3011",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 3616,
+  "style": "shm"
+ },
+ "3020": {
+  "g_size": 20,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_3020",
+  "nroots": 4,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "3021": {
+  "g_size": 40,
+  "gout_stride": 3,
+  "minblocks": 1,
+  "name": "ejk_3021",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 4576,
+  "style": "shm"
+ },
+ "3022": {
+  "g_size": 60,
+  "gout_stride": 6,
+  "minblocks": 1,
+  "name": "ejk_3022",
+  "nroots": 5,
+  "nsq": 16,
+  "shm_fixed": 3280,
+  "style": "shm"
+ },
+ "3030": {
+  "g_size": 25,
+  "gout_stride": 2,
+  "minblocks": 1,
+  "name": "ejk_3030",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 3136,
+  "style": "shm"
+ },
+ "3031": {
+  "g_size": 50,
+  "gout_stride": 5,
+  "minblocks": 1,
+  "name": "ejk_3031",
+  "nroots": 5,
+  "nsq": 32,
+  "shm_fixed": 5600,
+  "style": "shm"
+ },
+ "3032": {
+  "g_size": 75,
+  "gout_stride": 10,
+  "minblocks": 1,
+  "name": "ejk_3032",
+  "nroots": 5,
+  "nsq": 16,
+  "shm_fixed": 4000,
+  "style": "shm"
+ },
+ "3033": {
+  "g_size": 100,
+  "gout_stride": 20,
+  "minblocks": 1,
+  "name": "ejk_3033",
+  "nroots": 6,
+  "nsq": 8,
+  "shm_fixed": 2616,
+  "style": "shm"
+ },
+ "3100": {
+  "g_size": 20,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_3100",
+  "nroots": 3,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "3110": {
+  "g_size": 30,
+  "gout_stride": 3,
+  "minblocks": 1,
+  "name": "ejk_3110",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 3776,
+  "style": "shm"
+ },
+ "3111": {
+  "g_size": 60,
+  "gout_stride": 9,
+  "minblocks": 1,
+  "name": "ejk_3111",
+  "nroots": 4,
+  "nsq": 16,
+  "shm_fixed": 3328,
+  "style": "shm"
+ },
+ "3120": {
+  "g_size": 40,
+  "gout_stride": 3,
+  "minblocks": 1,
+  "name": "ejk_3120",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 4736,
+  "style": "shm"
+ },
+ "3121": {
+  "g_size": 80,
+  "gout_stride": 9,
+  "minblocks": 1,
+  "name": "ejk_3121",
+  "nroots": 5,
+  "nsq": 16,
+  "shm_fixed": 4320,
+  "style": "shm"
+ },
+ "3122": {
+  "g_size": 120,
+  "gout_stride": 18,
+  "minblocks": 1,
+  "name": "ejk_3122",
+  "nroots": 5,
+  "nsq": 8,
+  "shm_fixed": 3120,
+  "style": "shm"
+ },
+ "3130": {
+  "g_size": 50,
+  "gout_stride": 6,
+  "minblocks": 1,
+  "name": "ejk_3130",
+  "nroots": 5,
+  "nsq": 32,
+  "shm_fixed": 5760,
+  "style": "shm"
+ },
+ "3131": {
+  "g_size": 100,
+  "gout_stride": 15,
+  "minblocks": 1,
+  "name": "ejk_3131",
+  "nroots": 5,
+  "nsq": 16,
+  "shm_fixed": 5280,
+  "style": "shm"
+ },
+ "3132": {
+  "g_size": 150,
+  "gout_stride": 30,
+  "minblocks": 1,
+  "name": "ejk_3132",
+  "nroots": 6,
+  "nsq": 8,
+  "shm_fixed": 3856,
+  "style": "shm"
+ },
+ "3133": {
+  "g_size": 200,
+  "gout_stride": 60,
+  "minblocks": 1,
+  "name": "ejk_3133",
+  "nroots": 6,
+  "nsq": 4,
+  "shm_fixed": 2528,
+  "style": "shm"
+ },
+ "3200": {
+  "g_size": 30,
+  "gout_stride": 1,
+  "minblocks": 1,
+  "name": "ejk_3200",
+  "nroots": 4,
+  "nsq": 256,
+  "shm_fixed": 0,
+  "style": "reg"
+ },
+ "3210": {
+  "g_size": 45,
+  "gout_stride": 3,
+  "minblocks": 1,
+  "name": "ejk_3210",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 5376,
+  "style": "shm"
+ },
+ "3211": {
+  "g_size": 90,
+  "gout_stride": 18,
+  "minblocks": 1,
+  "name": "ejk_3211",
+  "nroots": 5,
+  "nsq": 8,
+  "shm_fixed": 2440,
+  "style": "shm"
+ },
+ "3220": {
+  "g_size": 60,
+  "gout_stride": 6,
+  "minblocks": 1,
+  "name": "ejk_3220",
+  "nroots": 5,
+  "nsq": 16,
+  "shm_fixed": 3440,
+  "style": "shm"
+ },
+ "3221": {
+  "g_size": 120,
+  "gout_stride": 18,
+  "minblocks": 1,
+  "name": "ejk_3221",
+  "nroots": 5,
+  "nsq": 8,
+  "shm_fixed": 3160,
+  "style": "shm"
+ },
+ "3222": {
+  "g_size": 180,
+  "gout_stride": 36,
+  "minblocks": 1,
+  "name": "ejk_3222",
+  "nroots": 6,
+  "nsq": 4,
+  "shm_fixed": 2308,
+  "style": "shm"
+ },
+ "3230": {
+  "g_size": 75,
+  "gout_stride": 12,
+  "minblocks": 1,
+  "name": "ejk_3230",
+  "nroots": 5,
+  "nsq": 16,
+  "shm_fixed": 4160,
+  "style": "shm"
+ },
+ "3231": {
+  "g_size": 150,
+  "gout_stride": 30,
+  "minblocks": 1,
+  "name": "ejk_3231",
+  "nroots": 6,
+  "nsq": 8,
+  "shm_fixed": 3896,
+  "style": "shm"
+ },
+ "3232": {
+  "g_size": 225,
+  "gout_stride": 60,
+  "minblocks": 1,
+  "name": "ejk_3232",
+  "nroots": 6,
+  "nsq": 4,
+  "shm_fixed": 2848,
+  "style": "shm"
+ },
+ "3233": {
+  "g_size": 300,
+  "gout_stride": 120,
+  "minblocks": 1,
+  "name": "ejk_3233",
+  "nroots": 7,
+  "nsq": 2,
+  "shm_fixed": 1878,
+  "style": "shm"
+ },
+ "3300": {
+  "g_size": 40,
+  "gout_stride": 2,
+  "minblocks": 1,
+  "name": "ejk_3300",
+  "nroots": 4,
+  "nsq": 32,
+  "shm_fixed": 5056,
+  "style": "shm"
+ },
+ "3310": {
+  "g_size": 60,
+  "gout_stride": 5,
+  "minblocks": 1,
+  "name": "ejk_3310",
+  "nroots": 5,
+  "nsq": 16,
+  "shm_fixed": 3520,
+  "style": "shm"
+ },
+ "3311": {
+  "g_size": 120,
+  "gout_stride": 30,
+  "minblocks": 1,
+  "name": "ejk_3311",
+  "nroots": 5,
+  "nsq": 8,
+  "shm_fixed": 3200,
+  "style": "shm"
+ },
+ "3320": {
+  "g_size": 80,
+  "gout_stride": 10,
+  "minblocks": 1,
+  "name": "ejk_3320",
+  "nroots": 5,
+  "nsq": 16,
+  "shm_fixed": 4480,
+  "style": "shm"
+ },
+ "3321": {
+  "g_size": 160,
+  "gout_stride": 30,
+  "minblocks": 1,
+  "name": "ejk_3321",
+  "nroots": 6,
+  "nsq": 8,
+  "shm_fixed": 4176,
+  "style": "shm"
+ },
+ "3322": {
+  "g_size": 240,
+  "gout_stride": 60,
+  "minblocks": 1,
+  "name": "ejk_3322",
+  "nroots": 6,
+  "nsq": 4,
+  "shm_fixed": 3048,
+  "style": "shm"
+ },
+ "3330": {
+  "g_size": 100,
+  "gout_stride": 20,
+  "minblocks": 1,
+  "name": "ejk_3330",
+  "nroots": 6,
+  "nsq": 8,
+  "shm_fixed": 2736,
+  "style": "shm"
+ },
+ "3331": {
+  "g_size": 200,
+  "gout_stride": 50,
+  "minblocks": 1,
+  "name": "ejk_3331",
+  "nroots": 6,
+  "nsq": 4,
+  "shm_fixed": 2568,
+  "style": "shm"
+ },
+ "3332": {
+  "g_size": 300,
+  "gout_stride": 100,
+  "minblocks": 1,
+  "name": "ejk_3332",
+  "nroots": 7,
+  "nsq": 2,
+  "shm_fixed": 1888,
+  "style": "shm"
+ },
+ "3333": {
+  "g_size": 400,
+  "gout_stride": 200,
+  "minblocks": 1,
+  "name": "ejk_3333",
+  "nroots": 7,
+  "nsq": 1,
+  "shm_fixed": 1244,
+  "style": "shm"
+ }
+}

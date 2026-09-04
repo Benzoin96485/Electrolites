@@ -1,0 +1,40 @@
+Electrolites
+Copyright 2026 Weiliang Luo
+
+This product includes software derived from GPU4PySCF
+(https://github.com/pyscf/gpu4pyscf), Copyright 2021-2026 The PySCF
+Developers, licensed under the Apache License, Version 2.0.
+
+Specifically:
+
+* electrolites/kernels/cuda/gvhf-rys/*, electrolites/kernels/cuda/gint/*
+  are copies of GPU4PySCF 1.7.0 sources, unmodified, and are compiled here
+  only as support for the library below.
+
+* electrolites/kernels/cuda/myk2/rys_k_general.cu is derived from
+  GPU4PySCF's lib/gvhf-rys/rys_contract_k.cu.  One change is a bug fix
+  upstream made independently in 1.8.0 (the gout_pattern bit shift, upstream
+  PR #791); the rest is the restructuring described in docs/README_fastk.md.
+
+* electrolites/kernels/fastk_generated.cu and fastk2_generated.cu are emitted
+  by codegen/gen_kernels.py and codegen/gen_k2_kernels.py, which lift the
+  integral arithmetic of GPU4PySCF's lib/gvhf-rys/unrolled_rys_k.cu and
+  restructure the code around it.  electrolites/kernels/fastj_generated.cu is
+  emitted the same way from lib/gvhf-md/unrolled_md_j.cu.
+
+* electrolites/kernels/fastkhigh_generated.cu and fastejk_generated.cu are
+  written from the angular-momentum class alone by codegen/gen_khigh.py and
+  codegen/gen_ejk.py; no GPU4PySCF source is used as input for them.  They do
+  follow GPU4PySCF's screening tests, task ordering and symmetry factors.
+
+* electrolites/kernels/data/rys_roots_dat.npz holds the Rys root and weight
+  tables of GPU4PySCF's lib/gvhf-rys/rys_roots_dat.cu, repacked.
+
+* electrolites/compat.py's tril_pair_mappings is GPU4PySCF 1.7.0's
+  jk._make_tril_pair_mappings, vendored because 1.8.0 removed it while the
+  kernels here still consume its output.
+
+The screening criteria, the Rys quadrature and the density-matrix contraction
+symmetry factors are GPU4PySCF's throughout, which is why a patched run
+reproduces an unpatched one to round-off.  See docs/UPGRADE_1.8.1.md for the
+measured agreement.
