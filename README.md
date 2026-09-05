@@ -97,7 +97,7 @@ separate processes; that is the only honest way to A/B them.
 | module | replaces | covers |
 |---|---|---|
 | `fastk` | `scf.jk._VHFOpt.get_k` | every angular-momentum class an spdf basis reaches — the 25 GPU4PySCF unrolls and the 40 it does not — for the full-range and the long-range (erf) operator. On 1.8.x it also serves the fused `lr*erf + sr*erfc` request, by way of `erf + erfc == 1` |
-| `fastj` | `scf.j_engine._VHFOpt.get_j` | **every `(lij\|lkl)` class an spdf basis reaches** -- the 12 GPU4PySCF unrolls, lifted, and the 17 it does not, written from the class |
+| `fastj` | `scf.j_engine._VHFOpt.get_j` | **every `(lij\|lkl)` class an spdf basis reaches** -- the 12 GPU4PySCF unrolls, lifted, and the 17 it does not, written from the class.  Also the **multi-density** build that CPHF, TDDFT and polarizability ask for, four densities to a pass, for every class through `(4,4)` |
 | `fastxc` | `dft.numint.NumInt.nr_rks` | LDA and GGA, so hybrids too |
 | `fastnlc` | `dft.numint._vv10nlc` | the VV10 / VV10-family `O(n_grid^2)` double sum |
 | `fastrsh` | `dft.rks.RKS.get_veff` | range-separated hybrids on GPU4PySCF **1.7.x only**: the two exchange builds fused into one. 1.8.0 does that fusion itself, so this module stands down there |
@@ -107,10 +107,12 @@ separate processes; that is the only honest way to A/B them.
 | `fastxcgrad` | `grad.rks.get_exc`, `get_nlc_exc` | the XC (LDA, GGA **and** meta-GGA) and VV10 grid contractions of the gradient |
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | the nuclear-attraction part of the one-electron derivative, on the GPU |
 
-**Limits, all of which fall through rather than fail.** `fastk`, `fastj`,
-`fastxc` and the four gradient modules are spin-restricted closed-shell only:
-an unrestricted calculation reaches them with two density matrices and is
-handed back. `fastnlc` covers UKS, because `nr_nlc_vxc` sums the two densities
+**Limits, all of which fall through rather than fail.** `fastk`, `fastxc` and
+the four gradient modules are spin-restricted closed-shell only: an
+unrestricted calculation reaches them with two density matrices and is handed
+back.  `fastj` takes any number of densities, so it also covers the Coulomb
+build inside a CPHF or Davidson solve; what it declines there is the classes
+past `(4,4)` and the long-range operator. `fastnlc` covers UKS, because `nr_nlc_vxc` sums the two densities
 before the double sum. `fastxc` hands **meta-GGA** back in the SCF, while
 `fastxcgrad` covers it in the gradient. Shells with `l > 4` go through
 GPU4PySCF's CPU path. Density fitting is untouched. Single GPU only —
@@ -125,6 +127,8 @@ python tests/test_full.py --patch all      # 15 cases: energy and gradient,
 python tests/test_full.py --patch ''       # ... the unpatched half
 python tests/test_grad.py                  # 23 cases: gradient at a fixed
                                            # density, both codes in one process
+python tests/test_j_ndm.py                 # 162 cases: the multi-density
+                                           # Coulomb build against GPU4PySCF
 ```
 
 They need a GPU and take a few minutes. The cases span six basis sets to
@@ -138,6 +142,11 @@ method, with a synchronisation point on both sides of each -- use it before
 concluding that anything outside J, K and XC matters.
 `benchmarks/perclass_j.py` times the Coulomb build one angular-momentum class
 at a time and checks the J matrix against GPU4PySCF's;
+`benchmarks/ndm_j.py` says how the Coulomb build's cost grows with the number
+of density matrices, fits the per-pass and per-density parts of it, and A/Bs
+the density-block sizes -- use it before assuming that a cap GPU4PySCF pays for
+is still worth removing once the kernel under it has been rewritten
+(`docs/ROUND3_B4A.md`);
 `benchmarks/sweep_j_high.py` searches the launch configuration of the written
 classes; `benchmarks/compile_time.py` reports the first-run NVRTC cost with
 and without the module split; `benchmarks/aoscreen_probe.py` measures how much
@@ -160,8 +169,10 @@ the repository.
 
 `electrolites/codegen/` holds the three that write a kernel from the
 angular-momentum class alone, taking nothing from GPU4PySCF: `gen_khigh.py`,
-`gen_ejk.py` and `gen_j_high.py`.  **Their output is not tracked.**  It is
-13 MB of straight-line CUDA, it regenerates in 0.7 s byte for byte, and
+`gen_ejk.py` and `gen_j_high.py` -- the last of which writes two families, the
+single-density kernels and, with `--ndm`, the multi-density ones.  **Their
+output is not tracked.**  It is 15 MB of straight-line CUDA, it regenerates in
+0.8 s byte for byte, and
 `electrolites/_gen.py` produces it on first use and caches it under
 `~/.cache/electrolites/generated/`, keyed by a hash of the generator and its
 launch table so that editing either regenerates.  `ELECTROLITES_GENERATED_DIR`
@@ -202,6 +213,7 @@ starting point, not an optimum.
 | `ELECTROLITES_LIBMYKG` | use a prebuilt copy of it instead of building |
 | `ELECTROLITES_CACHE` | where to cache the build (default `~/.cache/electrolites`) |
 | `FASTK_NO_GENERAL`, `FASTK_NO_K2`, `FASTK_NO_HIGH`, `FASTK_NO_OMEGA`, `FASTK_NO_FUSED` | hand the corresponding class group back to GPU4PySCF (ablations) |
+| `FASTJ_NO_MDM`, `FASTJ_MDM_BLOCKS` | hand every multi-density Coulomb build back to GPU4PySCF; restrict which density-block sizes are used (the `docs/ROUND3_B4A.md` ablation) |
 | `FASTNLC_MODE` | `mixed` (default) or `fp64` for the VV10 double sum |
 | `FASTJ_TIME`, `FASTXCGRAD_MODE` | per-call timing split; XC-gradient block strategy |
 
