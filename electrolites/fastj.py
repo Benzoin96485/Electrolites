@@ -27,6 +27,7 @@ from gpu4pyscf.__config__ import num_devices
 from .compat import NEW_JK_ABI as _NEW_ABI, dense_q_cond as _dense_q_cond
 
 from ._paths import KERNEL_DIR as HERE
+from . import _ksplit
 PTR_RANGE_OMEGA = 8
 # FASTJ_TIME=1 prints the host/transfer vs kernel split of each J build
 TIME = int(os.environ.get('FASTJ_TIME', 0))
@@ -35,21 +36,55 @@ _T = {'prep': 0., 'kern': 0., 'post': 0., 'n': 0}
 with open(os.path.join(HERE, 'fastj_launch.json')) as _f:
     LAUNCH = json.load(_f)
 
+# The four classes GPU4PySCF does not unroll -- (3,3), (4,2), (4,3), (4,4) --
+# are written from the angular-momentum class alone by codegen/gen_j_high.py
+# rather than lifted, because there is no upstream kernel for them to lift.
+# FASTJ_NO_HIGH=1 hands them back, which is the ablation for that generator.
+_HIGH = {}
+if not int(os.environ.get('FASTJ_NO_HIGH', 0)):
+    with open(os.path.join(HERE, 'fastjhigh_launch.json')) as _f:
+        _HIGH = json.load(_f)
+    LAUNCH.update(_HIGH)
 
-@functools.lru_cache(maxsize=1)
-def _module():
+
+def _sources():
     gen = os.environ.get('FASTJ_SRC', 'fastj_generated.cu')
-    src = (open(os.path.join(HERE, 'fastj_prologue.cu')).read() +
-           open(os.path.join(HERE, gen)).read())
+    out = [os.path.join(HERE, 'fastj_prologue.cu'), os.path.join(HERE, gen)]
+    if _HIGH:
+        out.append(os.path.join(HERE, os.environ.get(
+            'FASTJ_HIGH_SRC', 'fastjhigh_generated.cu')))
+    return out
+
+
+@functools.lru_cache(maxsize=8)
+def _module(lmax=None):
+    """The kernels a basis of this ``lmax`` can reach, and only those.
+
+    ``lmax`` of ``None`` compiles the whole family, which is what a caller
+    that cannot name its basis gets.
+    """
+    files = _sources()
+    names = None if lmax is None else _ksplit.names_within(files, lmax)
     opts = ['-std=c++17']
     if os.environ.get('FASTJ_LINEINFO'):
         opts.append('-lineinfo')
-    return cp.RawModule(code=src, options=tuple(opts), backend='nvrtc')
+    return cp.RawModule(code=_ksplit.source(files, names),
+                        options=tuple(opts), backend='nvrtc')
 
 
-@functools.lru_cache(maxsize=32)
-def _function(name):
-    return _module().get_function(name)
+@functools.lru_cache(maxsize=128)
+def _function(name, lmax=None):
+    try:
+        f = _module(lmax).get_function(name)
+    except Exception:                     # a class the lmax subset missed
+        f = _module(None).get_function(name)
+    # The written high-l classes carry the whole Rt tensor plus the ket vj
+    # accumulators in shared memory, which is past the 48 KB a kernel gets
+    # without asking.
+    shm = LAUNCH.get(name[2:], {}).get('shm', 0) * 8
+    if shm > 48 * 1024:
+        f.max_dynamic_shared_size_bytes = shm
+    return f
 
 
 def _qd_offset_for_threads(npairs, threads):
@@ -67,29 +102,23 @@ def _qd_offset_for_threads(npairs, threads):
     return address
 
 
-def get_j_181(self, dms, verbose=None):
-    """Build the J matrix on GPU4PySCF 1.8.x (see j_engine._VHFOpt.get_j).
+class _JSetup:
+    """Everything ``MD_build_j`` (or our kernels) needs, built once.
 
-    1.8.0 folded the primitive molecule into the option object's own
-    ``sorted_mol`` (``SortedGTO.from_mol(..., decontract=True)``, and
-    ``j_engine._cache_q_cond_and_non0pairs`` asserts one primitive per shell),
-    so ``prim_mol`` and ``prim_to_ctr_mapping`` are gone.  It also moved the
-    Hermite transform to the GPU -- ``_dm_to_Rt`` / ``_Rt_to_dm`` with
-    ``rys_envs`` instead of the host-side ``Et_dot_dm`` / ``jengine_dot_Et``
-    -- and made ``MD_build_j`` take the per-group compact ``q_cond_ij`` /
-    ``q_cond_kl`` rather than one global matrix.
-
-    Our kernels are unchanged: they index a dense ``nbas x nbas`` q_cond,
-    which ``g4pcompat.dense_q_cond`` rebuilds from the per-group cache, and
-    the tile-max hierarchy ``_make_tile_max_hierarchy`` writes has the same
-    layout ``_qd_offset_for_threads`` assumes.
+    Split out of :func:`get_j_181` so that the per-class benchmark can drive
+    exactly the same task list, screening data and Hermite density as a real
+    build does, instead of an approximation of it.
     """
-    assert num_devices == 1, 'fastj currently supports a single device'
-    log = logger.new_logger(self.mol, verbose)
+    __slots__ = ('opt', 'mol', 'n_dm', 'dm_xyz', 'dm_xyz_size', 'pair_lst',
+                 'pair_loc', 'task_offsets', 'pair_mappings', 'tasks',
+                 'schemes', 'q_cond', 'l_ctr_bas_loc', 'log_cutoff', '_env',
+                 'd_bas', 'd_env', 'use_ours', 'lmax')
+
+
+def _setup_181(self, dms):
+    """Build the task list, screening data and Hermite density for a J build."""
     mol = self.sorted_mol
     assert mol.nbas < 65536
-    if callable(dms):
-        dms = dms()
     ao_loc = mol.ao_loc
     n_dm, nao = dms.shape[:2]
     assert dms.ndim == 3 and nao == ao_loc[-1]
@@ -99,7 +128,6 @@ def get_j_181(self, dms, verbose=None):
     l_counts = np.bincount(mol._bas[:, ANG_OF])[:JE.LMAX+1]
     n_groups = len(l_counts)
     l_ctr_bas_loc = np.cumsum(np.append(0, l_counts))
-    l_symb = lib.param.ANGULAR
     pair_mappings = JE._make_pair_qd_cond(mol, self.bas_pair_cache, dm_cond)
     dm_cond = None
 
@@ -124,7 +152,6 @@ def get_j_181(self, dms, verbose=None):
 
     _env = JE._scale_sp_ctr_coeff(mol)
     dm_xyz = JE._dm_to_Rt(mol, dms, pair_lst, pair_loc, self.rys_envs)
-    vj_xyz = cp.zeros_like(dm_xyz)
 
     tasks = [(i, j, k, l)
              for i in range(n_groups)
@@ -132,65 +159,133 @@ def get_j_181(self, dms, verbose=None):
              for k in range(i+1)
              for l in range(k+1)
              if not (i == k and j < l)]
-    schemes = {t: JE._md_j_engine_quartets_scheme(t, n_dm=n_dm) for t in tasks}
 
-    q_cond = _dense_q_cond(self)
+    s = _JSetup()
+    s.opt = self
+    s.mol = mol
+    s.n_dm = n_dm
+    s.dm_xyz = dm_xyz
+    s.dm_xyz_size = dm_xyz_size
+    s.pair_lst = pair_lst
+    s.pair_loc = pair_loc
+    s.task_offsets = task_offsets
+    s.pair_mappings = pair_mappings
+    s.tasks = tasks
+    s.schemes = {t: JE._md_j_engine_quartets_scheme(t, n_dm=n_dm) for t in tasks}
+    s.q_cond = _dense_q_cond(self)
+    s.l_ctr_bas_loc = l_ctr_bas_loc
+    s.log_cutoff = log_cutoff
+    s._env = _env
     rys_envs = self.rys_envs
-    d_bas, d_env = rys_envs._env_ref_holder[1], rys_envs._env_ref_holder[2]
-    kern_ref = JE.libvhf_md.MD_build_j
-    use_ours = (n_dm == 1 and float(_env[PTR_RANGE_OMEGA]) == 0.)
+    s.d_bas = rys_envs._env_ref_holder[1]
+    s.d_env = rys_envs._env_ref_holder[2]
+    s.use_ours = (n_dm == 1 and float(_env[PTR_RANGE_OMEGA]) == 0.)
+    s.lmax = int(mol._bas[:, ANG_OF].max())
+    return s
 
-    for i, j, k, l in tasks:
-        shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
-        pair_ij_mapping, q_cond_ij, qd_ij = pair_mappings[i, j]
-        pair_kl_mapping, q_cond_kl, qd_kl = pair_mappings[k, l]
-        npairs_ij = pair_ij_mapping.size
-        npairs_kl = pair_kl_mapping.size
-        if npairs_ij == 0 or npairs_kl == 0:
-            continue
-        pair_ij_loc = pair_loc[task_offsets[i, j]:]
-        pair_kl_loc = pair_loc[task_offsets[k, l]:]
-        tag = f'{i+j}_{k+l}'
-        entry = LAUNCH.get(tag) if use_ours else None
-        if entry is not None:
-            bx, by = entry['bsizex'], entry['bsizey']
-            off_ij = _qd_offset_for_threads(npairs_ij, 16)
-            off_kl = _qd_offset_for_threads(npairs_kl, 16)
-            grid = ((npairs_ij + bx - 1) // bx, (npairs_kl + by - 1) // by)
-            kern = _function('j_' + tag)
-            kern(grid, (16, 16),
-                 (vj_xyz, dm_xyz, d_bas, d_env, np.int32(mol.nbas),
-                  np.int32(npairs_ij), np.int32(npairs_kl),
-                  pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
-                  qd_ij[off_ij:], qd_kl[off_kl:], q_cond,
-                  np.float32(log_cutoff)),
-                 shared_mem=entry['shm'] * 8)
-            continue
-        err = kern_ref(
-            ctypes.cast(vj_xyz.data.ptr, ctypes.c_void_p),
-            ctypes.cast(dm_xyz.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(n_dm), ctypes.c_int(dm_xyz_size),
-            ctypes.byref(rys_envs), (ctypes.c_int*6)(*schemes[i, j, k, l]),
-            (ctypes.c_int*8)(*shls_slice),
-            ctypes.c_int(npairs_ij), ctypes.c_int(npairs_kl),
-            ctypes.cast(pair_ij_mapping.data.ptr, ctypes.c_void_p),
-            ctypes.cast(pair_kl_mapping.data.ptr, ctypes.c_void_p),
-            ctypes.cast(pair_ij_loc.data.ptr, ctypes.c_void_p),
-            ctypes.cast(pair_kl_loc.data.ptr, ctypes.c_void_p),
-            ctypes.cast(qd_ij.data.ptr, ctypes.c_void_p),
-            ctypes.cast(qd_kl.data.ptr, ctypes.c_void_p),
-            ctypes.cast(q_cond_ij.data.ptr, ctypes.c_void_p),
-            ctypes.cast(q_cond_kl.data.ptr, ctypes.c_void_p),
-            ctypes.c_float(log_cutoff),
-            mol._atm.ctypes, ctypes.c_int(mol.natm),
-            mol._bas.ctypes, ctypes.c_int(mol.nbas), _env.ctypes)
-        if err != 0:
-            llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
-            raise RuntimeError(f'MD_build_j kernel for {llll} failed')
+
+def _launch_task(s, task, vj_xyz, force=None, override=None):
+    """Run one (i,j,k,l) task into ``vj_xyz``.
+
+    ``force`` is ``'ours'`` or ``'ref'`` to override the dispatch, which is
+    what the per-class benchmark uses to A/B one class at a time.
+    ``override`` maps a class tag to ``(entry, kernel)``, which is how the
+    launch-configuration sweep drives a candidate kernel through exactly the
+    same task list and screening data as the shipped one.  Returns the tag
+    that ran, or ``None`` if the task has no pairs.
+    """
+    i, j, k, l = task
+    self = s.opt
+    mol = s.mol
+    shls_slice = s.l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
+    pair_ij_mapping, q_cond_ij, qd_ij = s.pair_mappings[i, j]
+    pair_kl_mapping, q_cond_kl, qd_kl = s.pair_mappings[k, l]
+    npairs_ij = pair_ij_mapping.size
+    npairs_kl = pair_kl_mapping.size
+    if npairs_ij == 0 or npairs_kl == 0:
+        return None
+    pair_ij_loc = s.pair_loc[s.task_offsets[i, j]:]
+    pair_kl_loc = s.pair_loc[s.task_offsets[k, l]:]
+    tag = f'{i+j}_{k+l}'
+    entry = LAUNCH.get(tag) if s.use_ours else None
+    kern = None
+    if override and tag in override and force != 'ref':
+        entry, kern = override[tag]
+    elif force == 'ref':
+        entry = None
+    elif force == 'ours' and entry is None:
+        raise KeyError(f'no fastj kernel for class {tag}')
+    if entry is not None:
+        bx, by = entry['bsizex'], entry['bsizey']
+        tx, ty = entry.get('threadsx', 16), entry.get('threadsy', 16)
+        off_ij = _qd_offset_for_threads(npairs_ij, tx)
+        off_kl = _qd_offset_for_threads(npairs_kl, ty)
+        grid = ((npairs_ij + bx - 1) // bx, (npairs_kl + by - 1) // by)
+        if kern is None:
+            kern = _function('j_' + tag, s.lmax)
+        kern(grid, tuple(entry.get('block', (16, 16))),
+             (vj_xyz, s.dm_xyz, s.d_bas, s.d_env, np.int32(mol.nbas),
+              np.int32(npairs_ij), np.int32(npairs_kl),
+              pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
+              qd_ij[off_ij:], qd_kl[off_kl:], s.q_cond,
+              np.float32(s.log_cutoff)),
+             shared_mem=entry['shm'] * 8)
+        return tag
+    rys_envs = self.rys_envs
+    err = JE.libvhf_md.MD_build_j(
+        ctypes.cast(vj_xyz.data.ptr, ctypes.c_void_p),
+        ctypes.cast(s.dm_xyz.data.ptr, ctypes.c_void_p),
+        ctypes.c_int(s.n_dm), ctypes.c_int(s.dm_xyz_size),
+        ctypes.byref(rys_envs), (ctypes.c_int*6)(*s.schemes[i, j, k, l]),
+        (ctypes.c_int*8)(*shls_slice),
+        ctypes.c_int(npairs_ij), ctypes.c_int(npairs_kl),
+        ctypes.cast(pair_ij_mapping.data.ptr, ctypes.c_void_p),
+        ctypes.cast(pair_kl_mapping.data.ptr, ctypes.c_void_p),
+        ctypes.cast(pair_ij_loc.data.ptr, ctypes.c_void_p),
+        ctypes.cast(pair_kl_loc.data.ptr, ctypes.c_void_p),
+        ctypes.cast(qd_ij.data.ptr, ctypes.c_void_p),
+        ctypes.cast(qd_kl.data.ptr, ctypes.c_void_p),
+        ctypes.cast(q_cond_ij.data.ptr, ctypes.c_void_p),
+        ctypes.cast(q_cond_kl.data.ptr, ctypes.c_void_p),
+        ctypes.c_float(s.log_cutoff),
+        mol._atm.ctypes, ctypes.c_int(mol.natm),
+        mol._bas.ctypes, ctypes.c_int(mol.nbas), s._env.ctypes)
+    if err != 0:
+        l_symb = lib.param.ANGULAR
+        llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
+        raise RuntimeError(f'MD_build_j kernel for {llll} failed')
+    return tag
+
+
+def get_j_181(self, dms, verbose=None):
+    """Build the J matrix on GPU4PySCF 1.8.x (see j_engine._VHFOpt.get_j).
+
+    1.8.0 folded the primitive molecule into the option object's own
+    ``sorted_mol`` (``SortedGTO.from_mol(..., decontract=True)``, and
+    ``j_engine._cache_q_cond_and_non0pairs`` asserts one primitive per shell),
+    so ``prim_mol`` and ``prim_to_ctr_mapping`` are gone.  It also moved the
+    Hermite transform to the GPU -- ``_dm_to_Rt`` / ``_Rt_to_dm`` with
+    ``rys_envs`` instead of the host-side ``Et_dot_dm`` / ``jengine_dot_Et``
+    -- and made ``MD_build_j`` take the per-group compact ``q_cond_ij`` /
+    ``q_cond_kl`` rather than one global matrix.
+
+    Our kernels are unchanged: they index a dense ``nbas x nbas`` q_cond,
+    which ``g4pcompat.dense_q_cond`` rebuilds from the per-group cache, and
+    the tile-max hierarchy ``_make_tile_max_hierarchy`` writes has the same
+    layout ``_qd_offset_for_threads`` assumes.
+    """
+    assert num_devices == 1, 'fastj currently supports a single device'
+    log = logger.new_logger(self.mol, verbose)
+    if callable(dms):
+        dms = dms()
+    s = _setup_181(self, dms)
+    vj_xyz = cp.zeros_like(s.dm_xyz)
+    for task in s.tasks:
+        _launch_task(s, task, vj_xyz)
 
     if self.h_shls:
         raise NotImplementedError('fastj does not handle the CPU high-l path')
-    vj = JE._Rt_to_dm(mol, vj_xyz.get(), pair_lst, pair_loc, self.rys_envs)
+    vj = JE._Rt_to_dm(s.mol, vj_xyz.get(), s.pair_lst, s.pair_loc, self.rys_envs)
     vj *= 2.
     log.timer_debug1('get_j (fastj)')
     return vj
@@ -219,6 +314,7 @@ def get_j(self, dms, verbose=None):
     dm_cond = dm_cond[p2c_mapping[:, None], p2c_mapping]
 
     l_counts = np.bincount(prim_mol._bas[:, ANG_OF])[:JE.LMAX+1]
+    lmax = int(prim_mol._bas[:, ANG_OF].max())
     n_groups = len(l_counts)
     l_ctr_bas_loc = np.cumsum(np.append(0, l_counts))
     l_symb = lib.param.ANGULAR
@@ -299,7 +395,7 @@ def get_j(self, dms, verbose=None):
             off_ij = _qd_offset_for_threads(npairs_ij, 16)
             off_kl = _qd_offset_for_threads(npairs_kl, 16)
             grid = ((npairs_ij + bx - 1) // bx, (npairs_kl + by - 1) // by)
-            kern = _function('j_' + tag)
+            kern = _function('j_' + tag, lmax)
             kern(grid, (16, 16),
                  (vj_xyz, dm_xyz, d_bas, d_env, np.int32(prim_mol.nbas),
                   np.int32(npairs_ij), np.int32(npairs_kl),
