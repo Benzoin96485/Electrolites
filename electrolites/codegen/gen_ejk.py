@@ -951,9 +951,16 @@ def generate(classes, threads=256, gout_max=64, shm_max=48 * 1024 - 2688,
     return '\n'.join(out)
 
 
+#: Every class an spdf basis reaches.  codegen/build_ejk.sh passes the same
+#: list explicitly; this is the copy electrolites._gen uses on demand.
+DEFAULT_CLASSES = [f'{i}{j}{k}{l}'
+                   for i in range(4) for j in range(i+1)
+                   for k in range(i+1) for l in range(k+1)]
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('classes')
+    ap.add_argument('classes', nargs='?', default=','.join(DEFAULT_CLASSES))
     ap.add_argument('--threads', type=int, default=256)
     ap.add_argument('--reg-threads', type=int, default=256)
     ap.add_argument('--gout-max', type=int, default=64,

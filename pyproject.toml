@@ -32,7 +32,10 @@ Homepage = "https://github.com/Benzoin96485/Electrolites"
 
 [tool.setuptools]
 # the CUDA sources, launch tables and Rys tables are package data: a wheel
-# carries them, so nothing depends on where the repository was checked out
+# carries them, so nothing depends on where the repository was checked out.
+# The three *written* kernel families are the exception -- electrolites.codegen
+# emits them from the angular-momentum class in 0.7 s and electrolites._gen
+# caches the result, so the generator ships and its 13 MB of output does not.
 include-package-data = true
 
 [tool.setuptools.packages.find]

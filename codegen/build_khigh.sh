@@ -9,6 +9,9 @@
 set -e
 cd "$(dirname "$0")"
 KERNELS=${KERNELS:-"$(cd "$(dirname "$0")/../electrolites/kernels" && pwd)"}
+# these two generators moved into the package (electrolites/codegen); their
+# output is generated on demand by electrolites/_gen.py and is not tracked
+GEN=${GEN:-"$(cd "$(dirname "$0")/../electrolites/codegen" && pwd)"}
 # Everything with l <= 3 except: the 19 classes gen_kernels.py runs with one
 # thread per shell quartet (that design keeps the 2D integrals in registers and
 # is still faster for them), and 2021, where GPU4PySCF's own unrolled kernel
@@ -21,6 +24,6 @@ print(','.join(f'{i}{j}{k}{l}' for i in range(4) for j in range(i+1)
                 if f'{i}{j}{k}{l}' not in KEEP))
 PY
 )}
-python gen_khigh.py "$CLASSES" --table "$KERNELS/fastkhigh_launch.json" "${@:2}" \
+python "$GEN/gen_khigh.py" "$CLASSES" --table "$KERNELS/fastkhigh_launch.json" "${@:2}" \
     > "$KERNELS/fastkhigh_generated.cu"
 echo "wrote $KERNELS/fastkhigh_generated.cu ($(wc -l < "$KERNELS/fastkhigh_generated.cu") lines)"

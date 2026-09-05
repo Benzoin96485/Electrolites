@@ -28,6 +28,7 @@ from .compat import NEW_JK_ABI as _NEW_ABI, dense_q_cond as _dense_q_cond
 
 from ._paths import KERNEL_DIR as HERE
 from . import _ksplit
+from . import _gen
 PTR_RANGE_OMEGA = 8
 # FASTJ_TIME=1 prints the host/transfer vs kernel split of each J build
 TIME = int(os.environ.get('FASTJ_TIME', 0))
@@ -49,9 +50,9 @@ if not int(os.environ.get('FASTJ_NO_HIGH', 0)):
 
 def _sources():
     gen = os.environ.get('FASTJ_SRC', 'fastj_generated.cu')
-    out = [os.path.join(HERE, 'fastj_prologue.cu'), os.path.join(HERE, gen)]
+    out = [os.path.join(HERE, 'fastj_prologue.cu'), _gen.source_path(gen)]
     if _HIGH:
-        out.append(os.path.join(HERE, os.environ.get(
+        out.append(_gen.source_path(os.environ.get(
             'FASTJ_HIGH_SRC', 'fastjhigh_generated.cu')))
     return out
 

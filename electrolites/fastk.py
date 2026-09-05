@@ -33,6 +33,7 @@ from gpu4pyscf.__config__ import props as gpu_specs, num_devices
 
 from ._paths import KERNEL_DIR as HERE
 from . import _ksplit
+from . import _gen
 from . import _nvcc
 
 from .compat import (
@@ -77,8 +78,8 @@ if os.environ.get('FASTK_NO_K2'):       # ablation: hand the lifted ones back
 _HIGH_SRC = os.environ.get('FASTKH_SRC', 'fastkhigh_generated.cu')
 _HIGH_TAB = os.path.join(HERE, os.path.splitext(_HIGH_SRC)[0]
                          .replace('_generated', '_launch') + '.json')
-_HIGH = (not os.environ.get('FASTK_NO_HIGH')) and os.path.exists(_HIGH_TAB) \
-        and os.path.exists(os.path.join(HERE, _HIGH_SRC))
+_HIGH = ((not os.environ.get('FASTK_NO_HIGH')) and os.path.exists(_HIGH_TAB)
+         and _gen.available(_HIGH_SRC))
 if _HIGH:
     with open(_HIGH_TAB) as _f:
         _LAUNCH_H = json.load(_f)
@@ -90,10 +91,10 @@ def _sources():
     gen1 = os.environ.get('FASTK_SRC', 'fastk_generated.cu')
     gen2 = os.environ.get('FASTK2_SRC', 'fastk2_generated.cu')
     out = [os.path.join(HERE, 'fastk_prologue.cu'),
-           os.path.join(HERE, gen1),
-           os.path.join(HERE, gen2)]
+           _gen.source_path(gen1),
+           _gen.source_path(gen2)]
     if _HIGH:                      # the classes GPU4PySCF does not unroll
-        out.append(os.path.join(HERE, _HIGH_SRC))
+        out.append(_gen.source_path(_HIGH_SRC))
     return out
 
 

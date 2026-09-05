@@ -817,9 +817,24 @@ def generate(classes, threads=256, gout_max=96, shm_max=48 * 1024,
     return '\n'.join(out)
 
 
+#: The classes this generator is responsible for: everything with l <= 3
+#: except the 19 that gen_kernels.py runs with one thread per shell quartet
+#: (that design keeps the 2D integrals in registers and is still faster for
+#: them), and 2021, where GPU4PySCF's own unrolled kernel wins -- 0.87x,
+#: measured.  codegen/build_khigh.sh passes the same list explicitly; this is
+#: the copy electrolites._gen uses when it generates on demand.
+_LIFTED = {'0000', '1000', '1010', '1011', '1100', '1110', '1111', '2000',
+           '2010', '2011', '2020', '2100', '2110', '2200', '3000', '3010',
+           '3020', '3100', '3200', '2021'}
+DEFAULT_CLASSES = [f'{i}{j}{k}{l}'
+                   for i in range(4) for j in range(i+1)
+                   for k in range(i+1) for l in range(k+1)
+                   if f'{i}{j}{k}{l}' not in _LIFTED]
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('classes')
+    ap.add_argument('classes', nargs='?', default=','.join(DEFAULT_CLASSES))
     ap.add_argument('--threads', type=int, default=256)
     # doubles of gout each lane accumulates.  Wider means fewer lanes, which
     # means more shell quartets per block and less of the block idling through

@@ -26,6 +26,7 @@ from .compat import (
 
 from ._paths import KERNEL_DIR as HERE
 from . import _ksplit
+from . import _gen
 QUEUE_DEPTH = int(os.environ.get('FASTEJK_QUEUE_DEPTH', 1 << 16))
 # a block may run one thread-block of tasks past ntasks with a zero density
 # factor, and pads its queue there, so each slot needs a block's worth of slack
@@ -38,7 +39,7 @@ _TAB = os.path.join(HERE, os.path.splitext(_SRC)[0].replace('_generated', '')
                     + '_launch.json')
 _OFF = set(x for x in os.environ.get('FASTEJK_SKIP', '').split(',') if x)
 IMPLEMENTED = {}
-if os.path.exists(_TAB) and os.path.exists(os.path.join(HERE, _SRC)):
+if os.path.exists(_TAB) and _gen.available(_SRC):
     IMPLEMENTED = {t: e for t, e in json.load(open(_TAB)).items()
                    if t not in _OFF}
 
@@ -54,7 +55,7 @@ _LMAX = None
 
 
 def _sources():
-    return [os.path.join(HERE, 'fastejk_prologue.cu'), os.path.join(HERE, _SRC)]
+    return [os.path.join(HERE, 'fastejk_prologue.cu'), _gen.source_path(_SRC)]
 
 
 @functools.lru_cache(maxsize=8)

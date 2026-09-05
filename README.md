@@ -155,16 +155,35 @@ python benchmarks/fixed_density.py --xyz benchmarks/molecules/HcgC.xyz --charge 
 
 ## Regenerating kernels
 
-`codegen/` holds the generators. `gen_khigh.py`, `gen_ejk.py` and
-`gen_j_high.py` write a kernel from the angular-momentum class alone;
-`gen_kernels.py`, `gen_k2_kernels.py` and `gen_j_kernels.py` lift the integral
-arithmetic out of a GPU4PySCF source file, so they take its path:
+There are two kinds of generator here, and the difference decides what is in
+the repository.
+
+`electrolites/codegen/` holds the three that write a kernel from the
+angular-momentum class alone, taking nothing from GPU4PySCF: `gen_khigh.py`,
+`gen_ejk.py` and `gen_j_high.py`.  **Their output is not tracked.**  It is
+13 MB of straight-line CUDA, it regenerates in 0.7 s byte for byte, and
+`electrolites/_gen.py` produces it on first use and caches it under
+`~/.cache/electrolites/generated/`, keyed by a hash of the generator and its
+launch table so that editing either regenerates.  `ELECTROLITES_GENERATED_DIR`
+points at a pre-generated tree instead, for an offline or read-only install or
+to share one copy across a cluster.
+
+`codegen/` holds the other three -- `gen_kernels.py`, `gen_k2_kernels.py` and
+`gen_j_kernels.py` -- which *lift* the integral arithmetic out of a GPU4PySCF
+source file and rewrite the scaffolding around it, so they take its path and
+need a checkout an installed user has no reason to have.  Their output stays
+tracked:
 
 ```bash
-python codegen/gen_khigh.py --table electrolites/kernels/fastkhigh_launch.json \
-    > electrolites/kernels/fastkhigh_generated.cu
-python codegen/gen_j_high.py > electrolites/kernels/fastjhigh_generated.cu
 codegen/build_kernels.sh /path/to/gpu4pyscf/lib/gvhf-rys/unrolled_rys_k.cu
+```
+
+The written families need no such path, and normally need no command either --
+they appear when they are first wanted.  To force it, or to fill a cache
+ahead of time:
+
+```bash
+python -c 'from electrolites import _gen; print(_gen.ensure_all())'
 ```
 
 `gen_j_high.py` needs no GPU4PySCF source at all -- it writes each

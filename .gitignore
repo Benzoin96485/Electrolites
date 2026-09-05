@@ -15,3 +15,14 @@ dist/
 *.nsys-rep
 *.sqlite
 results/
+
+# Written, not lifted: electrolites/codegen/ emits these three from the
+# angular-momentum class alone in 0.7 s, byte for byte the same every time,
+# and electrolites/_gen.py produces and caches them on first use.  13 MB of
+# straight-line CUDA does not belong in the history for that.  The kernels
+# that are *lifted* out of a GPU4PySCF source file are a different matter and
+# stay tracked -- regenerating those needs a checkout an installed user has
+# no reason to have.
+electrolites/kernels/fastjhigh_generated.cu
+electrolites/kernels/fastkhigh_generated.cu
+electrolites/kernels/fastejk_generated.cu
