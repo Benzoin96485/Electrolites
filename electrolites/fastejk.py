@@ -14,6 +14,7 @@ import os, math, json, ctypes, functools
 import numpy as np
 import cupy as cp
 from pyscf import lib
+from pyscf.gto import ANG_OF
 from gpu4pyscf.scf import jk as JK
 from gpu4pyscf.grad import rhf as grhf
 from gpu4pyscf.lib.cupy_helper import condense
@@ -24,6 +25,7 @@ from .compat import (
     diffuse_exps as _diffuse_exps)
 
 from ._paths import KERNEL_DIR as HERE
+from . import _ksplit
 QUEUE_DEPTH = int(os.environ.get('FASTEJK_QUEUE_DEPTH', 1 << 16))
 # a block may run one thread-block of tasks past ntasks with a zero density
 # factor, and pads its queue there, so each slot needs a block's worth of slack
@@ -44,19 +46,38 @@ _ZERO = np.float64(0.0)
 _ONE = np.float64(1.0)
 
 
-@functools.lru_cache(maxsize=1)
-def _module():
-    src = (open(os.path.join(HERE, 'fastejk_prologue.cu')).read() +
-           open(os.path.join(HERE, _SRC)).read())
-    return cp.RawModule(code=src, options=('-std=c++17',), backend='nvrtc')
+#: Maximum angular momentum of the basis currently being built; see
+#: fastk._LMAX.  This module is the largest generated file here -- 140 000
+#: lines for 65 classes -- so it is where compiling only what the basis
+#: reaches is worth the most.
+_LMAX = None
 
 
-@functools.lru_cache(maxsize=128)
-def _function(name, shm=0):
-    f = _module().get_function(name)
+def _sources():
+    return [os.path.join(HERE, 'fastejk_prologue.cu'), os.path.join(HERE, _SRC)]
+
+
+@functools.lru_cache(maxsize=8)
+def _module(lmax=None):
+    files = _sources()
+    names = None if lmax is None else _ksplit.names_within(files, lmax)
+    return cp.RawModule(code=_ksplit.source(files, names),
+                        options=('-std=c++17',), backend='nvrtc')
+
+
+@functools.lru_cache(maxsize=256)
+def _function_for(name, shm, lmax):
+    try:
+        f = _module(lmax).get_function(name)
+    except Exception:                     # a class the lmax subset missed
+        f = _module(None).get_function(name)
     if shm > 48 * 1024 - 2688:      # opt in to the A100's large shared window
         f.max_dynamic_shared_size_bytes = shm
     return f
+
+
+def _function(name, shm=0):
+    return _function_for(name, shm, _LMAX)
 
 
 @functools.lru_cache(maxsize=1)
@@ -201,6 +222,8 @@ def jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1., verbose=None):
     n_dm, nao = dms.shape[:2]
     ao_loc = smol.ao_loc
     uniq_l_ctr, l_ctr_bas_loc = _sorted_meta(vhfopt)
+    global _LMAX
+    _LMAX = int(vhfopt.sorted_mol._bas[:, ANG_OF].max())
     uniq_l = uniq_l_ctr[:, 0]
     nprim = uniq_l_ctr[:, 1]
     n_groups = len(uniq_l_ctr)

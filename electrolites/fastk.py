@@ -24,6 +24,7 @@ import os, json, math, ctypes, functools, inspect
 import numpy as np
 import cupy as cp
 from pyscf import lib
+from pyscf.gto import ANG_OF
 
 from gpu4pyscf.scf import jk as JK
 from gpu4pyscf.lib.cupy_helper import condense, transpose_sum, hermi_triu, asarray
@@ -31,6 +32,7 @@ from gpu4pyscf.lib import logger
 from gpu4pyscf.__config__ import props as gpu_specs, num_devices
 
 from ._paths import KERNEL_DIR as HERE
+from . import _ksplit
 from . import _nvcc
 
 from .compat import (
@@ -84,16 +86,30 @@ if _HIGH:
                          for t, e in _LAUNCH_H.items()})
 
 
-@functools.lru_cache(maxsize=1)
-def _module():
+def _sources():
+    gen1 = os.environ.get('FASTK_SRC', 'fastk_generated.cu')
     gen2 = os.environ.get('FASTK2_SRC', 'fastk2_generated.cu')
-    src = (open(os.path.join(HERE, 'fastk_prologue.cu')).read() +
-           open(os.path.join(HERE, 'fastk_generated.cu')).read() +
-           open(os.path.join(HERE, gen2)).read())
+    out = [os.path.join(HERE, 'fastk_prologue.cu'),
+           os.path.join(HERE, gen1),
+           os.path.join(HERE, gen2)]
     if _HIGH:                      # the classes GPU4PySCF does not unroll
-        src += open(os.path.join(HERE, _HIGH_SRC)).read()
-    return cp.RawModule(code=src, options=('-std=c++17',),
-                        backend='nvrtc')
+        out.append(os.path.join(HERE, _HIGH_SRC))
+    return out
+
+
+#: Maximum angular momentum of the basis currently being built.  The driver
+#: sets it before any launch; the kernels of higher classes are then not
+#: compiled at all, which is what a 6-31G* job would otherwise pay ~30 s of
+#: NVRTC for on its first run.  ``None`` compiles the whole family.
+_LMAX = None
+
+
+@functools.lru_cache(maxsize=8)
+def _module(lmax=None):
+    files = _sources()
+    names = None if lmax is None else _ksplit.names_within(files, lmax)
+    return cp.RawModule(code=_ksplit.source(files, names),
+                        options=('-std=c++17',), backend='nvrtc')
 
 
 @functools.lru_cache(maxsize=1)
@@ -131,9 +147,16 @@ def _workspace():
     return _Workspace()
 
 
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=256)
+def _function_for(name, lmax):
+    try:
+        return _module(lmax).get_function(name)
+    except Exception:                     # a class the lmax subset missed
+        return _module(None).get_function(name)
+
+
 def _function(name):
-    return _module().get_function(name)
+    return _function_for(name, _LMAX)
 
 
 def _usable(omega, n_dm, nprim, i, j, k, l):
@@ -353,6 +376,12 @@ def _run_ref(self, ws, vk, dms, n_dm, nao, shls_slice, pm_ij, pm_kl, q_cond,
             raise RuntimeError(f'RYS_build_k kernel for {lll} failed')
 
 
+def _note_lmax(mol):
+    """Record the basis' maximum angular momentum for the module split."""
+    global _LMAX
+    _LMAX = int(mol._bas[:, ANG_OF].max())
+
+
 def _classes(self):
     """(i, j, k, l) group indices in GPU4PySCF's order, with their l values."""
     uniq_l = _sorted_meta(self)[0][:, 0]
@@ -404,6 +433,7 @@ def get_k(self, dms, hermi, verbose, omega=None, lr_factor=None,
     dev = self.rys_envs._env_ref_holder[1:]
 
     uniq_l_ctr, l_ctr_bas_loc = _sorted_meta(self)
+    _note_lmax(self.sorted_mol)
     nprim = uniq_l_ctr[:, 1]             # used by the shared-memory guard
     inv_om2 = np.float64(0.0 if rsh_omega == 0 else 1.0 / rsh_omega**2)
     dm_penalty = float(dm_cond.max())
@@ -522,6 +552,7 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
     vk = cp.zeros(dms.shape)
     dev_f = opt_f.rys_envs._env_ref_holder[1:]
     dev_l = opt_l.rys_envs._env_ref_holder[1:]
+    _note_lmax(opt_f.sorted_mol)
     nprim = _sorted_meta(opt_f)[0][:, 1]
     inv_om2 = _inv_om2(opt_l.sorted_mol)
     c_f, c_l = np.float64(coef_f), np.float64(coef_l)
