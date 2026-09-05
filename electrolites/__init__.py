@@ -33,7 +33,7 @@ TESTED_GPU4PYSCF = ('1.7.0', '1.8.1')
 
 #: The SCF modules, then the gradient modules, in the order they should load.
 MODULES = (
-    'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastnlc',
+    'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh',
 )
 
@@ -45,6 +45,7 @@ _TARGETS = {
     'fastj': ('gpu4pyscf.scf.j_engine', '_VHFOpt.get_j'),
     'fastxc': ('gpu4pyscf.dft.numint', 'NumInt.nr_rks'),
     'fastrsh': ('gpu4pyscf.dft.rks', 'RKS.get_veff'),
+    'fastxcnlc': ('gpu4pyscf.dft.rks', 'RKS.get_veff'),
     'fastnlc': ('gpu4pyscf.dft.numint', '_vv10nlc'),
     'fastejk': ('gpu4pyscf.grad.rhf', '_jk_energy_per_atom'),
     'fastgrad': ('gpu4pyscf.grad.rks', 'Gradients.energy_ee'),
