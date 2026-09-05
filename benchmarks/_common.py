@@ -17,6 +17,20 @@ def parser(description):
                     help="'all', a comma separated module list, or '' for "
                          "unpatched GPU4PySCF")
     ap.add_argument('--reps', type=int, default=3)
+    ap.add_argument('--cycles', type=int, default=0,
+                    help='run this many SCF cycles first and time the builds '
+                         'on the resulting density instead of on the `minao` '
+                         'guess.  A `minao` guess is exactly zero on the '
+                         'polarisation shells and screens far harder than a '
+                         'converged density, so a fixed-density speedup '
+                         'measured on it is not the speedup the SCF sees -- '
+                         'see docs/ROUND2_1.8.1.md 2.')
+    ap.add_argument('--no-grad', action='store_true',
+                    help='skip the gradient timing.  Its unpatched half runs '
+                         "GPU4PySCF's CPU one-electron derivative, so it is "
+                         'sensitive to OMP_NUM_THREADS in a way the GPU '
+                         'builds are not -- set that explicitly, or leave the '
+                         'gradient out when only the builds are wanted.')
     return ap
 
 
