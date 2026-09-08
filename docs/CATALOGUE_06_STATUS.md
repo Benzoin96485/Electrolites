@@ -1,7 +1,7 @@
 # Status of `instructions/06.gpu4pyscf_kernel_targets.md` in this repository
 
-What this repository has done, per catalogue ID, as of commit `06eb0a8` plus
-`fast1e` (GPU4PySCF **1.8.1**, one A100).  The catalogue is the file
+What this repository has done, per catalogue ID, as of the `fastxcfxc` round
+(GPU4PySCF **1.8.1**, one A100).  The catalogue is the file
 `LLM-GPU-QM/instructions/06.gpu4pyscf_kernel_targets.md`; its §4 is the target
 list and its §5 the ranking.  This file is a **record**, not a re-measurement:
 every number quoted here is one this repository measured and wrote down in
@@ -46,24 +46,28 @@ status column.
 | 5 | **A4** — `nr_rks` for UKS and mGGA | **partial**: mGGA covered in the *gradient*, open in the SCF; UKS open | `fastxcgrad` covers mGGA; `fastxc.py:65` declines it |
 | 6 | **F2 + F3** — spatial screening in `int3c1e`, PCM D/S | **F2 done, and its premise corrected; F3 rejected** | `fast1e`; `docs/README_fast1e.md` |
 | 7 | **B5** — batch the atom dimension in the XC Hessian | **done** (GGA), and its stated mechanism corrected | `fastxchess`; `docs/README_fastxchess.md` |
-| 8 | **B4b + B4c** — K in CPHF, per-density screening | **open** — and now measured to be the Hessian's largest entry at any size: 24 % at 42 atoms, **47 %** at 113 | `fastk.py:175` declines `n_dm != 1`; `docs/HESSIAN_1.8.1.md` |
+| 8 | **B4b + B4c** — K in CPHF, per-density screening | **open** — and now measured to be the largest entry on *two* profiles: the Hessian's, at 24 % at 42 atoms and **47 %** at 113, and the response path's, at **61–82 %** | `fastk.py:175` declines `n_dm != 1`; `docs/HESSIAN_1.8.1.md`, `docs/RESPONSE_1.8.1.md` §4 |
 | 9 | **B3** — `ejk_ip2` | **open** (8.8 % at 42 atoms, 2.6 % at 113) | `docs/HESSIAN_1.8.1.md` |
 | 10 | **B6** — batch `hess_nuc_elec` | **upstream**: 1.8.1 replaced the per-charge loop | `docs/HESSIAN_1.8.1.md` §1 |
 | 11 | **A3** — the J engine's host-side Hermite transform | **upstream**: 1.8.0 moved it to the GPU | `docs/UPGRADE_1.8.1.md` §6 |
-| 12 | **B4d + D8** — batching and AO repetition on the response path | **open** | — |
-| 13 | **D2** — preallocate `lr_eigh`'s trial space | **open** | — |
+| 12 | **B4d + D8** — batching and AO repetition on the response path | **B4d done** on the response path, and the entry's prescription corrected; **D8 re-sized and rejected** | `fastxcfxc`; `docs/README_fastxcfxc.md`, `docs/RESPONSE_1.8.1.md` |
+| 13 | **D2** — preallocate `lr_eigh`'s trial space | **rejected on a measured size**: 0.19 GB of copying over a whole 22 s TDA run | `docs/RESPONSE_1.8.1.md` §5 |
 | — | **A12 / F1 / C2 / E3** — the low-contamination four | **open** (all four) | — |
 
 **The highest-ranked entry with nothing done to it is now rank 3, A5**, and
-after this round the highest *wholly untouched* one is rank 8, B4b — ranks 6
-and 7 were taken in `docs/README_fast1e.md` and
-`docs/README_fastxchess.md`, and rank 10 turned out to have been closed
-upstream.  Rank
+the highest *wholly untouched* one is rank 8, B4b — ranks 6, 7 and 12 were
+taken in `docs/README_fast1e.md`, `docs/README_fastxchess.md` and
+`docs/README_fastxcfxc.md`, and ranks 10 and 11 turned out to have been closed
+upstream while rank 13 measured too small to take.  Rank
 2, B4a, was taken in `docs/ROUND3_B4A.md`; what came back is a 1.23x on the
 Coulomb build at `n_dm > 1` and a correction to the entry's premise, since the
 part of it that is really about the four-density cap measures **1.09x** once
 the per-quartet overheads are fixed.  Ranks 2, 8 and 12 are one family: every one of them is a
-build with `n_dm > 1`, and this repository's SCF modules all decline that.
+build with `n_dm > 1`.  Rank 12's XC half is now `fastxcfxc`; its two-electron
+half, and 8, are the same open target seen from two profiles — the Hessian's
+CPHF solve and the response path's Davidson — and `fastk` declines `n_dm > 1`
+on both.  §7 has the shape that target should take, which the response probe
+changed from "multi-density `fastk`" to "a fused multi-density `fastjk`".
 
 ---
 
@@ -76,7 +80,7 @@ build with `n_dm > 1`, and this repository's SCF modules all decline that.
 | **A3** host-side Hermite transform | **upstream** | 1.8.0's `_dm_to_Rt`/`_Rt_to_dm` replaced the host-side `Et_dot_dm`/`jengine_dot_Et`.  `docs/UPGRADE_1.8.1.md` §6.  Nothing for this repository to do |
 | **A4** `nr_rks`'s UKS / non-Hermitian / multi-density / mGGA paths | **partial** | `fastxc.py:65` still asserts `dms.ndim == 2` and declines mGGA in the SCF.  **mGGA is covered in the gradient** by `fastxcgrad` (3.98x–4.46x on the two mGGA columns, `docs/README_fastxcgrad.md`), which is direct evidence *against* catalogue §3.5's "the mGGA XC build is not a gap worth closing" — but that evidence is from the gradient's contraction, not the SCF's, so catalogue **Q13 is still open**: nobody has measured whether the SCF mGGA build is launch-bound at small `nao_sub`.  UKS is untouched |
 | **A5** the grid AO-evaluation kernel | **partial** | The **repetition** is addressed: `fastxc` fuses GPU4PySCF's two grid passes into one (P7+P8), and `fastxcnlc` fuses the XC and VV10 passes on 1.8.x, worth **1.036x** on `get_veff` for ωB97M-V (`docs/ROUND2_1.8.1.md` §5).  The **kernel** — `nr_eval_gto.cu`'s run-time `nprim` bound, absent per-point radial screening, per-shell recomputation — is untouched.  `docs/README_fastxcgrad.md` §312 measures `eval_ao` at deriv=2 as **26 %** of the gradient's XC block and names it as A5, not B2 |
-| **A6** VV10 gradient and Hessian | **partial** | `fastxcgrad` replaces `grad.rks.get_nlc_exc`, so the VV10 **gradient** grid contraction is covered.  The VV10 **Hessian** (`hessian/rks.py _get_enlc_deriv2`) is open |
+| **A6** VV10 gradient and Hessian | **partial** | `fastxcgrad` replaces `grad.rks.get_nlc_exc`, so the VV10 **gradient** grid contraction is covered.  The VV10 **Hessian** (`hessian/rks.py _get_enlc_deriv2`) is open.  The VV10 **response** -- `hessian/rks.py nr_rks_fnlc_mo`, which the catalogue does not list anywhere and which is **80 % of a wB97M-V polarizability** -- is `fastfnlc`, 1.43x over a real CPKS solve; see §4 |
 | **A7** extend the RSH fusion to the high-`l` classes | **open** | `get_k_rsh` (`fastk.py:583-588`) fuses only the `IMPLEMENTED` one-thread-per-quartet classes; the comment on the `IMPLEMENTED2` branch says it outright — *"These still take one pass per operator"*.  Catalogue sizes it at ~9 % of K for RSH functionals |
 | **A8** Rys roots: run-time `nroots`, shared memory, fp64 division | **done for the kernels here** | P1/P2/P5 are applied throughout `fastk`, `fastejk` and the written `gen_khigh` family: roots in a register array rather than shared memory, `rsqrt(fma(aij*akl, inv_om2, aij+akl))` as the sole source of all three scalings (`gen_khigh.py:676-680`).  GPU4PySCF's own `rys_roots.cu` is unchanged — anything still falling through pays it |
 | **A9** screening and task generation | **open** | The union-over-densities `dm_cond` is untouched, and `fastj`'s multi-density kernels take it as it is, so they screen exactly what GPU4PySCF screens.  Per-density screening is B4c and is a separate, algorithmic change |
@@ -111,7 +115,7 @@ build with `n_dm > 1`, and this repository's SCF modules all decline that.
 | **B4a** J engine multi-density block cap | **partial** | The cap is still live on 1.8.1 (`scf/j_engine.py:299-301` pins `n_dm` to 4; `MD_build_j` steps `dm_offset += 4`), and `fastj` now has multi-density kernels: **1.23x** on the whole J build at `n_dm` = 8, 16 and 32 on a 284-atom cluster and **1.19x** on a 545-atom one, 1.57x/1.55x at `n_dm` = 4.  But that gain is the kernel's, not the cap's: measured on GPU4PySCF the cap looks worth 3.4x, measured on *our* kernels it is worth **1.09x**, because the 3.4x is the per-quartet overhead (P1–P5) the cap repeats and the single-density rewrite had already removed it.  Blocks of 8 and 16 were written, measured at **0.90x** and **0.64x** against blocks of 4, and are not shipped.  `docs/ROUND3_B4A.md` |
 | **B4b** K in CPHF | **open** | `fastk.py:175` `if n_dm != 1: return False` |
 | **B4c** per-density screening | **open** | Inherits A9 |
-| **B4d** `nr_rks_fxc` | **open, and re-sized** | 1.8.1 renamed it `hessian/rks.py:3486 _nr_rks_fxc_mo_task` and contracts to the MO basis per block group.  Instrumented rather than inferred (catalogue Q3 infers ~11 % of a Hessian): **6.5 %** on penicillin V, **5.9 %** on taxol.  Its per-`nset` loop looks like B5's launch problem but is not — the arithmetic is `nset x nao_sub^2 x ngrids`, about 6.0 TFLOP per call on penicillin V, and it does that in 0.91 s = **6.6 TFLOP/s**, a third of the card's fp64 peak.  A function at a third of peak is not launch-bound, so batching its sets is worth the difference between a 214x214x4096 GEMM and a large one — not what batching bought in B5.  `docs/HESSIAN_1.8.1.md` |
+| **B4d** `nr_rks_fxc` | **done on the response path; open on the Hessian's, and re-sized there** | Two different functions on 1.8.1, and they want different treatments.  (a) The **response** path -- CPKS, TDA/TDDFT, NMR, IR/Raman, C6 -- still goes through `dft/numint.py:1339 nr_rks_fxc`, which is **23.2 %** of a polarizability and **28.4 %** of a five-root TDA run on 1.8.1 (`docs/RESPONSE_1.8.1.md`).  `fastxcfxc` replaces it for LDA and GGA: **2.93x/3.97x** at `nset = 3` and **3.35x/4.65x** at `nset = 5` (`hermi` 1/0) at 42 atoms, **1.43x/1.91x** and **1.58x/2.21x** at 113, and the entry's prescription is corrected -- see the row below.  `docs/README_fastxcfxc.md`.  (b) The **Hessian's** CPHF solve is a different function, `hessian/rks.py:3486 _nr_rks_fxc_mo_task`, which contracts to the MO basis per block group.  Instrumented rather than inferred (catalogue Q3 infers ~11 % of a Hessian): **6.5 %** on penicillin V, **5.9 %** on taxol.  Its per-`nset` loop looks like B5's launch problem but is not -- the arithmetic is `nset x nao_sub^2 x ngrids`, about 6.0 TFLOP per call on penicillin V, and it does that in 0.91 s = **6.6 TFLOP/s**, a third of the card's fp64 peak.  A function at a third of peak is not launch-bound, so batching its sets is worth the difference between a 214x214x4096 GEMM and a large one -- not what batching bought in B5.  `docs/HESSIAN_1.8.1.md` |
 | **B5** the XC Hessian's Python atom loop | **done** (GGA) | `fastxchess` replaces `_get_vxc_deriv1` and `_get_vxc_deriv2`: the two terms together **7.34x** on penicillin V and **5.30x** on taxol at fixed density, which is 18.2 % of a 42-atom Hessian turned into 4.1 % and takes the whole run 84.26 s → 53.93 s (1.56x with the rest of Electrolites, of which `fastj` was already 1.24x).  The catalogue's prescription for it — "the same change as G1, generalized", i.e. batch the grid blocks so libxc is called once per group — is measured **not** to be where the time is: `eval_xc_eff` is 1.5 % of `_get_vxc_deriv1`, against 42 % of the XC gradient where `fastxcgrad` found it.  The atom loop is 90 % on penicillin V and 93 % on taxol, and what makes it expensive is that `d rho / d R_A` is supported only where atom A's basis functions are, so most of it is arithmetic on exact zeros.  `docs/README_fastxchess.md`.  LDA and meta-GGA are declined, both for reasons found in upstream — see §5 and §6 below |
 | **B6** `hess_nuc_elec` | **upstream**: gone in 1.8.1 | `hessian/rhf.py:200 _hess_nuc_without_ecp` replaced the per-charge loop, and the `# TODO: It is computing one charge at a time` comment with it.  It does not appear in either 1.8.1 profile in `docs/HESSIAN_1.8.1.md`.  The catalogue ranks it 10th at 4.5 % of a Hessian; there is nothing left to do |
 | **B7** `hess_nuc_elec_ecp` | **open** | — |
@@ -131,15 +135,45 @@ catalogue measures the CPU one-electron integrals at 8–13 % of a gradient
 
 | Section | Status |
 |---|---|
-| **C** response properties (C1 polarizability/CPKS, C2 NMR/GIAO, C3 IR/Raman, C4 EDA, C5 C6) | **all open.**  Every one of them routes through `nr_rks_fxc` and/or a multi-density `get_jk`, i.e. through B4a/B4b/B4d |
-| **D** excited states (D1 Davidson, D2 `lr_eigh`, D3 third XC derivative on CPU, D4 `get_ab`, D5 TDDFT+PCM, D6 ris, D7 spin-flip, D8 AO re-evaluation) | **all open**, same reason |
+| **C** response properties (C1 polarizability/CPKS, C2 NMR/GIAO, C3 IR/Raman, C4 EDA, C5 C6) | **C1 partial**: its XC half is `fastxcfxc` (2.10x on `nr_rks_fxc` inside a real B3LYP CPKS solve, 2.72x on a wB97M-V one, 1.52x at 113 atoms) and its VV10 half -- 80.6 % of the run on an NLC functional -- is `fastfnlc` (1.43x), giving **1.15x** on a whole B3LYP polarizability and **1.39x** on a wB97M-V one at 42 atoms.  Its J+K half is untouched and is 71 % of the B3LYP run at 42 atoms and **82 %** at 113.  C3, C4, C5 inherit the same XC half and are otherwise **open**; C2 (NMR/GIAO) is **open** and is one of the catalogue's four low-contamination entries.  `docs/RESPONSE_1.8.1.md` |
+| **D** excited states (D1 Davidson, D2 `lr_eigh`, D3 third XC derivative on CPU, D4 `get_ab`, D5 TDDFT+PCM, D6 ris, D7 spin-flip, D8 AO re-evaluation) | **D1 partial**: its `nr_rks_fxc_st` half is `fastxcfxc` (3.84x inside a real TDA run, 1.28x on the whole run at 42 atoms), its `get_jk` half is 61 % of the run and untouched.  **D2 rejected** on a measured size, **D8 re-sized from 9.7 % to 1.2 % and rejected** -- both in `docs/RESPONSE_1.8.1.md` §5 and `docs/README_fastxcfxc.md` §5.  D3-D7 **open** |
 | **E** real-space and population analysis (E1–E4) | **all open.**  E3 is greenfield and one of the catalogue's four low-contamination entries |
 | **F** dispersion, solvation, fields, embedding (F1–F7) | **F2 done** in `fast1e` — the `int3c1e` kernels that reach PCM, QM/MM, ESP and CHELPG, 1.57x–1.77x per SCF cycle over 20–168 atoms.  **F3 rejected**: the matrix-free PCM D/S products it names are off the default path in 1.8.1 and `get_D_S` runs once per geometry (0.026 s of a 141 s Taxol SCF).  F1, F4–F7 **open**.  `fast1e` patches only the three `int3c1e` drivers, so the `int3c1e_ip`/`_ipip` kernels behind the PCM **gradient and Hessian** are untouched |
-| **G1** extend `_grouped_block_loop` everywhere | **partial**: it reached `grad.rks.get_exc` (B2) and, in a different form, the SCF's `nr_rks` (`fastxc`).  It has **not** reached `nr_rks_fxc` (B4d) or `hessian.rks._get_vxc_deriv1/2` (B5) |
+| **G1** extend `_grouped_block_loop` everywhere | **partial, and its premise now has two counterexamples.**  It reached `grad.rks.get_exc` (B2) and, in a different form, the SCF's `nr_rks` (`fastxc`), where P8 was measured as the largest single effect.  It has **not** reached `hessian.rks._get_vxc_deriv1/2` (B5), where the batching the entry names is **1.1 %** of the function (`docs/README_fastxchess.md` §1), and it is implemented for `nr_rks_fxc` (B4d) and measured **slower than leaving GPU4PySCF's issue order alone** -- 0.72 s against 0.22 s at `nset = 20` (`docs/README_fastxcfxc.md` §2).  P8 pays where a grid block issues a few GEMMs and then waits; it does not where the block already has `nset` independent GEMMs back to back, and there `grouped_gemm`'s host-side pointer table costs more than the batching saves.  The catalogue calls G1 "the highest-leverage single piece of infrastructure work"; on the evidence here it is the highest-leverage piece **for the gradient**, and one of three places it was prescribed |
 | **G2** fusing small memory-bound kernels | **partly rejected on a measured ceiling.**  Deleting *every* `vk` `atomicAdd` — the ceiling for a block reduction, not an implementation of one — is worth **1.1 %** at 6-31G\* and **2.2 %** at def2-TZVP, so a block reduction cannot pay.  `docs/ROUND2_1.8.1.md` §3b.  This is the same Amdahl warning the catalogue attaches to G2 |
 | **G3** NVRTC/ptxas compile time | **done**: 162 s → 37 s, above |
 | **G4** the multi-GPU layer | **open** and deliberately so: every module here asserts a single device, except `fast1e`, which keys its kernels and tables on the current device because the `int3c1e` path is not distributed upstream |
 | **H1–H3** negative controls | **n/a** by construction |
+
+### Three response-side results this repository added that the catalogue does not have
+
+- **On an NLC functional the response property's cost is neither of the two
+  stages the catalogue lists.**  C1 names `get_jk` and `nr_rks_fxc`.  For
+  wB97M-V they are 14.1 % and 5.6 % of a polarizability, and
+  `hessian.rks.nr_rks_fnlc_mo` -- the response of the VV10 term, which has no
+  catalogue ID -- is **80.6 %**.  Taken in `docs/README_fastfnlc.md`:
+  **1.44x-1.49x** per warm call and 1.43x over a whole solve, of which the
+  exact part is that the ground-state half of
+  the function, including an `O(ngrids^2)` double sum, was being recomputed on
+  every one of the 19 CPKS iterations.  What is left is one more
+  `O(ngrids^2)` fp64 kernel that only exists compiled.
+- **The same term dominates a wB97M-V analytic Hessian, which no profile in
+  `docs/` or in the catalogue could see.**  `benchmarks/hessian_anatomy.py
+  --cphf-only` on alanine dipeptide with wB97M-V: `nr_rks_fnlc_mo` is
+  **83.3 %** of the CPHF solve (112.88 s of 135.56 s) and
+  `_get_vnlc_deriv1` is 23.1 % of `make_h1`, against 11.9 % for the
+  multi-density J and K build that `docs/HESSIAN_1.8.1.md` -- a B3LYP profile
+  -- ranks first.  Catalogue **A6** lists the VV10 Hessian as an entry with no
+  share attached; this is the share, and it is the largest one in any Hessian
+  profile taken here.  `docs/README_fastfnlc.md` §4b.
+- **The split between the grid half and the two-electron half is a property of
+  the functional, not of the response solver.**  The catalogue profiles B3LYP
+  and ranks from that.  Measured on the same molecule: `nr_rks_fxc` is
+  **46-48 %** of a PBE response property and **47-48 %** of an M06-2X one
+  against 25-28 % for B3LYP, and on a pure functional the two-electron half
+  goes through `mf.get_j` -- the McMurchie-Davidson engine `fastj` patches --
+  rather than the fused Rys kernel of hazard 5.
+  `docs/RESPONSE_1.8.1.md` §2b.
 
 ---
 
@@ -157,6 +191,10 @@ effort gets wasted.  Each is a measurement, not an opinion.
 | Carrying 8 or 16 densities through one Coulomb pass instead of 4 | **0.90x** and **0.64x** against four, and the ceiling for removing the cap altogether is **1.09x** once the per-quartet overheads are fixed | `docs/ROUND3_B4A.md` §4 |
 | Grouping the grid blocks in the XC **Hessian**, which is what the catalogue asks for in B5 | `eval_xc_eff(deriv=2)` on all 519 680 penicillin V grid points in one call is **26.7 ms**; the same points in 127 calls is **119.3 ms**.  The whole of the gain the catalogue names is 93 ms of an 8.2 s function — 1.1 % | `docs/README_fastxchess.md` §1 |
 | Sub-dividing the 4096-point grid block to sharpen the XC Hessian's atom screen | at 64-point chunks `natm_local/natm` falls only from 0.745 to 0.683 (taxol 0.626 → 0.537), because GPU4PySCF's AO mask cutoff of 1e-10 keeps a Gaussian tail alive far past where it matters.  9–17 % for a per-chunk atom list and a gather | `docs/README_fastxchess.md` §4 |
+| Grouping the grid blocks in the XC **response** kernel, which is what the catalogue asks for in B4d and G1 | **0.72 s against 0.22 s** at `nset = 20` on penicillin V — slower than leaving GPU4PySCF's one-block-at-a-time issue order alone, because the response path already has `nset` independent GEMMs in flight per block and `grouped_gemm` pays a host-side pointer table per `(block, set)` pair.  Kept in the module as `FASTXCFXC_MODE=grouped` so the comparison stays runnable | `docs/README_fastxcfxc.md` §2 |
+| Caching the AOs across response iterations (catalogue D8 route a) | the call count the entry rests on is exact and reproduces — 2921 `eval_ao` calls in a polarizability — but they are **2.2 %** of the run on 1.8.1, not 16.3 %.  A cache would be 4.2 GB on a 42-atom molecule to save 0.35 s of 16 s | `docs/RESPONSE_1.8.1.md` §3.1 |
+| Preallocating `lr_eigh`'s trial space (catalogue D2) | the reallocation is real and still there on 1.8.1, and it is **0.19 GB over a whole 22 s TDA run** at 42 atoms, 1.3 GB at 113 — under a millisecond either way.  The entry's premise needs `nov ~ 10⁶` | `docs/RESPONSE_1.8.1.md` §5 |
+| Splitting the response path's fused J+K into `j_engine.get_j` + `jk.get_k` | **0.70x–0.93x** on stock code at every `nset`: J is nearly free inside the fused Rys kernel (0.52 s fused against 0.51 s for K alone).  With Electrolites patched the single-density row is **2.30x** the other way, which is what makes a *fused* multi-density rewrite the target rather than a split | `docs/RESPONSE_1.8.1.md` §4 |
 
 The AO screen's headroom is **not** zero: `docs/ROUND2_1.8.1.md`'s "What is
 left" item 1 keeps it open as a per-(block, shell) log-magnitude estimate moved
@@ -165,10 +203,10 @@ left" item 1 keeps it open as a per-(block, shell) log-magnitude estimate moved
 
 ---
 
-## 6. Two measurement hazards found here, which constrain any future entry
+## 6. Measurement hazards found here, which constrain any future entry
 
-Both are the same kind of finding as catalogue §3.7's warning, and both are
-reasons a number in a table can be wrong while every correctness test passes.
+All are the same kind of finding as catalogue §3.7's warning: reasons a
+number in a table can be wrong while every correctness test passes.
 
 1. **A build timed on the `minao` initial guess is not the build an SCF runs.**
    The guess is far sparser, so it screens harder.  On the 545-atom cluster the
@@ -194,14 +232,24 @@ reasons a number in a table can be wrong while every correctness test passes.
    other way round by a factor of six.  Catalogue §3.4's size-independence
    rule applies to the choice of *target*, not only to the speedup.
    `docs/HESSIAN_1.8.1.md` §4.
-5. **GPU4PySCF's meta-GGA `_get_vxc_deriv1` is not reproducible run to run.**
+5. **A patch target is not a code path.**  `fastj` patches
+   `j_engine._VHFOpt.get_j` and `fastk` patches `jk._VHFOpt.get_k`, which is
+   where the *SCF* builds J and K.  The response path calls `mf.get_jk`, which
+   lands in `jk._VHFOpt.get_jk` — a **fused** Rys kernel that builds both from
+   one integral pass — so neither module is on it, and a polarizability or a
+   TDDFT run is stock GPU4PySCF in 61–82 % of its wall clock even with
+   `patch_all()`.  Nothing failed and no test noticed; the modules simply were
+   not called.  Before an entry's Amdahl share is claimed as reached, the
+   entry's *caller* has to be checked, not only the function name.
+   `docs/RESPONSE_1.8.1.md` §3.2.
+6. **GPU4PySCF's meta-GGA `_get_vxc_deriv1` is not reproducible run to run.**
    Called twice on the same input it differs by **3.0e-5**, and the resulting
    Hessian by 1.7e-5; every LDA and GGA case gives exactly zero.  That is a
    different statement from `hessian/rks.py`'s own warning that the MGGA
    Hessian is grid-sensitive — this is at a fixed grid.  Any meta-GGA Hessian
    work needs this understood first, because until then there is no reference
    to converge against.  `tests/test_xchess.py`'s `self` column.
-6. **A factor 2 that looks missing and is not.**  GPU4PySCF's LDA and GGA
+7. **A factor 2 that looks missing and is not.**  GPU4PySCF's LDA and GGA
    branches of `_get_vxc_deriv1` apply different factors to `d rho / d R` —
    the GGA branch has `_make_dR_rho1`'s `rho1 *= 2`, the LDA branch says "*2
    is not applied because + c.c. in the end" — and the two then do the same
@@ -233,7 +281,12 @@ By catalogue §5's ranking, filtered to what is open:
    measured: is the SCF mGGA build launch-bound at small `nao_sub`?  This
    repository's own mGGA gradient result (4.46x on M06-2X) is a reason to
    expect yes, but it is not that measurement.
-3. ~~**B5** (rank 7)~~ — taken in `docs/README_fastxchess.md`, and, like F2
+3. ~~**B4d**, the response half of rank 12~~ — taken in
+   `docs/README_fastxcfxc.md`, with the entry's own prescription (G1's grouped
+   GEMM) measured **slower** than leaving the issue order alone, and with
+   **D8, its other half, re-sized from 16.3 % to 2.2 % and rejected**.  What
+   pays there is batching along `nset`, which is a stride rather than a list
+   of pointers.  ~~**B5** (rank 7)~~ — taken in `docs/README_fastxchess.md`, and, like F2
    before it, with a correction to the entry: the mechanism the catalogue
    names for B5 (batch the grid blocks, as G1 does) is 1.1 % of the function,
    while the mechanism that carries it (most of the atom loop is arithmetic
@@ -245,15 +298,47 @@ By catalogue §5's ranking, filtered to what is open:
    pair, cavity point) tasks — while a rigorous error-budget screen in the P11
    style turns out to be worth only 21 % of tasks, and those come off the
    branch the patch already made cheap.
-4. **B4b, and it should be first.**  On a 113-atom Hessian the exchange build
-   inside CPHF is **47 %** of the wall clock — larger than every other
-   Hessian entry put together — and this repository's `fastk` hands every
-   `n_dm > 1` call straight back.  Two cautions from `docs/ROUND3_B4A.md`
-   apply before anything is written: measure the ceiling on *these* kernels
-   rather than GPU4PySCF's, and note that K's amortisation over densities is
-   already good (the catalogue's own §2.3 table puts it at 14.5x of the ideal
-   126x, against J's 4.8x), so what is left for a rewrite is the per-quartet
-   integral cost, not the density handling.
+4. **B4b, and it should be first — now with a second profile behind it and a
+   shape.**  It was already the Hessian's largest entry (47 % of a 113-atom
+   run).  This round adds that it is also **61 % of a five-root TDA run and
+   71–82 % of a polarizability**, and it measures the ceiling on *this
+   repository's* kernels as `docs/ROUND3_B4A.md` requires: at one density,
+   `fastj` + `fastk` are **2.30x** GPU4PySCF's fused response build
+   (`docs/RESPONSE_1.8.1.md` §4).  Three things that probe settled about how
+   to write it:
+
+   * **The target is `jk._VHFOpt.get_jk`, not `get_k`.**  The response path
+     asks for J and K from one *fused* Rys kernel, which is a third code path
+     that neither `fastj` nor `fastk` patches (hazard 5 in §6).  Whatever is
+     written has to be reachable from there or it reaches no response
+     property.
+   * **Fused, not split.**  On stock code the fusion beats two separate builds
+     at every `nset` (0.70x–0.93x) because J is nearly free from integrals
+     computed for K.  Splitting only wins here because `fastk` at one density
+     is 3.3x GPU4PySCF's K — and at `n_dm = 3` the split's J half
+     (`fastj`, 0.221 s) would already exceed its K half, giving ~1.5x instead
+     of 2.3x.  A `fastjk` that accumulates both operators from one Rys pass
+     keeps the 2.3x, and `codegen/gen_ejk.py` already does exactly that for
+     the *gradient* of `j·J − k·K`, so the machinery exists.
+   * **The density handling is not the problem; the per-quartet cost is.**
+     GPU4PySCF's K costs 0.509 s at one density and 0.527 s at three, so its
+     amortisation is already excellent (the catalogue's §2.3 table puts it at
+     14.5x of the ideal 126x, against J's 4.8x).  What a rewrite buys is
+     P1–P5 on the integrals, at `n_dm > 1`.
+   * One more thing to handle that the entry does not mention: at
+     `hermi = 0` — every TDDFT call — `jk.py:443` stacks the transposed
+     densities, so the kernel is run at `2·nset`.
+
+5. **`VXC_vv10nlc_hess_eval_f_t`** -- not a catalogue entry, and the largest
+   single kernel left on any response path measured here: **64.7 %** of the
+   VV10 response term, which is 80 % of a wB97M-V polarizability.  It is an
+   `O(ngrids^2)` fp64 double sum and `fastnlc`'s three measured techniques
+   (a MUFU-seeded reciprocal, single precision beyond 10 Bohr, an
+   error-budgeted grid trim -- 3.92x together on the ground-state sum) apply
+   to it.  The obstacle is that it exists only inside `libgdft.so`, so it
+   needs either GPU4PySCF's CUDA source or a re-derivation from the paper its
+   docstring cites, with the `.so` as the oracle.
+   `docs/README_fastfnlc.md` §4.
 
 For the LLM-GPU-QM task suite rather than for throughput, the catalogue's own
 advice stands unchanged: **A12, F1, C2, E3** are worth more than ranks 1–13

@@ -28,6 +28,50 @@ grids, `conv_tol_cpscf = 1e-6`):
 | ↳ its two XC terms, at fixed density | 15.5 s | **2.11 s** | **7.34x** |
 | 113-atom Hessian (taxol), its two XC terms | 117.8 s | **22.2 s** | **5.30x** |
 
+and, for the **response properties** this round added -- whole runs, 42-atom
+penicillin V/def2-SVP, level-3 grids, five roots for TDA:
+
+| functional | property | GPU4PySCF 1.8.1 | + Electrolites | |
+|---|---|---|---|---|
+| PBE | polarizability (CPKS, 3 RHS) | 9.49 s | **7.12 s** | **1.33x** |
+| | TDA | 9.16 s | **5.13 s** | **1.79x** |
+| B3LYP | polarizability | 16.33 s | **14.26 s** | **1.15x** |
+| | TDA | 22.06 s | **17.74 s** | **1.24x** |
+| M06-2X | polarizability | 22.53 s | **15.59 s** | **1.45x** |
+| | TDA | 32.30 s | **21.75 s** | **1.49x** |
+| wB97M-V | polarizability | 154.67 s | **111.26 s** | **1.39x** |
+| | TDA | 49.02 s | **38.10 s** | **1.29x** |
+
+The XC response kernel itself is 2.1x-3.7x inside those runs, and 4.65x at
+fixed density and `nset` = 5 (1.057 s -> 0.479 s, i.e. 2.21x, on 113-atom
+taxol -- the gain falls with system size and `docs/README_fastxcfxc.md` §6
+says why).  On the wB97M-V polarizability the VV10 response term carries the
+row: 124.7 s -> 87.2 s, 1.43x, and 1.44x-1.49x per call at three sizes --
+that one *is* size-independent, and `docs/README_fastfnlc.md` §6 says why the
+two modules scale opposite ways.
+
+Every stock/patched pair in that table is measured back-to-back in one script,
+because the node is shared: the same stock B3LYP TDA run measured 22.2 s twice
+and 43.3 s once, on a node whose load average had gone from 5 to 70.  Only the
+ratio inside a pair is meaningful; `docs/RESPONSE_1.8.1.md` §4b has the
+method.  Measured that way, the fused J and K build of a **hybrid** does not
+move at all under `patch_all()` -- 11.67 -> 11.70 s, 13.56 -> 13.64 s,
+19.64 -> 20.07 s -- which is the direct evidence that neither `fastj` nor
+`fastk` is on that path.
+
+Two things the profile behind those numbers says, both in
+`docs/RESPONSE_1.8.1.md`.  **The split between the grid half and the
+two-electron half is a property of the functional**: the XC response kernel is
+46-48 % of a PBE response property and 47-48 % of an M06-2X one but only
+25-28 % of B3LYP's, and on wB97M-V neither is the target -- **80 %** of that
+polarizability is the VV10 response term, which no catalogue entry names.
+And **the hybrid's two-electron half is a third code path that no module here
+reaches**: the response solve asks `mf.get_jk` for J and K from one *fused*
+Rys kernel (`scf/jk.py:401 _VHFOpt.get_jk`) where the SCF calls `get_j` and
+`get_k` separately, so `fastj` and `fastk` are not on it and 61-82 % of a
+B3LYP response property is stock GPU4PySCF.  The ceiling for closing that,
+measured on these kernels, is **2.30x** at 42 atoms and 1.60x at 113.
+
 The Hessian rows are dominated by something none of these modules touches: the
 exchange build inside the CPHF solve is 37 % of the 42-atom run after this
 round and 54 % of the 113-atom one, and `fastk` hands every multi-density call
@@ -122,6 +166,8 @@ separate processes; that is the only honest way to A/B them.
 | `fastxcgrad` | `grad.rks.get_exc`, `get_nlc_exc` | the XC (LDA, GGA **and** meta-GGA) and VV10 grid contractions of the gradient |
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | the nuclear-attraction part of the one-electron derivative, on the GPU |
 | `fastxchess` | `hessian.rks._get_vxc_deriv1`, `_get_vxc_deriv2` | the two XC terms of an analytic **Hessian**: the same arithmetic in the masked AO space, with the atoms that have no basis function on a grid block skipped -- their contribution is identically zero -- and the atom dimension batched instead of looped in Python.  GGA |
+| `fastxcfxc` | `dft.numint.nr_rks_fxc` (the module attribute **and** `NumInt.nr_rks_fxc`) | the XC response kernel -- the grid half of **every response property**: CPKS/polarizability, TDA/TDDFT, NMR, IR/Raman, C6.  One GEMM per grid block instead of one per right-hand side, three custom kernels in place of ten GPU4PySCF launches per right-hand side, and one symmetrisation per call instead of an extra matrix product per block.  LDA and GGA |
+| `fastfnlc` | `hessian.rks.nr_rks_fnlc_mo` | the **VV10 non-local-correlation response**, which is 80 % of a wB97M-V polarizability: the ground-state half of it -- including an `O(n_grid^2)` double sum -- computed once per coupled-perturbed solve instead of once per iteration, and the potential contraction batched over the perturbed densities.  Reaches CPKS, NMR, C6 and the analytic Hessian; TDDFT excludes the term itself |
 
 **Limits, all of which fall through rather than fail.** `fastk`, `fastxc` and
 the four gradient modules are spin-restricted closed-shell only: an
@@ -131,7 +177,12 @@ build inside a CPHF or Davidson solve; what it declines there is the classes
 past `(4,4)` and the long-range operator. `fastnlc` covers UKS, because `nr_nlc_vxc` sums the two densities
 before the double sum. `fastxc` hands **meta-GGA** back in the SCF, while
 `fastxcgrad` covers it in the gradient. `fastxchess` covers GGA and declines
-LDA, meta-GGA, the grid-response path and the VV10 Hessian.  Two of those have
+LDA, meta-GGA, the grid-response path and the VV10 Hessian.  `fastxcfxc` covers
+LDA, GGA and meta-GGA for a plain-density-matrix response and declines the
+`mo1` path (which is the Hessian's own CPHF solve) and UKS.  `fastfnlc`
+covers a closed-shell NLC response and declines UKS; its `return_in_mo=True`
+path (the Hessian's) gets the cache but keeps GPU4PySCF's potential
+contraction.  Two of those have
 a reason worth reading before extending it: GPU4PySCF's LDA branch of the same
 function uses different factor conventions term by term (they agree with the
 GGA branch's -- `docs/README_fastxchess.md` §5 has the algebra), and its
@@ -158,6 +209,12 @@ python tests/test_xchess.py                # 11 cases: the two XC Hessian
                                            # Hessian, patched vs unpatched
 python tests/test_xchess_fd.py             # the analytic Hessian against
                                            # finite differences of the gradient
+python tests/test_fxc.py                   # 15 cases: the XC response kernel
+                                           # against GPU4PySCF at both hermi
+                                           # values, plus a polarizability
+                                           # tensor and a TDA spectrum
+python tests/test_fnlc.py                  # 8 cases: the VV10 response term,
+                                           # bit-identical on the cached path
 ```
 
 They need a GPU and take a few minutes. The cases span six basis sets to
@@ -189,6 +246,18 @@ by a factor of six between 42 and 113 atoms (`docs/HESSIAN_1.8.1.md`).
 the XC Hessian's time goes and how much of its atom loop is arithmetic on
 exact zeros; `benchmarks/xchess_bench.py` A/Bs the two terms on one converged
 density.
+
+`benchmarks/response_anatomy.py` does the same for a polarizability and a TDA
+run -- use it before taking a response-property target from `instructions/06`,
+whose two profiles are 1.7.0 ones and whose `eval_ao` share (entry D8, 16.3 %)
+is 2.2 % on 1.8.1.  `benchmarks/response_jk_probe.py` answers whether the
+response path should split that fused build into `fastj` + `fastk` and
+measures the ceiling for rewriting it -- the answer flips sign between 42 and
+113 atoms, which is the argument for a fused rewrite rather than a
+dispatch; `benchmarks/fnlc_probe.py` and `fnlc_bench.py` do the same for the
+VV10 response term; `benchmarks/fxc_bench.py` sweeps the XC
+response kernel over the number of right-hand sides, all three arrangements,
+with the correctness check inline.
 
 `benchmarks/cluster_bench.py` times an SCF and a gradient end to end;
 `benchmarks/fixed_density.py` times each build separately on one fixed density,
@@ -254,6 +323,8 @@ starting point, not an optimum.
 | `FASTJ_NO_MDM`, `FASTJ_MDM_BLOCKS` | hand every multi-density Coulomb build back to GPU4PySCF; restrict which density-block sizes are used (the `docs/ROUND3_B4A.md` ablation) |
 | `FASTNLC_MODE` | `mixed` (default) or `fp64` for the VV10 double sum |
 | `FASTJ_TIME`, `FASTXCGRAD_MODE` | per-call timing split; XC-gradient block strategy |
+| `FASTFNLC_CACHE`, `FASTFNLC_BATCH` | hand the two halves of the VV10 response change back (the ablations) |
+| `FASTXCFXC_MODE`, `FASTXCFXC_TIME` | `blocked` (default), `nokernel` or `grouped` for the XC response kernel -- the last is catalogue B4d as written and is the slowest of the three; and its per-stage timing split |
 
 ## License
 
