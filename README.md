@@ -102,6 +102,7 @@ separate processes; that is the only honest way to A/B them.
 | `fastnlc` | `dft.numint._vv10nlc` | the VV10 / VV10-family `O(n_grid^2)` double sum |
 | `fastrsh` | `dft.rks.RKS.get_veff` | range-separated hybrids on GPU4PySCF **1.7.x only**: the two exchange builds fused into one. 1.8.0 does that fusion itself, so this module stands down there |
 | `fastxcnlc` | `dft.rks.RKS.get_veff` | the XC potential and the VV10 non-local correlation from **one** sweep of the grid instead of two, on 1.8.x (on 1.7.x `fastrsh` drives it). LDA falls back; GGA and meta-GGA are covered, so wB97M-V is |
+| `fast1e` | `gto.int3c1e.get_int3c1e{,_density_contracted,_charge_contracted}` | the three-centre one-electron integrals -- **PCM, QM/MM, ESP, CHELPG** -- every angular-momentum class up to g, contracted with a density, with charges, or neither |
 | `fastejk` | `grad.rhf._jk_energy_per_atom` | the per-atom derivative of `j*J - k*K`, every class an spdf basis reaches, full-range and long-range |
 | `fastgrad` | `grad.rks.Gradients.energy_ee` | range-separated-hybrid gradients: the long-range operator in place of GPU4PySCF's short-range one |
 | `fastxcgrad` | `grad.rks.get_exc`, `get_nlc_exc` | the XC (LDA, GGA **and** meta-GGA) and VV10 grid contractions of the gradient |
@@ -117,7 +118,10 @@ before the double sum. `fastxc` hands **meta-GGA** back in the SCF, while
 `fastxcgrad` covers it in the gradient. Shells with `l > 4` go through
 GPU4PySCF's CPU path. Density fitting is untouched. Single GPU only —
 GPU4PySCF 1.8.x runs these builds through `multi_gpu.run`, and every module
-here asserts one device.
+here asserts one device.  `fast1e` is the exception: GPU4PySCF does not
+distribute the `int3c1e` path, and the module keys its compiled kernels and
+its Rys tables on the current device, so it stays correct in a process where
+the J and K builds are spread over several.
 
 ## Tests
 

@@ -1,7 +1,7 @@
 # Status of `instructions/06.gpu4pyscf_kernel_targets.md` in this repository
 
-What this repository has done, per catalogue ID, as of commit `06eb0a8`
-(GPU4PySCF **1.8.1**, one A100).  The catalogue is the file
+What this repository has done, per catalogue ID, as of commit `06eb0a8` plus
+`fast1e` (GPU4PySCF **1.8.1**, one A100).  The catalogue is the file
 `LLM-GPU-QM/instructions/06.gpu4pyscf_kernel_targets.md`; its §4 is the target
 list and its §5 the ranking.  This file is a **record**, not a re-measurement:
 every number quoted here is one this repository measured and wrote down in
@@ -44,7 +44,7 @@ status column.
 | 3 | **A5** — the grid AO-evaluation kernel, and the second pass | **partial**: the second pass is gone, the kernel is untouched | `fastxc`, `fastxcnlc`; `docs/ROUND2_1.8.1.md` §5 |
 | 4 | **B1** — the §3.6 treatment in `ejk_ip1` | **done** | `fastejk`; `docs/README_fastejk.md` |
 | 5 | **A4** — `nr_rks` for UKS and mGGA | **partial**: mGGA covered in the *gradient*, open in the SCF; UKS open | `fastxcgrad` covers mGGA; `fastxc.py:65` declines it |
-| 6 | **F2 + F3** — spatial screening in `int3c1e`, PCM D/S | **open** | — |
+| 6 | **F2 + F3** — spatial screening in `int3c1e`, PCM D/S | **F2 done, and its premise corrected; F3 rejected** | `fast1e`; `docs/README_fast1e.md` |
 | 7 | **B5** — batch the atom dimension in the XC Hessian | **open** | — |
 | 8 | **B4b + B4c** — K in CPHF, per-density screening | **open** | `fastk.py:175` declines `n_dm != 1` |
 | 9 | **B3** — `ejk_ip2` | **open** | — |
@@ -54,7 +54,9 @@ status column.
 | 13 | **D2** — preallocate `lr_eigh`'s trial space | **open** | — |
 | — | **A12 / F1 / C2 / E3** — the low-contamination four | **open** (all four) | — |
 
-**The highest-ranked entry with nothing done to it is now rank 3, A5.**  Rank
+**The highest-ranked entry with nothing done to it is now rank 3, A5**, and the
+highest *wholly untouched* one is rank 7, B5, since rank 6 was taken in
+`docs/README_fast1e.md`.  Rank
 2, B4a, was taken in `docs/ROUND3_B4A.md`; what came back is a 1.23x on the
 Coulomb build at `n_dm > 1` and a correction to the entry's premise, since the
 part of it that is really about the four-density cap measures **1.09x** once
@@ -130,11 +132,11 @@ catalogue measures the CPU one-electron integrals at 8–13 % of a gradient
 | **C** response properties (C1 polarizability/CPKS, C2 NMR/GIAO, C3 IR/Raman, C4 EDA, C5 C6) | **all open.**  Every one of them routes through `nr_rks_fxc` and/or a multi-density `get_jk`, i.e. through B4a/B4b/B4d |
 | **D** excited states (D1 Davidson, D2 `lr_eigh`, D3 third XC derivative on CPU, D4 `get_ab`, D5 TDDFT+PCM, D6 ris, D7 spin-flip, D8 AO re-evaluation) | **all open**, same reason |
 | **E** real-space and population analysis (E1–E4) | **all open.**  E3 is greenfield and one of the catalogue's four low-contamination entries |
-| **F** dispersion, solvation, fields, embedding (F1–F7) | **all open.**  F2 is rank 6 and reaches PCM, QM/MM, ESP, CHELPG and `hess_nuc_elec` through one kernel |
+| **F** dispersion, solvation, fields, embedding (F1–F7) | **F2 done** in `fast1e` — the `int3c1e` kernels that reach PCM, QM/MM, ESP and CHELPG, 1.57x–1.77x per SCF cycle over 20–168 atoms.  **F3 rejected**: the matrix-free PCM D/S products it names are off the default path in 1.8.1 and `get_D_S` runs once per geometry (0.026 s of a 141 s Taxol SCF).  F1, F4–F7 **open**.  `fast1e` patches only the three `int3c1e` drivers, so the `int3c1e_ip`/`_ipip` kernels behind the PCM **gradient and Hessian** are untouched |
 | **G1** extend `_grouped_block_loop` everywhere | **partial**: it reached `grad.rks.get_exc` (B2) and, in a different form, the SCF's `nr_rks` (`fastxc`).  It has **not** reached `nr_rks_fxc` (B4d) or `hessian.rks._get_vxc_deriv1/2` (B5) |
 | **G2** fusing small memory-bound kernels | **partly rejected on a measured ceiling.**  Deleting *every* `vk` `atomicAdd` — the ceiling for a block reduction, not an implementation of one — is worth **1.1 %** at 6-31G\* and **2.2 %** at def2-TZVP, so a block reduction cannot pay.  `docs/ROUND2_1.8.1.md` §3b.  This is the same Amdahl warning the catalogue attaches to G2 |
 | **G3** NVRTC/ptxas compile time | **done**: 162 s → 37 s, above |
-| **G4** the multi-GPU layer | **open** and deliberately so: every module here asserts a single device |
+| **G4** the multi-GPU layer | **open** and deliberately so: every module here asserts a single device, except `fast1e`, which keys its kernels and tables on the current device because the `int3c1e` path is not distributed upstream |
 | **H1–H3** negative controls | **n/a** by construction |
 
 ---
@@ -200,8 +202,13 @@ By catalogue §5's ranking, filtered to what is open:
    measured: is the SCF mGGA build launch-bound at small `nao_sub`?  This
    repository's own mGGA gradient result (4.46x on M06-2X) is a reason to
    expect yes, but it is not that measurement.
-3. **F2** (rank 6, 13.9 % of SCF at PCM defaults), where P10 and P11 from
-   `fastnlc` apply verbatim.
+3. **B5** (rank 7) and the rest of the multi-density family.  Rank 6, **F2**,
+   was taken in `docs/README_fast1e.md`, and what came back was a correction
+   to the entry as well as a 1.71x: the mechanism is not the missing screen
+   but the far field being evaluated with the near-field formula — 92 % of
+   (primitive pair, cavity point) tasks — while a rigorous error-budget screen
+   in the P11 style turns out to be worth only 21 % of tasks, and those come
+   off the branch the patch already made cheap.
 
 For the LLM-GPU-QM task suite rather than for throughput, the catalogue's own
 advice stands unchanged: **A12, F1, C2, E3** are worth more than ranks 1–13
