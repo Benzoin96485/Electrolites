@@ -45,6 +45,14 @@ Specifically:
 * electrolites/kernels/data/rys_roots_dat.npz holds the Rys root and weight
   tables of GPU4PySCF's lib/gvhf-rys/rys_roots_dat.cu, repacked.
 
+* electrolites/fastfnlc.py's _nr_rks_fnlc_mo is derived from GPU4PySCF
+  1.8.1's hessian/rks.py nr_rks_fnlc_mo.  Two changes, both described in
+  docs/README_fastfnlc.md: the ground-state half is factored into
+  _ground_state and memoised on the orbitals it depends on, and the
+  potential contraction is batched over the perturbed densities.  Every
+  libgdft call, the VV10 parameters, the grid, the zero-density threshold and
+  the factors are upstream's, unaltered.
+
 * electrolites/compat.py's tril_pair_mappings is GPU4PySCF 1.7.0's
   jk._make_tril_pair_mappings, vendored because 1.8.0 removed it while the
   kernels here still consume its output.

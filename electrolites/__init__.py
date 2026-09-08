@@ -31,11 +31,12 @@ __version__ = '0.1.0'
 #: GPU4PySCF releases this has been run against end to end.
 TESTED_GPU4PYSCF = ('1.7.0', '1.8.1')
 
-#: The SCF modules, then the gradient modules, in the order they should load.
+#: The SCF modules, then the gradient and Hessian ones, then the response
+#: ones, in the order they should load.
 MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
-    'fastxcfxc',
+    'fastxcfxc', 'fastfnlc',
 )
 
 # (module, dotted path of what it replaces) -- checked before anything patches,
@@ -55,6 +56,7 @@ _TARGETS = {
     'fastgradh': ('gpu4pyscf.grad.rhf', 'GradientsBase.get_hcore'),
     'fastxchess': ('gpu4pyscf.hessian.rks', '_get_vxc_deriv1'),
     'fastxcfxc': ('gpu4pyscf.dft.numint', 'nr_rks_fxc'),
+    'fastfnlc': ('gpu4pyscf.hessian.rks', 'nr_rks_fnlc_mo'),
 }
 
 _patched = []
