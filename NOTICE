@@ -11,6 +11,21 @@ Specifically:
   are copies of GPU4PySCF 1.7.0 sources, unmodified, and are compiled here
   only as support for the library below.
 
+* electrolites/kernels/cuda/my1e/{g1e.cu, g1e_root_1.cu, g3c1e.cu,
+  rys_roots.cu, constant.cu} are derived from the GPU4PySCF 1.8.1 files of
+  the same names under lib/gint.  Three kinds of change: the far-field Boys
+  and Rys path described in docs/README_fast1e.md (new headers
+  gint1e_boys.cuh and gint1e_g1e_roots.cuh); the int3c1e kernels demoted from
+  __global__ to __device__ so that int3c1e_wrappers.cu can give each angular
+  -momentum class an extern "C" entry point NVRTC can name; and #include
+  lines rewritten because NVRTC resolves them only against -I and has no
+  <math.h>.  The declarations those includes used to bring in are reproduced
+  in my1e/int3c1e_prologue.cuh, BasisProdCache verbatim -- fast1e.py copies
+  GPU4PySCF's own instance of that struct into the kernels' __constant__, so
+  the two definitions have to agree.  my1e/rys_tables.cuh replaces
+  lib/gvhf-rys/rys_roots.cuh's extern arrays with pointers into the repacked
+  tables below.
+
 * electrolites/kernels/cuda/myk2/rys_k_general.cu is derived from
   GPU4PySCF's lib/gvhf-rys/rys_contract_k.cu.  One change is a bug fix
   upstream made independently in 1.8.0 (the gout_pattern bit shift, upstream
