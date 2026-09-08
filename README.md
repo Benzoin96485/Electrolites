@@ -19,6 +19,20 @@ On one A100-SXM4-40GB, GPU4PySCF 1.8.1, B3LYP-D3(BJ)/6-31G\*, level-3 grids,
 | 545-atom cluster, one SCF cycle's work (`minao`) | 9.62 s | **3.22 s** | **2.98x** |
 | 545-atom cluster, one SCF cycle's work (converged) | 29.8 s | **14.1 s** | **2.11x** |
 
+and, for the analytic **Hessian** this round added (B3LYP/def2-SVP, level-3
+grids, `conv_tol_cpscf = 1e-6`):
+
+| | GPU4PySCF 1.8.1 | + Electrolites | |
+|---|---|---|---|
+| 42-atom Hessian (penicillin V), whole run | 84.3 s | **53.9 s** | **1.56x** |
+| ↳ its two XC terms, at fixed density | 15.5 s | **2.11 s** | **7.34x** |
+| 113-atom Hessian (taxol), its two XC terms | 117.8 s | **22.2 s** | **5.30x** |
+
+The Hessian rows are dominated by something none of these modules touches: the
+exchange build inside the CPHF solve is 37 % of the 42-atom run after this
+round and 54 % of the 113-atom one, and `fastk` hands every multi-density call
+back to GPU4PySCF.  `docs/HESSIAN_1.8.1.md` is the profile that says so.
+
 A build timed on the `minao` initial guess is not the build an SCF runs -- the
 guess is far sparser, so it screens harder.  Both rows are given for the
 545-atom cluster because the difference is a factor of 1.4 in the ratio; the
@@ -107,6 +121,7 @@ separate processes; that is the only honest way to A/B them.
 | `fastgrad` | `grad.rks.Gradients.energy_ee` | range-separated-hybrid gradients: the long-range operator in place of GPU4PySCF's short-range one |
 | `fastxcgrad` | `grad.rks.get_exc`, `get_nlc_exc` | the XC (LDA, GGA **and** meta-GGA) and VV10 grid contractions of the gradient |
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | the nuclear-attraction part of the one-electron derivative, on the GPU |
+| `fastxchess` | `hessian.rks._get_vxc_deriv1`, `_get_vxc_deriv2` | the two XC terms of an analytic **Hessian**: the same arithmetic in the masked AO space, with the atoms that have no basis function on a grid block skipped -- their contribution is identically zero -- and the atom dimension batched instead of looped in Python.  GGA |
 
 **Limits, all of which fall through rather than fail.** `fastk`, `fastxc` and
 the four gradient modules are spin-restricted closed-shell only: an
@@ -115,7 +130,12 @@ back.  `fastj` takes any number of densities, so it also covers the Coulomb
 build inside a CPHF or Davidson solve; what it declines there is the classes
 past `(4,4)` and the long-range operator. `fastnlc` covers UKS, because `nr_nlc_vxc` sums the two densities
 before the double sum. `fastxc` hands **meta-GGA** back in the SCF, while
-`fastxcgrad` covers it in the gradient. Shells with `l > 4` go through
+`fastxcgrad` covers it in the gradient. `fastxchess` covers GGA and declines
+LDA, meta-GGA, the grid-response path and the VV10 Hessian.  Two of those have
+a reason worth reading before extending it: GPU4PySCF's LDA branch of the same
+function uses different factor conventions term by term (they agree with the
+GGA branch's -- `docs/README_fastxchess.md` §5 has the algebra), and its
+meta-GGA branch is not reproducible run to run. Shells with `l > 4` go through
 GPU4PySCF's CPU path. Density fitting is untouched. Single GPU only —
 GPU4PySCF 1.8.x runs these builds through `multi_gpu.run`, and every module
 here asserts one device.  `fast1e` is the exception: GPU4PySCF does not
@@ -133,6 +153,11 @@ python tests/test_grad.py                  # 23 cases: gradient at a fixed
                                            # density, both codes in one process
 python tests/test_j_ndm.py                 # 162 cases: the multi-density
                                            # Coulomb build against GPU4PySCF
+python tests/test_xchess.py                # 11 cases: the two XC Hessian
+                                           # terms, and the whole analytic
+                                           # Hessian, patched vs unpatched
+python tests/test_xchess_fd.py             # the analytic Hessian against
+                                           # finite differences of the gradient
 ```
 
 They need a GPU and take a few minutes. The cases span six basis sets to
@@ -155,6 +180,15 @@ is still worth removing once the kernel under it has been rewritten
 classes; `benchmarks/compile_time.py` reports the first-run NVRTC cost with
 and without the module split; `benchmarks/aoscreen_probe.py` measures how much
 a density-aware AO screen could remove from the XC build.
+
+`benchmarks/hessian_anatomy.py` does the same for an analytic Hessian, stage
+by stage -- use it before taking a Hessian target from
+`instructions/06`, whose Hessian profile is a 1.7.0 one and whose shares move
+by a factor of six between 42 and 113 atoms (`docs/HESSIAN_1.8.1.md`).
+`benchmarks/vxc_hess_probe.py` and `benchmarks/xchess_locality.py` say where
+the XC Hessian's time goes and how much of its atom loop is arithmetic on
+exact zeros; `benchmarks/xchess_bench.py` A/Bs the two terms on one converged
+density.
 
 `benchmarks/cluster_bench.py` times an SCF and a gradient end to end;
 `benchmarks/fixed_density.py` times each build separately on one fixed density,

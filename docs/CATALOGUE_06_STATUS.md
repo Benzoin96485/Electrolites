@@ -45,18 +45,20 @@ status column.
 | 4 | **B1** — the §3.6 treatment in `ejk_ip1` | **done** | `fastejk`; `docs/README_fastejk.md` |
 | 5 | **A4** — `nr_rks` for UKS and mGGA | **partial**: mGGA covered in the *gradient*, open in the SCF; UKS open | `fastxcgrad` covers mGGA; `fastxc.py:65` declines it |
 | 6 | **F2 + F3** — spatial screening in `int3c1e`, PCM D/S | **F2 done, and its premise corrected; F3 rejected** | `fast1e`; `docs/README_fast1e.md` |
-| 7 | **B5** — batch the atom dimension in the XC Hessian | **open** | — |
-| 8 | **B4b + B4c** — K in CPHF, per-density screening | **open** | `fastk.py:175` declines `n_dm != 1` |
-| 9 | **B3** — `ejk_ip2` | **open** | — |
-| 10 | **B6** — batch `hess_nuc_elec` | **open** | — |
+| 7 | **B5** — batch the atom dimension in the XC Hessian | **done** (GGA), and its stated mechanism corrected | `fastxchess`; `docs/README_fastxchess.md` |
+| 8 | **B4b + B4c** — K in CPHF, per-density screening | **open** — and now measured to be the Hessian's largest entry at any size: 24 % at 42 atoms, **47 %** at 113 | `fastk.py:175` declines `n_dm != 1`; `docs/HESSIAN_1.8.1.md` |
+| 9 | **B3** — `ejk_ip2` | **open** (8.8 % at 42 atoms, 2.6 % at 113) | `docs/HESSIAN_1.8.1.md` |
+| 10 | **B6** — batch `hess_nuc_elec` | **upstream**: 1.8.1 replaced the per-charge loop | `docs/HESSIAN_1.8.1.md` §1 |
 | 11 | **A3** — the J engine's host-side Hermite transform | **upstream**: 1.8.0 moved it to the GPU | `docs/UPGRADE_1.8.1.md` §6 |
 | 12 | **B4d + D8** — batching and AO repetition on the response path | **open** | — |
 | 13 | **D2** — preallocate `lr_eigh`'s trial space | **open** | — |
 | — | **A12 / F1 / C2 / E3** — the low-contamination four | **open** (all four) | — |
 
-**The highest-ranked entry with nothing done to it is now rank 3, A5**, and the
-highest *wholly untouched* one is rank 7, B5, since rank 6 was taken in
-`docs/README_fast1e.md`.  Rank
+**The highest-ranked entry with nothing done to it is now rank 3, A5**, and
+after this round the highest *wholly untouched* one is rank 8, B4b — ranks 6
+and 7 were taken in `docs/README_fast1e.md` and
+`docs/README_fastxchess.md`, and rank 10 turned out to have been closed
+upstream.  Rank
 2, B4a, was taken in `docs/ROUND3_B4A.md`; what came back is a 1.23x on the
 Coulomb build at `n_dm > 1` and a correction to the entry's premise, since the
 part of it that is really about the four-density cap measures **1.09x** once
@@ -109,9 +111,9 @@ build with `n_dm > 1`, and this repository's SCF modules all decline that.
 | **B4a** J engine multi-density block cap | **partial** | The cap is still live on 1.8.1 (`scf/j_engine.py:299-301` pins `n_dm` to 4; `MD_build_j` steps `dm_offset += 4`), and `fastj` now has multi-density kernels: **1.23x** on the whole J build at `n_dm` = 8, 16 and 32 on a 284-atom cluster and **1.19x** on a 545-atom one, 1.57x/1.55x at `n_dm` = 4.  But that gain is the kernel's, not the cap's: measured on GPU4PySCF the cap looks worth 3.4x, measured on *our* kernels it is worth **1.09x**, because the 3.4x is the per-quartet overhead (P1–P5) the cap repeats and the single-density rewrite had already removed it.  Blocks of 8 and 16 were written, measured at **0.90x** and **0.64x** against blocks of 4, and are not shipped.  `docs/ROUND3_B4A.md` |
 | **B4b** K in CPHF | **open** | `fastk.py:175` `if n_dm != 1: return False` |
 | **B4c** per-density screening | **open** | Inherits A9 |
-| **B4d** `nr_rks_fxc` | **open** | The common entry point for Hessian, TDDFT, polarizability and NMR; no module here patches it |
-| **B5** the XC Hessian's Python atom loop | **open** | — |
-| **B6** `hess_nuc_elec` | **open** | — |
+| **B4d** `nr_rks_fxc` | **open, and re-sized** | 1.8.1 renamed it `hessian/rks.py:3486 _nr_rks_fxc_mo_task` and contracts to the MO basis per block group.  Instrumented rather than inferred (catalogue Q3 infers ~11 % of a Hessian): **6.5 %** on penicillin V, **5.9 %** on taxol.  Its per-`nset` loop looks like B5's launch problem but is not — the arithmetic is `nset x nao_sub^2 x ngrids`, about 6.0 TFLOP per call on penicillin V, and it does that in 0.91 s = **6.6 TFLOP/s**, a third of the card's fp64 peak.  A function at a third of peak is not launch-bound, so batching its sets is worth the difference between a 214x214x4096 GEMM and a large one — not what batching bought in B5.  `docs/HESSIAN_1.8.1.md` |
+| **B5** the XC Hessian's Python atom loop | **done** (GGA) | `fastxchess` replaces `_get_vxc_deriv1` and `_get_vxc_deriv2`: the two terms together **7.34x** on penicillin V and **5.30x** on taxol at fixed density, which is 18.2 % of a 42-atom Hessian turned into 4.1 % and takes the whole run 84.26 s → 53.93 s (1.56x with the rest of Electrolites, of which `fastj` was already 1.24x).  The catalogue's prescription for it — "the same change as G1, generalized", i.e. batch the grid blocks so libxc is called once per group — is measured **not** to be where the time is: `eval_xc_eff` is 1.5 % of `_get_vxc_deriv1`, against 42 % of the XC gradient where `fastxcgrad` found it.  The atom loop is 90 % on penicillin V and 93 % on taxol, and what makes it expensive is that `d rho / d R_A` is supported only where atom A's basis functions are, so most of it is arithmetic on exact zeros.  `docs/README_fastxchess.md`.  LDA and meta-GGA are declined, both for reasons found in upstream — see §5 and §6 below |
+| **B6** `hess_nuc_elec` | **upstream**: gone in 1.8.1 | `hessian/rhf.py:200 _hess_nuc_without_ecp` replaced the per-charge loop, and the `# TODO: It is computing one charge at a time` comment with it.  It does not appear in either 1.8.1 profile in `docs/HESSIAN_1.8.1.md`.  The catalogue ranks it 10th at 4.5 % of a Hessian; there is nothing left to do |
 | **B7** `hess_nuc_elec_ecp` | **open** | — |
 | **B8** Hessian 1e integrals on the CPU | **open** | Catalogue flags this as an Amdahl tail (0.1 % at 42 atoms) listed for re-measurement, not for fixing |
 | **B9** grid-response kernels | **open** | `fastxcgrad` **declines** the grid-response path and hands it to GPU4PySCF (`docs/README_fastxcgrad.md`) |
@@ -153,6 +155,8 @@ effort gets wasted.  Each is a measurement, not an opinion.
 | The log-magnitude AO screen, post-hoc | the headroom was a `minao` artifact — **65 %** of the XC GEMM work on the initial guess, **4 %** on a converged density — and the implementation measured **0.28x** | `docs/ROUND2_1.8.1.md` §3c |
 | A fused single grid pass *without* batching | **0.54x** — P7 is negative on its own and only pays with P8 | catalogue §3.6 |
 | Carrying 8 or 16 densities through one Coulomb pass instead of 4 | **0.90x** and **0.64x** against four, and the ceiling for removing the cap altogether is **1.09x** once the per-quartet overheads are fixed | `docs/ROUND3_B4A.md` §4 |
+| Grouping the grid blocks in the XC **Hessian**, which is what the catalogue asks for in B5 | `eval_xc_eff(deriv=2)` on all 519 680 penicillin V grid points in one call is **26.7 ms**; the same points in 127 calls is **119.3 ms**.  The whole of the gain the catalogue names is 93 ms of an 8.2 s function — 1.1 % | `docs/README_fastxchess.md` §1 |
+| Sub-dividing the 4096-point grid block to sharpen the XC Hessian's atom screen | at 64-point chunks `natm_local/natm` falls only from 0.745 to 0.683 (taxol 0.626 → 0.537), because GPU4PySCF's AO mask cutoff of 1e-10 keeps a Gaussian tail alive far past where it matters.  9–17 % for a per-chunk atom list and a gather | `docs/README_fastxchess.md` §4 |
 
 The AO screen's headroom is **not** zero: `docs/ROUND2_1.8.1.md`'s "What is
 left" item 1 keeps it open as a per-(block, shell) log-magnitude estimate moved
@@ -181,6 +185,33 @@ reasons a number in a table can be wrong while every correctness test passes.
    Amdahl share is "what GPU4PySCF wastes" has to be re-measured against
    whatever has already replaced that code.  `docs/ROUND3_B4A.md` §4.
 
+4. **A Hessian entry's share is not a molecule-independent number, and the
+   catalogue's §5 ranking of the Hessian entries is built from one 42-atom
+   profile.**  Between 42 and 113 atoms the exchange build inside CPHF (B4b)
+   goes from 24.0 % to **47.3 %** of the wall clock while the XC Hessian (B5)
+   goes from 18.2 % to 7.7 % and `ejk_ip2` (B3) from 8.8 % to 2.6 %.  The
+   catalogue ranks B5 seventh and B4b eighth; at 113 atoms the order is the
+   other way round by a factor of six.  Catalogue §3.4's size-independence
+   rule applies to the choice of *target*, not only to the speedup.
+   `docs/HESSIAN_1.8.1.md` §4.
+5. **GPU4PySCF's meta-GGA `_get_vxc_deriv1` is not reproducible run to run.**
+   Called twice on the same input it differs by **3.0e-5**, and the resulting
+   Hessian by 1.7e-5; every LDA and GGA case gives exactly zero.  That is a
+   different statement from `hessian/rks.py`'s own warning that the MGGA
+   Hessian is grid-sensitive — this is at a fixed grid.  Any meta-GGA Hessian
+   work needs this understood first, because until then there is no reference
+   to converge against.  `tests/test_xchess.py`'s `self` column.
+6. **A factor 2 that looks missing and is not.**  GPU4PySCF's LDA and GGA
+   branches of `_get_vxc_deriv1` apply different factors to `d rho / d R` —
+   the GGA branch has `_make_dR_rho1`'s `rho1 *= 2`, the LDA branch says "*2
+   is not applied because + c.c. in the end" — and the two then do the same
+   two contractions.  They still agree, because the GGA branch also carries a
+   compensating `wv2[:,0] *= .5` on the density component only.  Recorded
+   because it cost an hour to chase and because it is the reason LDA is not a
+   special case of the GGA code with `ncomp = 1`: the factor conventions
+   differ term by term.  `docs/README_fastxchess.md` §5 has the algebra and
+   `tests/test_xchess_fd.py` an LDA row that checks it.
+
 Catalogue §3.4's size-independence rule — re-measure on a second,
 differently-sized system and count the result only if the ratios agree — is
 followed throughout `docs/`, and every table there gives both systems.
@@ -202,13 +233,27 @@ By catalogue §5's ranking, filtered to what is open:
    measured: is the SCF mGGA build launch-bound at small `nao_sub`?  This
    repository's own mGGA gradient result (4.46x on M06-2X) is a reason to
    expect yes, but it is not that measurement.
-3. **B5** (rank 7) and the rest of the multi-density family.  Rank 6, **F2**,
-   was taken in `docs/README_fast1e.md`, and what came back was a correction
-   to the entry as well as a 1.71x: the mechanism is not the missing screen
-   but the far field being evaluated with the near-field formula — 92 % of
-   (primitive pair, cavity point) tasks — while a rigorous error-budget screen
-   in the P11 style turns out to be worth only 21 % of tasks, and those come
-   off the branch the patch already made cheap.
+3. ~~**B5** (rank 7)~~ — taken in `docs/README_fastxchess.md`, and, like F2
+   before it, with a correction to the entry: the mechanism the catalogue
+   names for B5 (batch the grid blocks, as G1 does) is 1.1 % of the function,
+   while the mechanism that carries it (most of the atom loop is arithmetic
+   on exact zeros, because `d rho / d R_A` lives only where atom A's basis
+   does) is not in the entry at all.  Rank 6, **F2**, was taken in
+   `docs/README_fast1e.md`, and what came back was a correction to that entry
+   as well as a 1.71x: the mechanism is not the missing screen but the far
+   field being evaluated with the near-field formula — 92 % of (primitive
+   pair, cavity point) tasks — while a rigorous error-budget screen in the P11
+   style turns out to be worth only 21 % of tasks, and those come off the
+   branch the patch already made cheap.
+4. **B4b, and it should be first.**  On a 113-atom Hessian the exchange build
+   inside CPHF is **47 %** of the wall clock — larger than every other
+   Hessian entry put together — and this repository's `fastk` hands every
+   `n_dm > 1` call straight back.  Two cautions from `docs/ROUND3_B4A.md`
+   apply before anything is written: measure the ceiling on *these* kernels
+   rather than GPU4PySCF's, and note that K's amortisation over densities is
+   already good (the catalogue's own §2.3 table puts it at 14.5x of the ideal
+   126x, against J's 4.8x), so what is left for a rewrite is the per-quartet
+   integral cost, not the density handling.
 
 For the LLM-GPU-QM task suite rather than for throughput, the catalogue's own
 advice stands unchanged: **A12, F1, C2, E3** are worth more than ranks 1–13

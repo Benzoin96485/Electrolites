@@ -34,7 +34,7 @@ TESTED_GPU4PYSCF = ('1.7.0', '1.8.1')
 #: The SCF modules, then the gradient modules, in the order they should load.
 MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
-    'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh',
+    'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
 )
 
 # (module, dotted path of what it replaces) -- checked before anything patches,
@@ -52,6 +52,7 @@ _TARGETS = {
     'fastgrad': ('gpu4pyscf.grad.rks', 'Gradients.energy_ee'),
     'fastxcgrad': ('gpu4pyscf.grad.rks', 'get_exc'),
     'fastgradh': ('gpu4pyscf.grad.rhf', 'GradientsBase.get_hcore'),
+    'fastxchess': ('gpu4pyscf.hessian.rks', '_get_vxc_deriv1'),
 }
 
 _patched = []
