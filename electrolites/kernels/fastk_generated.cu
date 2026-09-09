@@ -147,6 +147,14 @@ kbody_1000(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -178,6 +186,7 @@ kbody_1000(KARGS)
                 val += gout2 * dm[(i0+2)*nao+(l0+0)];
                 atomicAdd(vk+(j0+0)*nao+(k0+0), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -355,6 +364,14 @@ kbody_1010(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -426,6 +443,7 @@ kbody_1010(KARGS)
                 val += gout8 * dm[(i0+2)*nao+(l0+0)];
                 atomicAdd(vk+(j0+0)*nao+(k0+2), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -602,6 +620,14 @@ kbody_1100(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -665,6 +691,7 @@ kbody_1100(KARGS)
                 val += gout8 * dm[(i0+2)*nao+(l0+0)];
                 atomicAdd(vk+(j0+2)*nao+(k0+0), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -832,6 +859,14 @@ kbody_2000(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -887,6 +922,7 @@ kbody_2000(KARGS)
                 val += gout5 * dm[(i0+5)*nao+(l0+0)];
                 atomicAdd(vk+(j0+0)*nao+(k0+0), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -1101,6 +1137,14 @@ kbody_1011(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -1260,6 +1304,7 @@ kbody_1011(KARGS)
                 val += gout26 * dm[(i0+2)*nao+(l0+2)];
                 atomicAdd(vk+(j0+0)*nao+(k0+2), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -1474,6 +1519,14 @@ kbody_1110(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -1633,6 +1686,7 @@ kbody_1110(KARGS)
                 val += gout26 * dm[(i0+2)*nao+(l0+0)];
                 atomicAdd(vk+(j0+2)*nao+(k0+2), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -1826,6 +1880,14 @@ kbody_2010(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -1957,6 +2019,7 @@ kbody_2010(KARGS)
                 val += gout17 * dm[(i0+5)*nao+(l0+0)];
                 atomicAdd(vk+(j0+0)*nao+(k0+2), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -2148,6 +2211,14 @@ kbody_2100(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -2259,6 +2330,7 @@ kbody_2100(KARGS)
                 val += gout17 * dm[(i0+5)*nao+(l0+0)];
                 atomicAdd(vk+(j0+2)*nao+(k0+0), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -2512,6 +2584,14 @@ kbody_2110(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -2803,6 +2883,7 @@ kbody_2110(KARGS)
                 val += gout53 * dm[(i0+5)*nao+(l0+0)];
                 atomicAdd(vk+(j0+2)*nao+(k0+2), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -3111,6 +3192,14 @@ kbody_1111(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -3510,6 +3599,7 @@ kbody_1111(KARGS)
                 val += gout80 * dm[(i0+2)*nao+(l0+2)];
                 atomicAdd(vk+(j0+2)*nao+(k0+2), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -3767,6 +3857,14 @@ kbody_2011(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -4070,6 +4168,7 @@ kbody_2011(KARGS)
                 val += gout53 * dm[(i0+5)*nao+(l0+2)];
                 atomicAdd(vk+(j0+0)*nao+(k0+2), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -4291,6 +4390,14 @@ kbody_2020(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -4536,6 +4643,7 @@ kbody_2020(KARGS)
                 val += gout35 * dm[(i0+5)*nao+(l0+0)];
                 atomicAdd(vk+(j0+0)*nao+(k0+5), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -4760,6 +4868,14 @@ kbody_2200(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -4955,6 +5071,7 @@ kbody_2200(KARGS)
                 val += gout35 * dm[(i0+5)*nao+(l0+0)];
                 atomicAdd(vk+(j0+5)*nao+(k0+0), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -5129,6 +5246,14 @@ kbody_3000(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -5216,6 +5341,7 @@ kbody_3000(KARGS)
                 val += gout9 * dm[(i0+9)*nao+(l0+0)];
                 atomicAdd(vk+(j0+0)*nao+(k0+0), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -5427,6 +5553,14 @@ kbody_3010(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -5638,6 +5772,7 @@ kbody_3010(KARGS)
                 val += gout29 * dm[(i0+9)*nao+(l0+0)];
                 atomicAdd(vk+(j0+0)*nao+(k0+2), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -5892,6 +6027,14 @@ kbody_3020(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -6289,6 +6432,7 @@ kbody_3020(KARGS)
                 val += gout59 * dm[(i0+9)*nao+(l0+0)];
                 atomicAdd(vk+(j0+0)*nao+(k0+5), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -6498,6 +6642,14 @@ kbody_3100(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -6673,6 +6825,7 @@ kbody_3100(KARGS)
                 val += gout29 * dm[(i0+9)*nao+(l0+0)];
                 atomicAdd(vk+(j0+2)*nao+(k0+0), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -6930,6 +7083,14 @@ kbody_3200(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
 
             double val;
             val = 0;
@@ -7237,6 +7398,7 @@ kbody_3200(KARGS)
                 val += gout59 * dm[(i0+9)*nao+(l0+0)];
                 atomicAdd(vk+(j0+5)*nao+(k0+0), val);
             
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);

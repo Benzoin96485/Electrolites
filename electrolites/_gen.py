@@ -56,6 +56,12 @@ _SPECS = {
                               ('--ndm', '4')),
     'fastkhigh_generated.cu': ('electrolites.codegen.gen_khigh',
                                ('--table', 'fastkhigh_launch.json')),
+    # the fused Coulomb-and-exchange family (catalogue B4b): the response
+    # path's build, which asks for J and K from one Rys pass.  Separate from
+    # the exchange-only family so an ordinary SCF never compiles it
+    'fastjkhigh_generated.cu': ('electrolites.codegen.gen_khigh',
+                                ('--jk', '--table',
+                                 'fastjkhigh_launch.json')),
     'fastejk_generated.cu': ('electrolites.codegen.gen_ejk',
                              ('--table', 'fastejk_launch.json')),
 }

@@ -158,7 +158,7 @@ void fill_vk_tasks(int *ntasks, int *bas_kl_idx, int bas_ij, int nbas,
 // (ss|ss)
 // ---------------------------------------------------------------------------
 #define KARGS                                                                  \
-    double *vk, const double *dm, int nao,                                     \
+    double *vk_all, const double *dm_all, int n_dm, int nao,                   \
     const int *bas, const double *env, const int *ao_loc, int nbas,            \
     int npairs_ij, int npairs_kl,                                              \
     const int *pair_ij_mapping, const int *pair_kl_mapping,                    \
@@ -167,7 +167,7 @@ void fill_vk_tasks(int *ntasks, int *bas_kl_idx, int bas_ij, int nbas,
     double inv_om2, double coef0, double coef1
 // the same names, to forward KARGS from an entry point to the templated body
 #define KFWD                                                                   \
-    vk, dm, nao, bas, env, ao_loc, nbas, npairs_ij, npairs_kl,                 \
+    vk_all, dm_all, n_dm, nao, bas, env, ao_loc, nbas, npairs_ij, npairs_kl,   \
     pair_ij_mapping, pair_kl_mapping, q_cond, dm_cond, cutoff,                 \
     pool, head, queue_depth, tab, inv_om2, coef0, coef1
 
@@ -285,10 +285,15 @@ kbody_0000(KARGS)
                 }
             }
             int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
+            size_t nao2 = (size_t)nao * nao;
+            for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+            const double *dm = dm_all + i_dm * nao2;
+            double *vk = vk_all + i_dm * nao2;
             atomicAdd(vk + i0*nao + l0, gout0 * dm[j0*nao + k0]);
             atomicAdd(vk + j0*nao + l0, gout0 * dm[i0*nao + k0]);
             atomicAdd(vk + i0*nao + k0, gout0 * dm[j0*nao + l0]);
             atomicAdd(vk + j0*nao + k0, gout0 * dm[i0*nao + l0]);
+            }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
         __syncthreads();
@@ -395,7 +400,7 @@ void rys_roots_tab(double x, double *rw, int block_size, int rt_id, int stride,
 }
 
 #define KARGS2                                                                 \
-    double *vk_all, double *dm_all, int nao,                                   \
+    double *vk_all, double *dm_all, int n_dm, int nao,                         \
     int *bas, double *env, int *ao_loc, int nbas,                              \
     int npairs_ij, int npairs_kl,                                              \
     int *pair_ij_mapping, int *pair_kl_mapping,                                \
@@ -404,7 +409,7 @@ void rys_roots_tab(double x, double *rw, int block_size, int rt_id, int stride,
     int iprim_a, int jprim_a, int kprim_a, int lprim_a,                        \
     double inv_om2, double coef0, double coef1
 #define KFWD2                                                                  \
-    vk_all, dm_all, nao, bas, env, ao_loc, nbas, npairs_ij, npairs_kl,         \
+    vk_all, dm_all, n_dm, nao, bas, env, ao_loc, nbas, npairs_ij, npairs_kl,   \
     pair_ij_mapping, pair_kl_mapping, q_cond, dm_cond, cutoff,                 \
     pool, head, queue_depth, tab, iprim_a, jprim_a, kprim_a, lprim_a,          \
     inv_om2, coef0, coef1

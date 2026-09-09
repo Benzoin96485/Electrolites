@@ -1,28 +1,36 @@
-"""Build the one library that is not JIT-compiled, on first use.
+"""Build the two libraries that are not JIT-compiled, on first use.
 
 Almost every kernel here is compiled at run time by NVRTC through
 ``cupy.RawModule``, so nothing has to be built at install time and no wheel
-carries device code.  The exception is ``libmykg``: a faster copy of
-GPU4PySCF's *general* Rys exchange kernel, which is split over several
-translation units and needs relocatable device code, so NVRTC cannot build it.
+carries device code.  Two are exceptions, both because they are split over
+several translation units and need relocatable device code, which NVRTC cannot
+do:
 
-It is therefore compiled with ``nvcc`` the first time ``fastk`` wants it and
-cached per compute capability.  If ``nvcc`` is not on the machine, this returns
-None and ``fastk`` hands the angular-momentum classes that would have used it
-back to GPU4PySCF -- slower, still correct.
+* ``libmykg``, a faster copy of GPU4PySCF's *general* Rys exchange kernel,
+  which `fastk` wants for the angular-momentum classes it does not unroll.
+* ``libmyejk2``, the second-derivative ERI kernels of catalogue B3, lifted from
+  GPU4PySCF's ``rys_contract_jk_ip2.cu`` and ``unrolled_ejk_ip2_type{12,3}.cu``
+  with the divisions folded and a register cap added (codegen/gen_ejk_ip2.py),
+  which `fastejk2` binds over GPU4PySCF's own entry points.
+
+Each is compiled with ``nvcc`` the first time it is wanted and cached per
+compute capability.  If ``nvcc`` is not on the machine, the accessor returns
+None and the module that wanted it stands down -- slower, still correct.
 
 Overrides:
-  ELECTROLITES_LIBMYKG   path to a prebuilt library; used as-is
+  ELECTROLITES_LIBMYKG   path to a prebuilt libmykg; used as-is
+  ELECTROLITES_LIBMYEJK2 path to a prebuilt libmyejk2; used as-is
   ELECTROLITES_CACHE     where to put the build (default ~/.cache/electrolites)
   ELECTROLITES_NVCC      the compiler to use (default: nvcc on PATH)
   ELECTROLITES_ARCH      compute capability digits, e.g. 80 (default: this GPU)
 """
+import functools
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import functools
 
 from ._paths import CUDA_DIR
 
@@ -30,6 +38,16 @@ _SOURCES = (
     'gvhf-rys/rys_roots_dat.cu',
     'gvhf-rys/rys_constant.cu',
     'myk2/rys_k_general.cu',
+)
+#: the second-derivative ERI library (catalogue B3).  Its support headers are
+#: a 1.8.x copy and live in their own directory, because BoundsInfo gained
+#: per-group q_cond/s_cond after 1.7.0 and the two sets are not interchangeable.
+_EJK2_SOURCES = (
+    'gvhf-rys181/gvhf-rys/rys_roots_dat.cu',
+    'gvhf-rys181/gvhf-rys/rys_constant.cu',
+    'myejk2/rys_contract_jk_ip2.cu',
+    'myejk2/unrolled_ejk_ip2_type12.cu',
+    'myejk2/unrolled_ejk_ip2_type3.cu',
 )
 _warned = False
 
@@ -72,49 +90,81 @@ def nvcc_path():
         return None
 
 
-@functools.lru_cache(maxsize=1)
-def general_k_library():
-    """Path to ``libmykg`` for this GPU, or None if it cannot be provided."""
-    override = os.environ.get('ELECTROLITES_LIBMYKG')
+def _build(name, sources, includes, what, override_env):
+    """Path to one nvcc-built library for this GPU, or None.
+
+    ``what`` names the thing that stands down if the build cannot happen, so
+    the one warning a process prints says which module lost what.
+    """
+    override = os.environ.get(override_env)
     if override:
         return override if os.path.exists(override) else None
 
     arch = compute_capability()
+    srcs = [os.path.join(CUDA_DIR, s) for s in sources]
+    # The cache key carries a hash of the sources and of the compile line, so
+    # editing a kernel or changing a flag invalidates it.  Keying on the
+    # compute capability alone silently serves a stale library, which is a
+    # whole afternoon of measuring the previous build.
     out_dir = os.path.join(cache_dir(), f'sm_{arch}')
-    out = os.path.join(out_dir, 'libmykg.so')
+    out = os.path.join(out_dir, name)
+    if all(os.path.exists(s) for s in srcs):
+        h = hashlib.sha256()
+        for s_ in srcs:
+            with open(s_, 'rb') as f:
+                h.update(f.read())
+        h.update(repr((arch, includes)).encode())
+        out = os.path.join(out_dir, h.hexdigest()[:16], name)
+        out_dir = os.path.dirname(out)
     if os.path.exists(out):
         return out
 
     nvcc = nvcc_path()
     if nvcc is None:
-        _log('nvcc not found: the general exchange kernel falls back to '
-             'GPU4PySCF (set ELECTROLITES_NVCC or ELECTROLITES_LIBMYKG)')
+        _log(f'nvcc not found: {what} falls back to GPU4PySCF '
+             f'(set ELECTROLITES_NVCC or {override_env})')
         return None
 
-    srcs = [os.path.join(CUDA_DIR, s) for s in _SOURCES]
     if not all(os.path.exists(s) for s in srcs):
-        _log('the general exchange kernel sources are not installed; '
-             'those classes fall back to GPU4PySCF')
+        _log(f'the sources for {what} are not installed; it falls back to '
+             f'GPU4PySCF')
         return None
 
     os.makedirs(out_dir, exist_ok=True)
     cmd = [nvcc, '-O3', '-std=c++17', f'-arch=sm_{arch}',
-           '--compiler-options', '-fPIC', '-rdc=true',
-           '-I', CUDA_DIR, '-I', os.path.join(CUDA_DIR, 'gvhf-rys'),
-           '-shared', '-o', 'libmykg.so'] + srcs
+           '--compiler-options', '-fPIC', '-rdc=true']
+    for inc in includes:
+        cmd += ['-I', os.path.join(CUDA_DIR, inc) if inc else CUDA_DIR]
+    cmd += ['-shared', '-o', name] + srcs
     # the staging directory has to sit inside the cache directory: the final
     # step is a rename, and a rename across filesystems is not possible
     with tempfile.TemporaryDirectory(dir=out_dir) as tmp:
         proc = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True)
-        if proc.returncode != 0 or not os.path.exists(
-                os.path.join(tmp, 'libmykg.so')):
+        if proc.returncode != 0 or not os.path.exists(os.path.join(tmp, name)):
             tail = (proc.stderr or proc.stdout or '').strip().splitlines()[-6:]
-            _log('could not build the general exchange kernel; those classes '
-                 'fall back to GPU4PySCF:\n  ' + '\n  '.join(tail))
+            _log(f'could not build {what}; it falls back to GPU4PySCF:\n  '
+                 + '\n  '.join(tail))
             return None
         # atomic, so two processes racing on a cold cache cannot half-write it
-        os.replace(os.path.join(tmp, 'libmykg.so'), out)
+        os.replace(os.path.join(tmp, name), out)
     return out
 
 
-__all__ = ['general_k_library', 'cache_dir', 'compute_capability', 'nvcc_path']
+@functools.lru_cache(maxsize=1)
+def general_k_library():
+    """Path to ``libmykg`` for this GPU, or None if it cannot be provided."""
+    return _build('libmykg.so', _SOURCES, ('', 'gvhf-rys'),
+                  'the general exchange kernel', 'ELECTROLITES_LIBMYKG')
+
+
+@functools.lru_cache(maxsize=1)
+def ejk_ip2_library():
+    """Path to ``libmyejk2`` for this GPU, or None if it cannot be provided."""
+    return _build('libmyejk2.so', _EJK2_SOURCES,
+                  ('gvhf-rys181', 'gvhf-rys181/gvhf-rys'),
+                  "the Hessian's second-derivative ERI kernels",
+                  'ELECTROLITES_LIBMYEJK2')
+
+
+__all__ = ['general_k_library', 'ejk_ip2_library', 'cache_dir',
+           'compute_capability', 'nvcc_path']

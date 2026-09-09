@@ -31,16 +31,49 @@ Specifically:
   upstream made independently in 1.8.0 (the gout_pattern bit shift, upstream
   PR #791); the rest is the restructuring described in docs/README_fastk.md.
 
+* electrolites/kernels/cuda/gvhf-rys181/gvhf-rys/* are copies of GPU4PySCF
+  **1.8.1** sources.  All but one are unmodified and are compiled here only as
+  support for the library below; a 1.8.1 set is needed alongside the 1.7.0 one
+  because BoundsInfo gained per-group q_cond/s_cond in between.  The exception
+  is build_rys_gxyz.cuh, whose three per-Rys-root divisions are folded like the
+  rest of the P1 treatment.  A second file, vhf.cuh, is modified only when the
+  generator is asked for the register cap (--p3, which is measured not to pay
+  and so is not the shipped configuration): its adjust_threads macro then has
+  the register-driven thread doubling disabled, because with a cap in place
+  that branch becomes reachable and could change the block shape out from under
+  the launch bound.  docs/README_fastejk2.md 4 has the measurements.
+
+* electrolites/kernels/cuda/myejk2/{rys_contract_jk_ip2.cu,
+  unrolled_ejk_ip2_type12.cu, unrolled_ejk_ip2_type3.cu} are derived from the
+  GPU4PySCF 1.8.1 files of the same names under lib/gvhf-rys, by
+  codegen/gen_ejk_ip2.py.  Two changes, both described in
+  docs/README_fastejk2.md: every double-precision division in the primitive and
+  Rys-root loops becomes a multiply by a reciprocal formed once per primitive
+  pair, and each kernel gains a __launch_bounds__.  The Rys recurrences, the
+  per-atom contraction, the screening, the symmetry factors and the two extern
+  "C" drivers are upstream's, unaltered apart from the entry-point names.
+
 * electrolites/kernels/fastk_generated.cu and fastk2_generated.cu are emitted
   by codegen/gen_kernels.py and codegen/gen_k2_kernels.py, which lift the
   integral arithmetic of GPU4PySCF's lib/gvhf-rys/unrolled_rys_k.cu and
   restructure the code around it.  electrolites/kernels/fastj_generated.cu is
   emitted the same way from lib/gvhf-md/unrolled_md_j.cu.
 
-* electrolites/kernels/fastkhigh_generated.cu and fastejk_generated.cu are
-  written from the angular-momentum class alone by codegen/gen_khigh.py and
-  codegen/gen_ejk.py; no GPU4PySCF source is used as input for them.  They do
-  follow GPU4PySCF's screening tests, task ordering and symmetry factors.
+* electrolites/kernels/fastjk_generated.cu and fastjk2_generated.cu are
+  emitted the same way by codegen/gen_kernels.py --jk and
+  codegen/gen_k2_kernels.py --jk, lifting the integral arithmetic and the
+  fused J-and-K contraction of GPU4PySCF's lib/gvhf-rys/unrolled_rys_jk.cu.
+  electrolites/kernels/fastjk_prologue.cu's fill_vjk_tasks/fill_vjk_tasks2
+  reproduce the screening tests of that release's
+  lib/gvhf-rys/create_tasks.cu _fill_vjk_tasks for a 1D and a 2D thread block.
+
+* electrolites/kernels/fastkhigh_generated.cu, fastjkhigh_generated.cu and
+  fastejk_generated.cu are written from the angular-momentum class alone by
+  codegen/gen_khigh.py (with and without --jk) and codegen/gen_ejk.py; no
+  GPU4PySCF source is used as input for them.  They do follow GPU4PySCF's
+  screening tests, task ordering and symmetry factors, and the fused ones
+  follow the index order of its two Coulomb contractions, which is
+  load-bearing at hermi = 0.
 
 * electrolites/kernels/data/rys_roots_dat.npz holds the Rys root and weight
   tables of GPU4PySCF's lib/gvhf-rys/rys_roots_dat.cu, repacked.

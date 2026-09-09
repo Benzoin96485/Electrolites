@@ -441,9 +441,9 @@ while (pair_ij < npairs_ij) {
             int k0 = ao_loc[ksh];
             int l0 = ao_loc[lsh];
             double val;
-            for (int i_dm = 0; i_dm < 1; ++i_dm) {
-                double *dm = dm_all + i_dm * nao * nao;
-                double *vk = vk_all + i_dm * nao * nao;
+            for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                double *dm = dm_all + i_dm * (size_t)nao * nao;
+                double *vk = vk_all + i_dm * (size_t)nao * nao;
                 switch (gout_id) {
                 case 0:
                 val = 0;
@@ -1639,9 +1639,9 @@ while (pair_ij < npairs_ij) {
             int k0 = ao_loc[ksh];
             int l0 = ao_loc[lsh];
             double val;
-            for (int i_dm = 0; i_dm < 1; ++i_dm) {
-                double *dm = dm_all + i_dm * nao * nao;
-                double *vk = vk_all + i_dm * nao * nao;
+            for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                double *dm = dm_all + i_dm * (size_t)nao * nao;
+                double *vk = vk_all + i_dm * (size_t)nao * nao;
                 switch (gout_id) {
                 case 0:
                 val = 0;
@@ -3335,9 +3335,9 @@ while (pair_ij < npairs_ij) {
             int k0 = ao_loc[ksh];
             int l0 = ao_loc[lsh];
             double val;
-            for (int i_dm = 0; i_dm < 1; ++i_dm) {
-                double *dm = dm_all + i_dm * nao * nao;
-                double *vk = vk_all + i_dm * nao * nao;
+            for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                double *dm = dm_all + i_dm * (size_t)nao * nao;
+                double *vk = vk_all + i_dm * (size_t)nao * nao;
                 switch (gout_id) {
                 case 0:
                 val = 0;
@@ -4578,9 +4578,9 @@ while (pair_ij < npairs_ij) {
             int k0 = ao_loc[ksh];
             int l0 = ao_loc[lsh];
             double val;
-            for (int i_dm = 0; i_dm < 1; ++i_dm) {
-                double *dm = dm_all + i_dm * nao * nao;
-                double *vk = vk_all + i_dm * nao * nao;
+            for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                double *dm = dm_all + i_dm * (size_t)nao * nao;
+                double *vk = vk_all + i_dm * (size_t)nao * nao;
                 switch (gout_id) {
                 case 0:
                 val = 0;
@@ -5733,9 +5733,9 @@ while (pair_ij < npairs_ij) {
             int k0 = ao_loc[ksh];
             int l0 = ao_loc[lsh];
             double val;
-            for (int i_dm = 0; i_dm < 1; ++i_dm) {
-                double *dm = dm_all + i_dm * nao * nao;
-                double *vk = vk_all + i_dm * nao * nao;
+            for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                double *dm = dm_all + i_dm * (size_t)nao * nao;
+                double *vk = vk_all + i_dm * (size_t)nao * nao;
                 switch (gout_id) {
                 case 0:
                 val = 0;
@@ -6812,9 +6812,9 @@ while (pair_ij < npairs_ij) {
             int k0 = ao_loc[ksh];
             int l0 = ao_loc[lsh];
             double val;
-            for (int i_dm = 0; i_dm < 1; ++i_dm) {
-                double *dm = dm_all + i_dm * nao * nao;
-                double *vk = vk_all + i_dm * nao * nao;
+            for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                double *dm = dm_all + i_dm * (size_t)nao * nao;
+                double *vk = vk_all + i_dm * (size_t)nao * nao;
                 switch (gout_id) {
                 case 0:
                 val = 0;

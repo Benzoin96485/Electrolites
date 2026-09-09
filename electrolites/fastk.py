@@ -55,6 +55,9 @@ _USE_GENERAL = not os.environ.get('FASTK_NO_GENERAL')
 _NO_OMEGA = bool(os.environ.get('FASTK_NO_OMEGA'))
 # ablation: hand 1.8.x's fused lr*erf + sr*erfc request straight back
 _FUSED_OFF = bool(os.environ.get('FASTK_NO_FUSED'))
+# ablation: hand every multi-density request back, which is what this module
+# did before the B4b round -- the measurement behind docs/ROUND4_B4B.md
+_NO_NDM = bool(os.environ.get('FASTK_NO_NDM'))
 
 # angular-momentum classes handled by our kernels: (li,lj,lk,ll) -> entry point
 with open(os.path.join(HERE, 'fastk_launch.json')) as _f:
@@ -167,12 +170,17 @@ def _usable(omega, n_dm, nprim, i, j, k, l):
     basis set and of what the caller asked for.  ``omega`` is the resolved
     operator (see _resolve_rsh), not mol.omega: on 1.8.x the operator is an
     argument of get_k rather than a property of the option object.
+
+    ``n_dm`` used to be one of these conditions -- the kernels accumulated a
+    single density, so every CPHF, TDDFT and polarizability call fell through
+    (catalogue B4b).  They now carry the density loop inside the quartet, so
+    the only thing left of that restriction is the ablation switch.
     """
     if omega < 0:                           # short-range (erfc) ERIs need
         return False                        # twice the roots and s_estimator
     if omega != 0 and _NO_OMEGA:            # ablation: the pre-range-separation
         return False                        # behaviour, for the timing tables
-    if n_dm != 1:                           # kernels accumulate a single density
+    if n_dm != 1 and _NO_NDM:               # ablation: the pre-B4b behaviour
         return False
     # the bra primitive-pair cache is a fixed-size shared array
     if int(nprim[i]) * int(nprim[j]) > MAX_PRIM_PAIR:
@@ -203,7 +211,7 @@ def _prep(self, dms, hermi):
 
 
 def _run_k1(name, nthreads, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
-            q_cond, dm_cond, log_cutoff, inv_om2, coef0, coef1):
+            q_cond, dm_cond, log_cutoff, inv_om2, coef0, coef1, n_dm=1):
     """One of the 14 classes with one thread per shell quartet."""
     d_bas, d_env, d_ao_loc = dev
     kern = _function(name)
@@ -213,14 +221,15 @@ def _run_k1(name, nthreads, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
     for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
         ws.head.fill(0)
         kern((n_blocks,), (nthreads,),
-             (vk, dms, np.int32(nao), d_bas, d_env, d_ao_loc, np.int32(nbas),
+             (vk, dms, np.int32(n_dm), np.int32(nao),
+              d_bas, d_env, d_ao_loc, np.int32(nbas),
               np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
               q_cond, dm_cond, np.float32(log_cutoff), ws.pool, ws.head,
               np.int32(POOL_STRIDE), tab, inv_om2, coef0, coef1))
 
 
 def _run_k2(tag, e, prim, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
-            q_cond, dm_cond, log_cutoff, inv_om2, coef0):
+            q_cond, dm_cond, log_cutoff, inv_om2, coef0, n_dm=1):
     """One of the 4 classes GPU4PySCF splits across threadIdx.y."""
     iprim, jprim, kprim, lprim = prim
     d_bas, d_env, d_ao_loc = dev
@@ -231,7 +240,8 @@ def _run_k2(tag, e, prim, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
     for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
         ws.head.fill(0)
         kern((n_blocks,), nthreads,
-             (vk, dms, np.int32(nao), d_bas, d_env, d_ao_loc, np.int32(nbas),
+             (vk, dms, np.int32(n_dm), np.int32(nao),
+              d_bas, d_env, d_ao_loc, np.int32(nbas),
               np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
               q_cond, dm_cond, np.float32(log_cutoff), ws.pool, ws.head,
               np.int32(POOL_STRIDE), tab, np.int32(iprim), np.int32(jprim),
@@ -306,7 +316,8 @@ def _run_general(self, ws, vk, dms, n_dm, nao, shls_slice, pm_ij, pm_kl,
 
 def _general_ok(omega, n_dm, lll):
     tag = ''.join(str(c) for c in lll)
-    return (_USE_GENERAL and tag not in UNROLLED and n_dm == 1
+    return (_USE_GENERAL and tag not in UNROLLED
+            and not (n_dm != 1 and _NO_NDM)
             and omega >= 0 and not (_NO_OMEGA and omega != 0))
 
 
@@ -453,14 +464,15 @@ def get_k(self, dms, hermi, verbose, omega=None, lr_factor=None,
         if entry2 is not None:
             tag, e = entry2
             _run_k2(tag, e, prim, ws, tab, dev, vk, dms, nao, mol.nbas,
-                    pm_ij, pm_kl, q_cond, dm_cond, log_cutoff, inv_om2, _ONE)
+                    pm_ij, pm_kl, q_cond, dm_cond, log_cutoff, inv_om2, _ONE,
+                    n_dm)
             continue
         entry = IMPLEMENTED.get(lll) if ok else None
         if entry is not None:
             name, nthreads = entry
             _run_k1(name, nthreads, ws, tab, dev, vk, dms, nao, mol.nbas,
                     pm_ij, pm_kl, q_cond, dm_cond, log_cutoff,
-                    inv_om2, _ONE, _ZERO)
+                    inv_om2, _ONE, _ZERO, n_dm)
             continue
         shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
         if _general_ok(rsh_omega, n_dm, lll) and _run_general(
@@ -573,7 +585,7 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
             name, nthreads = entry
             _run_k1('k_rs_' + name[2:], nthreads, ws, tab, dev_f, vk, dms, nao,
                     mol.nbas, pm_ij, pm_kl, q_cond_f, dm_cond, log_cutoff,
-                    inv_om2, c_f, c_l)
+                    inv_om2, c_f, c_l, n_dm)
             continue
         entry2 = IMPLEMENTED2.get(lll) if ok else None
         if entry2 is not None:
@@ -586,7 +598,7 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
                 if pm_ij.size == 0 or pm_kl.size == 0:
                     continue
                 _run_k2(tag, e, prim, ws, tab, dev, vk, dms, nao, mol.nbas,
-                        pm_ij, pm_kl, qc, dm_cond, log_cutoff, io2, cf)
+                        pm_ij, pm_kl, qc, dm_cond, log_cutoff, io2, cf, n_dm)
             continue
         fallthrough.append(((i, j, k, l), lll))
 

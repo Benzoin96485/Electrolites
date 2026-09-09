@@ -1,0 +1,50 @@
+{
+ "2021": {
+  "g_size": 18,
+  "gout_stride": 4,
+  "minblocks": 2,
+  "nroots": 3,
+  "nsq": 64,
+  "shm_fixed": 4480
+ },
+ "2111": {
+  "g_size": 24,
+  "gout_stride": 8,
+  "minblocks": 2,
+  "nroots": 3,
+  "nsq": 32,
+  "shm_fixed": 2816
+ },
+ "2120": {
+  "g_size": 18,
+  "gout_stride": 4,
+  "minblocks": 2,
+  "nroots": 3,
+  "nsq": 64,
+  "shm_fixed": 4480
+ },
+ "2210": {
+  "g_size": 18,
+  "gout_stride": 4,
+  "minblocks": 2,
+  "nroots": 3,
+  "nsq": 64,
+  "shm_fixed": 4480
+ },
+ "3011": {
+  "g_size": 16,
+  "gout_stride": 4,
+  "minblocks": 2,
+  "nroots": 3,
+  "nsq": 64,
+  "shm_fixed": 4096
+ },
+ "3110": {
+  "g_size": 16,
+  "gout_stride": 4,
+  "minblocks": 2,
+  "nroots": 3,
+  "nsq": 64,
+  "shm_fixed": 4096
+ }
+}

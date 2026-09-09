@@ -98,10 +98,17 @@ if vhfopt is None:
     vhfopt = mf._opt_gpu[0.0] = sjk._VHFOpt(mol, mf.direct_scf_tol).build()
 jopt = sje._VHFOpt(mol, mf.direct_scf_tol).build()
 
+# With `fastjk` patched, `_VHFOpt.get_jk` is *our* fused kernel and
+# `_get_jk_orig` is GPU4PySCF's, so both arrangements and both fused builds are
+# timed in one process against one density -- which is what makes the ratio
+# meaningful on a shared node (docs/RESPONSE_1.8.1.md 4b).
+_stock_fused = getattr(sjk._VHFOpt, '_get_jk_orig', None)
+
 rows = []
-print(f'\n{"hermi":>5s} {"nset":>5s} {"fused/s":>9s} {"split/s":>9s} '
-      f'{"..j/s":>8s} {"..k/s":>8s} {"ratio":>7s}  {"max|dJ|":>9s} {"max|dK|":>9s}')
-print('-' * 82)
+print(f'\n{"hermi":>5s} {"nset":>5s} {"fused/s":>9s} {"g4p fused":>9s} '
+      f'{"split/s":>9s} {"..j/s":>8s} {"..k/s":>8s} {"ratio":>7s}  '
+      f'{"max|dJ|":>9s} {"max|dK|":>9s}')
+print('-' * 96)
 for hermi in [int(x) for x in a.hermi.split(',')]:
     for nset in [int(x) for x in a.nset.split(',')]:
         if nset > len(xs):
@@ -112,6 +119,10 @@ for hermi in [int(x) for x in a.hermi.split(',')]:
 
         t_fused, (vj0, vk0) = timeit(
             lambda: vhfopt.get_jk(dms, hermi, None), a.reps)
+        t_stock = float('nan')
+        if _stock_fused is not None:
+            t_stock, (vj2, vk2) = timeit(
+                lambda: _stock_fused(vhfopt, dms, hermi, None), a.reps)
         t_j, vj1 = timeit(lambda: sje.get_j(mol, dm1, hermi, jopt), a.reps)
         t_k, vk1 = timeit(
             lambda: sjk.get_k(mol, dm1, hermi, vhfopt, None, None, None),
@@ -121,10 +132,11 @@ for hermi in [int(x) for x in a.hermi.split(',')]:
         dj = float(cp.abs(vj0 - vj1).max())
         dk = float(cp.abs(vk0 - vk1).max())
         t_split = t_j + t_k
-        print(f'{hermi:5d} {nset:5d} {t_fused:9.4f} {t_split:9.4f} '
-              f'{t_j:8.4f} {t_k:8.4f} {t_fused/t_split:6.2f}x  '
-              f'{dj:9.2e} {dk:9.2e}', flush=True)
-        rows.append(dict(hermi=hermi, nset=nset, fused=t_fused, split=t_split,
+        print(f'{hermi:5d} {nset:5d} {t_fused:9.4f} {t_stock:9.4f} '
+              f'{t_split:9.4f} {t_j:8.4f} {t_k:8.4f} '
+              f'{t_fused/t_split:6.2f}x  {dj:9.2e} {dk:9.2e}', flush=True)
+        rows.append(dict(hermi=hermi, nset=nset, fused=t_fused,
+                         stock_fused=t_stock, split=t_split,
                          j=t_j, k=t_k, dj=dj, dk=dk))
 
 print('\n' + json.dumps({'tag': tag, 'natm': mol.natm, 'nao': int(mol.nao),

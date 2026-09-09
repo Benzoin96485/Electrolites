@@ -471,10 +471,18 @@ def gout_compact(c, per):
     return o
 
 
-def contract_compact(c, per, d):
+def contract_compact(c, per, d, jk=False):
     """The four exchange contractions, grouped so each output element takes one
     atomicAdd.  Every group is a compile-time subset of the lane's PER
-    combinations, so one body again serves every lane."""
+    combinations, so one body again serves every lane.
+
+    ``jk`` appends the two Coulomb contractions -- ``vj[i,j] += sum_kl gout *
+    dm[l,k]`` and ``vj[k,l] += sum_ij gout * dm[j,i]`` -- which is what makes
+    this a *fused* build: J comes out of integrals the exchange half has
+    already computed, and the quartet's geometry, screening and Rys work are
+    paid once instead of twice (catalogue B4b).  The index order of the two
+    density reads is GPU4PySCF's own and matters at ``hermi = 0``, where the
+    caller stacks the transposed densities rather than symmetrising them."""
     nfi = c.nf[0]
     o = ['int ii = i0, jj = j0 + jb_, kk = k0 + kb_, llx = l0 + lb_;']
 
@@ -519,6 +527,24 @@ def contract_compact(c, per, d):
                 o.append('val += %s * dm[(ii+%d)*nao+(llx+%d)];'
                          % (g(m, ci), ci, d[m][2]))
         o.append('atomicAdd(vk+(jj+%d)*nao+(kk+%d), val);' % (dj, dk))
+    if not jk:
+        return o
+    # vj[i,j] += sum_{k,l} gout * dm[l,k]
+    for dj, ms in group(lambda t: t[0]):
+        for ci in range(nfi):
+            o.append('val = 0;')
+            for m in ms:
+                o.append('val += %s * dm[(llx+%d)*nao+(kk+%d)];'
+                         % (g(m, ci), d[m][2], d[m][1]))
+            o.append('atomicAdd(vj+(ii+%d)*nao+(jj+%d), val);' % (ci, dj))
+    # vj[k,l] += sum_{i,j} gout * dm[j,i]
+    for (dk, dl), ms in group(lambda t: (t[1], t[2])):
+        o.append('val = 0;')
+        for m in ms:
+            for ci in range(nfi):
+                o.append('val += %s * dm[(jj+%d)*nao+(ii+%d)];'
+                         % (g(m, ci), d[m][0], ci))
+        o.append('atomicAdd(vj+(kk+%d)*nao+(llx+%d), val);' % (dk, dl))
     return o
 
 
@@ -537,7 +563,7 @@ HEAD = r'''
 #define NTHREADS_%(tag)s %(nthreads)d
 #define MINBLOCKS_%(tag)s %(minblocks)d
 extern "C" __global__ void __launch_bounds__(NTHREADS_%(tag)s, MINBLOCKS_%(tag)s)
-kh_%(tag)s(KARGS2)
+%(pfx)s_%(tag)s(%(args)s)
 {
     constexpr int NSQ = %(nsq)d;
     constexpr int GSTRIDE = %(gs)d;
@@ -564,7 +590,7 @@ while (pair_ij < npairs_ij) {
         ntasks = 0;
     }
     __syncthreads();
-    fill_vk_tasks2(&ntasks, bas_kl_idx, bas_ij, nbas, pair_kl_mapping,
+    %(fill)s(&ntasks, bas_kl_idx, bas_ij, nbas, pair_kl_mapping,
                    npairs_kl, q_cond, dm_cond, cutoff);
     if (ntasks == 0) {
         if (thread_id == 0) {
@@ -715,11 +741,20 @@ while (pair_ij < npairs_ij) {
         if (task_id < ntasks) {
             int i0 = ao_loc[ish], j0 = ao_loc[jsh];
             int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
-            double *dm = dm_all;
-            double *vk = vk_all;
+            size_t nao2 = (size_t)nao * nao;
             double val;
             (void)val;
-%(contract)s
+            // The quartet's 2D integrals are in shared memory and its gout in
+            // registers by the time we get here, so n_dm densities cost n_dm
+            // contractions and one integral pass -- which is the whole point
+            // of catalogue B4b.  The loop is outside the contraction rather
+            // than inside it so that the compile-time g-array addresses stay
+            // compile-time.
+            for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+            double *dm = dm_all + i_dm * nao2;
+            double *vk = vk_all + i_dm * nao2;
+%(vjdecl)s%(contract)s
+            }
         }
     }
     if (thread_id == 0) {
@@ -765,10 +800,19 @@ def scheme(c, threads, gout_max, shm_max):
     return best
 
 
+#: What differs between the exchange-only and the fused build.
+FLAVOUR = {
+    False: dict(pfx='kh', args='KARGS2', fill='fill_vk_tasks2', vjdecl=''),
+    True: dict(pfx='jkh', args='JKARGS2', fill='fill_vjk_tasks2',
+               vjdecl='            double *vj = vj_all + i_dm * nao2;\n'),
+}
+
+
 def generate(classes, threads=256, gout_max=96, shm_max=48 * 1024,
              layout='blocked', minblocks=1, table=None, mode='compact',
-             par_hrr=False):
+             par_hrr=False, jk=False):
     out, tab = [], {}
+    fl = FLAVOUR[jk]
     if mode == 'compact':
         out.append(lex_table())
     for spec in classes:
@@ -782,7 +826,8 @@ def generate(classes, threads=256, gout_max=96, shm_max=48 * 1024,
             d = deltas(c, per)
             pre = lane_pre(c, per, d)
             gout = '\n'.join(' ' * 20 + l for l in gout_compact(c, per))
-            contract = '\n'.join(' ' * 12 + l for l in contract_compact(c, per, d))
+            contract = '\n'.join(
+                ' ' * 12 + l for l in contract_compact(c, per, d, jk))
         else:
             sch = scheme(c, threads, gout_max, shm_max)
             if sch is None:
@@ -792,6 +837,7 @@ def generate(classes, threads=256, gout_max=96, shm_max=48 * 1024,
             per = w
             own = lanes(c, gs, layout)
             pre = ''
+            assert not jk, '--jk is only implemented for --mode compact'
             gout = _switch([gout_body(c, o) for o in own], ' ' * 20)
             contract = _switch([contract_body(c, o) for o in own], ' ' * 12)
         body = HEAD % dict(
@@ -801,13 +847,14 @@ def generate(classes, threads=256, gout_max=96, shm_max=48 * 1024,
             nthreads=nsq * gs, minblocks=minblocks,
             recur=(recurrence_split(c, 20) if par_hrr
                    else recurrence_fused(c, 20)),
-            gout=gout, contract=contract)
+            gout=gout, contract=contract, **fl)
         out.append(body)
-        tab[c.tag] = dict(name='kh_' + c.tag, nsq=nsq, gout_stride=gs,
+        tab[c.tag] = dict(name=fl['pfx'] + '_' + c.tag, nsq=nsq, gout_stride=gs,
                           nroots=c.nroots, g_size=c.gsz,
                           shm_fixed=shm - MAX_PRIM_PAIR, minblocks=minblocks)
         sys.stderr.write(
-            f'generated kh_{c.tag}: ngout={c.ngout} threads={nsq}x{gs} '
+            f'generated {fl["pfx"]}_{c.tag}: ngout={c.ngout} '
+            f'threads={nsq}x{gs} '
             f'gout/lane={w} g_size={c.gsz} nroots={c.nroots} '
             f'shm={shm*8/1024:.1f}KB\n')
     if table:
@@ -848,6 +895,9 @@ if __name__ == '__main__':
     ap.add_argument('--mode', default='compact', choices=['compact', 'full'])
     ap.add_argument('--par-hrr', action='store_true',
                     help='spread the horizontal transfers over every lane')
+    ap.add_argument('--jk', action='store_true',
+                    help='write the fused Coulomb-and-exchange kernels '
+                         '(catalogue B4b) instead of the exchange-only ones')
     a = ap.parse_args()
     print(generate(a.classes.split(','), a.threads, a.gout_max, a.shm_max,
-                   a.layout, a.minblocks, a.table, a.mode, a.par_hrr))
+                   a.layout, a.minblocks, a.table, a.mode, a.par_hrr, a.jk))

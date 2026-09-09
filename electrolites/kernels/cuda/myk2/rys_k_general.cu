@@ -504,8 +504,8 @@ void myk_k_general(RysIntEnvVars envs, JKMatrix kmat, BoundsInfo bounds,
             int ldl = bounds.ntiles_l * 3;
             double *dm_cache = shared_memory + sq_id;
             int active = task_id < ntasks;
-            double *dm = kmat.dm + i_dm * nao * nao;
-            double *vk = kmat.vk + i_dm * nao * nao;
+            double *dm = kmat.dm + i_dm * (size_t)nao * nao;
+            double *vk = kmat.vk + i_dm * (size_t)nao * nao;
             load_dm(dm+j0*nao+k0, dm_cache, nao, nfj, nfk, ldj, ldk, active);
             dot_dm<1, 3, 9, 27>(vk, dm_cache, gout, nao, i0, l0,
                                 ioff, joff, koff, loff, ldk, nfi, nfl, active);

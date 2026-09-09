@@ -14,7 +14,17 @@ this generator changes is the scaffolding around that arithmetic:
   * the geometric prefactor uses one division and one rsqrt instead of three
     divisions and a sqrt.
 
+``--jk`` lifts the *fused* build instead, from gvhf-rys/unrolled_rys_jk.cu:
+the same 25 classes, the same Rys arithmetic -- the two files' root loops are
+textually identical, checked by ``assert_same_integrals`` below -- but the
+contraction accumulates J as well as K, from the integrals of one pass.  That
+is the kernel the response path of a hybrid asks for (`scf/jk.py`'s
+``_VHFOpt.get_jk``, catalogue B4b) and it is a third code path that neither
+`fastj` nor `fastk` is on.
+
 Run:  python gen_kernels.py <path-to-unrolled_rys_k.cu>  > fastk_generated.cu
+      python gen_kernels.py --jk <path-to-unrolled_rys_jk.cu> \
+                                                     > fastjk_generated.cu
 """
 import re, sys, os, json
 
@@ -24,8 +34,12 @@ GOUT_STRIDE_NOT_1 = {(2,0,2,1), (2,1,1,1), (2,1,2,0), (2,2,0,1), (2,2,1,0),
                      (3,0,1,1), (3,1,1,0)}
 
 
-def parse_kernel(src, name):
-    """Return (gout_names, irys_body, contraction_body) for rys_k_<name>."""
+def parse_kernel(src, name, jk=False):
+    """Return (gout_names, irys_body, contraction_body) for one kernel.
+
+    ``jk`` selects the fused file, whose contraction block names the struct
+    ``jk`` rather than ``kmat`` and carries a ``vj`` pointer beside ``vk``.
+    """
     m = re.search(r'\nvoid ' + name + r'\(RysIntEnvVars.*?\n\}\n', src, re.S)
     if m is None:
         return None
@@ -57,9 +71,13 @@ def parse_kernel(src, name):
     contract = re.sub(r'int \*ao_loc = envs\.ao_loc;\s*', '', contract)
     contract = re.sub(r'int nao = ao_loc\[nbas\];\s*', '', contract)
     contract = re.sub(r'int [ijkl]0 = ao_loc\[[ijkl]sh\];\s*', '', contract)
-    contract = re.sub(r'for \(int i_dm = 0; i_dm < kmat\.n_dm; \+\+i_dm\) \{\s*', '', contract)
-    contract = re.sub(r'double \*dm = kmat\.dm \+ i_dm \* nao \* nao;\s*', '', contract)
-    contract = re.sub(r'double \*vk = kmat\.vk \+ i_dm \* nao \* nao;\s*', '', contract)
+    st = 'jk' if jk else 'kmat'
+    contract = re.sub(r'size_t nao2 = \(size_t\)nao \* nao;\s*', '', contract)
+    contract = re.sub(r'for \(int i_dm = 0; i_dm < %s\.n_dm; \+\+i_dm\) \{\s*'
+                      % st, '', contract)
+    for v in ('dm', 'vk', 'vj'):
+        contract = re.sub(r'double \*%s = %s\.%s \+ i_dm \* (nao \* nao|nao2);\s*'
+                          % (v, st, v), '', contract)
     contract = contract.rstrip()
     assert contract.endswith('}'), 'unexpected contraction tail'
     contract = contract[:-1]          # drop the i_dm loop's closing brace
@@ -107,7 +125,7 @@ TEMPLATE = r'''
 #define NTHREADS_%(tag)s  %(nthreads)d
 #define MINBLOCKS_%(tag)s %(minblocks)d
 template <int NRANGE> __device__ __forceinline__ void
-kbody_%(tag)s(KARGS)
+%(pfx)sbody_%(tag)s(%(args)s)
 {
     constexpr int NROOTS = %(nroots)d;
     int tid = threadIdx.x;
@@ -130,7 +148,7 @@ kbody_%(tag)s(KARGS)
         int bas_ij = pair_ij_mapping[pair_ij];
         if (tid == 0) ntasks = 0;
         __syncthreads();
-        fill_vk_tasks(&ntasks, bas_kl_idx, bas_ij, nbas, pair_kl_mapping,
+        %(fill)s(&ntasks, bas_kl_idx, bas_ij, nbas, pair_kl_mapping,
                       npairs_kl, q_cond, dm_cond, cutoff);
         if (ntasks == 0) {
             if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -235,7 +253,16 @@ kbody_%(tag)s(KARGS)
             }
             {
                 int k0 = ao_loc[ksh], l0 = ao_loc[lsh];
-%(contract)s
+                // One pass over the densities around the contraction, which is
+                // where GPU4PySCF's own kernel puts it: the shell quartet's
+                // integrals are in registers by now, so a CPHF or TDDFT call
+                // with n_dm densities pays for them once (catalogue B4b).
+                size_t nao2 = (size_t)nao * nao;
+                for (int i_dm = 0; i_dm < n_dm; ++i_dm) {
+                const double *dm = dm_all + i_dm * nao2;
+                double *vk = vk_all + i_dm * nao2;
+%(vjdecl)s%(contract)s
+                }
             }
         }
         if (tid == 0) pair_ij = atomicAdd(head, 1);
@@ -243,19 +270,35 @@ kbody_%(tag)s(KARGS)
     }
 }
 extern "C" __global__ void __launch_bounds__(NTHREADS_%(tag)s, MINBLOCKS_%(tag)s)
-k_%(tag)s(KARGS)    { kbody_%(tag)s<1>(KFWD); }
+%(pfx)s_%(tag)s(%(args)s)    { %(pfx)sbody_%(tag)s<1>(%(fwd)s); }
 extern "C" __global__ void __launch_bounds__(NTHREADS_%(tag)s, MINBLOCKS_%(tag)s)
-k_rs_%(tag)s(KARGS) { kbody_%(tag)s<2>(KFWD); }
+%(pfx)s_rs_%(tag)s(%(args)s) { %(pfx)sbody_%(tag)s<2>(%(fwd)s); }
 '''
 
 
-def generate(path, classes):
+#: What differs between the exchange-only and the fused build: the entry-point
+#: names, the argument macro, and the task filter -- ``_fill_vjk_tasks`` tests
+#: two more ``dm_cond`` entries than ``_fill_vk_tasks``, because J reads the
+#: bra and ket blocks that K does not (create_tasks.cu).
+FLAVOUR = {
+    False: dict(pfx='k', args='KARGS', fwd='KFWD', fill='fill_vk_tasks',
+                vjdecl='', src='rys_k_', table='fastk_launch.json'),
+    True: dict(pfx='jk', args='JKARGS', fwd='JKFWD', fill='fill_vjk_tasks',
+               vjdecl='                double *vj = vj_all + i_dm * nao2;\n',
+               src='rys_jk_', table='fastjk_launch.json'),
+}
+
+
+def generate(path, classes, jk=False):
     src = open(path).read()
+    f = FLAVOUR[jk]
     out = []
-    launch_table = {'0000': (256, 4)}   # the hand-written (ss|ss) kernel
+    # the hand-written (ss|ss) kernel in fastk_prologue.cu; the fused build
+    # lifts its own (ss|ss) from the file, so it needs no such entry
+    launch_table = {} if jk else {'0000': (256, 4)}
     for (li, lj, lk, ll) in classes:
         tag = f'{li}{lj}{lk}{ll}'
-        parsed = parse_kernel(src, 'rys_k_' + tag)
+        parsed = parse_kernel(src, f['src'] + tag, jk)
         if parsed is None:
             sys.stderr.write(f'skip {tag}: not unrolled in gpu4pyscf\n')
             continue
@@ -265,21 +308,48 @@ def generate(path, classes):
         nth, mb = LAUNCH.get(tag, default_launch(len(gouts)))
         out.append(TEMPLATE % dict(tag=tag, nroots=nroots, gout_decl=decl,
                                    irys_body=irys_body, contract=contract,
-                                   nthreads=nth, minblocks=mb))
+                                   nthreads=nth, minblocks=mb, **f))
         launch_table[tag] = (nth, mb)
-        sys.stderr.write(f'generated k_{tag}: {len(gouts)} gout, nroots={nroots}, '
-                         f'launch_bounds({nth},{mb})\n')
-    _tab = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fastk_launch.json')
-    with open(_tab + '.tmp', 'w') as f:
-        json.dump(launch_table, f, indent=1, sort_keys=True)
+        sys.stderr.write(f'generated {f["pfx"]}_{tag}: {len(gouts)} gout, '
+                         f'nroots={nroots}, launch_bounds({nth},{mb})\n')
+    _tab = os.path.join(os.path.dirname(os.path.abspath(__file__)), f['table'])
+    with open(_tab + '.tmp', 'w') as fh:
+        json.dump(launch_table, fh, indent=1, sort_keys=True)
     os.replace(_tab + '.tmp', _tab)
     return '\n'.join(out)
 
 
+def assert_same_integrals(k_path, jk_path, classes):
+    """The two GPU4PySCF files must differ only in the contraction.
+
+    The fused kernels are lifted on that assumption -- it is what lets one
+    template serve both -- so it is checked rather than trusted.  If a future
+    release changes the Rys arithmetic in one file and not the other, this
+    fails instead of silently producing a kernel that computes something else.
+    """
+    ks, js = open(k_path).read(), open(jk_path).read()
+    for (li, lj, lk, ll) in classes:
+        tag = f'{li}{lj}{lk}{ll}'
+        a = parse_kernel(ks, 'rys_k_' + tag)
+        b = parse_kernel(js, 'rys_jk_' + tag, jk=True)
+        if a is None or b is None:
+            continue
+        assert a[1] == b[1], f'{tag}: the two files\' root loops differ'
+        assert a[0] == b[0], f'{tag}: different gout registers'
+    sys.stderr.write('integral arithmetic identical in both files\n')
+
+
 if __name__ == '__main__':
-    path = sys.argv[1]
-    classes = [tuple(int(c) for c in t) for t in sys.argv[2].split(',')]
-    for spec in sys.argv[3:]:               # e.g. 1111:128:4
+    argv = sys.argv[1:]
+    jk = '--jk' in argv
+    argv = [x for x in argv if x != '--jk']
+    path = argv[0]
+    classes = [tuple(int(c) for c in t) for t in argv[1].split(',')]
+    for spec in argv[2:]:                   # e.g. 1111:128:4
         tag, nt, mb = spec.split(':')
         LAUNCH[tag] = (int(nt), int(mb))
-    print(generate(path, classes))
+    if jk:
+        assert_same_integrals(path.replace('unrolled_rys_jk.cu',
+                                           'unrolled_rys_k.cu'),
+                              path, classes)
+    print(generate(path, classes, jk))

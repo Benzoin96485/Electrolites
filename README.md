@@ -1,13 +1,17 @@
 # Electrolites
 
 Drop-in GPU kernel replacements for [GPU4PySCF](https://github.com/pyscf/gpu4pyscf):
-the exchange and Coulomb builds, the XC build, the VV10 non-local correlation,
-and the analytic nuclear gradient.
+the exchange and Coulomb builds and the fused build of both, the XC build, the
+VV10 non-local correlation, the analytic nuclear gradient, and the grid and
+two-electron terms of an analytic Hessian and of every response property.
 
 Importing a module monkey-patches one GPU4PySCF entry point in place.  Anything
 a module does not cover falls through to GPU4PySCF's own code, so a patched run
-computes the same quantity as an unpatched one — measured at **8.2e-12 Eh** on
-the energy and **2.9e-12** per gradient component over the suites in `tests/`.
+computes the same quantity as an unpatched one — measured over the suites in
+`tests/` at **7.3e-12 Eh** on the energy and **3.1e-12** per gradient
+component (15 SCF + gradient pairs in separate processes), **1.0e-14** relative
+on an exchange matrix and **2.1e-14** on a fused Coulomb one at any number of
+densities, and **6.2e-11** on a whole analytic Hessian.
 
 On one A100-SXM4-40GB, GPU4PySCF 1.8.1, B3LYP-D3(BJ)/6-31G\*, level-3 grids,
 `OMP_NUM_THREADS=32`:
@@ -28,19 +32,29 @@ grids, `conv_tol_cpscf = 1e-6`):
 | ↳ its two XC terms, at fixed density | 15.5 s | **2.11 s** | **7.34x** |
 | 113-atom Hessian (taxol), its two XC terms | 117.8 s | **22.2 s** | **5.30x** |
 
-and, for the **response properties** this round added -- whole runs, 42-atom
-penicillin V/def2-SVP, level-3 grids, five roots for TDA:
+and, for the **response properties** -- whole runs, penicillin V/def2-SVP,
+level-3 grids, five roots for TDA.  The `fastxcfxc`/`fastfnlc` column is what
+the previous round reached; `+ fastjk` is this one, which adds the *fused*
+Coulomb-and-exchange build the response path actually calls:
 
-| functional | property | GPU4PySCF 1.8.1 | + Electrolites | |
-|---|---|---|---|---|
-| PBE | polarizability (CPKS, 3 RHS) | 9.49 s | **7.12 s** | **1.33x** |
-| | TDA | 9.16 s | **5.13 s** | **1.79x** |
-| B3LYP | polarizability | 16.33 s | **14.26 s** | **1.15x** |
-| | TDA | 22.06 s | **17.74 s** | **1.24x** |
-| M06-2X | polarizability | 22.53 s | **15.59 s** | **1.45x** |
-| | TDA | 32.30 s | **21.75 s** | **1.49x** |
-| wB97M-V | polarizability | 154.67 s | **111.26 s** | **1.39x** |
-| | TDA | 49.02 s | **38.10 s** | **1.29x** |
+| functional | property | GPU4PySCF 1.8.1 | + fastxcfxc/fastfnlc | | + fastjk | |
+|---|---|---|---|---|---|---|
+| B3LYP | polarizability (CPKS, 3 RHS) | 16.77 s | 14.26 s | 1.15x | **8.06 s** | **2.08x** |
+| | TDA | 22.21 s | 17.74 s | 1.24x | **14.26 s** | **1.56x** |
+| B3LYP, 113 atoms | polarizability | 101.08 s | — | — | **75.06 s** | **1.35x** |
+| | TDA | 189.66 s | — | — | **148.67 s** | **1.28x** |
+| PBE | polarizability | 9.49 s | **7.12 s** | **1.33x** | | |
+| | TDA | 9.16 s | **5.13 s** | **1.79x** | | |
+| M06-2X | polarizability | 22.53 s | **15.59 s** | **1.45x** | | |
+| | TDA | 32.30 s | **21.75 s** | **1.49x** | | |
+| wB97M-V | polarizability | 154.67 s | **111.26 s** | **1.39x** | | |
+| | TDA | 49.02 s | **38.10 s** | **1.29x** | | |
+
+The polarizability tensor and the excitation energies are unchanged to every
+digit printed.  `docs/README_fastjk.md` has the per-kernel table: the fused
+build itself is 2.79x at one right-hand side, 1.96x at three and 1.65x at
+five, and `docs/ROUND4_B4B.md` §4 says why that ratio falls with the number of
+densities and where its floor is.
 
 The XC response kernel itself is 2.1x-3.7x inside those runs, and 4.65x at
 fixed density and `nset` = 5 (1.057 s -> 0.479 s, i.e. 2.21x, on 113-atom
@@ -54,10 +68,11 @@ Every stock/patched pair in that table is measured back-to-back in one script,
 because the node is shared: the same stock B3LYP TDA run measured 22.2 s twice
 and 43.3 s once, on a node whose load average had gone from 5 to 70.  Only the
 ratio inside a pair is meaningful; `docs/RESPONSE_1.8.1.md` §4b has the
-method.  Measured that way, the fused J and K build of a **hybrid** does not
-move at all under `patch_all()` -- 11.67 -> 11.70 s, 13.56 -> 13.64 s,
-19.64 -> 20.07 s -- which is the direct evidence that neither `fastj` nor
-`fastk` is on that path.
+method.  Measured that way, the fused J and K build of a **hybrid** did not
+move at all under the previous round's `patch_all()` -- 11.67 -> 11.70 s,
+13.56 -> 13.64 s, 19.64 -> 20.07 s -- which was the direct evidence that
+neither `fastj` nor `fastk` was on that path.  It is a third code path, and
+`fastjk` is now on it: the same row is 11.76 -> 5.37 s and 13.53 -> 10.17 s.
 
 Two things the profile behind those numbers says, both in
 `docs/RESPONSE_1.8.1.md`.  **The split between the grid half and the
@@ -72,10 +87,15 @@ Rys kernel (`scf/jk.py:401 _VHFOpt.get_jk`) where the SCF calls `get_j` and
 B3LYP response property is stock GPU4PySCF.  The ceiling for closing that,
 measured on these kernels, is **2.30x** at 42 atoms and 1.60x at 113.
 
-The Hessian rows are dominated by something none of these modules touches: the
-exchange build inside the CPHF solve is 37 % of the 42-atom run after this
-round and 54 % of the 113-atom one, and `fastk` hands every multi-density call
-back to GPU4PySCF.  `docs/HESSIAN_1.8.1.md` is the profile that says so.
+The Hessian rows are dominated by the exchange build inside the CPHF solve --
+37 % of the 42-atom run and 54 % of the 113-atom one after the `fastxchess`
+round, because `fastk` used to hand every multi-density call back to
+GPU4PySCF.  It no longer does, and that row is **1.16x** (19.65 -> 16.96 s,
+whole Hessian 56.49 -> 53.36 s).  Only 1.16x, and
+`docs/ROUND4_B4B.md` §4 is the reason: fitting the build as
+`R + n_dm*C` puts the whole of these kernels' advantage in `R`, the
+per-quartet integral work, which at `n_dm = 126` is a sixth of it.  The same
+kernels are 3.28x at one density.  `docs/HESSIAN_1.8.1.md` is the profile.
 
 A build timed on the `minao` initial guess is not the build an SCF runs -- the
 guess is far sparser, so it screens harder.  Both rows are given for the
@@ -108,11 +128,12 @@ compiled**, so a 6-31G\* job's first run pays about 36 s of JIT rather than
 reaches every class and pays for all of them.
 `ELECTROLITES_FULL_MODULE=1` compiles everything, which is the ablation.
 
-One optional library is the exception — a faster copy of GPU4PySCF's *general*
-exchange kernel, which needs relocatable device code and so cannot go through
-NVRTC.  It is built with `nvcc` on first use and cached in
-`~/.cache/electrolites/sm_<arch>/`.  If `nvcc` is not installed, Electrolites
-says so once and those angular-momentum classes fall back to GPU4PySCF —
+Two optional libraries are the exception, both because they need relocatable
+device code and so cannot go through NVRTC: a faster copy of GPU4PySCF's
+*general* exchange kernel, and the Hessian's second-derivative ERI kernels
+(`fastejk2`).  Each is built with `nvcc` on first use — about 25 s — and cached
+in `~/.cache/electrolites/sm_<arch>/<source hash>/`.  If `nvcc` is not
+installed, Electrolites says so once and that piece falls back to GPU4PySCF —
 slower, still correct.
 
 ## Use
@@ -167,12 +188,18 @@ separate processes; that is the only honest way to A/B them.
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | the nuclear-attraction part of the one-electron derivative, on the GPU |
 | `fastxchess` | `hessian.rks._get_vxc_deriv1`, `_get_vxc_deriv2` | the two XC terms of an analytic **Hessian**: the same arithmetic in the masked AO space, with the atoms that have no basis function on a grid block skipped -- their contribution is identically zero -- and the atom dimension batched instead of looped in Python.  GGA |
 | `fastxcfxc` | `dft.numint.nr_rks_fxc` (the module attribute **and** `NumInt.nr_rks_fxc`) | the XC response kernel -- the grid half of **every response property**: CPKS/polarizability, TDA/TDDFT, NMR, IR/Raman, C6.  One GEMM per grid block instead of one per right-hand side, three custom kernels in place of ten GPU4PySCF launches per right-hand side, and one symmetrisation per call instead of an extra matrix product per block.  LDA and GGA |
+| `fastejk2` | `hessian.rhf._ip2_quartets_scheme` and its `type3` twin -- the block shape of the **second-derivative ERI** kernels, which GPU4PySCF derives from the shared-memory budget alone and never measured | **1.13x** on that stage of an analytic Hessian for two lines of Python.  The module also carries a lift of the kernels themselves (every fp64 division out of the primitive and Rys-root loops, a register cap), correct to 1e-13 but measured at 1.02x and 0.58x respectively -- so that half is **off unless `FASTEJK2_KERNELS=1`**.  `docs/README_fastejk2.md` says why, and why the catalogue's B3 entry expects the opposite |
+| `fastjk` | `scf.jk._VHFOpt.get_jk` | the **fused** Coulomb-and-exchange build -- the two-electron half of **every response property**, which is a third code path the SCF does not take and neither `fastj` nor `fastk` is on: 61-82 % of a polarizability or a TDDFT run.  Every angular-momentum class an spdf basis reaches, `hermi` 0 and 1, any number of densities, J and K accumulated from one pass over the Rys integrals |
 | `fastfnlc` | `hessian.rks.nr_rks_fnlc_mo` | the **VV10 non-local-correlation response**, which is 80 % of a wB97M-V polarizability: the ground-state half of it -- including an `O(n_grid^2)` double sum -- computed once per coupled-perturbed solve instead of once per iteration, and the potential contraction batched over the perturbed densities.  Reaches CPKS, NMR, C6 and the analytic Hessian; TDDFT excludes the term itself |
 
 **Limits, all of which fall through rather than fail.** `fastk`, `fastxc` and
 the four gradient modules are spin-restricted closed-shell only: an
 unrestricted calculation reaches them with two density matrices and is handed
-back.  `fastj` takes any number of densities, so it also covers the Coulomb
+back.  (`fastk` and `fastjk` do take **any** number of *perturbed* densities,
+which is a different thing: the density loop is inside the shell quartet, so a
+CPHF, TDDFT or polarizability call pays for the integrals once.  What they
+still decline is an open-shell *ground state*, where the two densities are
+alpha and beta and the exchange has to be built with a different factor.)  `fastj` takes any number of densities, so it also covers the Coulomb
 build inside a CPHF or Davidson solve; what it declines there is the classes
 past `(4,4)` and the long-range operator. `fastnlc` covers UKS, because `nr_nlc_vxc` sums the two densities
 before the double sum. `fastxc` hands **meta-GGA** back in the SCF, while
@@ -215,6 +242,15 @@ python tests/test_fxc.py                   # 15 cases: the XC response kernel
                                            # tensor and a TDA spectrum
 python tests/test_fnlc.py                  # 8 cases: the VV10 response term,
                                            # bit-identical on the cached path
+python tests/test_ejk_ip2.py               # 5 cases: the second-derivative
+                                           # ERIs and the whole analytic
+                                           # Hessian, our kernels against
+                                           # GPU4PySCF's under one driver
+python tests/test_jk.py                    # 6 molecule/basis combinations x
+                                           # hermi 0,1 x n_dm 1..8 x three
+                                           # density shapes: the multi-density
+                                           # exchange build and the fused J+K
+                                           # build against GPU4PySCF's
 ```
 
 They need a GPU and take a few minutes. The cases span six basis sets to
@@ -246,6 +282,20 @@ by a factor of six between 42 and 113 atoms (`docs/HESSIAN_1.8.1.md`).
 the XC Hessian's time goes and how much of its atom loop is arithmetic on
 exact zeros; `benchmarks/xchess_bench.py` A/Bs the two terms on one converged
 density.
+
+`benchmarks/ndm_k.py` fits the exchange build as `R + n_dm*C` against both
+implementations in one process -- use it before quoting a multi-density
+speedup at an `n_dm` the caller does not use, because `C` is the same code in
+both and the ratio runs from 3.28x to 1.18x over `n_dm` = 1 to 64
+(`docs/ROUND4_B4B.md` §4).  `benchmarks/ndm_screen_probe.py` asks whether the
+union-over-densities screening the catalogue's B4c objects to actually costs
+anything, on the densities a real solve produces; `benchmarks/ndm_layout_probe.py`
+measures the ceiling for transposing the density to `dm[(i,j),i_dm]`, which is
+the part of `C` that is memory layout.  `benchmarks/ejk_ip2_probe.py` splits
+the Hessian's second-derivative ERI stage by angular-momentum class and by
+whether GPU4PySCF has an unrolled kernel for it -- use it before taking
+catalogue B3, whose "same shape as B1" describes seven of the sixty-five
+classes.
 
 `benchmarks/response_anatomy.py` does the same for a polarizability and a TDA
 run -- use it before taking a response-property target from `instructions/06`,
@@ -294,7 +344,15 @@ tracked:
 
 ```bash
 codegen/build_kernels.sh /path/to/gpu4pyscf/lib/gvhf-rys/unrolled_rys_k.cu
+codegen/build_jk_kernels.sh /path/to/gpu4pyscf/lib/gvhf-rys/unrolled_rys_jk.cu
 ```
+
+The second one is the same two generators with `--jk`: the fused build's
+kernels differ from the exchange-only ones *only* in the contraction, and
+`gen_kernels.assert_same_integrals` checks that claim against the two
+GPU4PySCF files before emitting anything, so a release that changes one and
+not the other fails the build rather than producing a kernel that computes
+something else.
 
 The written families need no such path, and normally need no command either --
 they appear when they are first wanted.  To force it, or to fill a cache
@@ -307,6 +365,16 @@ python -c 'from electrolites import _gen; print(_gen.ensure_all())'
 `gen_j_high.py` needs no GPU4PySCF source at all -- it writes each
 McMurchie-Davidson class from `(lij, lkl)` -- and re-tuning it for another
 card is `benchmarks/sweep_j_high.py`, whose winners go into that file's `CFG`.
+
+`codegen/gen_ejk_ip2.py` is a fourth kind: it does not write or lift a kernel
+but *transforms* GPU4PySCF's second-derivative ERI sources in place, asserting
+the count of every substitution and then asserting that no double-precision
+division is left in the primitive or Rys-root loops.  Its output is tracked
+because it is compiled by `nvcc`, not NVRTC:
+
+```bash
+codegen/build_ejk_ip2.sh /path/to/gpu4pyscf/lib/gvhf-rys
+```
 
 The launch tables next to the generated sources (`*_launch.json`) are tuned per
 angular-momentum class and were measured on an A100; on another card they are a
@@ -324,6 +392,11 @@ starting point, not an optimum.
 | `FASTNLC_MODE` | `mixed` (default) or `fp64` for the VV10 double sum |
 | `FASTJ_TIME`, `FASTXCGRAD_MODE` | per-call timing split; XC-gradient block strategy |
 | `FASTFNLC_CACHE`, `FASTFNLC_BATCH` | hand the two halves of the VV10 response change back (the ablations) |
+| `FASTK_NO_NDM` | hand every multi-density exchange build back, which is what `fastk` did before the B4b round (the `docs/ROUND4_B4B.md` ablation) |
+| `FASTJK_OFF`, `FASTJK_NO_HIGH`, `FASTJK_NO_LIFTED` | hand the fused build back whole, or only its written / only its lifted classes |
+| `FASTEJK2_OFF`, `FASTEJK2_NO_SCHEME`, `FASTEJK2_SHIFT` | hand the Hessian's second-derivative ERI stage back whole, or only its launch-scheme half; and the quartets-per-block halving (1 is what was measured) |
+| `FASTEJK2_KERNELS` | **opt in** to the lifted ip2 kernels, which are correct and measured not to pay -- the one switch here that is off by default |
+| `ELECTROLITES_LIBMYEJK2` | use a prebuilt copy of the second-derivative ERI library instead of building |
 | `FASTXCFXC_MODE`, `FASTXCFXC_TIME` | `blocked` (default), `nokernel` or `grouped` for the XC response kernel -- the last is catalogue B4d as written and is the slowest of the three; and its per-stage timing split |
 
 ## License

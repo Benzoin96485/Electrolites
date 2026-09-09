@@ -29,7 +29,15 @@ the integral expressions verbatim from ``gvhf-rys/unrolled_rys_k.cu``:
   * **Per-class __launch_bounds__.**  GPU4PySCF compiles these with no register
     limit at all; the right cap is a property of the class.
 
+``--jk`` lifts the same six classes from ``gvhf-rys/unrolled_rys_jk.cu``
+instead -- the *fused* Coulomb-and-exchange build the response path asks for
+(catalogue B4b).  The two files' integral arithmetic is textually identical
+(``gen_kernels.assert_same_integrals`` checks it); only the contraction differs,
+so the same transformations apply unchanged.
+
 Run:  python gen_k2_kernels.py <path-to-unrolled_rys_k.cu> > fastk2_generated.cu
+      python gen_k2_kernels.py --jk <path-to-unrolled_rys_jk.cu> \
+                                                       > fastjk2_generated.cu
 """
 import re, sys, os, json
 
@@ -42,11 +50,11 @@ LAUNCH = {'2021': 2, '2111': 2, '2120': 2, '2210': 2, '3011': 2, '3110': 2}
 MAX_PRIM_PAIR = 36      # matches fastk_prologue.cu
 
 
-def _body_of(src, name):
+def _body_of(src, name, struct='kmat'):
     """The body of `name`, matched by braces: the generated kernels put the
     persistent while-loop's closing brace in column 0, so a regex that stops at
     the first '\n}\n' cuts the function short."""
-    i = src.index(f'\nvoid {name}(RysIntEnvVars envs, JKMatrix kmat, '
+    i = src.index(f'\nvoid {name}(RysIntEnvVars envs, JKMatrix {struct}, '
                   f'BoundsInfo bounds, int *pool, int *head)\n{{\n')
     j = src.index('{', i + 1)
     depth, k = 1, j + 1
@@ -73,8 +81,9 @@ def _sub1(body, old, new, name):
     return body.replace(old, new)
 
 
-def transform(body, tag, nroots):
-    name = 'rys_k_' + tag
+def transform(body, tag, nroots, jk=False):
+    st = 'jk' if jk else 'kmat'
+    name = ('rys_jk_' if jk else 'rys_k_') + tag
     nsq = int(re.search(r'constexpr int nsq_per_block = (\d+);', body).group(1))
     g_size = int(re.search(r'constexpr int g_size = (\d+);', body).group(1))
 
@@ -84,14 +93,23 @@ def transform(body, tag, nroots):
     body = _sub1(body, 'bounds.npairs_ij', 'npairs_ij', name)
     body = _sub1(body, 'bounds.pair_ij_mapping[pair_ij]',
                  'pair_ij_mapping[pair_ij]', name)
-    body = _sub1(body, """    if (kmat.lr_factor != 0) {
-        _fill_vk_tasks(&ntasks, bas_kl_idx, bas_ij, envs, bounds);
-    } else {
-        _fill_sr_vk_tasks(&ntasks, bas_kl_idx, bas_ij, envs, bounds);
-    }
-""", """    fill_vk_tasks2(&ntasks, bas_kl_idx, bas_ij, nbas, pair_kl_mapping,
+    # the operator branch, whose condition GPU4PySCF writes two ways
+    v = 'jk' if jk else 'k'
+    new_fill = ("""    fill_v%s_tasks2(&ntasks, bas_kl_idx, bas_ij, nbas, pair_kl_mapping,
                    npairs_kl, q_cond, dm_cond, cutoff);
-""", name)
+""" % v)
+    for cond in ('%s.lr_factor != 0' % st, '%s.omega >= 0' % st):
+        old_fill = ("""    if (%s) {
+        _fill_v%s_tasks(&ntasks, bas_kl_idx, bas_ij, envs, bounds);
+    } else {
+        _fill_sr_v%s_tasks(&ntasks, bas_kl_idx, bas_ij, envs, bounds);
+    }
+""" % (cond, v, v))
+        if old_fill in body:
+            body = _sub1(body, old_fill, new_fill, name)
+            break
+    else:
+        raise AssertionError((name, 'no task-filter branch matched'))
 
     # ---- the struct fields are kernel arguments now ------------------------
     for line in ('int nbas = envs.nbas;', 'int *bas = envs.bas;',
@@ -103,8 +121,18 @@ def transform(body, tag, nroots):
         body = body.replace(f'bounds.{p}prim', f'{p}prim_a')
     body = body.replace('bounds.nroots', 'NROOTS')
     body = re.sub(r'\bnroots\b', 'NROOTS', body)
-    body = body.replace('kmat.dm', 'dm_all').replace('kmat.vk', 'vk_all')
-    body = body.replace('kmat.n_dm', '1')
+    for v in ('dm', 'vk', 'vj'):
+        body = body.replace(f'{st}.{v}', f'{v}_all')
+    # The i_dm loop GPU4PySCF wraps its contraction in stays, with n_dm a
+    # kernel argument: the quartet's 2D integrals are already in shared memory,
+    # so n_dm densities cost n_dm contractions and one integral pass, which is
+    # what a CPHF or TDDFT call needs (catalogue B4b).  int nao*nao overflows
+    # at 339 densities on a 2268-AO basis, so the offset is computed in size_t.
+    body = body.replace(f'{st}.n_dm', 'n_dm')
+    body = body.replace('dm_all + i_dm * nao * nao',
+                        'dm_all + i_dm * (size_t)nao * nao')
+    body = body.replace('vk_all + i_dm * nao * nao',
+                        'vk_all + i_dm * (size_t)nao * nao')
 
     # ---- one more slot in the ket cache, for 1/akl -------------------------
     body = _sub1(body, 'double *fac_ijkl = shared_memory + nsq_per_block * 8 + sq_id;',
@@ -195,13 +223,23 @@ def transform(body, tag, nroots):
 """, '', name)
     body = _sub1(body, 'double theta = aij * akl / (aij + akl);',
                  'double theta = aij * akl * inv_s2;', name)
-    body = _sub1(body,
-                 'rys_roots_for_k(NROOTS, theta, rr, rw, kmat.omega,\n'
-                 '                                kmat.lr_factor, kmat.sr_factor);'
-                 if 'rys_roots_for_k(NROOTS, theta, rr, rw, kmat.omega,\n' in body else
-                 'rys_roots_for_k(NROOTS, theta, rr, rw, kmat.omega, kmat.lr_factor, kmat.sr_factor);',
-                 f'rys_roots_tab<{nroots}>(theta * rr, rw, nsq_per_block, gout_id,'
-                 ' blockDim.y, tab);', name)
+    # The fused file calls a different root routine, with the block geometry
+    # in its signature; both reduce to the same recurrences for omega >= 0,
+    # and the omega scaling rides on inv_s here either way (see fastk.py).
+    rs = re.search(r'rys_roots_rs\(NROOTS, theta, rr, %s\.omega, rw, '
+                   r'nsq_per_block, gout_id, \d+\);' % st, body)
+    if rs is not None:
+        body = _sub1(body, rs.group(0),
+                     f'rys_roots_tab<{nroots}>(theta * rr, rw, nsq_per_block,'
+                     ' gout_id, blockDim.y, tab);', name)
+    else:
+        body = _sub1(body,
+                 f'rys_roots_for_k(NROOTS, theta, rr, rw, {st}.omega,\n'
+                     f'                                {st}.lr_factor, {st}.sr_factor);'
+                     if f'rys_roots_for_k(NROOTS, theta, rr, rw, {st}.omega,\n' in body else
+                     f'rys_roots_for_k(NROOTS, theta, rr, rw, {st}.omega, {st}.lr_factor, {st}.sr_factor);',
+                     f'rys_roots_tab<{nroots}>(theta * rr, rw, nsq_per_block, gout_id,'
+                     ' blockDim.y, tab);', name)
     body = _sub1(body, """                    double aij = aij_cache[0];
                     double rt_aa = rt / (aij + akl);
                     double akl = akl_cache[0];
@@ -212,8 +250,8 @@ def transform(body, tag, nroots):
     body = body.replace('.5/aij', '.5*iaij').replace('.5/akl', '.5*iakl')
 
     assert 'aij_cache' not in body, name
-    assert not re.search(r'\b(kmat|bounds|envs)\.', body), \
-        (name, re.findall(r'\b(?:kmat|bounds|envs)\.\w+', body))
+    assert not re.search(r'\b(%s|bounds|envs)\.' % st, body), \
+        (name, re.findall(r'\b(?:%s|bounds|envs)\.\w+' % st, body))
     leftover = [l for l in body.split('\n')
                 if '/' in re.sub(r'//.*', '', l)
                 and not re.search(r'(/ *nbas|% *nbas|/ *jprim|% *jprim|/ *lprim'
@@ -234,14 +272,17 @@ def transform(body, tag, nroots):
     return decl + body, nsq, g_size, shm_fixed
 
 
-def generate(path, variants=False):
+def generate(path, variants=False, jk=False):
     src = open(path).read()
+    pfx = 'jk2' if jk else 'k2'
+    args = 'JKARGS2' if jk else 'KARGS2'
     out = []
     table = {}
     for tag in CLASSES:
-        raw = _body_of(src, 'rys_k_' + tag)
+        raw = _body_of(src, ('rys_jk_' if jk else 'rys_k_') + tag,
+                       'jk' if jk else 'kmat')
         nroots = sum(int(c) for c in tag) // 2 + 1
-        body, nsq, g_size, shm = transform(raw, tag, nroots)
+        body, nsq, g_size, shm = transform(raw, tag, nroots, jk)
         mb = LAUNCH[tag]
         gout_stride = 256 // nsq
         names = [('', mb)]
@@ -249,15 +290,15 @@ def generate(path, variants=False):
             names += [(f'_mb{m}', m) for m in (1, 2, 3, 4)]
         for suffix, mm in names:
             out.append(f'extern "C" __global__ void __launch_bounds__(256, {mm})\n'
-                       f'k2_{tag}{suffix}(KARGS2)\n{{\n{body}\n}}\n')
+                       f'{pfx}_{tag}{suffix}({args})\n{{\n{body}\n}}\n')
         table[tag] = dict(nsq=nsq, gout_stride=gout_stride, nroots=nroots,
                           g_size=g_size, shm_fixed=shm, minblocks=mb)
-        sys.stderr.write(f'generated k2_{tag}: nroots={nroots} g_size={g_size} '
+        sys.stderr.write(f'generated {pfx}_{tag}: nroots={nroots} g_size={g_size} '
                          f'threads={nsq}x{gout_stride} shm>={shm*8/1024:.1f}KB '
                          f'launch_bounds(256,{mb})\n')
     if not variants:
         _tab = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            'fastk2_launch.json')
+                            f'fast{pfx}_launch.json')
         with open(_tab + '.tmp', 'w') as f:
             json.dump(table, f, indent=1, sort_keys=True)
         os.replace(_tab + '.tmp', _tab)
@@ -265,10 +306,13 @@ def generate(path, variants=False):
 
 
 if __name__ == '__main__':
-    variants = '--variants' in sys.argv[2:]
-    for spec in sys.argv[2:]:
+    argv = sys.argv[1:]
+    jk = '--jk' in argv
+    argv = [x for x in argv if x != '--jk']
+    variants = '--variants' in argv[1:]
+    for spec in argv[1:]:
         if spec.startswith('--'):
             continue
         tag, mb = spec.split(':')
         LAUNCH[tag] = int(mb)
-    print(generate(sys.argv[1], variants))
+    print(generate(argv[0], variants, jk))

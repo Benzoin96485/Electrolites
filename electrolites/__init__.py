@@ -36,7 +36,7 @@ TESTED_GPU4PYSCF = ('1.7.0', '1.8.1')
 MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
-    'fastxcfxc', 'fastfnlc',
+    'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2',
 )
 
 # (module, dotted path of what it replaces) -- checked before anything patches,
@@ -57,6 +57,10 @@ _TARGETS = {
     'fastxchess': ('gpu4pyscf.hessian.rks', '_get_vxc_deriv1'),
     'fastxcfxc': ('gpu4pyscf.dft.numint', 'nr_rks_fxc'),
     'fastfnlc': ('gpu4pyscf.hessian.rks', 'nr_rks_fnlc_mo'),
+    'fastjk': ('gpu4pyscf.scf.jk', '_VHFOpt.get_jk'),
+    # this one replaces two CUDA symbols rather than a Python entry point, so
+    # the target check only confirms the driver that looks them up still exists
+    'fastejk2': ('gpu4pyscf.hessian.rhf', '_partial_ejk_ip2'),
 }
 
 _patched = []
