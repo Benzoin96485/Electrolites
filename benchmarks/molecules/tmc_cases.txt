@@ -1,0 +1,13 @@
+# Open-shell transition-metal complexes drawn from BOS-TMC-28242
+# (OpenTMC / CSD geometries; `<CCD>_comp_<n>` is the source record).
+# 83 % of that set is open-shell, so these are UKS cases, and def2-SVP
+# already reaches an f shell on the metal -- which no organic 6-31G* or
+# def2-SVP case in this directory does.
+#
+# file                        charge  mult  natm  formula        source record
+# tmc_co_sextet.xyz               0      6   113  CoC46H60N2O4   LITMOT_comp_0
+# tmc_fecl4.xyz                  -1      6     5  FeCl4          VIYBOY_comp_0
+# tmc_cucl2.xyz                   0      2     3  CuCl2          ZAVKEP_comp_0
+# tmc_ni_dithiolene.xyz          -1      2    21  NiC8F6N2S4     HITXIS05_comp_0
+# tmc_pt_amine.xyz                0      3    23  PtC8Cl2H11N    MPEYPT11_comp_0
+# tmc_cu_macrocycle.xyz           2      4    60  CuC16H38N4O    CUCJOZ_comp_0

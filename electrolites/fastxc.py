@@ -1,7 +1,8 @@
 """
-Faster exchange-correlation (Vxc) build for GPU4PySCF's RKS.
+Faster exchange-correlation (Vxc) build for GPU4PySCF's RKS and UKS.
 
-Importing this module monkey-patches ``gpu4pyscf.dft.numint.NumInt.nr_rks``.
+Importing this module monkey-patches ``gpu4pyscf.dft.numint.NumInt.nr_rks``
+and ``NumInt.nr_uks``.
 Three things change; none of them touches the grid, the AO screening, the
 libxc call or the symmetry factors, so the potential matrix agrees with
 GPU4PySCF's to round-off.
@@ -27,6 +28,19 @@ GPU4PySCF's to round-off.
    flop-bound.  Grouping the blocks (GPU4PySCF's own ``grouped_gemm`` and
    ``grouped_dot``) fills the machine.  The group is sized by available memory,
    as in GPU4PySCF's ``grouped_block_loop``, not by the molecule.
+
+All three carry over to the unrestricted build, and the third one carries
+further: ``nr_uks`` issues *two* rho contractions and *two* potential GEMMs per
+grid block, so the same block count leaves the same fraction of the device idle
+twice as often.  The two spins go into one grouped call here, which is why the
+unrestricted ratio is the larger of the two -- see docs/README_fastxc.md.  An
+unrestricted ground state is the common case in a transition-metal complex
+(83 % of BOS-TMC-28242), so this is not a corner.
+
+``nr_uks`` also differs in one way that is not a speed question: it allocates
+``rho`` for the *whole* grid before calling libxc, i.e. ``2*nvar*ngrids``
+doubles at once, where the pass here holds one group.  On a 113-atom complex at
+level-3 grids that is 1.2 GB against 60 MB.
 """
 import os
 import numpy as np
@@ -65,6 +79,34 @@ def _prep(ni, mol, grids, dms):
         assert dms.ndim == 2
         mo = None
         dm = opt.sort_orbitals(cupy.asarray(dms), axis=[0, 1])
+    return opt, dm, mo
+
+
+def _prep_u(ni, mol, grids, dms):
+    """The same as ``_prep`` for a pair of spin densities.
+
+    ``dft.uks.get_veff`` strips the ``mo_coeff``/``mo_occ`` tag off the density
+    (``dm.view(cupy.ndarray)``) before calling ``nr_uks``, so the SCF always
+    arrives on the density-matrix route; the orbital route is kept because
+    ``nr_uks`` is a public entry point and other callers do tag it.
+    """
+    opt = getattr(ni, 'gdftopt', None)
+    if opt is None:
+        ni.build(mol, grids.coords)
+        opt = ni.gdftopt
+    mo_coeff = getattr(dms, 'mo_coeff', None)
+    mo_occ = getattr(dms, 'mo_occ', None)
+    if mo_coeff is not None:
+        mo = []
+        for s in range(2):
+            c = opt.sort_orbitals(cupy.asarray(mo_coeff[s]), axis=[0])
+            occ = cupy.asarray(mo_occ[s])
+            c = cupy.asarray(c[:, occ > 0], order='C') * occ[occ > 0] ** .5
+            mo.append(c)
+        dm = cupy.asarray([c.dot(c.T) for c in mo])
+    else:
+        mo = None
+        dm = opt.sort_orbitals(cupy.asarray(dms), axis=[1, 2])
     return opt, dm, mo
 
 
@@ -243,7 +285,217 @@ def _nr_rks_perblock(ni, mol, grids, xc_code, dms, hermi, verbose):
     return float(acc[0]), float(acc[1]), vmat
 
 
+def _uks_weights(ni, xc_code, xctype, rho, weight, acc):
+    """libxc on a whole group of blocks, both spins; the weighted potential.
+
+    ``rho`` is ``(2, nvar, ngrids_group)`` and the returned ``wv`` is the same
+    shape.  The factor conventions are GPU4PySCF's own (``numint._nr_uks_task``):
+    the half on the gradient term is there because the potential matrix is
+    symmetrised once at the end instead of both triangles being contracted.
+    """
+    den = rho[:, 0] * weight
+    acc[0] += den[0].sum()
+    acc[1] += den[1].sum()
+    exc, vxc = ni.eval_xc_eff(xc_code, rho, deriv=1, xctype=xctype, spin=1)[:2]
+    acc[2] += cupy.dot(den[0] + den[1], exc.ravel())
+    wv = vxc
+    wv *= weight
+    if xctype == 'GGA':
+        wv[:, 0] *= .5
+    elif xctype == 'MGGA':
+        wv[:, [0, 4]] *= .5
+    return wv
+
+
+#: how many density products ``D . ao[m]`` the density needs, per functional
+#: type -- meta-GGA needs all four, because tau is built from the same
+#: products and the potential contraction reuses them
+_NC = {'LDA': 1, 'HF': 1, 'GGA': 1, 'MGGA': 4}
+#: how many components ``rho`` carries
+_NVAR = {'LDA': 1, 'HF': 1, 'GGA': 4, 'MGGA': 5}
+
+
+def _rho_from_c(ao, c, xctype, ngrids):
+    """rho from the density products ``c[m] = D . ao[m]``, one spin.
+
+    Same arithmetic and the same layout as ``numint.eval_rho``: for meta-GGA
+    ``rho[4]`` is tau = 1/2 sum_m |nabla_m psi|^2 and ``with_lapl`` is off.
+    """
+    if xctype in ('LDA', 'HF'):
+        return _contract_rho(c[0], ao).reshape(1, -1)
+    rho = cupy.empty((_NVAR[xctype], ngrids))
+    rho[:4] = _contract_rho1(ao[:4], c[0])
+    rho[1:4] *= 2
+    if xctype == 'MGGA':
+        rho[4] = _contract_rho(c[1], ao[1])
+        for m in (2, 3):
+            rho[4] += _contract_rho(c[m], ao[m])
+        rho[4] *= .5
+    return rho
+
+
+def _vmat_pairs(ao, wv_s, xctype):
+    """The ``(A, B)`` operand pairs whose ``A . B^T`` sum is one spin's
+    potential matrix for one grid block.
+
+    GGA and LDA give one pair.  Meta-GGA gives four: GPU4PySCF's ``_tau_dot``
+    is three ``nabla_m phi . (nabla_m phi w)`` products, and they go into the
+    same grouped launch as the GGA one rather than three separate GEMMs.
+    """
+    if xctype in ('LDA', 'HF'):
+        return [(ao, _scale_ao(ao, wv_s[0]))]
+    pairs = [(ao[0], _scale_ao(ao[:4], wv_s[:4]))]
+    if xctype == 'MGGA':
+        w_tau = .5 * wv_s[4]        # the 1/2 of _tau_dot's <nabla i|v|nabla j>
+        pairs += [(ao[m], _scale_ao(ao[m], w_tau)) for m in (1, 2, 3)]
+    return pairs
+
+
+def _nr_uks_grouped(ni, mol, grids, xc_code, dms, hermi, verbose):
+    log = logger.new_logger(mol, verbose)
+    t0 = log.init_timer()
+    xctype = ni._xc_type(xc_code)
+    opt, dm, _mo = _prep_u(ni, mol, grids, dms)
+    _sorted_mol = opt._sorted_mol
+    nao = _sorted_mol.nao
+    ao_deriv = 0 if xctype in ('LDA', 'HF') else 1
+    nc = _NC[xctype]
+
+    acc = [cupy.zeros(()), cupy.zeros(()), cupy.zeros(())]
+    vmat = cupy.zeros((2, nao, nao))
+
+    for ao_group, idx_group, w_group, _ in NI._grouped_block_loop(
+            ni, _sorted_mol, grids, nao, ao_deriv):
+        ao0 = [a if ao_deriv == 0 else a[0] for a in ao_group]
+        # ---- the density products D_s . ao[m].  Both spins and, for
+        #      meta-GGA, all four components of every block in this group go
+        #      into one grouped launch: 2*nc*nblocks tiles instead of one GEMM
+        #      per block per spin, which is where GPU4PySCF leaves the device
+        #      idle twice as often on an unrestricted build as on a restricted
+        #      one.
+        masks = [[take_last2d(dm[s], idx) for s in range(2)]
+                 for idx in idx_group]
+        c_group = [[cupy.empty((nc,) + ao0[b].shape) for _ in range(2)]
+                   for b in range(len(ao_group))]
+        grouped_gemm([m_[s] for m_ in masks for s in range(2)
+                      for _ in range(nc)],
+                     [(ao if ao_deriv == 0 else ao[m])
+                      for ao in ao_group for _ in range(2)
+                      for m in range(nc)],
+                     Cs=[c[s][m] for c in c_group for s in range(2)
+                         for m in range(nc)])
+
+        rho_group = [cupy.asarray([_rho_from_c(ao, c[s], xctype,
+                                               ao0[b].shape[1])
+                                   for s in range(2)])
+                     for b, (ao, c) in enumerate(zip(ao_group, c_group))]
+        c_group = None
+        rho_cat = cupy.concatenate(rho_group, axis=2)
+        rho_group = None
+        w_cat = cupy.concatenate(w_group)
+        wv = _uks_weights(ni, xc_code, xctype, rho_cat, w_cat, acc)
+        rho_cat = None
+
+        # ---- the potential, batched over the same blocks and both spins
+        pairs, owner = [], []
+        p0 = 0
+        for b, (ao, w) in enumerate(zip(ao_group, w_group)):
+            p1 = p0 + w.size
+            for s in range(2):
+                for A, B in _vmat_pairs(ao, wv[s, :, p0:p1], xctype):
+                    pairs.append((A, B))
+                    owner.append((b, s))
+            p0 = p1
+        res = grouped_dot([A for A, _ in pairs], [B for _, B in pairs])
+        pairs = None
+        # meta-GGA contributes four products per block per spin; sum them
+        # before scattering, so add_sparse still runs once per (block, spin)
+        acc_v = {}
+        for r, key in zip(res, owner):
+            if key in acc_v:
+                acc_v[key] += r
+            else:
+                acc_v[key] = r
+        for (b, s), r in acc_v.items():
+            add_sparse(vmat[s], r, idx_group[b])
+        acc_v = None
+        res = ao0 = masks = None
+
+    if xctype not in ('LDA', 'HF'):
+        for s in range(2):
+            transpose_sum(vmat[s])
+    vmat = opt.unsort_orbitals(vmat, axis=[1, 2])
+    log.timer_debug1('nr_uks (fastxc, grouped)', *t0)
+    nelec = np.array([float(acc[0]), float(acc[1])])
+    return nelec, float(acc[2]), vmat
+
+
+def _nr_uks_perblock(ni, mol, grids, xc_code, dms, hermi, verbose):
+    """Single pass, one grid block at a time (used for the ablation)."""
+    log = logger.new_logger(mol, verbose)
+    t0 = log.init_timer()
+    xctype = ni._xc_type(xc_code)
+    opt, dm, _mo = _prep_u(ni, mol, grids, dms)
+    _sorted_mol = opt._sorted_mol
+    nao = _sorted_mol.nao
+    ao_deriv = 0 if xctype in ('LDA', 'HF') else 1
+    nc = _NC[xctype]
+
+    acc = [cupy.zeros(()), cupy.zeros(()), cupy.zeros(())]
+    vmat = cupy.zeros((2, nao, nao))
+
+    for ao_mask, idx, weight, _ in ni.block_loop(
+            _sorted_mol, grids, nao, ao_deriv, max_memory=None):
+        ao0 = ao_mask if ao_deriv == 0 else ao_mask[0]
+        rho = cupy.empty((2, _NVAR[xctype], weight.size))
+        cs = []
+        for s in range(2):
+            dm_mask = take_last2d(dm[s], idx)
+            c = cupy.empty((nc,) + ao0.shape)
+            for m in range(nc):
+                cupy.dot(dm_mask, ao_mask if ao_deriv == 0 else ao_mask[m],
+                         out=c[m])
+            cs.append(c)
+            rho[s] = _rho_from_c(ao_mask, c, xctype, ao0.shape[1])
+        wv = _uks_weights(ni, xc_code, xctype, rho, weight, acc)
+        for s in range(2):
+            v = None
+            for A, B in _vmat_pairs(ao_mask, wv[s], xctype):
+                v = A.dot(B.T) if v is None else v + A.dot(B.T)
+            add_sparse(vmat[s], v, idx)
+        cs = v = None
+
+    if xctype not in ('LDA', 'HF'):
+        for s in range(2):
+            transpose_sum(vmat[s])
+    vmat = opt.unsort_orbitals(vmat, axis=[1, 2])
+    log.timer_debug1('nr_uks (fastxc, per block)', *t0)
+    nelec = np.array([float(acc[0]), float(acc[1])])
+    return nelec, float(acc[2]), vmat
+
+
 _PATCHED = False
+
+
+def _nr_uks_dispatch(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
+                     max_memory=2000, verbose=None):
+    """One pair of spin densities, LDA or GGA, one device; else GPU4PySCF's.
+
+    ``nr_uks`` also serves ``nset`` > 1 -- a stack of density *pairs*, which
+    only the response path asks for.  That falls through: the return shapes
+    differ and the caller is `nr_uks_fxc`'s neighbourhood, not the SCF.
+    """
+    xctype = ni._xc_type(xc_code)
+    dma = dms[0]
+    ok = (num_devices == 1 and hermi == 1
+          and len(dms) == 2 and getattr(dma, 'ndim', 3) == 2
+          and xctype in ('LDA', 'GGA', 'MGGA'))
+    if ok and MODE == 'grouped':
+        return _nr_uks_grouped(ni, mol, grids, xc_code, dms, hermi, verbose)
+    if ok and MODE == 'perblock':
+        return _nr_uks_perblock(ni, mol, grids, xc_code, dms, hermi, verbose)
+    return NI._nr_uks_orig(ni, mol, grids, xc_code, dms, relativity, hermi,
+                           max_memory, verbose)
 
 
 def _nr_rks_dispatch(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
@@ -263,7 +515,12 @@ def apply_patch():
     global _PATCHED
     if not _PATCHED:
         NI._nr_rks_orig = NI.NumInt.nr_rks
-        NI.NumInt.nr_rks = _nr_rks_dispatch
+        NI._nr_uks_orig = NI.NumInt.nr_uks
+        # both the method and the module-level name, which are the same
+        # function: `properties/shielding.py` imports `nr_rks` from the module
+        # and would otherwise call the unpatched one
+        NI.NumInt.nr_rks = NI.nr_rks = _nr_rks_dispatch
+        NI.NumInt.nr_uks = NI.nr_uks = _nr_uks_dispatch
         _PATCHED = True
 
 

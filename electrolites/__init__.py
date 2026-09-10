@@ -39,20 +39,31 @@ MODULES = (
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2',
 )
 
-# (module, dotted path of what it replaces) -- checked before anything patches,
-# so a GPU4PySCF whose API moved fails loudly here instead of silently
-# mis-patching or computing the wrong operator.
+# What each module replaces: one ``(module path, dotted attribute)`` pair, or a
+# tuple of them where a module patches more than one entry point -- checked
+# before anything patches, so a GPU4PySCF whose API moved fails loudly here
+# instead of silently mis-patching or computing the wrong operator.
+#
+# A module that covers both spin cases has to name *both*, because
+# ``gpu4pyscf.dft.uks`` and ``gpu4pyscf.grad.uks`` bind their own copies of
+# these functions at import: patching the restricted one does not reach the
+# unrestricted path, and the only symptom is that an open-shell run is as fast
+# as an unpatched one.  ``benchmarks/coverage_probe.py`` counts which entry
+# points a given calculation actually reaches.
 _TARGETS = {
     'fastk': ('gpu4pyscf.scf.jk', '_VHFOpt.get_k'),
     'fastj': ('gpu4pyscf.scf.j_engine', '_VHFOpt.get_j'),
-    'fastxc': ('gpu4pyscf.dft.numint', 'NumInt.nr_rks'),
+    'fastxc': (('gpu4pyscf.dft.numint', 'NumInt.nr_rks'),
+               ('gpu4pyscf.dft.numint', 'NumInt.nr_uks')),
     'fastrsh': ('gpu4pyscf.dft.rks', 'RKS.get_veff'),
     'fastxcnlc': ('gpu4pyscf.dft.rks', 'RKS.get_veff'),
     'fastnlc': ('gpu4pyscf.dft.numint', '_vv10nlc'),
     'fast1e': ('gpu4pyscf.gto.int3c1e', 'get_int3c1e_density_contracted'),
     'fastejk': ('gpu4pyscf.grad.rhf', '_jk_energy_per_atom'),
     'fastgrad': ('gpu4pyscf.grad.rks', 'Gradients.energy_ee'),
-    'fastxcgrad': ('gpu4pyscf.grad.rks', 'get_exc'),
+    'fastxcgrad': (('gpu4pyscf.grad.rks', 'get_exc'),
+                   ('gpu4pyscf.grad.rks', 'get_nlc_exc'),
+                   ('gpu4pyscf.grad.uks', 'get_exc')),
     'fastgradh': ('gpu4pyscf.grad.rhf', 'GradientsBase.get_hcore'),
     'fastxchess': ('gpu4pyscf.hessian.rks', '_get_vxc_deriv1'),
     'fastxcfxc': ('gpu4pyscf.dft.numint', 'nr_rks_fxc'),
@@ -79,14 +90,18 @@ def check_targets(names=None):
     """
     out = {}
     for name in (names or MODULES):
-        mod_path, attr_path = _TARGETS[name]
-        try:
-            obj = importlib.import_module(mod_path)
-            for part in attr_path.split('.'):
-                obj = getattr(obj, part)
-            out[name] = None
-        except (ImportError, AttributeError) as exc:
-            out[name] = f'{mod_path}.{attr_path} is missing ({exc})'
+        pairs = _TARGETS[name]
+        if isinstance(pairs[0], str):                   # a single pair
+            pairs = (pairs,)
+        out[name] = None
+        for mod_path, attr_path in pairs:
+            try:
+                obj = importlib.import_module(mod_path)
+                for part in attr_path.split('.'):
+                    obj = getattr(obj, part)
+            except (ImportError, AttributeError) as exc:
+                out[name] = f'{mod_path}.{attr_path} is missing ({exc})'
+                break
     return out
 
 

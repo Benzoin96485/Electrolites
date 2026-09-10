@@ -58,27 +58,35 @@ def _sources():
     return [os.path.join(HERE, 'fastejk_prologue.cu'), _gen.source_path(_SRC)]
 
 
-@functools.lru_cache(maxsize=8)
-def _module(lmax=None):
+@functools.lru_cache(maxsize=16)
+def _module(lmax=None, n_dm=1):
+    """The kernels for this basis' angular momenta and this many densities.
+
+    ``n_dm`` is a preprocessor definition rather than a kernel argument, so the
+    exchange contraction's loop bound is known at compile time and the
+    restricted kernels are unchanged by the existence of the unrestricted ones.
+    The cost is a second NVRTC compile, and only an open-shell run pays it.
+    """
     files = _sources()
     names = None if lmax is None else _ksplit.names_within(files, lmax)
     return cp.RawModule(code=_ksplit.source(files, names),
-                        options=('-std=c++17',), backend='nvrtc')
+                        options=('-std=c++17', f'-DEJK_NDM={int(n_dm)}'),
+                        backend='nvrtc')
 
 
-@functools.lru_cache(maxsize=256)
-def _function_for(name, shm, lmax):
+@functools.lru_cache(maxsize=512)
+def _function_for(name, shm, lmax, n_dm):
     try:
-        f = _module(lmax).get_function(name)
+        f = _module(lmax, n_dm).get_function(name)
     except Exception:                     # a class the lmax subset missed
-        f = _module(None).get_function(name)
+        f = _module(None, n_dm).get_function(name)
     if shm > 48 * 1024 - 2688:      # opt in to the A100's large shared window
         f.max_dynamic_shared_size_bytes = shm
     return f
 
 
-def _function(name, shm=0):
-    return _function_for(name, shm, _LMAX)
+def _function(name, shm=0, n_dm=1):
+    return _function_for(name, shm, _LMAX, n_dm)
 
 
 @functools.lru_cache(maxsize=1)
@@ -111,31 +119,41 @@ def _workspace():
 
 def _usable(mol, n_dm, nprim, i, j, k, l, tag):
     """Conditions the kernels assume.  None depends on the size of the
-    molecule; they are properties of the basis and of what the caller asked."""
+    molecule; they are properties of the basis and of what the caller asked.
+
+    ``n_dm`` is 1 for a closed-shell reference and 2 for an unrestricted one.
+    It used to be a condition: the kernels contracted one density matrix, so
+    every open-shell gradient handed *every* class back -- 1649 of 1649 class
+    blocks on a UKS B3LYP/def2-SVP run, i.e. the module was inert on the 83 %
+    of BOS-TMC-28242 that is open-shell.  The exchange contraction now runs
+    over the density matrices and the Coulomb one over their sum
+    (``codegen/gen_ejk.py::dd_reg``), which is the shape both references
+    need."""
     if tag not in IMPLEMENTED:
         return False
     if mol.omega < 0:               # short-range (erfc) needs twice the roots
         return False                # and the s_estimator screening
-    if n_dm != 1:                   # closed-shell only
+    if n_dm > 2:
         return False
     if int(nprim[i]) * int(nprim[j]) > MAX_PRIM_PAIR:
         return False
     return True
 
 
-def _run(tag, ws, tab, dev, ejk, dms, nao, nbas, jf, kf, pm_ij, pm_kl,
-         q_cond, dm_cond, log_cutoff, prim, inv_om2, coef0):
+def _run(tag, ws, tab, dev, ejk, dms, dm_tot, n_dm, nao, nbas, jf, kf,
+         pm_ij, pm_kl, q_cond, dm_cond, log_cutoff, prim, inv_om2, coef0):
     e = IMPLEMENTED[tag]
     d_bas, d_env, d_ao_loc = dev
     iprim, jprim, kprim, lprim = prim
     nthreads = (e['nsq'], e['gout_stride'])
     shm = e['shm_fixed'] * 8
     n_blocks = min(ws.n_blocks, int(pm_ij.size))
-    kern = _function(e['name'], shm)
+    kern = _function(e['name'], shm, n_dm)
     for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
         ws.head.fill(0)
         kern((n_blocks,), nthreads,
-             (ejk, dms, np.int32(nao), np.float64(jf), np.float64(kf),
+             (ejk, dms, dm_tot, np.int32(nao),
+              np.float64(jf), np.float64(kf),
               d_bas, d_env, d_ao_loc, np.int32(nbas),
               np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
               q_cond, dm_cond, np.float32(log_cutoff), ws.pool, ws.head,
@@ -229,6 +247,16 @@ def jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1., verbose=None):
     nprim = uniq_l_ctr[:, 1]
     n_groups = len(uniq_l_ctr)
 
+    # The Coulomb term contracts the *total* density.  Its screening estimate
+    # stays GPU4PySCF's -- the max over the spin densities -- and not the max
+    # over the total: |D_a + D_b| <= 2 max(|D_a|, |D_b|), so the estimate is
+    # low by at most log 2, which is nothing against a 1e-13 cutoff, and
+    # matching the reference's screening is what keeps the two answers
+    # comparable at round-off instead of at the cutoff.  Widening it to include
+    # the total was tried and moved the agreement from 4e-14 to 7e-12
+    # *relative* -- the difference being the quartets GPU4PySCF drops and we
+    # then kept.
+    dm_tot = dms if n_dm == 1 else cp.asarray(dms.sum(axis=0)[None], order='C')
     dm_cond = cp.log(condense('absmax', dms, ao_loc) + 1e-300).astype(np.float32)
     log_cutoff = math.log(vhfopt.direct_scf_tol)
     q_cond = _dense_q_cond(vhfopt)
@@ -241,7 +269,10 @@ def jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1., verbose=None):
     ejk = cp.zeros((smol.natm, 3))
     # the kernel receives GPU4PySCF's scaled factors: the 8-fold permutation
     # symmetry and the 1/2 of the Coulomb operator give 4 in the J contraction,
-    # and the K contraction builds (dm_jk*dm_il + dm_jl*dm_ik), a further 1/2
+    # and the K contraction builds (dm_jk*dm_il + dm_jl*dm_ik), a further 1/2.
+    # The factor 2 at n_dm = 2 is the ratio between the two exchange energies:
+    # E_x is -1/4 Tr[D K(D)] in the total density and -1/2 sum_s Tr[D_s K(D_s)]
+    # per spin, and the kernel forms the same quartet contraction either way.
     jf = 4. * j_factor
     kf = -k_factor if n_dm == 1 else -2. * k_factor
     omega = smol.omega
@@ -261,8 +292,8 @@ def jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1., verbose=None):
                     prim = (int(nprim[i]), int(nprim[j]),
                             int(nprim[k]), int(nprim[l]))
                     if _usable(smol, n_dm, nprim, i, j, k, l, tag):
-                        _run(tag, ws, tab, dev, ejk, dms, nao, smol.nbas,
-                             jf, kf, pm_ij, pm_kl, q_cond, dm_cond,
+                        _run(tag, ws, tab, dev, ejk, dms, dm_tot, n_dm, nao,
+                             smol.nbas, jf, kf, pm_ij, pm_kl, q_cond, dm_cond,
                              log_cutoff, prim, inv_om2, _ONE)
                     else:
                         shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1,

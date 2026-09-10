@@ -288,7 +288,9 @@ def apply_patch():
         _PATCHED = True
         return
     _ORIG_GET_VEFF = _rks.RKS.get_veff
-    _rks.RKS.get_veff = get_veff
+    # both the method and the module-level name, which are the same function:
+    # `dft/rkspu.py` calls `rks.get_veff` directly (tests/test_patch_aliases.py)
+    _rks.RKS.get_veff = _rks.get_veff = get_veff
     _PATCHED = True
 
 

@@ -202,8 +202,17 @@ void fill_ejk_tasks(int *ntasks, int *bas_kl_idx, int bas_ij, int nbas,
     __syncthreads();
 }
 
+// How many density matrices the exchange contraction runs over: 1 for a
+// restricted reference, 2 for an unrestricted one.  It is a compile-time
+// constant rather than a kernel argument so that the unrolled contraction
+// stays unrolled -- the restricted module is byte for byte the kernel it was
+// before the unrestricted one existed, and pays nothing for it.
+#ifndef EJK_NDM
+#define EJK_NDM 1
+#endif
+
 #define EARGS                                                                  \
-    double *ejk, const double *dm, int nao,                                    \
+    double *ejk, const double *dm, const double *dm_tot, int nao,              \
     double j_factor, double k_factor,                                          \
     const int *bas, const double *env, const int *ao_loc, int nbas,            \
     int npairs_ij, int npairs_kl,                                              \

@@ -113,6 +113,36 @@ the correctness suites.
 > `get_veff` speedup against a *converged* wall clock, which are not the same
 > quantity.  `docs/ROUND2_1.8.1.md` §2 has the profile.
 
+Every number above is a **closed-shell organic** system in a basis that stops at
+d or f.  `docs/OPENSHELL_TMC.md` is what happened when the same modules were
+pointed at open-shell **transition-metal complexes** -- 83 % of a 28 242-entry
+CSD-derived set is open-shell, and def2-SVP already reaches an f shell on the
+metal.  Two entry points that an open-shell ground state takes had no
+replacement reaching them and a third declined the case outright, so the XC
+half of the SCF, the XC half of the gradient and the whole two-electron half of
+the gradient were running GPU4PySCF's own code with every module loaded.  They
+are covered now, on one A100 with one GPU visible to the process:
+
+| UKS, B3LYP/def2-SVP, level-3 grids | GPU4PySCF 1.8.1 | + Electrolites | |
+|---|---|---|---|
+| 21-atom Ni dithiolene (doublet, 327 AO), SCF | 101.9 s | **22.0 s** | **4.64x** |
+| ↳ its gradient | 7.84 s | **3.05 s** | **2.57x** |
+| 60-atom Cu macrocycle (quartet, 515 AO), SCF | 72.6 s | **25.6 s** | **2.84x** |
+| ↳ its gradient | 9.60 s | **4.94 s** | **1.94x** |
+
+The balance inside those runs is not the organic one: the **exchange build is
+83-88 % of a UKS SCF** on these systems and the XC build 3-5 %, where on the
+clusters above the XC build is a third of it.  So `nr_uks`, the module this
+round was written for, is the weakest row in the table at 1.17x-1.38x -- there
+is less idle device for it to fill -- while the XC *gradient* term, which was
+inert for a namespace reason, is the strongest at 4.5x-10.5x.
+`docs/OPENSHELL_TMC.md` §5 has the stage-by-stage table, what is still not
+covered, and the corrections the audit made to this README.
+`benchmarks/coverage_probe.py` is the tool that made the gaps visible, and it
+is worth running before believing any coverage claim here -- as is reading §5's
+account of the two measurement setups that produced confident wrong numbers
+first.
+
 ## Install
 
 ```bash
@@ -176,34 +206,42 @@ separate processes; that is the only honest way to A/B them.
 | module | replaces | covers |
 |---|---|---|
 | `fastk` | `scf.jk._VHFOpt.get_k` | every angular-momentum class an spdf basis reaches — the 25 GPU4PySCF unrolls and the 40 it does not — for the full-range and the long-range (erf) operator. On 1.8.x it also serves the fused `lr*erf + sr*erfc` request, by way of `erf + erfc == 1` |
-| `fastj` | `scf.j_engine._VHFOpt.get_j` | **every `(lij\|lkl)` class an spdf basis reaches** -- the 12 GPU4PySCF unrolls, lifted, and the 17 it does not, written from the class.  Also the **multi-density** build that CPHF, TDDFT and polarizability ask for, four densities to a pass, for every class through `(4,4)` |
-| `fastxc` | `dft.numint.NumInt.nr_rks` | LDA and GGA, so hybrids too |
+| `fastj` | `scf.j_engine._VHFOpt.get_j` | **every `(lij\|lkl)` class an spdf basis reaches** -- the 12 GPU4PySCF unrolls, lifted, and the 17 it does not, written from the class.  Also the **multi-density** build that CPHF, TDDFT and polarizability ask for, four densities to a pass, for every class through `(4,4)`.  A **g** shell is past the written set and falls through -- 672 class blocks of a def2-TZVPP build (`docs/OPENSHELL_TMC.md` §4) |
+| `fastxc` | `dft.numint.NumInt.nr_rks` **and** `NumInt.nr_uks` | LDA and GGA, so hybrids too -- and, on the unrestricted side only, meta-GGA.  The unrestricted build is the one an open-shell ground state takes, which is 83 % of a transition-metal set (`docs/OPENSHELL_TMC.md`); `dft/uks.py` calls `nr_uks`, so patching `nr_rks` never reached it |
 | `fastnlc` | `dft.numint._vv10nlc` | the VV10 / VV10-family `O(n_grid^2)` double sum |
 | `fastrsh` | `dft.rks.RKS.get_veff` | range-separated hybrids on GPU4PySCF **1.7.x only**: the two exchange builds fused into one. 1.8.0 does that fusion itself, so this module stands down there |
 | `fastxcnlc` | `dft.rks.RKS.get_veff` | the XC potential and the VV10 non-local correlation from **one** sweep of the grid instead of two, on 1.8.x (on 1.7.x `fastrsh` drives it). LDA falls back; GGA and meta-GGA are covered, so wB97M-V is |
 | `fast1e` | `gto.int3c1e.get_int3c1e{,_density_contracted,_charge_contracted}` | the three-centre one-electron integrals -- **PCM, QM/MM, ESP, CHELPG** -- every angular-momentum class up to g, contracted with a density, with charges, or neither |
-| `fastejk` | `grad.rhf._jk_energy_per_atom` | the per-atom derivative of `j*J - k*K`, every class an spdf basis reaches, full-range and long-range |
+| `fastejk` | `grad.rhf._jk_energy_per_atom` | the per-atom derivative of `j*J - k*K`, every class an spdf basis reaches, full-range and long-range, for a **restricted or an unrestricted** reference: the exchange contraction runs over the density matrices and the Coulomb one over their sum.  A **g** shell falls through here too, and more of it -- 26 % of the class blocks of a def2-TZVPP gradient |
 | `fastgrad` | `grad.rks.Gradients.energy_ee` | range-separated-hybrid gradients: the long-range operator in place of GPU4PySCF's short-range one |
-| `fastxcgrad` | `grad.rks.get_exc`, `get_nlc_exc` | the XC (LDA, GGA **and** meta-GGA) and VV10 grid contractions of the gradient |
-| `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | the nuclear-attraction part of the one-electron derivative, on the GPU |
+| `fastxcgrad` | `grad.rks.get_exc`, `get_nlc_exc`, **and `grad.uks.get_exc`** | the XC (LDA, GGA **and** meta-GGA) and VV10 grid contractions of the gradient.  `grad/uks.py` binds its own `get_exc` at import, so the restricted patch never reached an open-shell gradient; the unrestricted VV10 term is still handed back |
+| `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | the nuclear-attraction part of the one-electron derivative, on the GPU.  **On 1.8.1 a gradient does not call this**: `grad_elec` goes through `_hcore_energy`, and `get_hcore` is reached only from `get_grad_hcore`, i.e. a Hessian's CPHF right-hand side |
 | `fastxchess` | `hessian.rks._get_vxc_deriv1`, `_get_vxc_deriv2` | the two XC terms of an analytic **Hessian**: the same arithmetic in the masked AO space, with the atoms that have no basis function on a grid block skipped -- their contribution is identically zero -- and the atom dimension batched instead of looped in Python.  GGA |
 | `fastxcfxc` | `dft.numint.nr_rks_fxc` (the module attribute **and** `NumInt.nr_rks_fxc`) | the XC response kernel -- the grid half of **every response property**: CPKS/polarizability, TDA/TDDFT, NMR, IR/Raman, C6.  One GEMM per grid block instead of one per right-hand side, three custom kernels in place of ten GPU4PySCF launches per right-hand side, and one symmetrisation per call instead of an extra matrix product per block.  LDA and GGA |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` and its `type3` twin -- the block shape of the **second-derivative ERI** kernels, which GPU4PySCF derives from the shared-memory budget alone and never measured | **1.13x** on that stage of an analytic Hessian for two lines of Python.  The module also carries a lift of the kernels themselves (every fp64 division out of the primitive and Rys-root loops, a register cap), correct to 1e-13 but measured at 1.02x and 0.58x respectively -- so that half is **off unless `FASTEJK2_KERNELS=1`**.  `docs/README_fastejk2.md` says why, and why the catalogue's B3 entry expects the opposite |
 | `fastjk` | `scf.jk._VHFOpt.get_jk` | the **fused** Coulomb-and-exchange build -- the two-electron half of **every response property**, which is a third code path the SCF does not take and neither `fastj` nor `fastk` is on: 61-82 % of a polarizability or a TDDFT run.  Every angular-momentum class an spdf basis reaches, `hermi` 0 and 1, any number of densities, J and K accumulated from one pass over the Rys integrals |
 | `fastfnlc` | `hessian.rks.nr_rks_fnlc_mo` | the **VV10 non-local-correlation response**, which is 80 % of a wB97M-V polarizability: the ground-state half of it -- including an `O(n_grid^2)` double sum -- computed once per coupled-perturbed solve instead of once per iteration, and the potential contraction batched over the perturbed densities.  Reaches CPKS, NMR, C6 and the analytic Hessian; TDDFT excludes the term itself |
 
-**Limits, all of which fall through rather than fail.** `fastk`, `fastxc` and
-the four gradient modules are spin-restricted closed-shell only: an
-unrestricted calculation reaches them with two density matrices and is handed
-back.  (`fastk` and `fastjk` do take **any** number of *perturbed* densities,
-which is a different thing: the density loop is inside the shell quartet, so a
-CPHF, TDDFT or polarizability call pays for the integrals once.  What they
-still decline is an open-shell *ground state*, where the two densities are
-alpha and beta and the exchange has to be built with a different factor.)  `fastj` takes any number of densities, so it also covers the Coulomb
+**Limits, all of which fall through rather than fail.** An **open-shell ground
+state** is now covered through the SCF and the gradient: `fastk`, `fastj`,
+`fastxc`, `fastnlc` and `fastejk` all serve it, and `fastxcgrad` serves the XC
+half of the gradient.  What is still restricted-only is the **response and
+Hessian** side: `fastxcfxc` (`nr_uks_fxc`), `fastxchess`
+(`hessian.uks._get_vxc_deriv1/2`), `fastfnlc` (`nr_uks_fnlc_mo`) and
+`fastxcnlc`/`fastrsh` (`uks.get_veff`, so an unrestricted wB97M-V still walks
+the grid twice).  `docs/OPENSHELL_TMC.md` has the audit that produced that
+list, what each gap costs, and the correction to what this paragraph used to
+claim -- `fastk` never declined an unrestricted density, and
+`benchmarks/coverage_probe.py` is how to check a claim of this kind rather than
+believe one.  (`fastk` and `fastjk` also take **any** number of *perturbed*
+densities, which is a different thing: the density loop is inside the shell
+quartet, so a CPHF, TDDFT or polarizability call pays for the integrals once.)
+`fastj` takes any number of densities, so it also covers the Coulomb
 build inside a CPHF or Davidson solve; what it declines there is the classes
 past `(4,4)` and the long-range operator. `fastnlc` covers UKS, because `nr_nlc_vxc` sums the two densities
-before the double sum. `fastxc` hands **meta-GGA** back in the SCF, while
-`fastxcgrad` covers it in the gradient. `fastxchess` covers GGA and declines
+before the double sum. `fastxc` hands **meta-GGA** back in `nr_rks` -- where
+`fastxcnlc` reaches it instead -- and covers it in `nr_uks`, where nothing
+else would. `fastxcgrad` covers it in the gradient. `fastxchess` covers GGA and declines
 LDA, meta-GGA, the grid-response path and the VV10 Hessian.  `fastxcfxc` covers
 LDA, GGA and meta-GGA for a plain-density-matrix response and declines the
 `mo1` path (which is the Hessian's own CPHF solve) and UKS.  `fastfnlc`
@@ -246,6 +284,16 @@ python tests/test_ejk_ip2.py               # 5 cases: the second-derivative
                                            # ERIs and the whole analytic
                                            # Hessian, our kernels against
                                            # GPU4PySCF's under one driver
+python tests/test_uxc.py                   # 17 cases: the unrestricted XC
+                                           # build against GPU4PySCF's, on
+                                           # transition-metal complexes
+python tests/test_uxcgrad.py               # 10 cases: the unrestricted XC
+                                           # gradient term, and the whole
+                                           # gradient, ours against theirs
+python tests/test_patch_aliases.py         # no GPU: does every reference to a
+                                           # patched function see the patch, or
+                                           # did some module bind its own copy
+                                           # at import time
 python tests/test_jk.py                    # 6 molecule/basis combinations x
                                            # hermi 0,1 x n_dm 1..8 x three
                                            # density shapes: the multi-density
@@ -253,15 +301,27 @@ python tests/test_jk.py                    # 6 molecule/basis combinations x
                                            # build against GPU4PySCF's
 ```
 
-They need a GPU and take a few minutes. The cases span six basis sets to
+They need a GPU and take a few minutes (`test_patch_aliases.py` does not: it
+only imports). The cases span six basis sets to
 cc-pVQZ, twelve functionals including three meta-GGAs, `omega < 0`, third-row
-elements, a cation and an open-shell radical.
+elements, a cation and an open-shell radical -- and, since
+`docs/OPENSHELL_TMC.md`, six open-shell transition-metal complexes from
+BOS-TMC-28242 (`benchmarks/molecules/tmc_cases.txt`) with 3d, 4d and 5d metals,
+multiplicities to 6, an ECP, and def2-TZVPP, which reaches g.
 
 ## Benchmarks
 
 `benchmarks/scf_anatomy.py` says where an SCF wall clock goes, method by
 method, with a synchronisation point on both sides of each -- use it before
-concluding that anything outside J, K and XC matters.
+concluding that anything outside J, K and XC matters.  `--spin` makes it a UKS
+run and adds the gradient's stages.
+`benchmarks/coverage_probe.py` says which modules are on the code path of a
+given calculation at all, and how many angular-momentum class blocks each of
+the two-electron ones answered -- use it before believing any statement in
+this README about what a module covers, and in particular before assuming that
+a module which is loaded is doing anything.
+`benchmarks/ejk_ndm.py` times the gradient's two-electron derivative at one
+density and at two, both implementations in one process.
 `benchmarks/perclass_j.py` times the Coulomb build one angular-momentum class
 at a time and checks the J matrix against GPU4PySCF's;
 `benchmarks/ndm_j.py` says how the Coulomb build's cost grows with the number

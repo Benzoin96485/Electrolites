@@ -58,7 +58,11 @@ def apply_patch():
     global _PATCHED
     if not _PATCHED:
         grhf._get_hcore_orig = grhf.GradientsBase.get_hcore
-        grhf.GradientsBase.get_hcore = get_hcore
+        # both the method and the module-level name, which are the same
+        # function with the same signature; nothing in GPU4PySCF 1.8.1 calls
+        # the module-level one, but leaving it unpatched is a stale alias
+        # waiting to happen (tests/test_patch_aliases.py)
+        grhf.GradientsBase.get_hcore = grhf.get_hcore = get_hcore
         _PATCHED = True
 
 

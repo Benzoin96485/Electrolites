@@ -82,7 +82,9 @@ def apply_patch():
     global _PATCHED
     if not _PATCHED:
         grks.Gradients._energy_ee_orig = grks.Gradients.energy_ee
-        grks.Gradients.energy_ee = energy_ee
+        # both the method and the module-level name, which are the same
+        # function: `grad/rkspu.py` calls `rks_grad.energy_ee` directly
+        grks.Gradients.energy_ee = grks.energy_ee = energy_ee
         _PATCHED = True
 
 

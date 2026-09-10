@@ -46,10 +46,28 @@ def apply_patch(spec):
     return electrolites.patched()
 
 
-def build_mol(a):
+def needs_ecp(atoms, basis):
+    """Whether this basis carries an ECP that this molecule needs.
+
+    The def2 family replaces the core of everything past Kr with an ECP, and a
+    4d or 5d transition-metal complex is wrong without it.  Nothing else here
+    has one, and passing ``ecp=`` for a set that has none makes the parser
+    complain once per element, so the test is made rather than caught.
+    """
     from pyscf import gto
-    return gto.M(atom=a.xyz, basis=a.basis, charge=a.charge, spin=a.spin,
-                 verbose=0, max_memory=80000)
+    if not str(basis).lower().startswith('def2'):
+        return False
+    return any(gto.charge(sym) > 36 for sym, _ in gto.format_atom(atoms))
+
+
+def build_mol(a):
+    """Build the molecule, attaching the basis's own ECP if the elements need it."""
+    from pyscf import gto
+    kw = dict(atom=a.xyz, basis=a.basis, charge=a.charge, spin=a.spin,
+              verbose=0, max_memory=80000)
+    if needs_ecp(a.xyz, a.basis):
+        kw['ecp'] = a.basis
+    return gto.M(**kw)
 
 
 def make_timer(tag, results):

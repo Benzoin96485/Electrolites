@@ -204,18 +204,33 @@ def dd_reg(c):
          'double dfac;']
     o.append('#pragma unroll')
     o.append(f'for (int n = 0; n < {c.ngout}; ++n) dd_[n] = 0.;')
-    for do, fac, expr in (
-            ('do_k', 'k_factor',
-             'dm[(j0+{cj})*nao+(k0+{ck})] * dm[(l0+{cl})*nao+(i0+{ci})] + '
-             'dm[(j0+{cj})*nao+(l0+{cl})] * dm[(k0+{ck})*nao+(i0+{ci})]'),
-            ('do_j', 'j_factor',
-             'dm[(l0+{cl})*nao+(k0+{ck})] * dm[(j0+{cj})*nao+(i0+{ci})]')):
-        o.append(f'if ({do}) {{')
-        o.append(f'    dfac = fac_sym * {fac};')
-        for n, (ci, cj, ck, cl) in enumerate(quads_reg(c)):
-            o.append(f'    dd_[{n}] += dfac * (' +
-                     expr.format(ci=ci, cj=cj, ck=ck, cl=cl) + ');')
-        o.append('}')
+    # The exchange contraction runs over the `EJK_NDM` density matrices and the
+    # Coulomb one over their sum, which is what makes this kernel serve an
+    # unrestricted reference: E_x = -1/2 sum_s Tr[D_s K(D_s)] is a sum over
+    # spins, while E_J is a single term in the total density.  `EJK_NDM` is a
+    # compile-time constant (see fastejk_prologue.cu), so at 1 the loop
+    # disappears and `dm_tot` is `dm`: the restricted kernel is what it was
+    # before this loop existed.
+    o.append('if (do_k) {')
+    o.append('    dfac = fac_sym * k_factor;')
+    o.append('#pragma unroll')
+    o.append('    for (int i_dm = 0; i_dm < EJK_NDM; ++i_dm) {')
+    o.append('        const double *dmk = dm + (size_t)i_dm * nao * nao;')
+    kexpr = ('dmk[(j0+{cj})*nao+(k0+{ck})] * dmk[(l0+{cl})*nao+(i0+{ci})] + '
+             'dmk[(j0+{cj})*nao+(l0+{cl})] * dmk[(k0+{ck})*nao+(i0+{ci})]')
+    for n, (ci, cj, ck, cl) in enumerate(quads_reg(c)):
+        o.append(f'        dd_[{n}] += dfac * (' +
+                 kexpr.format(ci=ci, cj=cj, ck=ck, cl=cl) + ');')
+    o.append('    }')
+    o.append('}')
+    o.append('if (do_j) {')
+    o.append('    dfac = fac_sym * j_factor;')
+    jexpr = ('dm_tot[(l0+{cl})*nao+(k0+{ck})] * '
+             'dm_tot[(j0+{cj})*nao+(i0+{ci})]')
+    for n, (ci, cj, ck, cl) in enumerate(quads_reg(c)):
+        o.append(f'    dd_[{n}] += dfac * (' +
+                 jexpr.format(ci=ci, cj=cj, ck=ck, cl=cl) + ');')
+    o.append('}')
     return o
 
 
@@ -513,19 +528,30 @@ def dd_shm(c, per, d):
          'double dfac;',
          '#pragma unroll',
          f'for (int n = 0; n < {per * nfi}; ++n) dd_[n] = 0.;']
-    for do, fac, expr in (
-            ('do_k', 'k_factor',
-             'dm[(jj+{dj})*nao+(kk+{dk})] * dm[(ll_+{dl})*nao+(i0+{ci})] + '
-             'dm[(jj+{dj})*nao+(ll_+{dl})] * dm[(kk+{dk})*nao+(i0+{ci})]'),
-            ('do_j', 'j_factor',
-             'dm[(ll_+{dl})*nao+(kk+{dk})] * dm[(jj+{dj})*nao+(i0+{ci})]')):
-        o.append(f'if ({do}) {{')
-        o.append(f'    dfac = fac_sym * {fac};')
-        for m, (dj, dk, dl) in enumerate(d):
-            for ci in range(nfi):
-                o.append(f'    dd_[{m*nfi+ci}] += dfac * (' +
-                         expr.format(ci=ci, dj=dj, dk=dk, dl=dl) + ');')
-        o.append('}')
+    # see dd_reg for why the exchange term loops over the densities and the
+    # Coulomb term uses their sum
+    o.append('if (do_k) {')
+    o.append('    dfac = fac_sym * k_factor;')
+    o.append('#pragma unroll')
+    o.append('    for (int i_dm = 0; i_dm < EJK_NDM; ++i_dm) {')
+    o.append('        const double *dmk = dm + (size_t)i_dm * nao * nao;')
+    kexpr = ('dmk[(jj+{dj})*nao+(kk+{dk})] * dmk[(ll_+{dl})*nao+(i0+{ci})] + '
+             'dmk[(jj+{dj})*nao+(ll_+{dl})] * dmk[(kk+{dk})*nao+(i0+{ci})]')
+    for m, (dj, dk, dl) in enumerate(d):
+        for ci in range(nfi):
+            o.append(f'        dd_[{m*nfi+ci}] += dfac * (' +
+                     kexpr.format(ci=ci, dj=dj, dk=dk, dl=dl) + ');')
+    o.append('    }')
+    o.append('}')
+    o.append('if (do_j) {')
+    o.append('    dfac = fac_sym * j_factor;')
+    jexpr = ('dm_tot[(ll_+{dl})*nao+(kk+{dk})] * '
+             'dm_tot[(jj+{dj})*nao+(i0+{ci})]')
+    for m, (dj, dk, dl) in enumerate(d):
+        for ci in range(nfi):
+            o.append(f'    dd_[{m*nfi+ci}] += dfac * (' +
+                     jexpr.format(ci=ci, dj=dj, dk=dk, dl=dl) + ');')
+    o.append('}')
     return o
 
 

@@ -60,8 +60,17 @@ before contracting them with the density.  Two changes:
    ``FASTXCGRAD_MODE=groupedgemm`` ablation keeps the CUTLASS grouped path so
    the comparison can be re-run.
 
-LDA, GGA and meta-GGA are covered.  The grid-response path, unrestricted
-densities and multi-GPU fall through to GPU4PySCF unchanged.
+LDA, GGA and meta-GGA are covered, for a restricted (``grad.rks.get_exc``)
+and an unrestricted (``grad.uks.get_exc``) reference alike.  The two are the
+same arithmetic run once per spin: GPU4PySCF's unrestricted copy issues both
+sets of GEMMs *and* both libxc calls per grid block, so change 2 -- which is
+the largest item -- applies to it twice over.  That matters because an
+open-shell ground state is the common case in a transition-metal complex, not
+a corner: 83 % of BOS-TMC-28242 is open-shell.
+
+The grid-response path and multi-GPU fall through to GPU4PySCF unchanged, as
+does the VV10 term of an unrestricted gradient (``get_nlc_exc`` is reached
+with two densities and hands them back).
 
 Environment switches (for the ablations, not for normal use):
 ``FASTXCGRAD_OFF=1``          hand everything back to GPU4PySCF
@@ -78,6 +87,7 @@ from . import compat as g4pcompat
 from gpu4pyscf.dft import xc_deriv
 from gpu4pyscf.dft.numint import _contract_rho, _contract_rho1, _scale_ao
 from gpu4pyscf.grad import rks as grks
+from gpu4pyscf.grad import uks as guks
 from gpu4pyscf.lib.cupy_helper import (
     contract, take_last2d, grouped_gemm, get_avail_mem)
 from gpu4pyscf.lib import logger
@@ -202,6 +212,22 @@ def _rho_from_c(ao, c, xctype, buf=None):
         rho[4] += _contract_rho(c[m], ao[m], rho=buf)
     rho[4] *= .5
     return rho
+
+
+def _weights_u(ni, xc_code, xctype, rho, weight):
+    """``_weights`` for a pair of spin densities.
+
+    ``rho`` is ``(2, ncomp, ngrids)`` and so is the result.  The factors are
+    GPU4PySCF's own (``grad/uks.py::_get_exc_task``) and are per spin.
+    """
+    vxc = ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype, spin=1)[1]
+    wv = cupy.multiply(weight, vxc, out=vxc)
+    if xctype == 'LDA':
+        return wv[:, :1]
+    wv[:, 0] *= .5
+    if xctype == 'MGGA':
+        wv[:, 4] *= .5   # for the factor 1/2 in tau
+    return wv
 
 
 def _weights(ni, xc_code, xctype, rho, weight):
@@ -353,6 +379,87 @@ def _exc_grouped(ni, _sorted_mol, grids, xc_code, dm, xctype, nao,
     return exc1_ao
 
 
+def _exc_grouped_u(ni, _sorted_mol, grids, xc_code, dm, xctype, nao):
+    """``_exc_grouped`` for a pair of spin densities.
+
+    Everything downstream of libxc is per spin and unchanged, so the loop body
+    is ``_exc_grouped``'s with a spin index on the density products, the
+    potential product and the weights.  What is *not* per spin is the libxc
+    call: one call covers the group and both spins, where GPU4PySCF makes one
+    per block -- and that call is the item change 2 exists for.
+    """
+    ao_deriv = 1 if xctype == 'LDA' else 2
+    nc = _NC[xctype]
+    scratch = 2 * (nc + (1 if xctype == 'GGA' else 0))
+    exc1_ao = cupy.zeros((nao, 3))
+    for ao_group, idx_group, w_group in _group_block_loop(
+            ni, _sorted_mol, grids, nao, ao_deriv, scratch):
+        nblk = len(ao_group)
+        masks = [[take_last2d(dm[s], idx) for s in range(2)]
+                 for idx in idx_group]
+        c_group = [[cupy.empty((nc,) + ao.shape[1:]) for _ in range(2)]
+                   for ao in ao_group]
+        for m_, ao, C in zip(masks, ao_group, c_group):
+            for s in range(2):
+                for m in range(nc):
+                    cupy.dot(m_[s], ao[m], out=C[s][m])
+        buf = cupy.empty(max(w.size for w in w_group))
+        rho = cupy.concatenate(
+            [cupy.asarray([_rho_from_c(ao, c[0], xctype, buf=buf),
+                           _rho_from_c(ao, c[1], xctype, buf=buf)])
+             for ao, c in zip(ao_group, c_group)], axis=2)
+        buf = None
+        wv = _weights_u(ni, xc_code, xctype, rho, cupy.concatenate(w_group))
+        rho = None
+        wv_group = []
+        p0 = 0
+        for w in w_group:
+            p1 = p0 + w.size
+            wv_group.append([cupy.ascontiguousarray(wv[s, :, p0:p1])
+                             for s in range(2)])
+            p0 = p1
+        wv = None
+        if xctype in ('LDA', 'MGGA'):            # see _exc_grouped
+            t_group = [[None, None]] * nblk
+        else:
+            t_group = [[m_[s].dot(_scale_ao(ao[:4], w[s][:4]))
+                        for s in range(2)]
+                       for m_, ao, w in zip(masks, ao_group, wv_group)]
+        masks = None
+        for ao, idx, w, c, t in zip(ao_group, idx_group, wv_group,
+                                    c_group, t_group):
+            for s in range(2):
+                _accumulate(ao, idx, w[s], c[s], t[s], exc1_ao, xctype)
+        ao_group = c_group = t_group = wv_group = None
+    return exc1_ao
+
+
+def _exc_perblock_u(ni, _sorted_mol, grids, xc_code, dm, xctype, nao):
+    """The same arithmetic, one grid block at a time (for the ablation)."""
+    ao_deriv = 1 if xctype == 'LDA' else 2
+    nc = _NC[xctype]
+    exc1_ao = cupy.zeros((nao, 3))
+    for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao,
+                                                 ao_deriv, None):
+        masks = [take_last2d(dm[s], idx) for s in range(2)]
+        c = [cupy.empty((nc,) + ao_mask.shape[1:]) for _ in range(2)]
+        for s in range(2):
+            for m in range(nc):
+                cupy.dot(masks[s], ao_mask[m], out=c[s][m])
+        rho = cupy.asarray([_rho_from_c(ao_mask, c[s], xctype)
+                            for s in range(2)])
+        wv = _weights_u(ni, xc_code, xctype, rho, weight)
+        for s in range(2):
+            if xctype in ('LDA', 'MGGA'):
+                t = None
+            else:
+                t = masks[s].dot(_scale_ao(ao_mask[:4], wv[s, :4]))
+            _accumulate(ao_mask, idx, cupy.ascontiguousarray(wv[s]), c[s], t,
+                        exc1_ao, xctype)
+        masks = c = None
+    return exc1_ao
+
+
 def _exc_perblock(ni, _sorted_mol, grids, xc_code, dm, xctype, nao):
     """The same arithmetic, one grid block at a time (for the ablation)."""
     ao_deriv = 1 if xctype == 'LDA' else 2
@@ -398,6 +505,37 @@ def get_exc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
     # - sign because nabla_X = -nabla_x
     exc1 = -grks._reduce_to_atom(_sorted_mol, exc1_ao)
     log.timer_debug1(f'grad vxc (fastxcgrad, {MODE})', *t0)
+    return None, exc1
+
+
+def get_exc_u(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
+              max_memory=2000, verbose=None):
+    """Drop-in replacement for gpu4pyscf.grad.uks.get_exc."""
+    xctype = ni._xc_type(xc_code)
+    if _OFF or xctype not in _xctypes() or num_devices > 1:
+        return guks._get_exc_orig(ni, mol, grids, xc_code, dms, relativity,
+                                  hermi, max_memory, verbose)
+    log = logger.new_logger(mol, verbose)
+    t0 = log.init_timer()
+    opt = getattr(ni, 'gdftopt', None)
+    if opt is None:
+        ni.build(mol, grids.coords)
+        opt = ni.gdftopt
+    dm = cupy.asarray(dms).reshape(-1, mol.nao, mol.nao)
+    if dm.shape[0] != 2:
+        return guks._get_exc_orig(ni, mol, grids, xc_code, dms, relativity,
+                                  hermi, max_memory, verbose)
+    dm = opt.sort_orbitals(dm, axis=[1, 2])
+    _sorted_mol = opt._sorted_mol
+    if MODE == 'perblock':
+        exc1_ao = _exc_perblock_u(ni, _sorted_mol, grids, xc_code, dm, xctype,
+                                  mol.nao)
+    else:
+        exc1_ao = _exc_grouped_u(ni, _sorted_mol, grids, xc_code, dm, xctype,
+                                 mol.nao)
+    # - sign because nabla_X = -nabla_x
+    exc1 = -grks._reduce_to_atom(_sorted_mol, exc1_ao)
+    log.timer_debug1(f'uks grad vxc (fastxcgrad, {MODE})', *t0)
     return None, exc1
 
 
@@ -524,6 +662,11 @@ def apply_patch():
     if not _PATCHED:
         grks._get_exc_orig = grks.get_exc
         grks.get_exc = get_exc
+        # grad/uks.py binds its own `get_exc` at import; patching grad.rks's
+        # does not reach it, which is why an unrestricted gradient used to run
+        # GPU4PySCF's XC contraction with this module loaded
+        guks._get_exc_orig = guks.get_exc
+        guks.get_exc = get_exc_u
         grks._get_nlc_exc_orig = grks.get_nlc_exc
         grks.get_nlc_exc = get_nlc_exc
         _PATCHED = True
