@@ -9,6 +9,14 @@ so the same two numbers can be read off 1.8.1 before anything is written.
     python benchmarks/response_anatomy.py --prop pol \
         --xyz benchmarks/molecules/penicillinV.xyz --basis def2-svp [--patch all]
     python benchmarks/response_anatomy.py --prop tda --nstates 5 ...
+    python benchmarks/response_anatomy.py --prop tda --spin 1 --charge 1 ...
+
+`--spin` profiles the unrestricted path.  It is a different set of functions,
+not the same ones with two densities: `NumInt.nr_uks_fxc` in place of
+`nr_rks_fxc`/`nr_rks_fxc_st`, `hessian/uks.py`'s `nr_uks_fnlc_mo` in place of
+the restricted one, and `tdscf/uhf.py`'s `gen_vind`.  A polarizability is
+restricted-only on 1.8.1 (`properties/polarizability.py`), so `--spin` accepts
+`tda` and `tddft`.
 
 Nested rows (prefixed `..`) are sub-intervals of their parent and overlap it,
 so a column does not sum to its parent.  `nset` is the set of density counts
@@ -30,6 +38,14 @@ ap.add_argument('--cphf-tol', type=float, default=1e-7)
 a = ap.parse_args()
 apply_patch(a.patch)
 
+# the molecule is built here rather than below because which functions have
+# to be wrapped depends on the spin state, and the wrapping happens at import
+mol = build_mol(a)
+unrestricted = bool(mol.spin)
+if unrestricted and a.prop == 'pol':
+    raise SystemExit('a polarizability is restricted-only on 1.8.1; '
+                     'use --prop tda or --prop tddft with --spin')
+
 import numpy as np                                          # noqa: E402
 from gpu4pyscf import dft                                   # noqa: E402
 from gpu4pyscf.dft import numint as gnumint                 # noqa: E402
@@ -37,6 +53,9 @@ from gpu4pyscf.hessian import rks as hrks                   # noqa: E402
 from gpu4pyscf.properties import polarizability as gpol     # noqa: E402
 from gpu4pyscf.tdscf import rhf as gtdrhf                   # noqa: E402
 from gpu4pyscf.tdscf import rks as gtdrks                   # noqa: E402
+from gpu4pyscf.tdscf import uhf as gtduhf                   # noqa: E402
+from gpu4pyscf.tdscf import uks as gtduks                   # noqa: E402
+from gpu4pyscf.hessian import uks as huks                   # noqa: E402
 from gpu4pyscf.scf import cphf as gcphf                     # noqa: E402
 
 T = OrderedDict()
@@ -86,13 +105,22 @@ PLAN = [
     ('....jk', '....Coulomb + exchange response', 2),
     ('....fnlc', '....VV10 response', 2),
 ]
-_wrap(NI, 'nr_rks_fxc', '....fxc', nset_from=5)
-_wrap(NI, 'nr_rks_fxc_st', '....fxc', nset_from=5)
+# `nr_uks_fxc` has no `_st` twin -- an open-shell excited state has no
+# singlet/triplet split -- and every caller reaches it as `ni.nr_uks_fxc`,
+# so the class attribute is the one to wrap and there is no double count.
+if unrestricted:
+    _wrap(NI, 'nr_uks_fxc', '....fxc', nset_from=5)
+    _wrap(huks, 'nr_uks_fnlc_mo', '....fnlc')
+else:
+    _wrap(NI, 'nr_rks_fxc', '....fxc', nset_from=5)
+    _wrap(NI, 'nr_rks_fxc_st', '....fxc', nset_from=5)
+    _wrap(hrks, 'nr_rks_fnlc_mo', '....fnlc')
 _wrap(gnumint, 'eval_ao', '......eval_ao')
-_wrap(hrks, 'nr_rks_fnlc_mo', '....fnlc')
 # the matrix-vector product itself: `gen_vind` returns a closure, so the
 # closure is what has to be wrapped, not the generator.
-for _cls, _gen in ((gtdrhf.TDA, 'gen_vind'), (gtdrhf.TDHF, 'gen_vind')):
+_TD = ((gtduhf.TDA, 'gen_vind'), (gtduhf.TDHF, 'gen_vind')) if unrestricted \
+    else ((gtdrhf.TDA, 'gen_vind'), (gtdrhf.TDHF, 'gen_vind'))
+for _cls, _gen in _TD:
     _orig_gen = getattr(_cls, _gen)
 
     def _wrapped_gen(self, mf=None, _orig_gen=_orig_gen):
@@ -113,17 +141,16 @@ for _cls, _gen in ((gtdrhf.TDA, 'gen_vind'), (gtdrhf.TDHF, 'gen_vind')):
     setattr(_cls, _gen, _wrapped_gen)
 # `tdscf.rhf` and `tdscf.rks` do `from ._lr_eig import eigh as lr_eigh` at
 # import time, so the name to wrap is theirs, not `_lr_eig`'s.
-for _mod in (gtdrhf, gtdrks):
+for _mod in ((gtduhf, gtduks) if unrestricted else (gtdrhf, gtdrks)):
     if hasattr(_mod, 'lr_eigh'):
         _wrap(_mod, 'lr_eigh', 'solve')
 _wrap(gcphf, 'solve', 'solve')
 
-mol = build_mol(a)
 tag = (f'{a.xyz.rsplit("/", 1)[-1]}/{a.basis}/{a.xc}/L{a.grids}/'
-       f'{a.prop}/{a.patch or "stock"}')
-print(f'# {tag}  natm={mol.natm} nao={mol.nao}', flush=True)
+       f'{"UKS" if unrestricted else "RKS"}/{a.prop}/{a.patch or "stock"}')
+print(f'# {tag}  natm={mol.natm} nao={mol.nao} spin={mol.spin}', flush=True)
 
-mf = dft.RKS(mol, xc=a.xc)
+mf = (dft.UKS if unrestricted else dft.RKS)(mol, xc=a.xc)
 mf.grids.level = a.grids
 mf.conv_tol = a.conv_tol
 _sync()

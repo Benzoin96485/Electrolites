@@ -22,9 +22,10 @@ GPU4PySCF's, which is where a basis-set restriction (`MAX_PRIM_PAIR`, a class
 past the written set) shows up rather than as a fall-through of the whole call.
 
     python benchmarks/coverage_probe.py --xyz benchmarks/molecules/tmc_fecl4.xyz \
-        --charge -1 --spin 5 --basis def2-svp --xc b3lyp
+        --charge -1 --spin 5 --basis def2-svp --xc b3lyp [--hessian]
 
-`--spin` picks UKS.  Compare the same molecule at `--spin 0` to see which rows
+`--spin` picks UKS, and `--hessian` runs one after the SCF and the gradient,
+which is the only way the four Hessian rows are reached at all.  Compare the same molecule at `--spin 0` to see which rows
 only a closed shell reaches.
 """
 import json
@@ -34,6 +35,11 @@ from _common import apply_patch, build_mol, parser
 
 ap = parser(__doc__.splitlines()[0])
 ap.add_argument('--max-cycle', type=int, default=30)
+ap.add_argument('--hessian', action='store_true',
+                help='run an analytic Hessian too.  Nothing else in this '
+                     'script reaches the response or Hessian entry points, '
+                     'so without it those rows read `(-)` for a reason that '
+                     'has nothing to do with what the modules cover.')
 a = ap.parse_args()
 active = apply_patch(a.patch or 'all')
 
@@ -78,6 +84,8 @@ from gpu4pyscf.dft import rks as _rks                        # noqa: E402
 from gpu4pyscf.grad import rhf as _grhf, rks as _grks        # noqa: E402
 from gpu4pyscf.grad import uks as _guks                      # noqa: E402
 from gpu4pyscf.hessian import rks as _hrks                   # noqa: E402
+from gpu4pyscf.hessian import uks as _huks                   # noqa: E402
+from gpu4pyscf.dft import uks as _uks                        # noqa: E402
 
 _ENTRIES = [
     ('fastk   get_k',        _jk._VHFOpt, 'get_k',   _jk._VHFOpt, '_get_k_orig'),
@@ -97,10 +105,27 @@ _ENTRIES = [
     ('fastxcgrad get_nlc',   _grks, 'get_nlc_exc',   _grks, '_get_nlc_exc_orig'),
     ('fastxcgrad uks_exc',   _guks, 'get_exc',       _guks, '_get_exc_orig'),
     ('fastxcfxc nr_rks_fxc', _ni, 'nr_rks_fxc',      _ni, '_nr_rks_fxc_orig'),
+    ('fastxcfxc nr_uks_fxc', _ni.NumInt, 'nr_uks_fxc',
+     _ni, '_nr_uks_fxc_orig'),
     ('fastxchess vxc_deriv1', _hrks, '_get_vxc_deriv1',
      _hrks, '_get_vxc_deriv1_orig'),
+    ('fastxchess vxc_deriv2', _hrks, '_get_vxc_deriv2',
+     _hrks, '_get_vxc_deriv2_orig'),
+    ('fastxchess uks_deriv1', _huks, '_get_vxc_deriv1',
+     _huks, '_get_vxc_deriv1_orig'),
+    ('fastxchess uks_deriv2', _huks, '_get_vxc_deriv2',
+     _huks, '_get_vxc_deriv2_orig'),
     ('fastfnlc fnlc_mo',     _hrks, 'nr_rks_fnlc_mo',
      _hrks, '_nr_rks_fnlc_mo_orig'),
+    # the unrestricted twins.  `dft/uks.py` and `hessian/uks.py` bind their own
+    # copies of both of these, so each needs its own row: a run can reach the
+    # unrestricted one thousands of times while the restricted row above still
+    # reads `(-)`.  Neither has a `stock` counter of its own -- the two
+    # modules' `stats()` lines printed after the table give the exact
+    # ours/declined split, and a decline here would be counted against the
+    # restricted row's `stock`.
+    ('fastxcnlc uks_veff',   _uks.UKS, 'get_veff',   _uks.UKS, '_never'),
+    ('fastfnlc uks_fnlc',    _huks, 'nr_rks_fnlc_mo', _huks, '_never'),
 ]
 for e in _ENTRIES:
     _entry(*e)
@@ -149,6 +174,12 @@ if not a.no_grad:
     mf.nuc_grad_method().kernel()
     cp.cuda.Stream.null.synchronize()
     print(f'[{tag}] gradient done', flush=True)
+if a.hessian:
+    hobj = mf.Hessian()
+    hobj.auxbasis_response = 0
+    hobj.kernel()
+    cp.cuda.Stream.null.synchronize()
+    print(f'[{tag}] hessian done', flush=True)
 
 labels = []
 for lab, _kind in C:
@@ -171,9 +202,17 @@ for lab in labels:
     else:
         print(f'{lab:26s} {calls:7d} {shown_ours:7d} {stock:7d}')
 
+extra = {}
+for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc'):
+    if _m in active:
+        _mod = __import__(f'electrolites.{_m}', fromlist=['x'])
+        if hasattr(_mod, 'stats'):
+            extra[_m] = _mod.stats()
+            print(f'{_m}.stats() = {extra[_m]}')
+
 print('RESULT ' + json.dumps(dict(
     tag=tag, gpu4pyscf=gpu4pyscf.__version__, xyz=a.xyz, basis=a.basis,
     xc=a.xc, natm=mol.natm, nao=int(mol.nao), spin=int(mol.spin),
     charge=int(mol.charge), lmax=int(mol._bas[:, 1].max()),
-    nprim_max=int(mol._bas[:, 2].max()), e=float(e),
-    cycles=int(mf.cycles), rows=rows)), flush=True)
+    nprim_max=int(mol._bas[:, 2].max()), e=float(e), hessian=a.hessian,
+    cycles=int(mf.cycles), rows=rows, stats=extra)), flush=True)

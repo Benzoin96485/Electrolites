@@ -143,6 +143,23 @@ is worth running before believing any coverage claim here -- as is reading §5's
 account of the two measurement setups that produced confident wrong numbers
 first.
 
+The round after that took the three **VV10** entries off that list, which are
+the ones a wB97M-V, wB97X-V, B97M-V or VV10 calculation of an open-shell
+complex meets: the fused XC-and-VV10 grid pass of the SCF, the VV10 term of
+the gradient, and the VV10 **response** term -- which on an unrestricted
+reference is on the TDDFT path (`tdscf/uhf.py` does not set `exclude_nlc`)
+where on a restricted one it is not.  Two of the three gaps were entry points
+bound under another name rather than missing kernels.
+`docs/VV10_OPENSHELL.md` has the round and four corrections to what
+`docs/OPENSHELL_TMC.md` §4 says about the work.  Its measurements, on eight
+systems spanning 3 to 60 atoms and both chemical classes: **1.47x-1.63x** on
+the response term (a path that was 1.00x by construction), **2.7x-3.6x** on
+the gradient term's grid passes -- 1.17x-1.70x on the term as a whole, the
+rest of which is the `O(n_grid^2)` double sum -- and, for the SCF's fused
+pass, a saving that is linear in the grid and independent of the functional
+where `fastxc`'s grouped `nr_uks` saves latency that is neither, so the two
+compete rather than compose and §4b says which wins where.
+
 ## Install
 
 ```bash
@@ -210,27 +227,35 @@ separate processes; that is the only honest way to A/B them.
 | `fastxc` | `dft.numint.NumInt.nr_rks` **and** `NumInt.nr_uks` | LDA and GGA, so hybrids too -- and, on the unrestricted side only, meta-GGA.  The unrestricted build is the one an open-shell ground state takes, which is 83 % of a transition-metal set (`docs/OPENSHELL_TMC.md`); `dft/uks.py` calls `nr_uks`, so patching `nr_rks` never reached it |
 | `fastnlc` | `dft.numint._vv10nlc` | the VV10 / VV10-family `O(n_grid^2)` double sum |
 | `fastrsh` | `dft.rks.RKS.get_veff` | range-separated hybrids on GPU4PySCF **1.7.x only**: the two exchange builds fused into one. 1.8.0 does that fusion itself, so this module stands down there |
-| `fastxcnlc` | `dft.rks.RKS.get_veff` | the XC potential and the VV10 non-local correlation from **one** sweep of the grid instead of two, on 1.8.x (on 1.7.x `fastrsh` drives it). LDA falls back; GGA and meta-GGA are covered, so wB97M-V is |
+| `fastxcnlc` | `dft.rks.RKS.get_veff` **and `dft.uks.UKS.get_veff`** | the XC potential and the VV10 non-local correlation from **one** sweep of the grid instead of two, on 1.8.x (on 1.7.x `fastrsh` drives it). LDA falls back; GGA and meta-GGA are covered, so wB97M-V is. Restricted or unrestricted -- `dft/uks.py` binds its own `get_veff`, so patching `dft.rks`'s left an open-shell wB97M-V walking the grid four times per iteration (`docs/VV10_OPENSHELL.md`) |
 | `fast1e` | `gto.int3c1e.get_int3c1e{,_density_contracted,_charge_contracted}` | the three-centre one-electron integrals -- **PCM, QM/MM, ESP, CHELPG** -- every angular-momentum class up to g, contracted with a density, with charges, or neither |
 | `fastejk` | `grad.rhf._jk_energy_per_atom` | the per-atom derivative of `j*J - k*K`, every class an spdf basis reaches, full-range and long-range, for a **restricted or an unrestricted** reference: the exchange contraction runs over the density matrices and the Coulomb one over their sum.  A **g** shell falls through here too, and more of it -- 26 % of the class blocks of a def2-TZVPP gradient |
 | `fastgrad` | `grad.rks.Gradients.energy_ee` | range-separated-hybrid gradients: the long-range operator in place of GPU4PySCF's short-range one |
-| `fastxcgrad` | `grad.rks.get_exc`, `get_nlc_exc`, **and `grad.uks.get_exc`** | the XC (LDA, GGA **and** meta-GGA) and VV10 grid contractions of the gradient.  `grad/uks.py` binds its own `get_exc` at import, so the restricted patch never reached an open-shell gradient; the unrestricted VV10 term is still handed back |
+| `fastxcgrad` | `grad.rks.get_exc`, `get_nlc_exc`, **and `grad.uks.get_exc`, `get_nlc_exc`** | the XC (LDA, GGA **and** meta-GGA) and VV10 grid contractions of the gradient, restricted or unrestricted.  `grad/uks.py` binds its own copies at import, so the restricted patch never reached an open-shell gradient.  The VV10 term takes one or two density matrices and the second case needs no spin index: VV10 is a functional of the total density, so `D_a + D_b` is the whole change |
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | the nuclear-attraction part of the one-electron derivative, on the GPU.  **On 1.8.1 a gradient does not call this**: `grad_elec` goes through `_hcore_energy`, and `get_hcore` is reached only from `get_grad_hcore`, i.e. a Hessian's CPHF right-hand side |
-| `fastxchess` | `hessian.rks._get_vxc_deriv1`, `_get_vxc_deriv2` | the two XC terms of an analytic **Hessian**: the same arithmetic in the masked AO space, with the atoms that have no basis function on a grid block skipped -- their contribution is identically zero -- and the atom dimension batched instead of looped in Python.  GGA |
-| `fastxcfxc` | `dft.numint.nr_rks_fxc` (the module attribute **and** `NumInt.nr_rks_fxc`) | the XC response kernel -- the grid half of **every response property**: CPKS/polarizability, TDA/TDDFT, NMR, IR/Raman, C6.  One GEMM per grid block instead of one per right-hand side, three custom kernels in place of ten GPU4PySCF launches per right-hand side, and one symmetrisation per call instead of an extra matrix product per block.  LDA and GGA |
+| `fastxchess` | `hessian.rks._get_vxc_deriv1`, `_get_vxc_deriv2` **and the `hessian.uks` pair of the same names** | the two XC terms of an analytic **Hessian**: the same arithmetic in the masked AO space, with the atoms that have no basis function on a grid block skipped -- their contribution is identically zero -- and the atom dimension batched instead of looped in Python.  GGA, **restricted or unrestricted**.  `hessian/uks.py` defines its own copies rather than importing the restricted ones, so the restricted patch left every open-shell Hessian on GPU4PySCF's code; the unrestricted pair shares one AO evaluation, one mask, one atom list and one `d rho / d R` between the spin channels, which is why upstream pays **2.38x** for the second channel and this module **1.96x** on the same molecule (`docs/OPENSHELL_HESSIAN.md`) |
+| `fastxcfxc` | `dft.numint.nr_rks_fxc` **and `nr_uks_fxc`** (the module attribute **and** the `NumInt` one, for both) | the XC response kernel -- the grid half of **every response property**: CPKS/polarizability, TDA/TDDFT, NMR, IR/Raman, C6.  One GEMM per grid block instead of one per right-hand side, three custom kernels in place of ten GPU4PySCF launches per right-hand side, and one symmetrisation per call instead of an extra matrix product per block.  LDA, GGA and meta-GGA, **restricted or unrestricted**.  `fxc` is a 2x2 block in the spin index, so the unrestricted contraction runs over the pair (spin, component) and has the one kernel of its own that the round needed; interleaving the two spins' densities lets the other three serve both cases unchanged.  On an **unrestricted** reference this is also the Hessian's CPHF grid half -- there is no `nr_uks_fxc_mo`, so `hessian/uks.py` calls this function (`docs/OPENSHELL_FXC.md`) |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` and its `type3` twin -- the block shape of the **second-derivative ERI** kernels, which GPU4PySCF derives from the shared-memory budget alone and never measured | **1.13x** on that stage of an analytic Hessian for two lines of Python.  The module also carries a lift of the kernels themselves (every fp64 division out of the primitive and Rys-root loops, a register cap), correct to 1e-13 but measured at 1.02x and 0.58x respectively -- so that half is **off unless `FASTEJK2_KERNELS=1`**.  `docs/README_fastejk2.md` says why, and why the catalogue's B3 entry expects the opposite |
 | `fastjk` | `scf.jk._VHFOpt.get_jk` | the **fused** Coulomb-and-exchange build -- the two-electron half of **every response property**, which is a third code path the SCF does not take and neither `fastj` nor `fastk` is on: 61-82 % of a polarizability or a TDDFT run.  Every angular-momentum class an spdf basis reaches, `hermi` 0 and 1, any number of densities, J and K accumulated from one pass over the Rys integrals |
-| `fastfnlc` | `hessian.rks.nr_rks_fnlc_mo` | the **VV10 non-local-correlation response**, which is 80 % of a wB97M-V polarizability: the ground-state half of it -- including an `O(n_grid^2)` double sum -- computed once per coupled-perturbed solve instead of once per iteration, and the potential contraction batched over the perturbed densities.  Reaches CPKS, NMR, C6 and the analytic Hessian; TDDFT excludes the term itself |
+| `fastfnlc` | `hessian.rks.nr_rks_fnlc_mo` **and the `hessian.uks` binding of the same name** | the **VV10 non-local-correlation response**, which is 80 % of a wB97M-V polarizability: the ground-state half of it -- including an `O(n_grid^2)` double sum -- computed once per coupled-perturbed solve instead of once per iteration, and the potential contraction batched over the perturbed densities.  Restricted or unrestricted: `V_munu` is spin-free, so the unrestricted case is the same body on the summed density with an MO-basis answer projected once per spin.  Reaches CPKS, NMR, C6 and the analytic Hessian -- and, on an **unrestricted** reference only, TDA/TDDFT: `tdscf/rhf.py` sets `exclude_nlc = True` and `tdscf/uhf.py` sets nothing, so an open-shell TDDFT pays this term and a closed-shell one does not (`docs/VV10_OPENSHELL.md` §1) |
 
 **Limits, all of which fall through rather than fail.** An **open-shell ground
 state** is now covered through the SCF and the gradient: `fastk`, `fastj`,
-`fastxc`, `fastnlc` and `fastejk` all serve it, and `fastxcgrad` serves the XC
-half of the gradient.  What is still restricted-only is the **response and
-Hessian** side: `fastxcfxc` (`nr_uks_fxc`), `fastxchess`
-(`hessian.uks._get_vxc_deriv1/2`), `fastfnlc` (`nr_uks_fnlc_mo`) and
-`fastxcnlc`/`fastrsh` (`uks.get_veff`, so an unrestricted wB97M-V still walks
-the grid twice).  `docs/OPENSHELL_TMC.md` has the audit that produced that
-list, what each gap costs, and the correction to what this paragraph used to
+`fastxc`, `fastnlc`, `fastxcnlc` and `fastejk` all serve it, and `fastxcgrad`
+serves both the XC and the VV10 half of the gradient.  On the **response**
+side the VV10 term is covered too (`fastfnlc`, through the `hessian.uks`
+binding that reaches it), which is what an open-shell TDDFT with wB97M-V
+spends most of its time in, and the **analytic Hessian's two XC terms** are
+covered on both spin cases (`fastxchess`, through the `hessian.uks` pair).
+The **XC response kernel** is covered on both spin cases too
+(`fastxcfxc`, `nr_uks_fxc`), which is the grid half of every open-shell
+response property *and* -- since there is no `nr_uks_fxc_mo` -- of an
+unrestricted Hessian's CPHF solve.  What is left of
+`docs/OPENSHELL_TMC.md` §4 that is not a basis-set limit is the VV10 Hessian.
+`docs/OPENSHELL_TMC.md` has the audit that produced that list,
+`docs/VV10_OPENSHELL.md` the three VV10 entries of it that are now taken,
+`docs/OPENSHELL_HESSIAN.md` the Hessian XC terms and
+`docs/OPENSHELL_FXC.md` the response kernel, what each gap costs, and the correction to what this paragraph used to
 claim -- `fastk` never declined an unrestricted density, and
 `benchmarks/coverage_probe.py` is how to check a claim of this kind rather than
 believe one.  (`fastk` and `fastjk` also take **any** number of *perturbed*
@@ -241,11 +266,16 @@ build inside a CPHF or Davidson solve; what it declines there is the classes
 past `(4,4)` and the long-range operator. `fastnlc` covers UKS, because `nr_nlc_vxc` sums the two densities
 before the double sum. `fastxc` hands **meta-GGA** back in `nr_rks` -- where
 `fastxcnlc` reaches it instead -- and covers it in `nr_uks`, where nothing
-else would. `fastxcgrad` covers it in the gradient. `fastxchess` covers GGA and declines
+else would. `fastxcgrad` covers it in the gradient.  `fastxcnlc`'s fusion
+needs the XC and NLC grids to be the same *set* of points and declines
+otherwise; `stats()` says whether it fired, because nothing numerical can.
+`fastxchess` covers GGA, restricted and unrestricted, and declines
 LDA, meta-GGA, the grid-response path and the VV10 Hessian.  `fastxcfxc` covers
-LDA, GGA and meta-GGA for a plain-density-matrix response and declines the
-`mo1` path (which is the Hessian's own CPHF solve) and UKS.  `fastfnlc`
-covers a closed-shell NLC response and declines UKS; its `return_in_mo=True`
+LDA, GGA and meta-GGA, restricted and unrestricted.  It declines the
+**restricted** `mo1` path -- nothing on 1.8.1 was found to reach it, since a
+restricted Hessian's CPHF is served by a different function -- and covers the
+**unrestricted** one, which is an open-shell Hessian's CPHF.  `fastfnlc`
+covers a restricted and an unrestricted NLC response; its `return_in_mo=True`
 path (the Hessian's) gets the cache but keeps GPU4PySCF's potential
 contraction.  Two of those have
 a reason worth reading before extending it: GPU4PySCF's LDA branch of the same
@@ -287,6 +317,11 @@ python tests/test_ejk_ip2.py               # 5 cases: the second-derivative
 python tests/test_uxc.py                   # 17 cases: the unrestricted XC
                                            # build against GPU4PySCF's, on
                                            # transition-metal complexes
+python tests/test_unlc.py                  # 8 cases: the unrestricted fused
+                                           # XC+VV10 grid pass and the VV10
+                                           # gradient term at two densities
+python tests/test_ufnlc.py                 # 7 cases: the unrestricted VV10
+                                           # response term, and a UKS TDA run
 python tests/test_uxcgrad.py               # 10 cases: the unrestricted XC
                                            # gradient term, and the whole
                                            # gradient, ours against theirs
@@ -452,6 +487,8 @@ starting point, not an optimum.
 | `FASTNLC_MODE` | `mixed` (default) or `fp64` for the VV10 double sum |
 | `FASTJ_TIME`, `FASTXCGRAD_MODE` | per-call timing split; XC-gradient block strategy |
 | `FASTFNLC_CACHE`, `FASTFNLC_BATCH` | hand the two halves of the VV10 response change back (the ablations) |
+| `FASTFNLC_BUDGET` | `fastnlc`'s error-budgeted grid trim applied to the VV10 *response* term's two `O(n_grid^2)` sums. **Off by default** -- `docs/VV10_OPENSHELL.md` §4d has what it is worth and what it perturbs |
+| `FASTXCNLC_OFF` | hand every `get_veff` back, which is the ablation for the fused XC-and-VV10 grid pass. Worth running per system: the fusion and `fastxc`'s grouped `nr_rks`/`nr_uks` remove the same latency from opposite directions and do not compose (`docs/VV10_OPENSHELL.md` §4b) |
 | `FASTK_NO_NDM` | hand every multi-density exchange build back, which is what `fastk` did before the B4b round (the `docs/ROUND4_B4B.md` ablation) |
 | `FASTJK_OFF`, `FASTJK_NO_HIGH`, `FASTJK_NO_LIFTED` | hand the fused build back whole, or only its written / only its lifted classes |
 | `FASTEJK2_OFF`, `FASTEJK2_NO_SCHEME`, `FASTEJK2_SHIFT` | hand the Hessian's second-derivative ERI stage back whole, or only its launch-scheme half; and the quartets-per-block halving (1 is what was measured) |

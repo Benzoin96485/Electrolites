@@ -355,8 +355,7 @@ Declined, and handed back to GPU4PySCF rather than failed:
 
 | | why |
 |---|---|
-| the `mo1` / `occ_coeff` path | that is the Hessian's CPHF solve.  On 1.8.1 it is a different function (`hessian/rks.py:3486 _nr_rks_fxc_mo_task`), and `docs/HESSIAN_1.8.1.md` measures it at a third of the card's fp64 peak — not launch-bound, so this treatment is not the one it wants |
-| UKS (`nr_uks_fxc`) | open-shell response.  Same shape, twice the bookkeeping |
+| the `mo1` / `occ_coeff` path, **restricted only** | that is a restricted Hessian's CPHF solve, and on 1.8.1 it does not come here at all: `hessian/rks.py` serves it from `nr_rks_fxc_mo`, a different function, which `docs/HESSIAN_1.8.1.md` measures at a third of the card's fp64 peak — not launch-bound, so this treatment is not the one it wants.  Nothing found on 1.8.1 reaches the `mo1` branch of `nr_rks_fxc` itself.  The **unrestricted** `mo1` branch is a different matter and is covered: there is no `nr_uks_fxc_mo`, so an open-shell Hessian's CPHF lands here (`docs/OPENSHELL_FXC.md`) |
 | more than one GPU | as every module here |
 | an `fxc` cache that is not a contiguous `(ncomp, ncomp, ngrids)` array | the kernels index it with a stride of the whole grid; checked, not assumed |
 
@@ -365,8 +364,9 @@ Declined, and handed back to GPU4PySCF rather than failed:
 | file | what |
 |---|---|
 | `electrolites/fastxcfxc.py` | the module: three modes, the dispatch and the fall-through conditions |
-| `electrolites/kernels/fastxcfxc.cu` | `fxc_rho1`, `fxc_wv`, `fxc_scale` |
-| `tests/test_fxc.py` | 15 cases against GPU4PySCF, plus the polarizability tensor and a TDA spectrum end to end |
+| `electrolites/kernels/fastxcfxc.cu` | `fxc_rho1`, `fxc_wv`, `fxc_scale`, and `fxc_wv_u` -- the one kernel the unrestricted case needs of its own |
+| `tests/test_fxc.py` | 18 cases against GPU4PySCF, plus the polarizability tensor and a TDA spectrum end to end |
+| `tests/test_ufxc.py` | the unrestricted twin: 14 cases at both `hermi` values in both modes, a UKS TDA spectrum, and the `mo1` branch through a whole UKS Hessian (`docs/OPENSHELL_FXC.md`) |
 | `benchmarks/fxc_bench.py` | the `nset` sweep of §2 and §6, all three modes, with the correctness check inline |
 | `benchmarks/response_anatomy.py` | where a polarizability and a TDA run spend their time on 1.8.1 |
 | `docs/RESPONSE_1.8.1.md` | that profile, and the J/K half this module does not reach |

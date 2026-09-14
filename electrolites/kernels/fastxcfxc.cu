@@ -131,6 +131,50 @@ template <int NCOMP> __device__ static void wv_impl(
     }
 }
 
+// The unrestricted `fxc` contraction.  On an unrestricted reference `fxc`
+// couples the two spin channels, so the index contracted over is the *pair*
+// (spin, component) and runs over 2*NC values where the restricted one runs
+// over NC:
+//
+//   wv[i][t][y][g] = weight[g] * sum_{s,x} rho1[i][s][x][g] * fxc[t][y][s][x][g]
+//
+// This is the only kernel here that needs an unrestricted twin, and the
+// reason is a layout choice on the Python side: the two spins' density
+// matrices are interleaved a,b,a,b,..., so `rho1` for `nset` unrestricted
+// sets occupies exactly the memory of `rho1` for `2*nset` restricted sets of
+// NC components, and `fxc_rho1_*` and `fxc_scale_*` serve both cases with
+// `nset` doubled and nothing else changed.  Only the contraction has to know
+// that the pair index is a pair.
+//
+// `scale0` and `scale4` apply to the component *within* a spin, so the test
+// is on `y - NC` once `y` has passed the first channel.
+template <int NC> __device__ static void wv_u_impl(
+    double *wv, const double *rho1, const double *fxc, const double *weight,
+    int nset, int ngrids, int fxc_stride, double scale0, double scale4)
+{
+    const int g = blockIdx.x * WX + threadIdx.x;
+    const int i = blockIdx.y * TSY + threadIdx.y;
+    if (g >= ngrids || i >= nset) return;
+    const int N2 = 2 * NC;
+    const size_t sg = ngrids;
+    const double w = weight[g];
+
+    double r[2 * NC];
+#pragma unroll
+    for (int x = 0; x < N2; ++x)
+        r[x] = rho1[((size_t)i * N2 + x) * sg + g];
+#pragma unroll
+    for (int y = 0; y < N2; ++y) {
+        double s = 0.0;
+#pragma unroll
+        for (int x = 0; x < N2; ++x)
+            s += r[x] * fxc[((size_t)y * N2 + x) * fxc_stride + g];
+        const int c = y < NC ? y : y - NC;
+        wv[((size_t)i * N2 + y) * sg + g] =
+            w * s * (c == 0 ? scale0 : (c == 4 ? scale4 : 1.0));
+    }
+}
+
 // aow[i][v][g] = sum_n wv[i][n][g] * ao[n][v][g]
 // `wstride` is how many components a row of `wv` carries (5 for meta-GGA,
 // where only four of them are the gradient part), `w0` the first one used and
@@ -192,6 +236,19 @@ extern "C" __global__ void fxc_rho1_mgga(
     double *rho1, const double *c0, const double *ao,
     int nset, int nao, int ngrids)
 { rho1_mgga_impl(rho1, c0, ao, nset, nao, ngrids); }
+
+WRAP(fxc_wv_u_lda, wv_u_impl, 1,
+     (double *wv, const double *rho1, const double *fxc, const double *weight,
+      int nset, int ngrids, int fxc_stride, double scale0, double scale4),
+     (wv, rho1, fxc, weight, nset, ngrids, fxc_stride, scale0, scale4))
+WRAP(fxc_wv_u_gga, wv_u_impl, 4,
+     (double *wv, const double *rho1, const double *fxc, const double *weight,
+      int nset, int ngrids, int fxc_stride, double scale0, double scale4),
+     (wv, rho1, fxc, weight, nset, ngrids, fxc_stride, scale0, scale4))
+WRAP(fxc_wv_u_mgga, wv_u_impl, 5,
+     (double *wv, const double *rho1, const double *fxc, const double *weight,
+      int nset, int ngrids, int fxc_stride, double scale0, double scale4),
+     (wv, rho1, fxc, weight, nset, ngrids, fxc_stride, scale0, scale4))
 
 WRAP(fxc_scale_lda, scale_impl, 1,
      (double *aow, const double *wv, const double *ao,
