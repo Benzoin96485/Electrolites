@@ -2,7 +2,10 @@
 
 Catalogue entry **B5**, rank 7 in `instructions/06`'s §5 list and, until this
 round, the highest-ranked entry with nothing done to it.  It names
-`hessian/rks.py`'s two XC Hessian terms:
+`hessian/rks.py`'s two XC Hessian terms — and, in a later round,
+`hessian/uks.py`'s own copies of them, which are a separate pair of functions
+rather than the same two with an extra density; `docs/OPENSHELL_HESSIAN.md`
+is that round and everything below is the restricted one:
 
 | function | called from | what it returns |
 |---|---|---|
@@ -416,16 +419,22 @@ the conclusion it comes to about what to do next.
 
 ## 7. Scope, and what is left
 
-Covered: GGA (so B3LYP, PBE0, ωB97X-D3BJ and the rest of the hybrids), spin
-restricted, one GPU.
+Covered: GGA (so B3LYP, PBE0, ωB97X-D3BJ and the rest of the hybrids), one
+GPU, and — since `docs/OPENSHELL_HESSIAN.md` — **spin unrestricted as well as
+restricted**, through the `hessian.uks` pair of the same two names.
 
 Declined, falling through to GPU4PySCF unchanged: **meta-GGA** (§5),
 **LDA** (§5), the **grid-response** path (`hessobj.grid_response`, which
 GPU4PySCF routes to `_get_vxc_deriv1_grid_response` — and which, unlike the
 default path, already carries the masked-and-sparse machinery this module
-adds), the **VV10 Hessian** (`_get_enlc_deriv2`, catalogue A6), unrestricted
-references (`hessian/uks.py` has its own copies of both functions), density
-fitting, and multi-GPU.
+adds), the **VV10 Hessian** (`_get_enlc_deriv2`, catalogue A6), and multi-GPU.
+Density fitting is **not** declined by anything in this module, which is a
+correction to what this section used to say: `df/hessian/rks.py:93` and
+`df/hessian/uks.py:101` reach these two functions by a module-global lookup,
+and `_setup` has no test for a fitted mean field, so a DF Hessian goes through
+the patch.  That is the right behaviour -- the XC Hessian term is unaffected
+by how the Coulomb build is done -- but no suite here runs a DF Hessian, so it
+is stated as what the code does rather than as a tested claim.
 
 `_get_vxc_diag`, the third XC Hessian term, has the same shape but is 0.4–0.1 %
 of the Hessian and is left alone.
@@ -433,8 +442,14 @@ of the Hessian and is left alone.
 What is left in the same neighbourhood, sized by the profiles in
 `docs/HESSIAN_1.8.1.md`:
 
-1. **The same treatment for `hessian/uks.py`.**  Both functions are duplicated
-   there for two spin channels.
+1. ~~**The same treatment for `hessian/uks.py`.**~~  Done:
+   `docs/OPENSHELL_HESSIAN.md`.  **6.7x-8.8x** on the two terms together over
+   four systems and two chemical classes, above the restricted 7.25x rather
+   than equal to it, because upstream pays 2.38x for the second spin channel
+   and the port pays 1.96x.  What that round found next, and what §4c of it
+   ranks first, is `NumInt.nr_uks_fxc`: the grid half of an unrestricted
+   Hessian's CPHF solve, 5.2 % of a patched open-shell Hessian and entirely
+   stock, and the grid half of every open-shell response property besides.
 2. **Meta-GGA**, once the nondeterminism above is understood.  The batching
    generalises directly; the tau terms add four more GEMMs per (atom,
    direction), so the atom screen is worth proportionally more there.

@@ -37,7 +37,12 @@ from gpu4pyscf import dft                                    # noqa: E402
 from pyscf.gto.mole import ATOM_OF                           # noqa: E402
 
 mol = build_mol(a)
-mf = dft.RKS(mol, xc=a.xc)
+# the two fractions are properties of the molecule, the basis and the grid --
+# the AO mask does not know what the density is, let alone how many spin
+# channels it has -- so `--spin` here only picks a mean-field object that will
+# accept an open-shell molecule, and the numbers it reports are the ceiling
+# for the restricted and the unrestricted pair alike.
+mf = (dft.UKS if mol.spin else dft.RKS)(mol, xc=a.xc)
 mf.grids.level = a.grids
 mf.conv_tol = a.conv_tol
 mf.kernel()

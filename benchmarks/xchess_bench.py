@@ -6,7 +6,16 @@ the comparison the way there is for an SCF wall clock.  The ablation column
 keeps mechanism 2 (the masked AO space and the batched atom dimension) and
 drops mechanism 1 (the atom screen), so the two can be separated.
 
+`--spin` picks the unrestricted pair in `hessian/uks.py`, which is a different
+pair of functions rather than the same ones with two densities: the ratio a
+closed-shell row reports says nothing about the open-shell one, because
+upstream's unrestricted copy does twice the per-atom work against the same
+`natm_local` screen.
+
     python benchmarks/xchess_bench.py --xyz benchmarks/molecules/penicillinV.xyz \
+        --basis def2-svp --xc b3lyp --grids 3
+    python benchmarks/xchess_bench.py \
+        --xyz benchmarks/molecules/tmc_ni_dithiolene.xyz --charge -1 --spin 1 \
         --basis def2-svp --xc b3lyp --grids 3
 """
 import json
@@ -24,6 +33,7 @@ electrolites.patch('fastxchess')
 from electrolites import fastxchess                          # noqa: E402
 from gpu4pyscf import dft                                    # noqa: E402
 from gpu4pyscf.hessian import rks as hess_rks                 # noqa: E402
+from gpu4pyscf.hessian import uks as hess_uks                 # noqa: E402
 
 _sync = cp.cuda.Stream.null.synchronize
 
@@ -42,26 +52,33 @@ def timeit(fn, reps):
 
 
 mol = build_mol(a)
-mf = dft.RKS(mol, xc=a.xc)
+mf = (dft.UKS if mol.spin else dft.RKS)(mol, xc=a.xc)
 mf.grids.level = a.grids
 mf.conv_tol = a.conv_tol
 mf.kernel()
 h = mf.Hessian()
 args = (h, mf.mo_coeff, mf.mo_occ, 4000)
-tag = (f'{a.xyz.rsplit("/",1)[-1]}/{a.basis}/{a.xc}/L{a.grids}')
+hess = hess_uks if mol.spin else hess_rks
+tag = (f'{a.xyz.rsplit("/",1)[-1]}/{a.basis}/{a.xc}/L{a.grids}/'
+       f'{"UKS" if mol.spin else "RKS"}')
 gpu = cp.cuda.runtime.getDeviceProperties(0)['name'].decode()
-print(f'# {tag}  natm={mol.natm} nao={mol.nao}  {gpu}', flush=True)
+print(f'# {tag}  natm={mol.natm} nao={mol.nao} spin={mol.spin}  {gpu}',
+      flush=True)
 
 rows = []
 for name, fast, orig in (
-        ('_get_vxc_deriv1', hess_rks._get_vxc_deriv1,
-         hess_rks._get_vxc_deriv1_orig),
-        ('_get_vxc_deriv2', hess_rks._get_vxc_deriv2,
-         hess_rks._get_vxc_deriv2_orig)):
+        ('_get_vxc_deriv1', hess._get_vxc_deriv1,
+         hess._get_vxc_deriv1_orig),
+        ('_get_vxc_deriv2', hess._get_vxc_deriv2,
+         hess._get_vxc_deriv2_orig)):
     t_o, ref = timeit(lambda: orig(*args), a.reps)
     t_f, out = timeit(lambda: fast(*args), a.reps)
-    err = float(cp.abs(cp.asarray(out) - cp.asarray(ref)).max())
-    scale = float(cp.abs(cp.asarray(ref)).max())
+    # the unrestricted functions return a (spin-up, spin-down) tuple whose
+    # two members can have different shapes, so they are compared separately
+    pairs = list(zip(out, ref)) if mol.spin else [(out, ref)]
+    err = max(float(cp.abs(cp.asarray(o) - cp.asarray(r)).max())
+              for o, r in pairs)
+    scale = max(float(cp.abs(cp.asarray(r)).max()) for _, r in pairs)
     fastxchess._ATOMSCREEN = False
     t_n, _ = timeit(lambda: fast(*args), a.reps)
     fastxchess._ATOMSCREEN = True
@@ -86,7 +103,7 @@ print('-' * 82)
 print(f'{"both":18s} {tot_o:10.3f} {tot_f:11.3f} {tot_o/tot_f:7.2f}x '
       f'{tot_n:10.3f} {tot_o/tot_n:7.2f}x')
 print('\n' + json.dumps({'tag': tag, 'gpu': gpu, 'natm': mol.natm,
-                         'nao': int(mol.nao),
+                         'nao': int(mol.nao), 'spin': int(mol.spin),
                          'rows': [{'term': r[0], 'orig': r[1], 'fast': r[2],
                                    'no_atom_screen': r[3], 'err': r[4],
                                    'scale': r[5]} for r in rows]}))

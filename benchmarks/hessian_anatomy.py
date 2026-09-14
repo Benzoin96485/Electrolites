@@ -15,6 +15,13 @@ parent and overlap it, so a column does not sum to its parent.
 
 `--cphf-only` skips `partial_hess_elec` and `make_h1` and times the CPHF solve
 alone, which is what to use when iterating on a CPHF target.
+
+`--spin` profiles an unrestricted Hessian instead.  That is a different set of
+functions, not the same ones with two densities -- `hessian/uks.py` has its own
+`partial_hess_elec`, `make_h1`, `_get_vxc_deriv1/2` and `get_veff_resp_mo`, and
+the CPHF's grid half is `NumInt.nr_uks_fxc` where the restricted one is the
+module-level `nr_rks_fxc_mo` -- so the two column sets are wired separately
+below rather than parameterised.
 """
 import json
 import time
@@ -34,6 +41,8 @@ apply_patch(a.patch)
 import numpy as np                                          # noqa: E402
 from gpu4pyscf import dft                                   # noqa: E402
 from gpu4pyscf.hessian import rhf as hrhf, rks as hrks       # noqa: E402
+from gpu4pyscf.hessian import uks as huks                    # noqa: E402
+from gpu4pyscf.dft import numint as dni                      # noqa: E402
 from gpu4pyscf.grad import rhf as grhf                       # noqa: E402
 from gpu4pyscf.scf import jk as sjk, j_engine as sje         # noqa: E402
 from gpu4pyscf.pbc.gto import int1e as pint1e                # noqa: E402
@@ -68,8 +77,10 @@ def _wrap(obj, name, label, ndm_from=None):
 # (object, attribute, label, indent) -- class attributes where the method is
 # bound at class creation (`make_h1 = make_h1`), module attributes where the
 # call site looks the name up as a global at call time.
-Hess = hrks.Hessian
-PLAN = [
+mol = build_mol(a)
+unrestricted = bool(mol.spin)
+Hess = huks.Hessian if unrestricted else hrks.Hessian
+PLAN_R = [
     (Hess, 'partial_hess_elec', 'partial_hess_elec', 0),
     (hrhf, '_partial_ejk_ip2', '..ejk_ip2', 1),
     (hrhf, '_hcore_energy', '..hcore_energy', 1),
@@ -91,17 +102,46 @@ PLAN = [
     (sjk._VHFOpt, 'get_k', '......get_k', 3),
     (pint1e, 'int1e_ipovlp', 'int1e_ipovlp', 0),
 ]
+
+# The unrestricted twin of the same list.  `..ejk_ip2`, `..hcore_energy`,
+# `..grad_hcore` and `..jk_ip1` are the same spin-free functions
+# (`hessian/uhf.py` calls `rhf_hess._partial_ejk_ip2` and `_hcore_energy`
+# directly), and `_get_enlc_deriv2` / `_get_vnlc_deriv1` are imported into
+# `hessian/uks.py` from `hessian/rks.py` -- so those rows are shared and only
+# the XC and response rows move.
+PLAN_U = [
+    (Hess, 'partial_hess_elec', 'partial_hess_elec', 0),
+    (hrhf, '_partial_ejk_ip2', '..ejk_ip2', 1),
+    (hrhf, '_hcore_energy', '..hcore_energy', 1),
+    (huks, '_get_exc_deriv2', '..exc_deriv2', 1),
+    (huks, '_get_vxc_diag', '....vxc_diag', 2),
+    (huks, '_get_vxc_deriv2', '....vxc_deriv2', 2),
+    (hrks, '_get_enlc_deriv2', '..enlc_deriv2', 1),
+    (Hess, 'make_h1', 'make_h1', 0),
+    (huks, '_get_vxc_deriv1', '..vxc_deriv1', 1),
+    (hrks, '_get_vnlc_deriv1', '..vnlc_deriv1', 1),
+    (grhf, 'get_grad_hcore', '..grad_hcore', 1),
+    (hrhf, '_get_jk_ip1', '..jk_ip1', 1),
+    (Hess, 'solve_mo1', 'solve_mo1', 0),
+    (Hess, 'get_veff_resp_mo', '..veff_resp_mo', 1),
+    (dni.NumInt, 'nr_uks_fxc', '....nr_uks_fxc', 2),
+    (huks, 'nr_uks_fnlc_mo', '....nr_uks_fnlc_mo', 2),
+    (Hess, 'get_jk_mo', '....jk_mo', 2),
+    (sje._VHFOpt, 'get_j', '......get_j', 3),
+    (sjk._VHFOpt, 'get_k', '......get_k', 3),
+    (pint1e, 'int1e_ipovlp', 'int1e_ipovlp', 0),
+]
+PLAN = PLAN_U if unrestricted else PLAN_R
 for obj, name, label, _ in PLAN:
     # get_j/get_k are wrapped on the class, so args[0] is the _VHFOpt.
     _wrap(obj, name, label, ndm_from=1 if name in ('get_j', 'get_k') else None)
 
 
-mol = build_mol(a)
 tag = (f'{a.xyz.rsplit("/", 1)[-1]}/{a.basis}/{a.xc}/L{a.grids}/'
-       f'{a.patch or "stock"}')
-print(f'# {tag}  natm={mol.natm} nao={mol.nao}', flush=True)
+       f'{"UKS" if unrestricted else "RKS"}/{a.patch or "stock"}')
+print(f'# {tag}  natm={mol.natm} nao={mol.nao} spin={mol.spin}', flush=True)
 
-mf = dft.RKS(mol, xc=a.xc)
+mf = (dft.UKS if unrestricted else dft.RKS)(mol, xc=a.xc)
 mf.grids.level = a.grids
 mf.conv_tol = a.conv_tol
 mf.conv_tol_cpscf = a.conv_tol_cpscf
@@ -159,6 +199,7 @@ print('-' * 62)
 print(f'{"accounted (indent 0)":26s} {acc:9.3f} {100*acc/total:6.1f}%')
 
 out = {'tag': tag, 'natm': mol.natm, 'nao': int(mol.nao), 'total': total,
+       'spin': int(mol.spin),
        'scf': t_scf, 'cphf_only': a.cphf_only,
        'times': dict(T), 'calls': dict(N),
        'n_dm': {k: sorted(v) for k, v in NDM.items()}}

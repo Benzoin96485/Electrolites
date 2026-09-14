@@ -1,4 +1,4 @@
-"""The XC part of an analytic Hessian (``hessian.rks._get_vxc_deriv1/2``).
+"""The XC part of an analytic Hessian (``hessian.{rks,uks}._get_vxc_deriv1/2``).
 
 Catalogue entry **B5**: both functions run a Python ``for ia in range(natm)``
 loop *inside* ``ni.block_loop``, and both expand the block's masked AO values
@@ -70,9 +70,22 @@ Everything here is the same arithmetic as GPU4PySCF's, reassociated: the sums
 over grid points are reordered, so results agree to fp64 rounding rather than
 bit for bit.
 
-**Scope.**  GGA, so hybrids and B3LYP.  LDA, meta-GGA, the grid-response path
-(``hessobj.grid_response``), the VV10 Hessian (``_get_enlc_deriv2``),
-unrestricted references and multi-GPU all fall through to GPU4PySCF
+**Both spin cases.**  ``hessian/uks.py`` carries its own copies of these two
+functions -- it does not import the restricted ones -- so patching
+``hessian.rks`` alone left every open-shell Hessian on GPU4PySCF's code, which
+is ``docs/OPENSHELL_TMC.md`` 4 item 2 and the largest single entry on that
+list.  The unrestricted pair is the same four mechanisms with a spin index,
+and they are *shared* rather than run twice: one AO evaluation, one mask, one
+atom list and one set of AO-resolved ``d rho / d R`` products serve both
+channels.  The one line that is genuinely not the restricted expression twice
+is ``_wv2_u`` -- ``fxc`` couples the channels, so the perturbed potential of
+spin ``b`` takes both spins' perturbed densities -- and it is also the reason
+the two spins have to share a block rather than the module being called once
+per spin.
+
+**Scope.**  GGA, so hybrids and B3LYP; restricted and unrestricted.  LDA,
+meta-GGA, the grid-response path (``hessobj.grid_response``), the VV10 Hessian
+(``_get_enlc_deriv2``) and multi-GPU all fall through to GPU4PySCF
 unchanged.  LDA is a separate branch upstream with a different factor
 convention -- its ``d rho / d R`` carries no factor 2 where the GGA branch's
 ``_make_dR_rho1`` does, and the GGA branch's compensating ``wv2[:,0] *= .5``
@@ -99,6 +112,7 @@ from pyscf.gto.mole import ATOM_OF
 from gpu4pyscf.dft import numint
 from gpu4pyscf.grad import rks as rks_grad
 from gpu4pyscf.hessian import rks as hess_rks
+from gpu4pyscf.hessian import uks as hess_uks
 from gpu4pyscf.lib.cupy_helper import (
     contract, take_last2d, add_sparse, get_avail_mem)
 from gpu4pyscf.lib import logger
@@ -237,11 +251,14 @@ def _rho_gga(ao, c0):
     return rho
 
 
-def _dR_rho1(ao, c, P, bufs):
+def _dR_rho1(ao, c, P, bufs, out=None):
     """``d rho / d R_A`` for every present atom at once, GGA.
 
     ``hessian.rks._make_dR_rho1`` for all atoms: the AO-resolved products are
     formed for the whole block, and the atom dimension is one contraction.
+    ``out`` is where the answer goes; the unrestricted path passes one row of
+    a two-spin array, because ``fxc`` couples the channels and both spins'
+    ``d rho / d R`` have to be resident at once.
     """
     hg, _ = _index_arrays()
     nsub, ng = ao.shape[1:]
@@ -258,7 +275,8 @@ def _dR_rho1(ao, c, P, bufs):
         cupy.multiply(hess, c[0], out=prod[s, 1:4])
         cupy.multiply(ao[s + 1], c[1:4], out=tmp)
         prod[s, 1:4] += tmp
-    out = bufs('dR', (len(P), 3, 4, ng))
+    if out is None:
+        out = bufs('dR', (len(P), 3, 4, ng))
     contract('ap,sypg->asyg', P, prod, out=out)
     out *= 2            # for |mu> D <d_R nu|, as _make_dR_rho1 does
     return out
@@ -491,17 +509,291 @@ def _deriv2(hessobj, mo_coeff, mo_occ, max_memory, lay, grids, ni):
     return opt.unsort_orbitals(vmat_dm, axis=[3])
 
 
+# ------------------------------------------------ unrestricted --------------
+
+def _rho_gga_into(ao, c0, out):
+    """``_rho_gga`` into a caller-owned row of a ``(2, 4, ngrids)`` array."""
+    out[:] = _rho_gga(ao, c0)
+    return out
+
+
+def _c_and_rho_u(ao, mask, dm_s, bufs):
+    """``D_s . ao`` for both spins, and the two spin densities.
+
+    The block's masked density matrix is formed one spin at a time into the
+    same scratch, because only the product ``c`` has to survive.
+    """
+    nsub, ng = ao.shape[1:]
+    c = bufs('c', (2, 4, nsub, ng))
+    rho = cupy.empty((2, 4, ng))
+    for s in range(2):
+        dm_mask = take_last2d(dm_s[s], mask, out=bufs('dm', (nsub, nsub)))
+        for m in range(4):
+            cupy.dot(dm_mask, ao[m], out=c[s, m])
+        _rho_gga_into(ao, c[s, 0], rho[s])
+    return c, rho
+
+
+def _wv2_u(dR, wf, out):
+    """``fxc`` contracted with ``d rho / d R``, both spins at once.
+
+    This is the one place where an unrestricted XC Hessian is not the
+    restricted one run twice: ``fxc`` couples the channels, so the perturbed
+    potential of spin ``b`` takes *both* spins' perturbed densities,
+
+        wv2[b] = sum_s fxc[s, :, b] . dR_rho1[s]
+
+    -- which is why the two spins share a grid block here rather than the
+    module being called once per spin.  Everything downstream of this line is
+    the restricted arithmetic with a spin index, and everything upstream of it
+    (the AO evaluation, the mask, the atom list, ``d rho / d R``'s AO-resolved
+    products) is shared by both spins anyway.
+    """
+    contract('xbyg,asxg->basyg', wf[0], dR[0], out=out)
+    contract('xbyg,asxg->basyg', wf[1], dR[1], beta=1., out=out)
+    out[:, :, :, 0] *= .5
+    return out
+
+
+def _dR_and_wv2_u(ao, c, P, wf, bufs, na):
+    """``d rho / d R`` for both spins, and ``fxc`` contracted with it."""
+    ng = ao.shape[2]
+    dR = bufs('dR', (2, na, 3, 4, ng))
+    for s in range(2):
+        _dR_rho1(ao, c[s], P, bufs, out=dR[s])
+    return _wv2_u(dR, wf, bufs('wv2', (2, na, 3, 4, ng)))
+
+
+def _deriv1_block_u(ao, mask, atoms, P, weight, dm_s, mocc_s, ni, xc,
+                    v_ip, vmat2d, nao_s, bufs, chunk):
+    nsub, ng = ao.shape[1:]
+    c, rho = _c_and_rho_u(ao, mask, dm_s, bufs)
+    vxc, fxc = ni.eval_xc_eff(xc, rho, 2, xctype='GGA', spin=1)[1:3]
+    rho = None
+    wv = cupy.multiply(weight, vxc, out=vxc)
+    wv[:, 0] *= .5
+    wf = cupy.multiply(weight, fxc, out=fxc)
+    for s in range(2):
+        add_sparse(v_ip[s], rks_grad._gga_grad_sum_(
+            ao, wv[s], buf=bufs('gga', (3, nsub, ng)),
+            out=bufs('vip', (3, nsub, nsub))), mask)
+    vxc = fxc = wv = None
+
+    na_all = len(atoms)
+    wv2 = _dR_and_wv2_u(ao, c, P, wf, bufs, na_all)
+    wf = None
+    at3 = cupy.asarray((atoms[:, None] * 3 + np.arange(3)).ravel(),
+                       dtype=cupy.int64)
+    for s in range(2):
+        nocc = mocc_s[s].shape[1]
+        mo = bufs('mo', (4, nocc, ng))
+        contract('xpg,pq->xqg', ao[:4], mocc_s[s][mask], out=mo)
+        for a0 in range(0, na_all, chunk):
+            a1 = min(a0 + chunk, na_all)
+            nb = (a1 - a0) * 3
+            w = wv2[s, a0:a1].reshape(nb, 4, ng)
+            aow = bufs('aow', (nb, nsub, ng))
+            contract('ypg,ayg->apg', ao[:4], w, out=aow)
+            t = bufs('t1', (nb, nsub, nocc))
+            cupy.dot(aow.reshape(-1, ng), mo[0].T, out=t.reshape(-1, nocc))
+            mow = bufs('mow', (nb, nocc, ng))
+            contract('yqg,ayg->aqg', mo, w, out=mow)
+            t2 = bufs('t2', (nb, nocc, nsub))
+            cupy.dot(mow.reshape(-1, ng), ao[0].T, out=t2.reshape(-1, nsub))
+            t += t2.transpose(0, 2, 1)
+            rows = (at3[a0 * 3:a1 * 3, None] * nao_s
+                    + mask[None, :].astype(cupy.int64)).ravel()
+            cupyx.scatter_add(vmat2d[s], rows, t.reshape(-1, nocc))
+            rows = None
+
+
+def _deriv1_u(hessobj, mo_coeff, mo_occ, max_memory, lay, grids, ni):
+    mol = hessobj.mol
+    mf = hessobj.base
+    log = logger.new_logger(mol, mol.verbose)
+    t0 = log.init_timer()
+    mo_coeff = cupy.asarray(mo_coeff)
+    mo_occ = cupy.asarray(mo_occ)
+    nao, nmo = mo_coeff[0].shape
+    natm = mol.natm
+    nao_s = lay.nao_s
+    opt = lay.opt
+    dm0 = mf.make_rdm1(mo_coeff, mo_occ)
+    dm_s = [opt.sort_orbitals(cupy.asarray(dm0[s]), axis=[0, 1])
+            for s in range(2)]
+    mocc = [mo_coeff[s][:, mo_occ[s] > 0] for s in range(2)]
+    nocc = [int(m.shape[1]) for m in mocc]
+    nocc_max = max(nocc)
+    mocc_s = [opt.sort_orbitals(m, axis=[0]) for m in mocc]
+    mo_coeff_s = [opt.sort_orbitals(mo_coeff[s], axis=[0]) for s in range(2)]
+
+    v_ip = cupy.zeros((2, 3, nao_s, nao_s))
+    vmat = [cupy.zeros((natm, 3, nao_s, nocc[s])) for s in range(2)]
+    vmat2d = [vmat[s].reshape(natm * 3 * nao_s, nocc[s]) for s in range(2)]
+    blocks = lay.block_atoms(grids)
+    ns_max, na_max = lay.sizes(blocks)
+    blk = numint.MIN_BLK_SIZE
+    # `aow` and `mow` are the only scratch whose size grows with the atom
+    # block; `dR` and `wv2` carry a spin index the restricted path does not.
+    per_atom = 3 * (ns_max + nocc_max) * blk * 8
+    chunk = max(1, min(na_max,
+                       int(MEM_FRACTION * get_avail_mem() / per_atom)))
+    bufs = _Bufs(
+        dm=ns_max * ns_max, c=2 * 4 * ns_max * blk, gga=3 * ns_max * blk,
+        vip=3 * ns_max * ns_max, mo=4 * nocc_max * blk,
+        prod=12 * ns_max * blk, gather=3 * ns_max * blk,
+        tmp=3 * ns_max * blk, dR=2 * na_max * 12 * blk,
+        wv2=2 * na_max * 12 * blk,
+        aow=chunk * 3 * ns_max * blk, mow=chunk * 3 * nocc_max * blk,
+        t1=chunk * 3 * ns_max * nocc_max, t2=chunk * 3 * ns_max * nocc_max)
+    log.debug1(f'fastxchess deriv1 (uks): nao_sub_max {ns_max}, '
+               f'natm_local_max {na_max}, {chunk} atoms a pass, '
+               f'{bufs.nbytes/GB:.2f} GB scratch')
+    it = iter(blocks)
+    for ao, mask, weight, _ in ni.block_loop(lay._sorted_mol, grids, nao, 2,
+                                             None):
+        atoms, rows = next(it)
+        assert len(rows) == len(mask)
+        P = lay.atom_matrix(atoms, rows, len(mask))
+        _deriv1_block_u(ao, mask, atoms, P, weight, dm_s, mocc_s, ni, mf.xc,
+                        v_ip, vmat2d, nao_s, bufs, chunk)
+        P = None
+    bufs = None
+    t0 = log.timer_debug1('vxc_deriv1 uks (fastxchess)', *t0)
+
+    out = []
+    tmp_buf = cupy.empty((3, nao_s, nao_s))
+    for s in range(2):
+        v_mo = cupy.empty((natm, 3, nmo, nocc[s]))
+        for ia in range(natm):
+            p = lay.ao_of_atom[ia]
+            tmp_buf[:] = 0.
+            tmp_buf[:, p] = v_ip[s][:, p]
+            tmp_buf[:, :, p] += v_ip[s][:, p].transpose(0, 2, 1)
+            tmp = contract('xij,jq->xiq', tmp_buf, mocc_s[s])
+            tmp += vmat[s][ia]
+            contract('xiq,ip->xpq', tmp, mo_coeff_s[s], alpha=-1.,
+                     out=v_mo[ia])
+            tmp = None
+        out.append(v_mo)
+    return out[0], out[1]
+
+
+def _deriv2_block_u(ao, mask, atoms, P, weight, dm_s, ni, xc, ipip,
+                    vmat_dm1d, nao_s, bufs):
+    nsub, ng = ao.shape[1:]
+    c, rho = _c_and_rho_u(ao, mask, dm_s, bufs)
+    vxc, fxc = ni.eval_xc_eff(xc, rho, 2, xctype='GGA', spin=1)[1:3]
+    rho = None
+    wv1 = cupy.multiply(weight, vxc, out=vxc)
+    wv1[:, 0] *= .5
+    wf = cupy.multiply(weight, fxc, out=fxc)
+    for s in range(2):
+        aow = rks_grad._make_dR_dao_w(ao, wv1[s],
+                                      out=bufs('gga', (3, nsub, ng)))
+        ip = bufs('vip', (3, 3, nsub, nsub))
+        for d1 in range(3):
+            for d2 in range(3):
+                contract('ik,lk->il', aow[d2], ao[1 + d1], out=ip[d1, d2])
+        add_sparse(ipip[s], ip, mask)
+    vxc = fxc = wv1 = aow = ip = None
+
+    na = len(atoms)
+    wv2 = _dR_and_wv2_u(ao, c, P, wf, bufs, na)
+    wf = None
+    _, selg = _index_arrays()
+    rows = cupy.asarray(
+        ((atoms[:, None, None] * 3 + np.arange(3)[None, :, None]) * 3
+         + np.arange(3)[None, None, :]).ravel(), dtype=cupy.int64)
+    idx = (rows[:, None] * nao_s + mask[None, :].astype(cupy.int64)).ravel()
+    for s in range(2):
+        t = bufs('t1', (3, na, 3, nsub))      # [x, atom, direction, AO]
+        W = bufs('W', (4, nsub, ng))
+        for x in range(3):
+            cupy.take(ao, selg[x], axis=0, out=W)
+            W *= c[s, 0]
+            contract('yjg,asyg->asj', W, wv2[s], out=t[x])
+        U = W
+        for y in range(3):
+            cupy.multiply(ao[y + 1], c[s, :4], out=U)
+            contract('zjg,aszg->asj', U, wv2[s], beta=1., out=t[y])
+        W = U = None
+        tT = bufs('t2', (na, 3, 3, nsub))
+        tT[:] = t.transpose(1, 2, 0, 3)
+        cupyx.scatter_add(vmat_dm1d[s], idx, tT.reshape(-1))
+        t = tT = None
+    rows = idx = None
+
+
+def _deriv2_u(hessobj, mo_coeff, mo_occ, max_memory, lay, grids, ni):
+    mol = hessobj.mol
+    mf = hessobj.base
+    log = logger.new_logger(mol, mol.verbose)
+    t0 = log.init_timer()
+    nao = mol.nao
+    nao_s = lay.nao_s
+    natm = mol.natm
+    opt = lay.opt
+    mo_coeff = cupy.asarray(mo_coeff)
+    mo_occ = cupy.asarray(mo_occ)
+    dm0 = mf.make_rdm1(mo_coeff, mo_occ)
+    dm_s = [opt.sort_orbitals(cupy.asarray(dm0[s]), axis=[0, 1])
+            for s in range(2)]
+
+    vmat_dm = cupy.zeros((2, natm, 3, 3, nao_s))
+    vmat_dm1d = [vmat_dm[s].reshape(-1) for s in range(2)]
+    ipip = cupy.zeros((2, 3, 3, nao_s, nao_s))
+    blocks = lay.block_atoms(grids)
+    ns_max, na_max = lay.sizes(blocks)
+    blk = numint.MIN_BLK_SIZE
+    bufs = _Bufs(
+        dm=ns_max * ns_max, c=2 * 4 * ns_max * blk, gga=3 * ns_max * blk,
+        vip=9 * ns_max * ns_max, prod=12 * ns_max * blk,
+        gather=3 * ns_max * blk, tmp=3 * ns_max * blk,
+        dR=2 * na_max * 12 * blk, wv2=2 * na_max * 12 * blk,
+        W=4 * ns_max * blk, t1=9 * na_max * ns_max, t2=9 * na_max * ns_max)
+    log.debug1(f'fastxchess deriv2 (uks): nao_sub_max {ns_max}, '
+               f'natm_local_max {na_max}, {bufs.nbytes/GB:.2f} GB scratch')
+    it = iter(blocks)
+    for ao, mask, weight, _ in ni.block_loop(lay._sorted_mol, grids, nao, 2,
+                                             None):
+        atoms, rows = next(it)
+        assert len(rows) == len(mask)
+        P = lay.atom_matrix(atoms, rows, len(mask))
+        _deriv2_block_u(ao, mask, atoms, P, weight, dm_s, ni, mf.xc, ipip,
+                        vmat_dm1d, nao_s, bufs)
+        P = None
+    bufs = None
+    t0 = log.timer_debug1('vxc_deriv2 uks (fastxchess)', *t0)
+
+    for s in range(2):
+        for ia in range(natm):
+            p = lay.ao_of_atom[ia]
+            contract('xypq,pq->xyp', ipip[s][:, :, :, p], dm_s[s][:, p],
+                     beta=1, out=vmat_dm[s][ia])
+            contract('yxqp,pq->xyp', ipip[s][:, :, p], dm_s[s][:, p],
+                     beta=1, out=vmat_dm[s][ia])
+    out = opt.unsort_orbitals(vmat_dm, axis=[4])
+    return out[0], out[1]
+
+
 # -------------------------------------------------------------- the patch ----
 
-def _setup(hessobj, mo_occ):
-    """The common preamble, or None when this module declines the call."""
+def _setup(hessobj, mo_occ, unrestricted=False):
+    """The common preamble, or None when this module declines the call.
+
+    ``mo_occ`` is one vector on a restricted reference and two on an
+    unrestricted one, and ``hessian/rks.py`` and ``hessian/uks.py`` have
+    separate copies of both functions -- so the check is that the caller and
+    the occupancy agree, not merely that the occupancy has some shape.
+    """
     mol = hessobj.mol
     mf = hessobj.base
     if _OFF or num_devices > 1:
         return None
     if mf._numint._xc_type(mf.xc) != 'GGA':
         return None
-    if cupy.asarray(mo_occ).ndim != 1:      # unrestricted: uks.py's own copy
+    if cupy.asarray(mo_occ).ndim != (2 if unrestricted else 1):
         return None
     grids = hessobj.grids if hessobj.grids is not None else mf.grids
     if grids.coords is None:
@@ -534,10 +826,38 @@ def get_vxc_deriv2(hessobj, mo_coeff, mo_occ, max_memory):
     return _deriv2(hessobj, mo_coeff, mo_occ, max_memory, *ctx)
 
 
+def get_vxc_deriv1_u(hessobj, mo_coeff, mo_occ, max_memory):
+    ctx = (None if getattr(hessobj, 'grid_response', False)
+           else _setup(hessobj, mo_occ, unrestricted=True))
+    if ctx is None:
+        return hess_uks._get_vxc_deriv1_orig(hessobj, mo_coeff, mo_occ,
+                                             max_memory)
+    return _deriv1_u(hessobj, mo_coeff, mo_occ, max_memory, *ctx)
+
+
+def get_vxc_deriv2_u(hessobj, mo_coeff, mo_occ, max_memory):
+    ctx = _setup(hessobj, mo_occ, unrestricted=True)
+    if ctx is None:
+        return hess_uks._get_vxc_deriv2_orig(hessobj, mo_coeff, mo_occ,
+                                             max_memory)
+    return _deriv2_u(hessobj, mo_coeff, mo_occ, max_memory, *ctx)
+
+
 _PATCHED = False
 if not _PATCHED:
     hess_rks._get_vxc_deriv1_orig = hess_rks._get_vxc_deriv1
     hess_rks._get_vxc_deriv2_orig = hess_rks._get_vxc_deriv2
     hess_rks._get_vxc_deriv1 = get_vxc_deriv1
     hess_rks._get_vxc_deriv2 = get_vxc_deriv2
+    # `hessian/uks.py` defines its own copies of both -- it does not import
+    # the restricted ones -- so patching `hessian.rks` leaves an open-shell
+    # Hessian entirely on GPU4PySCF's code with no symptom but the wall
+    # clock.  `make_h1` and `_get_exc_deriv2` in that file look both names up
+    # as module globals at call time, and `df/hessian/uks.py` reaches them as
+    # `uks_hess._get_vxc_deriv1`, so these two assignments cover every caller
+    # on 1.8.1; `tests/test_patch_aliases.py` is what keeps that true.
+    hess_uks._get_vxc_deriv1_orig = hess_uks._get_vxc_deriv1
+    hess_uks._get_vxc_deriv2_orig = hess_uks._get_vxc_deriv2
+    hess_uks._get_vxc_deriv1 = get_vxc_deriv1_u
+    hess_uks._get_vxc_deriv2 = get_vxc_deriv2_u
     _PATCHED = True
