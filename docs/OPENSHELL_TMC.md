@@ -27,6 +27,12 @@ dithiolene and a 23-atom Pt complex (**with an ECP**, which no earlier case
 here has) for a realistic ligand field, and a 60-atom Cu macrocycle and a
 113-atom Co complex so that any ratio can be read at more than one size.
 
+**This document is a round's own record and is not kept up to date as a
+status page.**  Five of the eight gaps its §4 ranks have since been taken;
+§4's status block says which, where the work is, and what each of those
+rounds found this list had wrong about it.  Everything else here is left as
+it was measured.
+
 ## 1. What was actually on the code path, and what was not
 
 The modules fall through to GPU4PySCF for whatever they do not cover, which is
@@ -212,6 +218,36 @@ those are the columns the tests check.
 Everything below falls through and is correct; the cost is that the run is as
 fast as an unpatched one on that term.
 
+> ### Status: five of these eight have since been taken
+>
+> The list, its wording and its numbers are left exactly as this round wrote
+> them, so that what it measured stays what it says it measured.  What is
+> added is a marker on each entry that has been done, saying where the work
+> is, what it turned out to be worth, and what that round found **this list**
+> had wrong about it.  The corrections live in those documents and are not
+> edited into the entries below.
+>
+> | # | entry | taken in | what it came out at |
+> |---|---|---|---|
+> | **1** | the unrestricted response path | `docs/OPENSHELL_FXC.md` | 2.2x-11.9x on the term; 5.5x in situ in an open-shell TDA; 1.9x in an unrestricted Hessian's CPHF |
+> | **2** | the unrestricted Hessian's XC terms | `docs/OPENSHELL_HESSIAN.md` | 6.7x-8.8x on the two terms together; 8.8 % of a stock UKS Hessian |
+> | **3** | `uks.get_veff` has no `fastxcnlc` | `docs/VV10_OPENSHELL.md` | two of four grid passes removed, 1.6e-7-2.5e-7 s per grid point -- reported as a *comparison*, because it competes with `fastxc`'s grouping rather than adding to it |
+> | **4** | the unrestricted VV10 gradient | `docs/VV10_OPENSHELL.md` | 1.17x-1.70x on the term, **2.7x-3.6x** on the grid passes it actually replaces |
+> | **5** | `hessian.uks.nr_uks_fnlc_mo` | `docs/VV10_OPENSHELL.md` | 1.47x-1.63x on a path that was 1.00x by construction |
+> | 6, 7 | `MAX_PRIM_PAIR`, and g shells in `fastj`/`fastejk` | — | open; both are basis-set limits rather than spin ones |
+> | 8 | first-run JIT | — | open, and unchanged: the answer is a warm cache, not a code change |
+>
+> **Three of the five needed a patch point this list either did not name or
+> named wrongly**: item 3's module-level `dft.uks.get_veff` alongside the
+> class attribute, item 4's `grad.uks.get_nlc_exc`, and item 5's binding,
+> which is `hessian.uks.nr_rks_fnlc_mo` and not the name given here.  One
+> pattern is behind all three -- `dft/uks.py`, `grad/uks.py` and
+> `hessian/uks.py` each bind their own copies of what looks like a single
+> function -- and a patch that misses the copy is **silent**: the answer stays
+> right and only the wall clock says anything.  `tests/test_patch_aliases.py`
+> is the check that keeps that visible, and §1 of this document is the round
+> that learned it.
+
 1. **The unrestricted response path.**  `fastxcfxc` replaces `nr_rks_fxc`;
    `nr_uks_fxc` has no replacement, so the grid half of *every* open-shell
    polarizability, TDA/TDDFT, NMR and C6 run is stock.  `fastjk` is already on
@@ -219,6 +255,20 @@ fast as an unpatched one on that term.
    care about spin), so this is the one remaining half.  The arithmetic is
    `nr_rks_fxc`'s per spin with `spin=1` in the libxc call, i.e. the same
    relation `nr_uks` bears to `nr_rks`.
+
+   > **Taken** -- `docs/OPENSHELL_FXC.md`.  **2.2x-11.9x** on the term over a
+   > sweep of `nset`, at two sizes and in two chemical classes; **5.5x** in
+   > situ inside a five-root open-shell TDA, which is 1.09x-1.16x on the whole
+   > run because the XC half is 10.5 % of an open-shell TDA where it is 25 %
+   > of a closed-shell one.  Its §1 records two things this entry has wrong.
+   > **The arithmetic is not "`nr_rks_fxc`'s per spin":** `fxc` is a 2x2 block
+   > in the spin index, so running the restricted function once per channel
+   > would drop the off-diagonal blocks and give a wrong answer, not a slower
+   > one.  And **the list of consumers is missing the analytic Hessian**:
+   > there is no `nr_uks_fxc_mo`, so an unrestricted Hessian's CPHF calls this
+   > same function, which makes this entry and the first item of
+   > `docs/OPENSHELL_HESSIAN.md` §5 the same target named twice without
+   > either document noticing.
 2. **The unrestricted analytic Hessian's XC terms.**
    `hessian.uks._get_vxc_deriv1` and `_get_vxc_deriv2` are `hessian.rks`'s
    twins with a spin index, and `fastxchess` patches only the `hessian.rks`
@@ -226,20 +276,56 @@ fast as an unpatched one on that term.
    those terms at 42 atoms, so this is the largest single number in the list
    -- but a Hessian of an open-shell complex is a rarer thing to want than a
    gradient, which is why it is not first.
+
+   > **Taken** -- `docs/OPENSHELL_HESSIAN.md`.  **6.7x-8.8x** on the two terms
+   > together across four systems and two chemical classes, *above* the
+   > restricted 7.25x rather than equal to it, because GPU4PySCF pays 2.38x
+   > for the second spin channel where the port pays 1.96x.  Its §1 records
+   > two things this entry has wrong.  **"Twins with a spin index"
+   > understates it** in the one place that matters: `fxc` couples the
+   > channels, so the two spins cannot be run as independent passes and have
+   > to share a grid block -- which is what makes the port beat the restricted
+   > ratio.  And **the 7.3x quoted here is the restricted number**, which is
+   > not evidence about a different implementation of a different function; it
+   > came out at 8.82x on the same molecule and 6.69x at 60 atoms.
 3. **`uks.get_veff` has no `fastxcnlc`.**  On the restricted side that module
    fuses the XC and VV10 grid sweeps into one; on the unrestricted side the two
    sweeps stay separate, so a UKS wB97M-V walks the grid twice.  `fastnlc`
    already covers the double sum itself for UKS -- `nr_nlc_vxc` sums the
    spin densities before it -- so what is left is the second sweep of `eval_ao`
    and the second density evaluation.
+
+   > **Taken** -- `docs/VV10_OPENSHELL.md` §2, §4b.  The patch point was
+   > `dft.uks.UKS.get_veff` **and** the module-level `dft.uks.get_veff`, which
+   > this entry does not name.  Reported as a comparison rather than a
+   > speedup: the fusion and `fastxc`'s grouped `nr_uks` remove cost from the
+   > same two grid passes from opposite directions and do not compose, so
+   > `FASTXCNLC_OFF=1` exists for a user to A/B on their own system.
 4. **The unrestricted VV10 gradient.**  `grad.rks.get_nlc_exc` is reached with
    two densities and hands them back; the fix is `get_exc_u`'s, a spin loop
    around the same body.
+
+   > **Taken** -- `docs/VV10_OPENSHELL.md` §2, §4a.  **1.17x-1.70x** on the
+   > term and **2.7x-3.6x** on the grid passes it actually replaces, stable
+   > over a 20x range of system size, two chemical classes, three basis sets
+   > and both functional types.  Its §1 records that **there is no spin
+   > loop**: VV10 is a functional of the total density, so the fix is
+   > `D_a + D_b` and nothing else -- and that the term this entry calls a
+   > fall-through is GPU4PySCF's own two-density branch rather than nothing at
+   > all, so the ratio is against a real baseline.
 5. **`hessian.uks.nr_uks_fnlc_mo`.**  Two problems at once: `fastfnlc`
    declines UKS, *and* `hessian/uks.py` imported `nr_rks_fnlc_mo` by name at
    import time, so even a UKS-capable `fastfnlc` would not be reached without
    patching that binding too.  `tests/test_patch_aliases.py` is the check that
    keeps this kind of thing visible.
+
+   > **Taken** -- `docs/VV10_OPENSHELL.md` §2, §4c.  **1.47x-1.63x** on a path
+   > that was 1.00x by construction.  Its §1 records that the binding is
+   > `hessian.uks.nr_rks_fnlc_mo`, not `nr_uks_fnlc_mo` -- the forwarding
+   > function is fine and the stale name is the one it forwards *to* -- and
+   > that this path has a caller the restricted one does not: `tdscf/uhf.py`
+   > sets no `exclude_nlc`, so an open-shell TDDFT pays the VV10 response term
+   > on every Davidson iteration and a closed-shell one pays none of it.
 6. **`MAX_PRIM_PAIR = 36`, "6-prim x 6-prim is the worst case in Pople sets".**
    It is not the worst case in a def2 set for a metal: def2-TZVP contracts a 3d
    metal's innermost s shell over 8 primitives and an S or Cl ligand's over 7,
