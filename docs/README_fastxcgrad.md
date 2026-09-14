@@ -1,8 +1,17 @@
-# `fastxcgrad` — the XC part of an RKS nuclear gradient
+# `fastxcgrad` — the XC part of a KS nuclear gradient
 
-Replaces `gpu4pyscf.grad.rks.get_exc` and `get_nlc_exc`.  LDA, GGA **and
-meta-GGA**; the grid-response path, unrestricted densities and multi-GPU fall
-through to GPU4PySCF unchanged.
+Replaces `gpu4pyscf.grad.rks.get_exc` and `get_nlc_exc`, and — since
+`docs/OPENSHELL_TMC.md` and `docs/VV10_OPENSHELL.md` — `grad.uks.get_exc` and
+`grad.uks.get_nlc_exc` as well.  LDA, GGA **and meta-GGA**, restricted or
+unrestricted; the grid-response path and multi-GPU fall through to GPU4PySCF
+unchanged.
+
+The VV10 term takes **one or two** density matrices, and the second case is
+not a spin loop: VV10 is a functional of the total density and the atomic
+derivative it contributes contracts the same total density matrix, so
+`_prep_nlc` sums `D_a + D_b` and the rest of the function never sees a spin
+index.  That is also one GEMM per grid block rather than two — GPU4PySCF's
+own unrestricted branch calls `eval_rho2` once per spin and adds the results.
 
 ```python
 import sys; sys.path.insert(0, '.../side_test/HF/src')
@@ -342,7 +351,8 @@ grouping it, exactly as the no-libxc argument predicts.
 | group size `nslot` | free GPU memory and the caller's per-block scratch | `MEM_FRACTION` (0.3) of `get_avail_mem()` divided by the bytes one block needs; GPU4PySCF's own rule is 0.2 for the AO values alone. Not a tuned constant, and nothing about the molecule enters. |
 | kernel block size | the hardware | 256 threads over a grid block of `MIN_BLK_SIZE = 4096` points — GPU4PySCF's constant, the same for every molecule, so the per-thread loop is 16 iterations regardless of system size. The kernel's *grid* is `nao_sub`, so occupancy grows with the system and never shrinks. |
 | grid, block size, AO screening | GPU4PySCF's own | untouched. |
-| functional type | what the caller asked for | LDA, GGA and meta-GGA are handled; NLC has its own entry point; grid response, unrestricted and multi-GPU fall through. |
+| functional type | what the caller asked for | LDA, GGA and meta-GGA are handled; NLC has its own entry point; grid response and multi-GPU fall through. |
+| spin | the reference | restricted and unrestricted are both covered. The XC term is the same body run once per spin (`get_exc_u`); the VV10 term is the same body once, on the summed density. |
 
 The *speedup* does depend on the regime, and the three sizes show which way:
 at 6-31G\* there are many small blocks and the per-call overheads changes 2 and

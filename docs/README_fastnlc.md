@@ -167,6 +167,48 @@ The two clusters differ by 1.9× in grid points and 3.6× in pair count and land
 within 8 % of each other on the whole-`nr_nlc_vxc` ratio, which is the
 empirical form of "nothing here is tuned to a problem size".
 
+**But the *ratio* is size-dependent, and much more than those two clusters
+suggested.**  Both of them have grids of millions of points.  The VV10 round
+of `docs/VV10_OPENSHELL.md` needed the double sum timed on its own at four
+much smaller grid sizes — the same `rho`, the same grid, this kernel against
+GPU4PySCF's, min of 3, one A100-SXM4-80GB — and it falls off a long way
+below them:
+
+| system | grid points | GPU4PySCF | `fastnlc` | |
+|---|---|---|---|---|
+| CuCl2, 3 atoms | 58 624 | 0.0271 s | 0.0229 s | **1.18×** |
+| alanine dipeptide cation, 22 atoms | 258 560 | 0.2963 s | 0.2300 s | **1.29×** |
+| Ni dithiolene, 21 atoms | 322 560 | 0.4533 s | 0.2847 s | **1.59×** |
+| penicillin V cation, 42 atoms | 519 680 | 1.0782 s | 0.6314 s | **1.71×** |
+| Cu macrocycle, 60 atoms | 689 152 | 1.8114 s | 1.2282 s | **1.47×** |
+| `PfPMT`, 284 atoms (the row above) | 3 396 608 | 60.78 s | 22.69 s | **2.68×**\* |
+
+\* the five new rows are the module in its **default** configuration, i.e.
+with `FASTNLC_BUDGET = 1e-12` on; the `PfPMT` row is the kernel change with
+the trim *off*, and the strided micro-benchmark above puts the trim-inclusive
+figure at that size at 3.92×.  So the gap between the ends of this table is if
+anything understated.
+
+The pair sum is quadratic in the point count and this module's per-call
+overhead is not: a Morton sort of the points, a bounding box per tile, and
+the trim's own sort and cumulative sum are all `O(n log n)` or `O(n)` and are
+paid once per call.  At 3.4 million points they are invisible; at 59 000 they
+are most of what is left after the kernel change.  So **1.18×–1.71× is the
+honest range for a molecule of a few tens of atoms**, and the 2.68×–3.92×
+above is a large-cluster number, and both are the whole configuration
+rather than the kernel alone.  The Cu macrocycle row also shows the ratio
+is not a function of the point count alone — 689 152 points at 1.47× against
+519 680 at 1.71× — which is what the `RCUT` far-field split and the trim both
+imply: they depend on how the points are distributed in space, not only on
+how many there are.
+
+Two consequences worth stating.  A caller sizing up this module on a 20-atom
+complex should expect the small end of that range, and
+`docs/VV10_OPENSHELL.md` §4b's arms measured no difference at all from
+switching this module off on the two smallest systems — the double sum is
+40 % of the term there, and 1.18× on 40 % is 6 %, which is inside the scatter
+of the comparison it sat inside.
+
 ## Files
 
 | file | role |

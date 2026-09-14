@@ -68,9 +68,9 @@ the largest item -- applies to it twice over.  That matters because an
 open-shell ground state is the common case in a transition-metal complex, not
 a corner: 83 % of BOS-TMC-28242 is open-shell.
 
-The grid-response path and multi-GPU fall through to GPU4PySCF unchanged, as
-does the VV10 term of an unrestricted gradient (``get_nlc_exc`` is reached
-with two densities and hands them back).
+The grid-response path and multi-GPU fall through to GPU4PySCF unchanged.
+The VV10 term (``get_nlc_exc``) is covered for one or two density matrices,
+and the second case is not a spin loop: see ``_prep_nlc``.
 
 Environment switches (for the ablations, not for normal use):
 ``FASTXCGRAD_OFF=1``          hand everything back to GPU4PySCF
@@ -616,6 +616,37 @@ def _nlc_exc_perblock(ni, _sorted_mol, grids, dm, vv_vxc, nao, max_memory):
     return exc1_ao
 
 
+def _prep_nlc(ni, mol, grids, dms):
+    """The sorted mol, and the **total** density matrix in the sorted order.
+
+    The VV10 term is a functional of the total density alone, and the atomic
+    derivative it contributes contracts the same total density matrix, so the
+    unrestricted case is not a spin loop around this body -- it is this body
+    with ``D_a + D_b``.  GPU4PySCF's own ``get_nlc_exc`` says the same thing a
+    longer way: at ``nset = 2`` it forms ``rhoa + rhob`` for the double sum
+    and ``dms[0] + dms[1]`` for the contraction, and from there the two
+    branches are one.
+
+    Summing here rather than per grid block is also one GEMM per block
+    instead of two: GPU4PySCF's unrestricted branch calls ``eval_rho2`` once
+    per spin and adds the results, where the total density matrix gives the
+    same rho in a single contraction.
+    """
+    opt = getattr(ni, 'gdftopt', None)
+    if opt is None:
+        ni.build(mol, grids.coords)
+        opt = ni.gdftopt
+    nao = opt._sorted_mol.nao
+    dm = cupy.asarray(dms).reshape(-1, nao, nao)
+    if dm.shape[0] == 2:
+        dm = dm[0] + dm[1]
+    elif dm.shape[0] == 1:
+        dm = dm[0]
+    else:
+        return opt, None
+    return opt, opt.sort_orbitals(dm[None], axis=[1, 2])[0]
+
+
 def get_nlc_exc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
                 max_memory=2000, verbose=None):
     """Drop-in replacement for gpu4pyscf.grad.rks.get_nlc_exc.
@@ -623,8 +654,11 @@ def get_nlc_exc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
     The VV10 double sum itself is ``numint._vv10nlc`` (``fastnlc``'s kernel if
     that module is imported); what this replaces is the two passes over the
     grid around it, with the same changes as ``get_exc`` above.
+
+    One or two density matrices: see ``_prep_nlc`` for why the second case
+    needs no spin index.
     """
-    opt, dm = _prep(ni, mol, grids, dms, nao_from_sorted=True)
+    opt, dm = _prep_nlc(ni, mol, grids, dms)
     if _OFF or dm is None or num_devices > 1:
         return grks._get_nlc_exc_orig(ni, mol, grids, xc_code, dms, relativity,
                                       hermi, max_memory, verbose)
@@ -669,6 +703,12 @@ def apply_patch():
         guks.get_exc = get_exc_u
         grks._get_nlc_exc_orig = grks.get_nlc_exc
         grks.get_nlc_exc = get_nlc_exc
+        # `grad/uks.py` rebinds this name at import too.  Nothing on 1.8.1
+        # calls it -- an unrestricted gradient reaches the VV10 term through
+        # `rks_grad._get_denlc`, whose globals are `grad.rks`'s -- but a stale
+        # alias to the unpatched function is exactly the shape of the miss
+        # `tests/test_patch_aliases.py` exists to catch.
+        guks.get_nlc_exc = get_nlc_exc
         _PATCHED = True
 
 

@@ -58,11 +58,38 @@ it verbatim: a MUFU-seeded reciprocal (1.22x), single precision beyond 10 Bohr
 GPU4PySCF's CUDA source for that kernel, which a wheel does not ship, so it is
 the next round rather than this one.  ``docs/README_fastfnlc.md`` §4.
 
+**The unrestricted case, and why it is not a corner.**  ``V_munu`` here is
+spin-free: VV10 is a functional of the total density, so GPU4PySCF's own
+``hessian.uks.nr_uks_fnlc_mo`` sums the two perturbed densities and forwards
+to the restricted function, and the only thing the spin index changes is that
+an MO-basis answer is projected onto two MO bases instead of one.  So this
+module covers UKS with the ground-state density summed over spins in
+``_ground_state`` and one projection per spin at the end.
+
+Reaching it needs a second patch.  ``hessian/uks.py`` imports
+``nr_rks_fnlc_mo`` **by name at import time**, so its ``nr_uks_fnlc_mo`` calls
+that binding rather than ``hessian.rks``'s attribute -- and patching only
+``hessian.rks`` leaves every open-shell caller on GPU4PySCF's own code while
+still returning the right answer.  ``apply_patch`` sets both.
+
+Who those callers are is worth stating, because the restricted and
+unrestricted response paths do **not** agree about this term:
+``tdscf/rhf.py`` sets ``exclude_nlc = True`` and passes
+``with_nlc=not self.exclude_nlc`` into ``gen_response``, so a closed-shell
+TDA/TDDFT run skips the VV10 response entirely.  ``tdscf/uhf.py``'s
+``TDBase.gen_response`` -- which ``tdscf/uks.py``'s ``TDA`` and ``TDDFT``
+inherit -- forwards to ``_scf.gen_response(...)`` with **no** ``with_nlc``
+argument, and its default is ``True``.  An open-shell TDA or TDDFT run with
+wB97M-V therefore pays this term on every Davidson iteration where the
+closed-shell one pays none of it, which makes UKS TDDFT the largest consumer
+of this function in the package and not, as the restricted side suggests, a
+polarizability-only path.
+
 **Limits, all of which fall through to GPU4PySCF rather than fail.**
 The ``return_in_mo=True`` path (the Hessian's CPHF solve asks for the response
 in the MO basis) keeps GPU4PySCF's per-density loop for the potential
-contraction but still gets the cache; UKS (``mo_coeff.ndim == 3``) is handed
-back whole; and more than one GPU, as everywhere here.
+contraction but still gets the cache; a coefficient *tuple* rather than an
+array; and more than one GPU, as everywhere here.
 """
 import ctypes
 import functools
@@ -74,6 +101,7 @@ import numpy
 from gpu4pyscf.dft import numint
 from gpu4pyscf.dft.numint import NLC_REMOVE_ZERO_RHO_GRID_THRESHOLD
 from gpu4pyscf.hessian import rks as HR
+from gpu4pyscf.hessian import uks as HU
 from gpu4pyscf.lib.cupy_helper import (
     add_sparse, batched_vec_norm2, contract, get_avail_mem, ndarray,
     take_last2d, transpose_sum)
@@ -88,6 +116,18 @@ libgdft = numint.libgdft
 #: potential loop back, which is the ablation for change 2.
 CACHE = os.environ.get('FASTFNLC_CACHE', '1') != '0'
 BATCH = os.environ.get('FASTFNLC_BATCH', '1') != '0'
+
+#: Budget, in the same units as ``rho*weight``, for the grid points left out
+#: of the two ``O(ngrids^2)`` pair sums -- ``fastnlc``'s ``FASTNLC_BUDGET``
+#: criterion applied to the *response* term.  **Off by default**, unlike
+#: ``fastnlc``'s, and §4d of ``docs/README_fastfnlc.md`` says why: the pair
+#: sums here shrink quadratically in the point count so the win is real, but
+#: what it perturbs is a response operator rather than an energy, this
+#: module's correctness guarantee is currently *bit-identity* against
+#: GPU4PySCF on the MO path, and one measurement is not the suite that
+#: guarantee is worth trading for.  Set it to 1e-12 to get ``fastnlc``'s
+#: default.
+BUDGET = float(os.environ.get('FASTFNLC_BUDGET', 0.0))
 
 _WX = int(os.environ.get('FASTFNLC_WX', 32))
 _TSY = int(os.environ.get('FASTFNLC_TSY', 4))
@@ -110,6 +150,40 @@ def _kernel(name):
 #: from so that identity is a sound cache key: while the entry is live those
 #: arrays cannot be freed and their addresses cannot be reused.
 _CACHE = {}
+
+
+def _trim(keep, rho0, weights):
+    """Drop the grid points that carry the least density-weight.
+
+    ``fastnlc._trim``'s criterion, restated for this function rather than
+    imported from that module (importing it would apply its patch as a side
+    effect).  Every term of both pair sums here carries a factor
+    ``rho_j * w_j``, so leaving a set of points out of them perturbs the
+    result by at most a bounded multiple of ``sum |rho_j w_j|`` over that set
+    -- which is what the budget names.  The same set leaves the outer sum and
+    the potential contraction, where a point's share is bounded by the same
+    quantity.
+
+    The saving is quadratic in the point count, because both sums are.  How
+    many points a budget drops is a property of the system, not of the
+    budget: ``docs/README_fastnlc.md`` §3 measures 14-15 % on a level-3 grid
+    of an organic cluster, where the diffuse tails of many atomic grids carry
+    almost no density-weight, and §4d here measures far less on a small
+    metal complex, whose grid is compact and most of whose points matter.
+    """
+    rw = cupy.abs(rho0 * weights)
+    srt = cupy.sort(rw[keep])
+    k = min(int(cupy.searchsorted(cupy.cumsum(srt), BUDGET)), srt.size - 1)
+    if k <= 0:
+        return keep
+    cut = float(srt[k - 1])
+    out = keep & (rw > cut)
+    # the threshold form of the cut can take extra points along if |rho*w|
+    # ties at it, so the total actually left out is checked, not assumed
+    drop = float(cupy.where(out, 0., rw * keep).sum())
+    if drop > 4 * BUDGET:
+        return keep
+    return out
 
 
 def _ground_state(mf, mo_coeff, mo_occ, ni, opt, grids):
@@ -146,8 +220,17 @@ def _ground_state(mf, mo_coeff, mo_occ, ni, opt, grids):
     for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv=1,
                                             strict_grid_order=True):
         g0, g1 = g1, g1 + weight.size
-        rho_drho[:, g0:g1] = numint.eval_rho2(
-            _sorted_mol, ao, mo_sorted[idx, :], mo_occ, None, 'GGA')
+        if mo_sorted.ndim == 2:
+            rho_drho[:, g0:g1] = numint.eval_rho2(
+                _sorted_mol, ao, mo_sorted[idx, :], mo_occ, None, 'GGA')
+        else:
+            # unrestricted: everything below the density is a functional of
+            # the *total* density, so the two spins are summed here and the
+            # rest of the function never sees a spin index
+            rho_drho[:, g0:g1] = numint.eval_rho2(
+                _sorted_mol, ao, mo_sorted[0, idx, :], mo_occ[0], None, 'GGA')
+            rho_drho[:, g0:g1] += numint.eval_rho2(
+                _sorted_mol, ao, mo_sorted[1, idx, :], mo_occ[1], None, 'GGA')
     assert g1 == ngrids_full
 
     rho_i = rho_drho[0, :]
@@ -155,6 +238,8 @@ def _ground_state(mf, mo_coeff, mo_occ, ni, opt, grids):
         rho_i >= NLC_REMOVE_ZERO_RHO_GRID_THRESHOLD,
         cupy.abs(grids.weights) > 1e-14,
     )
+    if BUDGET > 0:
+        rho_nonzero_mask = _trim(rho_nonzero_mask, rho_i, grids.weights)
     rho_i = rho_i[rho_nonzero_mask]
     nabla_rho_i = rho_drho[1:4, rho_nonzero_mask]
     grids_coords = cupy.ascontiguousarray(grids.coords[rho_nonzero_mask, :])
@@ -266,11 +351,19 @@ def _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
     dm_mask_buf = cupy.empty(nao * nao)
     dm1s = None
 
+    # ``V_munu`` below is spin-free, so the unrestricted case differs only in
+    # what it is projected onto: one MO basis per spin when the caller asks
+    # for the response in the MO basis, and nothing at all when it does not.
+    uks = mo_sorted.ndim == 3
     if return_in_mo:
-        mocc = mo_sorted[:, mo_occ > 0]
-        vmat = cupy.zeros([n_dm1, mo_sorted.shape[1], mocc.shape[1]])
+        mos = list(mo_sorted) if uks else [mo_sorted]
+        occs = list(mo_occ) if uks else [mo_occ]
+        moccs = [m[:, o > 0] for m, o in zip(mos, occs)]
+        vmats = [cupy.zeros([n_dm1, m.shape[1], mo.shape[1]])
+                 for m, mo in zip(mos, moccs)]
     else:
-        vmat = cupy.zeros([n_dm1, nao, nao])
+        vmats = [cupy.zeros([n_dm1, nao, nao])]
+    vmat = vmats[0]
 
     available_gpu_memory = int(get_avail_mem() * 0.25)
     fxc_nbytes_per_dm1 = ((1*6 + 3*2) * ngrids + (1*2 + 3*2) * ngrids_full) * 8
@@ -406,8 +499,9 @@ def _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
                     V_munu += V_munu_gamma.T
                     del V_munu_gamma
                     if return_in_mo:
-                        vmat[i_dm + i_dm1_batch, :, :] += \
-                            mo_sorted[idx, :].T @ V_munu @ mocc[idx, :]
+                        for m, mo, vm in zip(mos, moccs, vmats):
+                            vm[i_dm + i_dm1_batch, :, :] += \
+                                m[idx, :].T @ V_munu @ mo[idx, :]
                     else:
                         add_sparse(vmat[i_dm + i_dm1_batch], V_munu, idx)
 
@@ -416,6 +510,11 @@ def _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
         assert g1_full == ngrids_full
         assert g1_nonzero == ngrids
 
+    if return_in_mo and uks:
+        # GPU4PySCF's own shape for this case: a two-element tuple
+        if output_in_2d:
+            return tuple(v[0] for v in vmats)
+        return tuple(vmats)
     if not return_in_mo:
         vmat = opt.unsort_orbitals(vmat, axis=[1, 2])
     if output_in_2d:
@@ -425,10 +524,26 @@ def _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
 
 _PATCHED = False
 
+#: How many calls this module answered and how many it handed back, since
+#: import.  A module that is allowed to decline returns the right answer
+#: either way, so nothing numerical can tell the two apart -- which is how the
+#: `hessian/uks.py` binding above kept every open-shell caller on GPU4PySCF's
+#: code through a round of benchmarking.  Assert on this.
+STATS = {'ours': 0, 'stock': 0}
+
+
+def stats():
+    """``{'ours': n, 'stock': m}`` since import.  See STATS."""
+    return dict(STATS)
+
 
 def _dispatch(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
-    ok = (num_devices == 1 and getattr(mo_coeff, 'ndim', 3) == 2
+    # `ndim` rather than a type test because `_gen_uhf_response` can hand a
+    # *tuple* of two coefficient matrices along (a SymAdaptedUHF reference
+    # converted with `to_gpu`), which has no `ndim` and falls through.
+    ok = (num_devices == 1 and getattr(mo_coeff, 'ndim', 0) in (2, 3)
           and getattr(dm1s, 'ndim', 0) in (2, 3))
+    STATS['ours' if ok else 'stock'] += 1
     if ok:
         return _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo)
     return HR._nr_rks_fnlc_mo_orig(mf, mol, mo_coeff, mo_occ, dm1s,
@@ -442,6 +557,15 @@ def apply_patch():
         # `_gen_rhf_response` imports the name inside the function body, so
         # the module attribute is what the call site reaches.
         HR.nr_rks_fnlc_mo = _dispatch
+        # `hessian/uks.py` does `from ...hessian.rks import nr_rks_fnlc_mo` at
+        # **import** time, and its `nr_uks_fnlc_mo` -- which is what both the
+        # unrestricted response function and the UKS Hessian's CPHF
+        # right-hand side call -- reaches that module-level name, not
+        # `hessian.rks`'s.  Patching only `HR` leaves every open-shell caller
+        # on GPU4PySCF's own code with this module loaded and nothing saying
+        # so.  `tests/test_patch_aliases.py` is the check that keeps it
+        # visible.
+        HU.nr_rks_fnlc_mo = _dispatch
         _PATCHED = True
 
 

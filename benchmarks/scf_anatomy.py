@@ -93,7 +93,19 @@ _wrap(mf._numint, 'nr_rks' if not mol.spin else 'nr_uks',
 _wrap(mf.grids, 'build', '..grids.build')
 if hasattr(mf, 'nlcgrids'):
     _wrap(mf.nlcgrids, 'build', '..nlcgrids.build')
+_wrap(mf._numint, 'nr_nlc_vxc', '..nr_nlc_vxc')
 _wrap(gnumint, '_vv10nlc', '..vv10nlc')
+# `fastxcnlc` runs the XC and NLC grid passes *before* GPU4PySCF's own
+# `get_veff`, and then answers `nr_rks`/`nr_uks` from the result -- so with it
+# loaded the `..nr_rks`/`..nr_uks` and `..nr_nlc_vxc` rows go to nothing and
+# the work lands here instead.  Both columns are needed to read the fusion:
+# stock puts it in the first two, patched in this one.
+try:
+    from electrolites import fastxcnlc as _fxnlc
+    _wrap(_fxnlc, 'nr_uks_nlc' if mol.spin else 'nr_rks_nlc',
+          '..fused xc+nlc')
+except ImportError:
+    pass
 
 # --- inside get_fock: what DIIS actually costs -----------------------------
 _wrap(gdiis.DIIS, 'update', '..diis.update')
