@@ -19,12 +19,53 @@ therefore the same CuPy disk-cache entry.
 
 ``ELECTROLITES_FULL_MODULE=1`` compiles every kernel, which is the ablation
 and the escape hatch if a driver ever asks for a kernel it did not declare.
+
+`mpp_plan` is the same idea applied to the other compile-time constant the
+kernels carry, the bra primitive-pair cache: it says whether a basis forms a
+pair too long for the default bound and, if so, how small a second module
+covers it.
 """
 import functools
 import os
 import re
 
 FULL = bool(int(os.environ.get('ELECTROLITES_FULL_MODULE', 0)))
+
+#: Largest bra primitive pair a second module will be compiled for.  ``0`` is
+#: the ablation: every class block past the default bound falls through, which
+#: is what this repository did before the bound was measured.
+MAX_PRIM_PAIR_CAP = int(os.environ.get('ELECTROLITES_MAX_PRIM_PAIR', 100))
+
+
+def mpp_plan(uniq_l_ctr, default, cap=None):
+    """``(mpp, lmax)`` for a second module, from the (l, nprim) group table.
+
+    ``mpp`` is the largest bra primitive pair this basis can form that
+    ``default`` does not cover, and ``lmax`` the largest angular momentum of a
+    group that takes part in one; ``(default, -1)`` means the basis needs no
+    second module.  A Pople set never does -- 6 x 6 is its worst case, which
+    is where the default came from -- and neither does a def2 set on first-row
+    elements alone.  A def2 set contracts a 3d metal's innermost s shell over
+    8 primitives and S or Cl over 7, and def2-QZVP reaches 10, so those form
+    pairs of 49, 56, 64 and 100.
+
+    Both numbers come from the group table alone -- the basis and the elements
+    -- and never from how many pairs survive screening, so two molecules in
+    the same basis over the same elements ask for the same second module and
+    therefore the same CuPy disk-cache entry.  That is the property the rest
+    of this file is built around.
+    """
+    if cap is None:
+        cap = MAX_PRIM_PAIR_CAP
+    mpp, lmax = default, -1
+    l, nprim = uniq_l_ctr[:, 0], uniq_l_ctr[:, 1]
+    for i in range(len(nprim)):
+        for j in range(i + 1):           # bra pairs are (i, j) with j <= i
+            n = int(nprim[i]) * int(nprim[j])
+            if default < n <= cap:
+                mpp, lmax = max(mpp, n), max(lmax, int(l[i]))
+    return mpp, lmax
+
 
 _KERNEL = re.compile(r'extern\s+"C"\s+__global__[^\n]*\n\s*([A-Za-z_]\w*)\s*\(')
 #: `fastk` and `fastejk` put each class's real work in a

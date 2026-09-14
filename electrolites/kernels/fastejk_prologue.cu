@@ -55,7 +55,14 @@
 #define OFF_LARGEX_W    275
 #define OFF_RW          330
 
-#define MAX_PRIM_PAIR   36      // 6-prim x 6-prim is the worst case in Pople sets
+// The bra primitive-pair cache is a fixed-size shared array.  36 is 6x6, the
+// worst case in a Pople set; a def2 set on a 3d metal, on S or Cl, or at
+// quadruple zeta forms bra pairs of 49, 56, 64 and 100.  fastejk._mpp_plan
+// compiles a second, small module with a larger bound for the classes that
+// need one, so that the array every other kernel carries stays this size.
+#ifndef MAX_PRIM_PAIR
+#define MAX_PRIM_PAIR   36
+#endif
 
 // ---------------------------------------------------------------------------
 // Rys roots and weights.  Bit-for-bit the recurrences of gvhf-rys/rys_roots.cu;

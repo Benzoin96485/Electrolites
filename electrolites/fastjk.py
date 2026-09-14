@@ -48,7 +48,7 @@ from ._paths import KERNEL_DIR as HERE
 from . import _ksplit
 from . import _gen
 from .fastk import QUEUE_DEPTH, BLOCKS_PER_SM, MAX_PRIM_PAIR, POOL_STRIDE
-from .fastk import _tables, _classes
+from .fastk import _tables, _classes, _mpp_plan  # noqa: F401
 
 from .compat import (
     NEW_JK_ABI as _NEW_ABI, sorted_meta as _sorted_meta,
@@ -84,11 +84,20 @@ if _HIGH:
                          for t, e in _LAUNCH_H.items()})
 
 
-def _sources():
+def _sources(wide=False):
+    """The CUDA files a module is compiled from.
+
+    ``wide`` is the subset the second, wide-bra-pair module may be built from;
+    `fastk._sources` says why that subset is a correctness restriction and not
+    a tuning one -- ``fastjk2_generated.cu`` bakes ``double[36]`` in where the
+    prologues and the one-thread-per-quartet family use the macro.
+    """
     out = [os.path.join(HERE, 'fastk_prologue.cu'),
            os.path.join(HERE, 'fastjk_prologue.cu'),
-           _gen.source_path('fastjk_generated.cu'),
-           _gen.source_path('fastjk2_generated.cu')]
+           _gen.source_path('fastjk_generated.cu')]
+    if wide:
+        return out
+    out.append(_gen.source_path('fastjk2_generated.cu'))
     if _HIGH:
         out.append(_gen.source_path(_HIGH_SRC))
     return out
@@ -98,24 +107,33 @@ def _sources():
 _LMAX = None
 
 
-@functools.lru_cache(maxsize=8)
-def _module(lmax=None):
-    files = _sources()
+@functools.lru_cache(maxsize=16)
+def _module(lmax=None, mpp=MAX_PRIM_PAIR):
+    """The kernels for this basis' angular momenta, at this bra-pair bound.
+
+    ``mpp`` above the default asks for `fastk._mpp_plan`'s second module: the
+    one-thread-per-quartet family alone, up to the angular momentum a long
+    contraction can reach.  See `fastk._module` for why the bound is a
+    preprocessor definition and why the second module is a small one.
+    """
+    files = _sources(wide=mpp != MAX_PRIM_PAIR)
     names = None if lmax is None else _ksplit.names_within(files, lmax)
+    opts = ('-std=c++17',) if mpp == MAX_PRIM_PAIR else (
+        '-std=c++17', f'-DMAX_PRIM_PAIR={int(mpp)}')
     return cp.RawModule(code=_ksplit.source(files, names),
-                        options=('-std=c++17',), backend='nvrtc')
+                        options=opts, backend='nvrtc')
 
 
 @functools.lru_cache(maxsize=256)
-def _function_for(name, lmax):
+def _function_for(name, lmax, mpp):
     try:
-        return _module(lmax).get_function(name)
+        return _module(lmax, mpp).get_function(name)
     except Exception:                     # a class the lmax subset missed
-        return _module(None).get_function(name)
+        return _module(None, mpp).get_function(name)
 
 
-def _function(name):
-    return _function_for(name, _LMAX)
+def _function(name, mpp=MAX_PRIM_PAIR, lmax=None):
+    return _function_for(name, _LMAX if lmax is None else lmax, mpp)
 
 
 class _Workspace:
@@ -134,7 +152,7 @@ def _workspace():
     return _Workspace()
 
 
-def _usable(omega, nprim, i, j, k, l):
+def _usable(omega, nprim, i, j, k, l, mpp=None):
     """Conditions these kernels assume; anything else falls through.
 
     None of them depends on the size of the molecule -- they are properties of
@@ -143,8 +161,9 @@ def _usable(omega, nprim, i, j, k, l):
     """
     if omega < 0:                    # the short-range (erfc) operator needs
         return False                 # twice the roots and s_estimator
-    # the bra primitive-pair cache is a fixed-size shared array
-    if int(nprim[i]) * int(nprim[j]) > MAX_PRIM_PAIR:
+    # the bra primitive-pair cache is a fixed-size shared array; ``mpp`` is
+    # the bound of the module this class block would be launched from
+    if int(nprim[i]) * int(nprim[j]) > (MAX_PRIM_PAIR if mpp is None else mpp):
         return False
     return True
 
@@ -172,10 +191,11 @@ def _prep(self, dms, hermi):
 
 
 def _run_jk1(name, nthreads, ws, tab, dev, vj, vk, dms, n_dm, nao, nbas,
-             pm_ij, pm_kl, q_cond, dm_cond, log_cutoff, inv_om2):
+             pm_ij, pm_kl, q_cond, dm_cond, log_cutoff, inv_om2,
+             mpp=MAX_PRIM_PAIR, mpp_lmax=None):
     """One of the nineteen classes with one thread per shell quartet."""
     d_bas, d_env, d_ao_loc = dev
-    kern = _function(name)
+    kern = _function(name, mpp, mpp_lmax)
     n_blocks = min(ws.n_blocks, int(pm_ij.size))
     for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
         ws.head.fill(0)
@@ -274,6 +294,7 @@ def get_jk(self, dms, hermi, verbose=None):
     uniq_l_ctr, l_ctr_bas_loc = _sorted_meta(self)
     _LMAX = int(mol._bas[:, ANG_OF].max())
     nprim = uniq_l_ctr[:, 1]
+    mpp_big, mpp_lmax = _mpp_plan(uniq_l_ctr)
     inv_om2 = np.float64(0.0 if rsh_omega == 0 else 1.0 / rsh_omega**2)
     dm_penalty = float(dm_cond.max())
     ws = _workspace()
@@ -286,8 +307,12 @@ def get_jk(self, dms, hermi, verbose=None):
         if pm_ij.size == 0 or pm_kl.size == 0:
             continue
         prim = tuple(int(nprim[x]) for x in (i, j, k, l))
-        ok = _usable(rsh_omega, nprim, i, j, k, l)
-        entry2 = IMPLEMENTED2.get(lll) if ok else None
+        # a bra pair past the default bound is served from the second module;
+        # see fastk.get_k for why only the one-thread-per-quartet classes are
+        # in it
+        mpp = MAX_PRIM_PAIR if prim[0] * prim[1] <= MAX_PRIM_PAIR else mpp_big
+        ok = _usable(rsh_omega, nprim, i, j, k, l, mpp)
+        entry2 = IMPLEMENTED2.get(lll) if (ok and mpp == MAX_PRIM_PAIR) else None
         if entry2 is not None:
             name, e = entry2
             _run_jk2(name, e, prim, ws, tab, dev, vj, vk, dms, n_dm, nao,
@@ -300,7 +325,8 @@ def get_jk(self, dms, hermi, verbose=None):
             name, nthreads = entry
             _run_jk1(name, nthreads, ws, tab, dev, vj, vk, dms, n_dm, nao,
                      mol.nbas, pm_ij, pm_kl, q_cond, dm_cond, log_cutoff,
-                     inv_om2)
+                     inv_om2, mpp,
+                     None if mpp == MAX_PRIM_PAIR else mpp_lmax)
             n_ours += 1
             continue
         shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]

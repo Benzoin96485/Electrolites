@@ -172,8 +172,27 @@ NVRTC through CuPy, which GPU4PySCF already depends on, and cached by CuPy on
 the source hash.  **Only the angular-momentum classes the basis can reach are
 compiled**, so a 6-31G\* job's first run pays about 36 s of JIT rather than
 98 s; later runs in any process reuse the cache.  A basis with f functions
-reaches every class and pays for all of them.
+reaches every class and pays for all of them — and every def2 set on a
+transition metal does, because def2-SVP already puts an f shell on a 3d metal.
 `ELECTROLITES_FULL_MODULE=1` compiles everything, which is the ablation.
+
+For a single job that JIT is part of the wall clock.  For a dataset run it
+should be the cost of the first molecule and of no other, and
+`electrolites.warmup` makes that a step rather than a hope: it compiles exactly
+what a given basis will ask for, in worker processes, into a cache directory a
+whole cluster can share.
+
+```bash
+python -m electrolites.warmup --basis def2-tzvp --elements Cu,Cl,C,H,N,O \
+    --spin 2 --jobs 8 --cupy-cache /shared/cupy \
+    --generated-dir /shared/electrolites/cuda
+export CUPY_CACHE_DIR=/shared/cupy ELECTROLITES_GENERATED_DIR=/shared/electrolites/cuda
+```
+
+What it compiles is a property of the basis and the elements, not of the
+geometry, so one atom of each element answers the question exactly;
+`--xyz` takes a real geometry instead if one is at hand.
+`benchmarks/warm_start.py` measures what it takes off a cold first run.
 
 Two optional libraries are the exception, both because they need relocatable
 device code and so cannot go through NVRTC: a faster copy of GPU4PySCF's
@@ -251,7 +270,12 @@ The **XC response kernel** is covered on both spin cases too
 (`fastxcfxc`, `nr_uks_fxc`), which is the grid half of every open-shell
 response property *and* -- since there is no `nr_uks_fxc_mo` -- of an
 unrestricted Hessian's CPHF solve.  What is left of
-`docs/OPENSHELL_TMC.md` §4 that is not a basis-set limit is the VV10 Hessian.
+`docs/OPENSHELL_TMC.md` §4 that is not a basis-set limit is the VV10 Hessian,
+and of its three basis-set limits two are now taken as well: the **bra
+primitive-pair bound** no longer fires on any def2 set up to def2-QZVP, and the
+first-run JIT is now something `electrolites.warmup` fills ahead of a run
+(`docs/PRIM_PAIR_AND_JIT.md`).  **g shells in `fastj` and `fastejk`** are the
+one that is open.
 `docs/OPENSHELL_TMC.md` has the audit that produced that list,
 `docs/VV10_OPENSHELL.md` the three VV10 entries of it that are now taken,
 `docs/OPENSHELL_HESSIAN.md` the Hessian XC terms and
@@ -329,6 +353,11 @@ python tests/test_patch_aliases.py         # no GPU: does every reference to a
                                            # patched function see the patch, or
                                            # did some module bind its own copy
                                            # at import time
+python tests/test_prim_pair.py             # 10 cases: the wide bra
+                                           # primitive-pair module against the
+                                           # default one and against
+                                           # GPU4PySCF, from 6-31G* (nothing
+                                           # to widen) to def2-QZVP
 python tests/test_jk.py                    # 6 molecule/basis combinations x
                                            # hermi 0,1 x n_dm 1..8 x three
                                            # density shapes: the multi-density
@@ -366,7 +395,11 @@ is still worth removing once the kernel under it has been rewritten
 (`docs/ROUND3_B4A.md`);
 `benchmarks/sweep_j_high.py` searches the launch configuration of the written
 classes; `benchmarks/compile_time.py` reports the first-run NVRTC cost with
-and without the module split; `benchmarks/aoscreen_probe.py` measures how much
+and without the module split, and `benchmarks/warm_start.py` what warming the
+cache ahead of the run takes off it; `benchmarks/prim_pair.py` times the
+exchange build and the gradient's two-electron derivative with and without the
+wide bra primitive-pair module, in one process, and says which class blocks the
+bound moves; `benchmarks/aoscreen_probe.py` measures how much
 a density-aware AO screen could remove from the XC build.
 
 `benchmarks/hessian_anatomy.py` does the same for an analytic Hessian, stage
@@ -482,6 +515,8 @@ starting point, not an optimum.
 | `ELECTROLITES_NVCC`, `ELECTROLITES_ARCH` | compiler and compute capability for the one `nvcc`-built library |
 | `ELECTROLITES_LIBMYKG` | use a prebuilt copy of it instead of building |
 | `ELECTROLITES_CACHE` | where to cache the build (default `~/.cache/electrolites`) |
+| `ELECTROLITES_GENERATED_DIR` | a pre-generated tree of the written CUDA, used as is — for an offline or read-only install, or one copy shared across a cluster |
+| `ELECTROLITES_MAX_PRIM_PAIR` | largest bra primitive pair a second kernel module will be compiled for (default 100, which covers def2-QZVP). **0 is the ablation**: every class block whose bra pair is longer than 36 falls through, which is what this repository did before `docs/PRIM_PAIR_AND_JIT.md` measured it |
 | `FASTK_NO_GENERAL`, `FASTK_NO_K2`, `FASTK_NO_HIGH`, `FASTK_NO_OMEGA`, `FASTK_NO_FUSED` | hand the corresponding class group back to GPU4PySCF (ablations) |
 | `FASTJ_NO_MDM`, `FASTJ_MDM_BLOCKS` | hand every multi-density Coulomb build back to GPU4PySCF; restrict which density-block sizes are used (the `docs/ROUND3_B4A.md` ablation) |
 | `FASTNLC_MODE` | `mixed` (default) or `fp64` for the VV10 double sum |

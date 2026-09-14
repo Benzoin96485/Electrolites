@@ -50,7 +50,16 @@
 #define OFF_LARGEX_W    275
 #define OFF_RW          330
 
-#define MAX_PRIM_PAIR   36      // 6-prim x 6-prim is the worst case in Pople sets
+// The bra primitive-pair cache is a fixed-size shared array.  36 is 6x6,
+// the worst case in a Pople set -- but a def2 set contracts a 3d metal's
+// innermost s shell over 8 primitives, S and Cl over 7 and def2-QZVP over 10,
+// so bra pairs of 49, 56, 64 and 100 exist there.  The driver compiles a
+// second, small module with a larger bound for the classes that need one
+// (fastk._mpp_plan); everything else keeps this default and the shared array
+// it was measured with.
+#ifndef MAX_PRIM_PAIR
+#define MAX_PRIM_PAIR   36
+#endif
 
 // ---------------------------------------------------------------------------
 // Rys roots and weights, entirely in registers.  Bit-for-bit the same

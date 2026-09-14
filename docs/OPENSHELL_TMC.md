@@ -234,8 +234,9 @@ fast as an unpatched one on that term.
 > | **3** | `uks.get_veff` has no `fastxcnlc` | `docs/VV10_OPENSHELL.md` | two of four grid passes removed, 1.6e-7-2.5e-7 s per grid point -- reported as a *comparison*, because it competes with `fastxc`'s grouping rather than adding to it |
 > | **4** | the unrestricted VV10 gradient | `docs/VV10_OPENSHELL.md` | 1.17x-1.70x on the term, **2.7x-3.6x** on the grid passes it actually replaces |
 > | **5** | `hessian.uks.nr_uks_fnlc_mo` | `docs/VV10_OPENSHELL.md` | 1.47x-1.63x on a path that was 1.00x by construction |
-> | 6, 7 | `MAX_PRIM_PAIR`, and g shells in `fastj`/`fastejk` | — | open; both are basis-set limits rather than spin ones |
-> | 8 | first-run JIT | — | open, and unchanged: the answer is a warm cache, not a code change |
+> | **6** | `MAX_PRIM_PAIR` | `docs/PRIM_PAIR_AND_JIT.md` | the bound no longer fires on any def2 set to def2-QZVP; **1.242x** on the exchange build at def2-QZVP, 1.01x-1.05x at def2-TZVP -- a saving of about 45 ms per build that is nearly independent of system size |
+> | 7 | g shells in `fastj`/`fastejk` | — | open; the one basis-set limit left |
+> | **8** | first-run JIT | `docs/PRIM_PAIR_AND_JIT.md` | **86-89 %** of a def2 first run is NVRTC (186-198 s against 42 s for 6-31G\*); `electrolites.warmup` fills the cache ahead of the run and compresses it **1.8x-3.0x** over workers |
 >
 > **Three of the five needed a patch point this list either did not name or
 > named wrongly**: item 3's module-level `dft.uks.get_veff` alongside the
@@ -346,6 +347,26 @@ fast as an unpatched one on that term.
    run, not because it has been shown to cost anything.  Raising the bound
    costs shared memory (six `double[MAX_PRIM_PAIR]` arrays per block) and
    should not be done without measuring what it buys.
+
+   > **Taken** -- `docs/PRIM_PAIR_AND_JIT.md`.  The bound is now a compile-time
+   > parameter and a *second*, small module covers the classes that need a
+   > wider one, so nothing is raised for the kernels that never see a long bra
+   > pair.  **1.242x** on the exchange build and 1.041x on the gradient term at
+   > def2-QZVP; 1.011x-1.046x and 1.002x-1.007x at def2-TZVP, which is a
+   > roughly constant 41-49 ms per exchange build over a 7.8x range of AO
+   > count.  Its §1 records three things this entry has wrong.  **It is not a
+   > transition-metal limit**: penicillin V -- closed-shell, organic, and in
+   > this repository's test set since the first round -- forms a 7 x 7 = 49
+   > pair on its sulfur at def2-TZVP, and at def2-QZVP every element reaches
+   > 8-11 primitives.  Its §3 adds the case that makes the point sharpest: the
+   > **Pt complex's** longest pair is 49 and not 64, because the def2 ECP
+   > replaced the deep core the 3d metals have.  **"Six arrays" is one kernel
+   > of one of four families** -- `gen_kernels.py` and `gen_khigh.py` declare
+   > seven and `gen_ejk.py` nine, which is the whole argument for not raising
+   > the bound globally.  And **"0.5 % of the class blocks is not 0.5 % of the
+   > work" understates it in the direction the entry does not consider**: those
+   > 25 blocks are **7.3 %** of the time the exchange build spends inside class
+   > blocks on CuCl2/def2-TZVP.
 7. **g shells: `fastj` and `fastejk` hand them back.**  This is the other half
    of "the basis reaches further than the test suite does", and it is not about
    spin at all.  `fastk` covers g: on CuCl2/def2-TZVPP (`lmax = 4`) it answered
@@ -376,6 +397,19 @@ fast as an unpatched one on that term.
    The split is not wrong, it just does not fire on this class of system; a
    shared `ELECTROLITES_GENERATED_DIR` and a warm CuPy cache is the answer for
    a dataset run, not a change to the split.
+
+   > **Taken** -- `docs/PRIM_PAIR_AND_JIT.md` §4c.  The diagnosis is right and
+   > there was no way to act on it: `_gen.ensure_all()` filled the generated
+   > CUDA, and nothing filled the NVRTC cache, which is where the time is.
+   > `electrolites.warmup` compiles the exact module keys a given basis will
+   > ask for -- the same `lmax`, the same bra-pair bound, the same `EJK_NDM` --
+   > in worker processes, into a cache directory a cluster can share.
+   > Measured: **42 s** of NVRTC inside a 6-31G\* first run and **186-198 s**
+   > inside a def2 one, which is **86-89 % of the whole first run** rather than
+   > an overhead on it, and **4.4x** the Pople figure rather than the 2.7x this
+   > entry's "36 s rather than 98 s" implies.  Filling the cache ahead of the
+   > run is **1.8x-3.0x** faster at eight workers, the floor being the longest
+   > single compile (`fastj` at `lmax = 3`, 75 s of the 90 s).
 
 ## 5. Measurement
 

@@ -152,7 +152,12 @@ def available(name):
 
 
 def ensure_all():
-    """Generate everything now rather than on first use.  Returns the paths."""
+    """Generate everything now rather than on first use.  Returns the paths.
+
+    This is the cheap half of warming a cold machine -- 0.8 s of Python
+    against minutes of NVRTC.  `electrolites.warmup` does this and then the
+    expensive half, compiling the modules a given basis will ask for.
+    """
     return {n: source_path(n) for n in _SPECS}
 
 

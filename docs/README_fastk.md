@@ -93,7 +93,7 @@ Deliberately not. The audit, and how each item is handled:
 | register/occupancy table | GPU + angular-momentum class | fixed per class; a molecule cannot change it. Re-tune with `bench/sweep.sh` for a different GPU. |
 | persistent grid width | number of bra shell pairs | `n_blocks = min(4·#SM, npairs_ij)` — a block can only work on one bra pair at a time, so a wider grid would just idle on small molecules. |
 | task queue depth | number of ket pairs | `pair_kl` is chunked to `QUEUE_DEPTH`, so the queue never overflows however large the system is. |
-| shared bra cache | basis contraction depth, **not** system size | sized for `iprim*jprim ≤ 36` (Pople sets); deeper contractions (cc-pVDZ, ANO) are detected in `_usable` and fall through to GPU4PySCF. |
+| shared bra cache | basis contraction depth, **not** system size | the default module is sized for `iprim*jprim ≤ 36`, which is 6x6 and the worst case in a Pople set. A def2 set forms longer pairs — 49 on an S or Cl pair, 64 on a 3d metal's innermost s shell, 100 at def2-QZVP — and since `docs/PRIM_PAIR_AND_JIT.md` those are served from a second, small module compiled with a wider bound rather than handed back. A pair past `ELECTROLITES_MAX_PRIM_PAIR` (100) still falls through. |
 | implemented classes | basis angular momentum, **not** system size | `f`/`g` shells and the classes GPU4PySCF splits across threads fall through. |
 | scratch memory | constant | 56 MB pool + GPU4PySCF's own. |
 

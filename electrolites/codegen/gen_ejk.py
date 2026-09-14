@@ -45,6 +45,13 @@ Run:  python gen_ejk.py <classes> --table fastejk_launch.json > fastejk_generate
 """
 import sys, os, json, argparse
 
+# The bra primitive-pair cache is emitted as ``double[MAX_PRIM_PAIR]``, i.e. as
+# the *macro*, so that the driver can compile a second module with a wider
+# bound for the classes a def2 metal basis reaches (fastejk._mpp_plan).  This
+# constant is the default the prologue defines and the one the shared-memory
+# budget below is computed against: an shm-style class sized here for 48 KB at
+# a 36-pair cache does not automatically fit at a wider one, which is why
+# `fastejk._usable` re-does that arithmetic before using the second module.
 MAX_PRIM_PAIR = 36              # matches fastejk_prologue.cu
 MAX_BLOCK = 1024
 
@@ -273,9 +280,9 @@ ejk_%(tag)s(EARGS)
     constexpr int NROOTS = %(nroots)d;
     constexpr int GSZ = %(gsz)d;
     constexpr int threads = %(nthreads)d;
-    __shared__ double s_aij[%(mpp)d], s_iaij[%(mpp)d], s_ajaij[%(mpp)d];
-    __shared__ double s_xij[%(mpp)d], s_yij[%(mpp)d], s_zij[%(mpp)d];
-    __shared__ double s_cicj[%(mpp)d], s_ai2[%(mpp)d], s_aj2[%(mpp)d];
+    __shared__ double s_aij[MAX_PRIM_PAIR], s_iaij[MAX_PRIM_PAIR], s_ajaij[MAX_PRIM_PAIR];
+    __shared__ double s_xij[MAX_PRIM_PAIR], s_yij[MAX_PRIM_PAIR], s_zij[MAX_PRIM_PAIR];
+    __shared__ double s_cicj[MAX_PRIM_PAIR], s_ai2[MAX_PRIM_PAIR], s_aj2[MAX_PRIM_PAIR];
     __shared__ int ntasks, pair_ij, ish, jsh;
     __shared__ double ri[3], rjri[3];
     int thread_id = threadIdx.x;
@@ -632,9 +639,9 @@ ejk_%(tag)s(EARGS)
     constexpr int PAD = %(pad)d;
     constexpr int HEADSZ = (10 + PAD) * NSQ;
     constexpr int threads = NSQ * GSTRIDE;
-    __shared__ double s_aij[%(mpp)d], s_iaij[%(mpp)d], s_ajaij[%(mpp)d];
-    __shared__ double s_xij[%(mpp)d], s_yij[%(mpp)d], s_zij[%(mpp)d];
-    __shared__ double s_cicj[%(mpp)d], s_ai2[%(mpp)d], s_aj2[%(mpp)d];
+    __shared__ double s_aij[MAX_PRIM_PAIR], s_iaij[MAX_PRIM_PAIR], s_ajaij[MAX_PRIM_PAIR];
+    __shared__ double s_xij[MAX_PRIM_PAIR], s_yij[MAX_PRIM_PAIR], s_zij[MAX_PRIM_PAIR];
+    __shared__ double s_cicj[MAX_PRIM_PAIR], s_ai2[MAX_PRIM_PAIR], s_aj2[MAX_PRIM_PAIR];
     __shared__ int ntasks, pair_ij, ish, jsh;
     __shared__ double ri[3], rjri[3];
     extern __shared__ double shared_memory[];

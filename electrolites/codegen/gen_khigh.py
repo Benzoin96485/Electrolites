@@ -52,6 +52,12 @@ Run:  python gen_khigh.py <classes> > fastkhigh_generated.cu
 """
 import sys, os, json, argparse
 
+# Emitted as the macro, not as a literal, so a module compiled with a wider
+# bound gets a wider cache (fastk._mpp_plan).  These classes are never asked
+# for at a wider bound today -- their bra is the highest-l group of the
+# quartet, and what a def2 set contracts over more than six primitives is an s
+# or a p shell -- but a kernel whose array silently disagreed with the bound
+# its driver checked against would be an illegal access, not a slow path.
 MAX_PRIM_PAIR = 36              # matches fastk_prologue.cu
 MAX_BLOCK = 1024                # CUDA threads per block
 
@@ -570,9 +576,9 @@ extern "C" __global__ void __launch_bounds__(NTHREADS_%(tag)s, MINBLOCKS_%(tag)s
     constexpr int NROOTS = %(nroots)d;
     constexpr int g_size = %(gsz)d;
     constexpr int nsq_per_block = NSQ;
-    __shared__ double s_aij[%(mpp)d], s_iaij[%(mpp)d], s_ajaij[%(mpp)d];
-    __shared__ double s_xij[%(mpp)d], s_yij[%(mpp)d], s_zij[%(mpp)d];
-    __shared__ double s_cicj[%(mpp)d];
+    __shared__ double s_aij[MAX_PRIM_PAIR], s_iaij[MAX_PRIM_PAIR], s_ajaij[MAX_PRIM_PAIR];
+    __shared__ double s_xij[MAX_PRIM_PAIR], s_yij[MAX_PRIM_PAIR], s_zij[MAX_PRIM_PAIR];
+    __shared__ double s_cicj[MAX_PRIM_PAIR];
 
     int sq_id = threadIdx.x;
     int gout_id = threadIdx.y;

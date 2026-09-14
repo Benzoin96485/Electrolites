@@ -32,7 +32,17 @@ QUEUE_DEPTH = int(os.environ.get('FASTEJK_QUEUE_DEPTH', 1 << 16))
 # factor, and pads its queue there, so each slot needs a block's worth of slack
 POOL_STRIDE = QUEUE_DEPTH + 1024
 BLOCKS_PER_SM = int(os.environ.get('FASTEJK_BLOCKS_PER_SM', 4))
+#: Bra primitive pairs the kernels cache in shared memory; 36 is 6x6, the
+#: worst case in a Pople set, and the bound the whole family is compiled with.
 MAX_PRIM_PAIR = 36              # must match fastejk_prologue.cu
+#: Nine ``double[MAX_PRIM_PAIR]`` arrays per block (codegen/gen_ejk.py), which
+#: is what a wider bound costs whatever is compiled with it -- and the reason
+#: the wide module carries only the classes that need one.
+SHM_PER_PRIM_PAIR = 9 * 8
+#: The rest of the block's static shared memory: ``ntasks``, ``pair_ij``, the
+#: two coordinates and the two expansion pointers.  ``SHM_PER_PRIM_PAIR * 36 +
+#: SHM_OTHER`` is the 2688 bytes ``gen_ejk.py`` subtracts from its 48 KB budget.
+SHM_OTHER = 96
 
 _SRC = os.environ.get('FASTEJK_SRC', 'fastejk_generated.cu')
 _TAB = os.path.join(HERE, os.path.splitext(_SRC)[0].replace('_generated', '')
@@ -58,35 +68,49 @@ def _sources():
     return [os.path.join(HERE, 'fastejk_prologue.cu'), _gen.source_path(_SRC)]
 
 
+def _mpp_plan(uniq_l_ctr, cap=None):
+    """`_ksplit.mpp_plan` for this module's default bound."""
+    return _ksplit.mpp_plan(uniq_l_ctr, MAX_PRIM_PAIR, cap)
+
+
 @functools.lru_cache(maxsize=16)
-def _module(lmax=None, n_dm=1):
+def _module(lmax=None, n_dm=1, mpp=MAX_PRIM_PAIR):
     """The kernels for this basis' angular momenta and this many densities.
 
     ``n_dm`` is a preprocessor definition rather than a kernel argument, so the
     exchange contraction's loop bound is known at compile time and the
     restricted kernels are unchanged by the existence of the unrestricted ones.
     The cost is a second NVRTC compile, and only an open-shell run pays it.
+
+    ``mpp`` is the same trade for the bra primitive-pair cache: above the
+    default it asks for `_mpp_plan`'s second module, the classes a long
+    contraction can reach and no others.  On a def2-TZVP metal basis that is
+    7 of the 65 classes and 0.28 MB of the family's 6.8 MB, because the
+    wider array is carried by whatever is compiled with it and the other 58
+    never see a bra pair that needs one.
     """
     files = _sources()
     names = None if lmax is None else _ksplit.names_within(files, lmax)
+    opts = ['-std=c++17', f'-DEJK_NDM={int(n_dm)}']
+    if mpp != MAX_PRIM_PAIR:
+        opts.append(f'-DMAX_PRIM_PAIR={int(mpp)}')
     return cp.RawModule(code=_ksplit.source(files, names),
-                        options=('-std=c++17', f'-DEJK_NDM={int(n_dm)}'),
-                        backend='nvrtc')
+                        options=tuple(opts), backend='nvrtc')
 
 
 @functools.lru_cache(maxsize=512)
-def _function_for(name, shm, lmax, n_dm):
+def _function_for(name, shm, lmax, n_dm, mpp):
     try:
-        f = _module(lmax, n_dm).get_function(name)
+        f = _module(lmax, n_dm, mpp).get_function(name)
     except Exception:                     # a class the lmax subset missed
-        f = _module(None, n_dm).get_function(name)
-    if shm > 48 * 1024 - 2688:      # opt in to the A100's large shared window
-        f.max_dynamic_shared_size_bytes = shm
+        f = _module(None, n_dm, mpp).get_function(name)
+    if shm > 48 * 1024 - SHM_PER_PRIM_PAIR * mpp - SHM_OTHER:
+        f.max_dynamic_shared_size_bytes = shm   # the A100's large window
     return f
 
 
-def _function(name, shm=0, n_dm=1):
-    return _function_for(name, shm, _LMAX, n_dm)
+def _function(name, shm=0, n_dm=1, mpp=MAX_PRIM_PAIR, lmax=None):
+    return _function_for(name, shm, _LMAX if lmax is None else lmax, n_dm, mpp)
 
 
 @functools.lru_cache(maxsize=1)
@@ -117,7 +141,7 @@ def _workspace():
     return _Workspace()
 
 
-def _usable(mol, n_dm, nprim, i, j, k, l, tag):
+def _usable(mol, n_dm, nprim, i, j, k, l, tag, mpp=None):
     """Conditions the kernels assume.  None depends on the size of the
     molecule; they are properties of the basis and of what the caller asked.
 
@@ -135,20 +159,34 @@ def _usable(mol, n_dm, nprim, i, j, k, l, tag):
         return False                # and the s_estimator screening
     if n_dm > 2:
         return False
-    if int(nprim[i]) * int(nprim[j]) > MAX_PRIM_PAIR:
+    if mpp is None:
+        mpp = MAX_PRIM_PAIR
+    if int(nprim[i]) * int(nprim[j]) > mpp:
+        return False
+    # A wider cache is only worth having where it still fits beside the 2D
+    # integrals: the shm-style classes hold those in dynamic shared memory and
+    # `gen_ejk.py` sized them against the default bound.  At the default cap
+    # nothing reaches this -- the widest shm-style class an over-36 bra pair
+    # can reach is 44.5 KB and a 100-pair cache is another 7.2 KB, which still
+    # fits -- but the bound is a knob and the arithmetic that says so belongs
+    # here rather than in a comment on the knob.
+    if mpp != MAX_PRIM_PAIR and (IMPLEMENTED[tag]['shm_fixed'] * 8
+                                 + SHM_PER_PRIM_PAIR * mpp + SHM_OTHER
+                                 > 48 * 1024):
         return False
     return True
 
 
 def _run(tag, ws, tab, dev, ejk, dms, dm_tot, n_dm, nao, nbas, jf, kf,
-         pm_ij, pm_kl, q_cond, dm_cond, log_cutoff, prim, inv_om2, coef0):
+         pm_ij, pm_kl, q_cond, dm_cond, log_cutoff, prim, inv_om2, coef0,
+         mpp=MAX_PRIM_PAIR, mpp_lmax=None):
     e = IMPLEMENTED[tag]
     d_bas, d_env, d_ao_loc = dev
     iprim, jprim, kprim, lprim = prim
     nthreads = (e['nsq'], e['gout_stride'])
     shm = e['shm_fixed'] * 8
     n_blocks = min(ws.n_blocks, int(pm_ij.size))
-    kern = _function(e['name'], shm, n_dm)
+    kern = _function(e['name'], shm, n_dm, mpp, mpp_lmax)
     for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
         ws.head.fill(0)
         kern((n_blocks,), nthreads,
@@ -245,6 +283,7 @@ def jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1., verbose=None):
     _LMAX = int(vhfopt.sorted_mol._bas[:, ANG_OF].max())
     uniq_l = uniq_l_ctr[:, 0]
     nprim = uniq_l_ctr[:, 1]
+    mpp_big, mpp_lmax = _mpp_plan(uniq_l_ctr)
     n_groups = len(uniq_l_ctr)
 
     # The Coulomb term contracts the *total* density.  Its screening estimate
@@ -291,10 +330,15 @@ def jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1., verbose=None):
                     tag = '%d%d%d%d' % lll
                     prim = (int(nprim[i]), int(nprim[j]),
                             int(nprim[k]), int(nprim[l]))
-                    if _usable(smol, n_dm, nprim, i, j, k, l, tag):
+                    # a bra pair past the default bound is served from the
+                    # second module; see fastk.get_k
+                    mpp = (MAX_PRIM_PAIR if prim[0] * prim[1] <= MAX_PRIM_PAIR
+                           else mpp_big)
+                    if _usable(smol, n_dm, nprim, i, j, k, l, tag, mpp):
                         _run(tag, ws, tab, dev, ejk, dms, dm_tot, n_dm, nao,
                              smol.nbas, jf, kf, pm_ij, pm_kl, q_cond, dm_cond,
-                             log_cutoff, prim, inv_om2, _ONE)
+                             log_cutoff, prim, inv_om2, _ONE, mpp,
+                             None if mpp == MAX_PRIM_PAIR else mpp_lmax)
                     else:
                         shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1,
                                                     k, k+1, l, l+1]]

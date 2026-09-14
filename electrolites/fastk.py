@@ -47,7 +47,13 @@ from .compat import (
 QUEUE_DEPTH = int(os.environ.get('FASTK_QUEUE_DEPTH', 1 << 16))
 # Persistent grid width, in blocks per SM.
 BLOCKS_PER_SM = int(os.environ.get('FASTK_BLOCKS_PER_SM', 4))
+#: Bra primitive pairs the kernels cache in shared memory.  36 is 6x6, the
+#: worst case in a Pople set, and it is the bound every kernel here is
+#: compiled with by default -- see fastk_prologue.cu.
 MAX_PRIM_PAIR = 36             # must match MAX_PRIM_PAIR in fastk_prologue.cu
+#: The largest bra pair a *second* module will be compiled for; see
+#: `_ksplit.mpp_plan`, and ELECTROLITES_MAX_PRIM_PAIR=0 for the ablation.
+MAX_PRIM_PAIR_CAP = _ksplit.MAX_PRIM_PAIR_CAP
 # Ablations, for the timing tables:  hand the classes GPU4PySCF does not unroll
 # back to it, and/or hand back every range-separated (omega != 0) class, which
 # is what this module did before the omega-B97X round.
@@ -90,12 +96,27 @@ if _HIGH:
                          for t, e in _LAUNCH_H.items()})
 
 
-def _sources():
+def _sources(wide=False):
+    """The CUDA files a module is compiled from.
+
+    ``wide`` is the subset the second, wide-bra-pair module may be built from
+    (see `_module`), and it is a *correctness* restriction rather than a
+    tuning one.  The shared arrays of the prologue and of the
+    one-thread-per-quartet family are declared ``double[MAX_PRIM_PAIR]``, so
+    they follow whatever the module is compiled with; `gen_k2_kernels.py`
+    bakes the default in as ``double[36]`` -- its output is tracked and
+    regenerating it needs a GPU4PySCF checkout -- and a module built from it
+    at a wider bound would write past the array instead of falling through.
+    Those classes never see a long bra pair in any case: their bra is the
+    highest-l group of the quartet, and what a def2 set contracts over more
+    than six primitives is an s or a p shell.
+    """
     gen1 = os.environ.get('FASTK_SRC', 'fastk_generated.cu')
+    out = [os.path.join(HERE, 'fastk_prologue.cu'), _gen.source_path(gen1)]
+    if wide:
+        return out
     gen2 = os.environ.get('FASTK2_SRC', 'fastk2_generated.cu')
-    out = [os.path.join(HERE, 'fastk_prologue.cu'),
-           _gen.source_path(gen1),
-           _gen.source_path(gen2)]
+    out.append(_gen.source_path(gen2))
     if _HIGH:                      # the classes GPU4PySCF does not unroll
         out.append(_gen.source_path(_HIGH_SRC))
     return out
@@ -108,12 +129,26 @@ def _sources():
 _LMAX = None
 
 
-@functools.lru_cache(maxsize=8)
-def _module(lmax=None):
-    files = _sources()
+@functools.lru_cache(maxsize=16)
+def _module(lmax=None, mpp=MAX_PRIM_PAIR):
+    """The kernels for this basis' angular momenta, at this bra-pair bound.
+
+    ``mpp`` above the default asks for the second module of `_mpp_plan`: the
+    one-thread-per-quartet family alone, and only up to the angular momentum a
+    long contraction can reach -- 14 kernels and 127 KB against the default
+    module's 388 KB on a def2-TZVP metal basis, because the cost of a larger
+    shared array is paid by every kernel compiled with it.  The bound is a
+    preprocessor definition rather than a kernel argument for the same reason
+    ``EJK_NDM`` is one in `fastejk`: as an argument the array would have to be
+    sized for the worst case always, and the common path would pay for the
+    rare one in shared memory it cannot be shown not to pay.
+    """
+    files = _sources(wide=mpp != MAX_PRIM_PAIR)
     names = None if lmax is None else _ksplit.names_within(files, lmax)
+    opts = ('-std=c++17',) if mpp == MAX_PRIM_PAIR else (
+        '-std=c++17', f'-DMAX_PRIM_PAIR={int(mpp)}')
     return cp.RawModule(code=_ksplit.source(files, names),
-                        options=('-std=c++17',), backend='nvrtc')
+                        options=opts, backend='nvrtc')
 
 
 @functools.lru_cache(maxsize=1)
@@ -151,19 +186,27 @@ def _workspace():
     return _Workspace()
 
 
+def _mpp_plan(uniq_l_ctr, cap=None):
+    """`_ksplit.mpp_plan` for this module's default bound."""
+    return _ksplit.mpp_plan(uniq_l_ctr, MAX_PRIM_PAIR, cap)
+
+
 @functools.lru_cache(maxsize=256)
-def _function_for(name, lmax):
+def _function_for(name, lmax, mpp):
     try:
-        return _module(lmax).get_function(name)
+        return _module(lmax, mpp).get_function(name)
     except Exception:                     # a class the lmax subset missed
-        return _module(None).get_function(name)
+        return _module(None, mpp).get_function(name)
 
 
-def _function(name):
-    return _function_for(name, _LMAX)
+def _function(name, mpp=MAX_PRIM_PAIR, lmax=None):
+    """``lmax`` overrides the basis' own for the wide-bra-pair module, whose
+    subset is the angular momenta a long contraction can reach and not the
+    whole basis -- see `_mpp_plan`."""
+    return _function_for(name, _LMAX if lmax is None else lmax, mpp)
 
 
-def _usable(omega, n_dm, nprim, i, j, k, l):
+def _usable(omega, n_dm, nprim, i, j, k, l, mpp=None):
     """Conditions our kernels assume.  Anything else falls through to GPU4PySCF.
 
     None of these depend on the size of the molecule; they are properties of the
@@ -182,8 +225,10 @@ def _usable(omega, n_dm, nprim, i, j, k, l):
         return False                        # behaviour, for the timing tables
     if n_dm != 1 and _NO_NDM:               # ablation: the pre-B4b behaviour
         return False
-    # the bra primitive-pair cache is a fixed-size shared array
-    if int(nprim[i]) * int(nprim[j]) > MAX_PRIM_PAIR:
+    # the bra primitive-pair cache is a fixed-size shared array.  ``mpp`` is
+    # the bound of the module this class block would be launched from, which
+    # is the default for every basis `_mpp_plan` finds nothing to widen.
+    if int(nprim[i]) * int(nprim[j]) > (MAX_PRIM_PAIR if mpp is None else mpp):
         return False
     return True
 
@@ -211,10 +256,11 @@ def _prep(self, dms, hermi):
 
 
 def _run_k1(name, nthreads, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
-            q_cond, dm_cond, log_cutoff, inv_om2, coef0, coef1, n_dm=1):
+            q_cond, dm_cond, log_cutoff, inv_om2, coef0, coef1, n_dm=1,
+            mpp=MAX_PRIM_PAIR, mpp_lmax=None):
     """One of the 14 classes with one thread per shell quartet."""
     d_bas, d_env, d_ao_loc = dev
-    kern = _function(name)
+    kern = _function(name, mpp, mpp_lmax)
     # One block can only ever work on one bra pair at a time, so there is
     # nothing to gain from a grid wider than the number of bra pairs.
     n_blocks = min(ws.n_blocks, int(pm_ij.size))
@@ -447,6 +493,7 @@ def get_k(self, dms, hermi, verbose, omega=None, lr_factor=None,
     uniq_l_ctr, l_ctr_bas_loc = _sorted_meta(self)
     _note_lmax(self.sorted_mol)
     nprim = uniq_l_ctr[:, 1]             # used by the shared-memory guard
+    mpp_big, mpp_lmax = _mpp_plan(uniq_l_ctr)
     inv_om2 = np.float64(0.0 if rsh_omega == 0 else 1.0 / rsh_omega**2)
     dm_penalty = float(dm_cond.max())
     ref_rsh = (rsh_omega, 1.0, 0.0) if rsh_omega > 0 else (0.0, 1.0, 1.0)
@@ -459,8 +506,17 @@ def get_k(self, dms, hermi, verbose, omega=None, lr_factor=None,
         if pm_ij.size == 0 or pm_kl.size == 0:
             continue
         prim = tuple(int(nprim[x]) for x in (i, j, k, l))
-        ok = _usable(rsh_omega, n_dm, nprim, i, j, k, l)
-        entry2 = IMPLEMENTED2.get(lll) if ok else None
+        # A bra pair past the default bound is served from the second
+        # module, which carries only the one-thread-per-quartet classes: the
+        # shared memory a wider cache costs is paid by whatever is compiled
+        # with it, and `_sources(wide=True)` says which files may be.  A class
+        # the second module does not have -- one GPU4PySCF splits across
+        # threadIdx.y, which happens from def2-QZVP up, where a d group can
+        # pair with a 10-primitive s one -- falls through as before, so
+        # `entry2` is suppressed rather than served from the wrong module.
+        mpp = MAX_PRIM_PAIR if prim[0] * prim[1] <= MAX_PRIM_PAIR else mpp_big
+        ok = _usable(rsh_omega, n_dm, nprim, i, j, k, l, mpp)
+        entry2 = IMPLEMENTED2.get(lll) if (ok and mpp == MAX_PRIM_PAIR) else None
         if entry2 is not None:
             tag, e = entry2
             _run_k2(tag, e, prim, ws, tab, dev, vk, dms, nao, mol.nbas,
@@ -472,7 +528,8 @@ def get_k(self, dms, hermi, verbose, omega=None, lr_factor=None,
             name, nthreads = entry
             _run_k1(name, nthreads, ws, tab, dev, vk, dms, nao, mol.nbas,
                     pm_ij, pm_kl, q_cond, dm_cond, log_cutoff,
-                    inv_om2, _ONE, _ZERO, n_dm)
+                    inv_om2, _ONE, _ZERO, n_dm, mpp,
+                    None if mpp == MAX_PRIM_PAIR else mpp_lmax)
             continue
         shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
         if _general_ok(rsh_omega, n_dm, lll) and _run_general(
@@ -567,6 +624,7 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
     dev_l = opt_l.rys_envs._env_ref_holder[1:]
     _note_lmax(opt_f.sorted_mol)
     nprim = _sorted_meta(opt_f)[0][:, 1]
+    mpp_big, mpp_lmax = _mpp_plan(_sorted_meta(opt_f)[0])
     inv_om2 = _inv_om2(opt_l.sorted_mol)
     c_f, c_l = np.float64(coef_f), np.float64(coef_l)
     ws = _workspace()
@@ -576,7 +634,9 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
 
     for (i, j, k, l), lll in _classes(opt_f):
         prim = tuple(int(nprim[x]) for x in (i, j, k, l))
-        ok = _usable(opt_l.sorted_mol.omega, n_dm, nprim, i, j, k, l)
+        # the wide bra-pair module, per class block, as in get_k
+        mpp = MAX_PRIM_PAIR if prim[0] * prim[1] <= MAX_PRIM_PAIR else mpp_big
+        ok = _usable(opt_l.sorted_mol.omega, n_dm, nprim, i, j, k, l, mpp)
         entry = IMPLEMENTED.get(lll) if ok else None
         if entry is not None:
             pm_ij, pm_kl = pm_f[i, j], pm_f[k, l]
@@ -585,9 +645,10 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
             name, nthreads = entry
             _run_k1('k_rs_' + name[2:], nthreads, ws, tab, dev_f, vk, dms, nao,
                     mol.nbas, pm_ij, pm_kl, q_cond_f, dm_cond, log_cutoff,
-                    inv_om2, c_f, c_l, n_dm)
+                    inv_om2, c_f, c_l, n_dm, mpp,
+                    None if mpp == MAX_PRIM_PAIR else mpp_lmax)
             continue
-        entry2 = IMPLEMENTED2.get(lll) if ok else None
+        entry2 = IMPLEMENTED2.get(lll) if (ok and mpp == MAX_PRIM_PAIR) else None
         if entry2 is not None:
             # These still take one pass per operator; the coefficient rides on
             # the geometric prefactor inside the kernel.
