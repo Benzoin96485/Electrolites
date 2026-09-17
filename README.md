@@ -19,7 +19,10 @@ and J/K construction, explains GPU concepts with concrete examples, and follows
 the optimizations through XC, VV10, gradients, Hessians and response properties.
 It distinguishes rearrangements of the same calculation from mixed-precision
 and error-budgeted approximations, and explains coverage, compilation costs and
-benchmark interpretation. The per-module `docs/README_*.md` files provide the
+benchmark interpretation. A [five-chapter companion](docs/intro/README.md) expands
+the arithmetic, architecture dependence, XC data flow, error bounds, response
+equations and AO screening, with links to the corresponding implementations.
+The per-module `docs/README_*.md` files provide the
 detailed measurements and implementation notes.
 
 On one A100-SXM4-40GB, GPU4PySCF 1.8.1, B3LYP-D3(BJ)/6-31G\*, level-3 grids,

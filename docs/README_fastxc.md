@@ -1,5 +1,7 @@
 # fastxc — a faster exchange–correlation (Vxc) build for GPU4PySCF
 
+> **Reading note:** For a source-checked account of the current RKS/UKS coverage and DM/MO selection, see the [XC companion chapter](intro/03-xc-pipeline.md). In particular, current grouped RKS selects one route using the largest AO count in the group; UKS is now covered and uses the density-matrix route. The per-block and coverage descriptions below record the earlier development state. [Architecture and grouping details](intro/02-architecture-and-grouping.md) also distinguish historical tile examples from the v1.8.1 helpers.
+
 On an A100-40GB, B3LYP/6-31G\* on these clusters spends about 19 % of the SCF
 inside `numint.nr_rks` once the J and K builds have been sped up.  `fastxc`
 replaces `nr_rks` and leaves the grid, the AO screening, the libxc call and the
