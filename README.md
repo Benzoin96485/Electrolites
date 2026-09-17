@@ -13,6 +13,13 @@ component (15 SCF + gradient pairs in separate processes), **1.0e-14** relative
 on an exchange matrix and **2.1e-14** on a fused Coulomb one at any number of
 densities, and **6.2e-11** on a whole analytic Hessian.
 
+If you have not written GPU code, start with `docs/INTRO_FROM_HF.md` rather
+than with the tables below.  It is a long Chinese guided tour: a closed-shell
+Hartree–Fock SCF, why J, K and XC are the wall clock, what a GPU actually is,
+and how this repository changes the scaffolding around GPU4PySCF's integral
+arithmetic rather than the arithmetic itself.  The per-module `docs/README_*.md`
+files assume that background.
+
 On one A100-SXM4-40GB, GPU4PySCF 1.8.1, B3LYP-D3(BJ)/6-31G\*, level-3 grids,
 `OMP_NUM_THREADS=32`:
 
