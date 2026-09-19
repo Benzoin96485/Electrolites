@@ -9,7 +9,8 @@ rediscovering it.
 Companion documents: `docs/README_fastdf.md` is the round that produced this
 list (what changed, why, and the full tables); `docs/README_fastdfj.md` is the
 round that closed **W1**, which is where the biggest number on this page now
-is; `docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
+is; `docs/README_fastdfgrad.md` closed **W3** and `docs/README_fastdfcderi.md`
+**W4**; `docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
 `instructions/06`'s catalogue.
 
 ---
@@ -203,6 +204,18 @@ Ranked by (value × confidence) / cost, **after** §3.3.  Each item gives what
 to change, the evidence it rests on, what would count as success, and what
 would falsify it.
 
+**W4 is done, and W11, W12 and W13 are what it found.**  The cderi build is
+1.14x–1.83x faster with the tensor on the device and **2.72x–3.20x** with it
+on the host (`docs/README_fastdfcderi.md`), and the item's headline lead —
+the metric contraction as a sparse gather and a triangular *solve* — is
+rejected by the falsification criterion the item itself attached, then
+rescued by a triangular *multiply*.  What the round found rather than closed
+is that the single largest stage of a large build is neither integrals nor
+arithmetic: `cudaHostAlloc`, which page-locks the host buffer at 2.09 GB/s
+and is 41.5 s of a 72.5 s 284-atom build.  Made 4.1x faster here; the
+remaining 10 s, the host store and `_decompose_j2c`'s latency are **W12**,
+**W11** and **W13**.
+
 **W3 is done, and W10 is what it found.**  The DF gradient's two-electron
 derivative is 1.75x–2.59x faster and the gradient around it 1.24x–2.27x
 (`docs/README_fastdfgrad.md`), from two things the entry did not predict —
@@ -227,8 +240,9 @@ sixth for the same reason and will come back at 500+ atoms.
 > option when the fitted exchange is wanted (it is the more accurate of the
 > two approximations, `docs/README_fastdfj.md` §5) and is still what every
 > *pure* functional, every gradient and every Hessian on this path uses.  W3
-> and W4 were untouched by W1 — **W3 is now done**, and W4 inherits a
-> measurement from it (the shell-pair aggregation, below).  W9 is worth *less*: §3.1 of
+> and W4 were untouched by W1 — **both are now done**, and W4 inherited a
+> measurement from W3 (the shell-pair aggregation, which is worth 1.19x–1.50x
+> on a whole build).  W9 is worth *less*: §3.1 of
 > `docs/README_fastdfj.md` measures the three-centre Coulomb engine at 1.67x
 > the direct four-centre build at 284 atoms, so the path it names is already
 > the faster of the two.
@@ -412,50 +426,97 @@ reads 1.12x instead of 1.24x.
   the cderi build, `_cholesky_eri` is **39.4 %** of a 15-cycle taxol DF SCF
   (§3.1), and this is the cheapest thing anyone has measured on it.
 
-### W4 — The cderi build
+### W4 — The cderi build — **done**
 
-`df/df.py:_cholesky_eri` is **39.4 %** of a 15-cycle taxol DF SCF and 12–23 %
-of the shorter ones.  Untouched.
+`electrolites/fastdfcderi.py`, `tests/test_dfcderi.py`,
+`benchmarks/df_cderi_probe.py`, `benchmarks/df_cderi_bench.py`, write-up in
+`docs/README_fastdfcderi.md`.
 
-One concrete lead: the metric contraction `j3c.dot(aux_coef)` forms `L^{-1}`
-explicitly (`_decompose_j2c` solves the triangular system against the
-contraction coefficients) and then multiplies by the dense result — a dense
-`npair × naux_sorted × naux` GEMM.  A triangular solve is half the arithmetic,
-and the auxiliary contraction coefficients it is folded with are **0.06 %
-dense** (measured: 3 412 non-zeros in a 2 590 × 2 191 matrix), so the two can
-be separated cheaply.
+**The stage table this item should have started from.**  A traced clone of
+`_cholesky_eri`, checked against the real function on every run, splits the
+block loop as
 
-* **Do**: `j3c · C` as a sparse gather, then `trsm` against the Cholesky
-  factor, instead of one dense GEMM against `C · L^{-T}`.
-* **Success**: measure `_cholesky_eri` before and after on taxol.
-* **Falsified if**: `dtrsm` at these shapes runs at less than half of `dgemm`,
-  which would eat the factor of two.  cuBLAS's triangular solve is not as well
-  tuned as its GEMM — the same trap `dsyrk` fell into in §1 item 1.
+| | atoms | `eval_j3c` | metric contraction | store |
+|---|---|---|---|---|
+| glycine, def2-SVP | 10 | 91.7 % | 8.2 % | — |
+| penicillin V, def2-SVP | 42 | 63.9 % | 36.1 % | — |
+| taxol, def2-SVP | 113 | 52.0 % | 48.0 % | — |
+| taxol, def2-SVP, host | 113 | 39.4 % | 36.5 % | 24.0 % |
+| PfPMT, def2-SVP, host | 284 | 24.5 % | **59.5 %** | 16.0 % |
 
-**And a second lead, handed over by W3 and much cheaper than the first.**
-`_cholesky_eri` evaluates its three-centre integrals through
-`int3c2e_evaluator`, which aggregates shell pairs at `nsp_per_block[0]*4`
-(`df/int3c2e_bdiv.py:176`) — the same constant W3 found costing the gradient's
-derivative kernel 1.26x–3.15x.  Swept on the *plain* integral kernel
-(`benchmarks/df_grad_ip1_sweep.py`, second table), `sp_mult = 1` is
+so the metric contraction does grow into the dominant term, as this entry
+guessed.  What the entry did not have is the stage that is not in the loop at
+all: **`empty_mapped`**, the `cudaHostAlloc` that page-locks the cderi's host
+buffer, is **6.8 s of a 10.5 s** host-resident taxol build and **41.5 s of a
+72.5 s** PfPMT one — bigger than the integrals and the contraction together,
+and about 40 s of the **88.7 s** §3.3 measures for this function at 284
+atoms.
 
-| | `*4` (GPU4PySCF) | `*1` | |
-|---|---|---|---|
-| penicillin V, def2-SVP | 188.4 ms | **151.9 ms** | 1.24x |
-| penicillin V, def2-TZVPP | 675.2 ms | **463.5 ms** | 1.46x |
-| taxol, def2-SVP | 1567.8 ms | **491.4 ms** | **3.19x** |
+**The first lead is rejected by its own falsification criterion.**  This
+entry proposes `j3c · C` as a sparse gather followed by a `trsm`, and says it
+is falsified if `dtrsm` runs at less than half of `dgemm`.  Swept on
+synthetic matrices from 256 to 5598 auxiliary functions, cuBLAS's `dtrsm`
+reaches **1.1 → 10.9 TF/s** against `dgemm`'s 12.4 → 19.0 and never exceeds
+**0.66** of it; on real blocks the whole route is **0.37x–1.76x**, a loss
+below about 2000 auxiliary functions.  The sparse half is fine — the
+coefficients are 0.010–0.28 % dense, about 1.5 per column, and a one-pass
+kernel applies them in 2.7 ms where the dense GEMM takes 43.7 (penicillin V).
+It is the solve that gives the factor back.
 
-and the answer is identical in every cell of the `sp_mult` column.  `*16` is
-in `_j_energy_per_atom` and in `Int3c2eOpt.contract_dm` and has not been
-swept.
+**With a triangular *multiply* it pays.**  `L^{-1}` formed once and
+explicitly — which is no more conservative than upstream, whose
+`_decompose_j2c` solves for `C L^{-T}` with *more* right-hand sides — lets
+cuBLAS's `dtrmm` run the per-block half at **15.4–16.8 TF/s**, GEMM
+throughput for half the arithmetic.  The contraction is then **2.08x** at 42
+atoms, **2.05x** at 21, **1.94x** at 113 and **1.90x** at 284.  Below
+`npair × naux_sorted × naux = 4e10` the setup costs more than it saves and
+the dense product is kept; that threshold is measured, not guessed.
 
-* **Do**: measure it end to end on `_cholesky_eri` rather than on the kernel
-  alone — the sweep above is the evaluator's kernel time, not a cderi build,
-  and the build has a metric contraction and a host transpose on top of it.
-* **Watch**: `gout_width` is a **ceiling**, not a preference.  Above 54 both
-  Rys kernels return a *different answer* — the plain one does so on taxol
-  and not on penicillin V, so a value that looks safe on one molecule is not
-  safe on the next.  Sweep `sp_mult` and leave `gout_width` where it is.
+**The second lead is worth what the sweep said.**  `sp_mult = 1` on the whole
+build is 1.00x at 10 atoms, 1.06x at 21, **1.19x** at 42/def2-SVP, **1.34x**
+at def2-TZVPP, **1.50x** at 113 and **1.18x** at 284, `1` is the best of
+`{1,2,4,8}` everywhere, and the cderi is identical at every value.  The
+`*16` in `_j_energy_per_atom` and `Int3c2eOpt.contract_dm` is still unswept.
+
+**And the allocation, which no lead named**, is ordinary memory page-locked
+with `cudaHostRegister` instead: **2.09 → 8.6 GB/s**, taxol's 14.31 GB in
+1.70 s instead of 6.84 and PfPMT's 86.41 GB in 10.1 s instead of 41.3.  It is
+the allocation that is slow and not the page-locking — registering
+pre-allocated memory reaches 8.6 GB/s on ordinary 4 kB pages, and huge pages
+change that by 0.3 % — and pinning does not parallelise across threads
+either.
+
+**What it is worth**, `_cholesky_eri` itself, every variant round robin in
+one process:
+
+| | cderi | GPU4PySCF | patched | |
+|---|---|---|---|---|
+| Ni dithiolene, def2-SVP (21 atoms) | device | 116.8 ms | **102.1 ms** | 1.14x |
+| penicillin V, def2-SVP (42) | device | 166.4 ms | **128.1 ms** | 1.30x |
+| penicillin V, def2-TZVPP | device | 589.8 ms | **339.6 ms** | **1.74x** |
+| taxol, def2-SVP (113) | device | 3208 ms | **1751 ms** | **1.83x** |
+| penicillin V, def2-SVP | host | 918.3 ms | **337.1 ms** | **2.72x** |
+| taxol, def2-SVP | host | 12764 ms | **3990 ms** | **3.20x** |
+| PfPMT, def2-SVP (284) | host | **87.1 s** | **29.5 s** | **2.95x** |
+
+and on the SCF the build sits in, second of two rounds: 1.05x (penicillin
+V/def2-TZVPP), **1.11x** (taxol, cderi on the device) and **1.37x** (taxol,
+cderi on the host — 24.27 s → 17.69 s).  The build is a one-time cost, so a
+module on it is worth the share it holds: 8 % of a small def2-SVP SCF and
+53 % of one whose cderi lives on the host, which is every large molecule.
+
+* **Success criterion met as stated**: the item asked for `_cholesky_eri`
+  measured before and after on taxol.  12764 ms → 3990 ms host-resident,
+  3208 ms → 1751 ms device-resident.  And the 284-atom row is the one number
+  on this page that can be checked against something written before the
+  round: §3.3 measures this function at **88.7 s** inside a full SCF, and the
+  bench's unpatched column reads **87.1 s**.
+* **Watch, as this entry says**: `gout_width` is a ceiling and was left at
+  GPU4PySCF's 54.  Only `sp_mult` was swept.
+* **Three things the round found rather than closed**, all in §4's new
+  items: the host store (**W11**), the pinned buffer that is still 10 s at
+  284 atoms (**W12**), and `_decompose_j2c`'s 20–62 ms of cuSOLVER latency at
+  the small end (**W13**).
 
 ### W5 — A block-sparse exchange contraction
 
@@ -559,6 +620,63 @@ gradient and the size the rest of this page is written around — the SCF at
   Guard it with a size threshold the way `fastdf`'s `SYRK_MIN_NAO` is
   guarded, and measure the threshold rather than guessing it.
 
+### W11 — The host store, and the thread it runs on
+
+*(Found by W4, which measured it rather than closed it.)*
+
+With the cderi on the host, `libvhf_rys.transpose_write` is **24 %** of a
+113-atom block loop (821 ms) and **16 %** of a 284-atom one (4.88 s).  It is
+a synchronous host-side transpose-and-copy on one thread, between two blocks
+of integrals, and nothing overlaps with it: the next block's `fill_int3c2e`
+cannot start until it returns.
+
+* **Do**: give it its own CUDA stream and a second work buffer, so block
+  `n`'s write overlaps block `n+1`'s integrals — the structure `DF.loop`
+  already uses for the read direction.  The TODO is in upstream's own source
+  (`df/df.py:551`, "async-write to host memory in another stream").
+* **Success**: `benchmarks/df_cderi_probe.py --cpu-cderi` shows the store
+  falling out of the block loop on taxol and PfPMT.
+* **Falsified if**: the transpose is bandwidth-bound on the host rather than
+  latency-bound, in which case overlapping it buys only the launch gap.
+  Measure the write's GB/s first; 14.31 GB in 821 ms is 17 GB/s, which is
+  well under a PCIe gen4 x16 link and suggests it is the transpose, not the
+  transfer.
+
+### W12 — A pinned-buffer pool
+
+*(Also from W4, which made the allocation 4.1x faster and did not remove it.)*
+
+Page-locking the cderi's host buffer with `cudaHostRegister` runs at
+**8.6 GB/s** against `cudaHostAlloc`'s 2.09, but 86.41 GB is
+still **10.1 s** at 284 atoms, and it is paid again on every `DF.build`: a
+geometry optimisation pays it per step, and a range-separated functional
+pays it twice per SCF because `DF.range_coulomb` builds a second object.
+
+* **Do**: keep the registered buffer in a module-level pool keyed by size,
+  and hand it back on `DF.reset()` instead of unregistering it.
+* **Success**: the second and later builds of one process pay nothing.
+* **Falsified if**: the pool holds 86 GB of the node's 251 across a
+  calculation that needs the DRAM for something else.  A pool that releases
+  under `get_avail_mem` pressure is the version to write.
+
+### W13 — `_decompose_j2c`'s latency at the small end
+
+*(From W4's stage table.)*
+
+`_decompose_j2c` is **20–62 ms** on every system from 10 to 42 atoms — 40 ms
+at 23 atoms against a 27 ms block loop — and it is two cuSOLVER calls
+(`int2c2e`, `potrf`) and a `trsm` on a matrix of one to two thousand rows.
+That is latency, not arithmetic: the same three operations at 5598 rows cost
+235 ms, eleven times the work for four times the time.
+
+* **Do**: find out which of the three it is (the probe prints the stage but
+  not its parts), and whether a batched or a CPU factorisation is faster at
+  those orders.
+* **Success**: the small-system end of `df_cderi_bench.py` moves.  It is
+  worth 20–40 ms of a 30–170 ms build there and nothing at all past 100
+  atoms, so this is the least valuable item on this page — it is here
+  because it is the only stage of the build nothing has looked at.
+
 ### Not on this list
 
 **Seminumerical exchange (sn-K / COSX)**, which would avoid the cderi
@@ -619,7 +737,19 @@ python benchmarks/df_grad_probe.py --xyz ... --whole             # W3's profile
 python benchmarks/df_grad_bench.py --xyz ... --whole --with-rebuild
 python benchmarks/df_grad_ip1_sweep.py --xyz ...   # the launch configuration
 python benchmarks/df_grad_metric_probe.py --xyz ... [--omega 0.3]
+
+python tests/test_dfcderi.py [--basis def2-tzvpp]        # W4's bar
+python benchmarks/df_cderi_probe.py --xyz ... [--cpu-cderi] [--no-check]
+python benchmarks/df_cderi_probe.py --xyz ... --skip-metric --sp-mults 4 \
+    --trmm-ladder 256,512,1024,2048,3072,5598   # where dtrsm stops paying
+python benchmarks/df_cderi_bench.py  --xyz ... [--cpu-cderi] [--scf]
 ```
+
+`fastdfcderi`'s switches (`FASTDFCDERI_OFF`, `FASTDFCDERI_METRIC`,
+`FASTDFCDERI_SPMULT`, `FASTDFCDERI_MIN_WORK`, `FASTDFCDERI_PIN`,
+`FASTDFCDERI_HUGEPAGE`) are listed at the top of
+`electrolites/fastdfcderi.py` and are what every ablation column in
+`docs/README_fastdfcderi.md` is measured with.
 
 `fastdf`'s switches (`FASTDF_OFF`, `FASTDF_STEP1`, `FASTDF_STEP2`,
 `FASTDF_JPASS`, `FASTDF_SYRK_MIN_NAO`, `FASTDF_BLK`, `FASTDF_RESIDENT_FRAC`)

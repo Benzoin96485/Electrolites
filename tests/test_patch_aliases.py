@@ -101,6 +101,10 @@ ORIGINALS = [
     # is a DF gradient that never reaches this module
     ('fastdfgrad', 'electrolites.fastdfgrad', '_ORIG_METHOD_R'),
     ('fastdfgrad', 'electrolites.fastdfgrad', '_ORIG_METHOD_U'),
+    # `df/df.py:105` is the only caller of the cderi build and looks it up on
+    # the module, so a second holder of the original is a DF object whose
+    # build this module never sees
+    ('fastdfcderi', 'gpu4pyscf.df.df', '_cholesky_eri_orig'),
 ]
 
 #: aliases that are known and deliberate: (holder, attribute) -> why

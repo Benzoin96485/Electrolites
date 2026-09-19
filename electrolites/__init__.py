@@ -37,7 +37,7 @@ MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
-    'fastdfgrad',
+    'fastdfgrad', 'fastdfcderi',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -106,6 +106,16 @@ _TARGETS = {
                    ('gpu4pyscf.df.grad.rhf', '_jk_energy_per_atom'),
                    ('gpu4pyscf.df.grad.uhf', '_jk_energy_per_atom'),
                    ('gpu4pyscf.df.df', '_decompose_j2c')),
+    # the cderi build itself.  `df/df.py:105` is the only caller and looks it
+    # up on the module, so one target covers every density-fitted run.  The
+    # other three are what the module reaches into rather than replaces: the
+    # sparse apply of the contraction coefficients, the aggregation call the
+    # launch configuration is changed through, and the scheme it is checked
+    # against
+    'fastdfcderi': (('gpu4pyscf.df.df', '_cholesky_eri'),
+                    ('gpu4pyscf.gto.mole', 'SortedMole.mat_dot_C'),
+                    ('gpu4pyscf.gto.mole', 'SortedMole.aggregate_shl_pairs'),
+                    ('gpu4pyscf.df.int3c2e_bdiv', 'int3c2e_scheme')),
 }
 
 _patched = []

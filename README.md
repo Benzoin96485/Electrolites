@@ -266,6 +266,38 @@ at 2e9 to 2e10.  `docs/README_fastdfgrad.md` has the stage tables, the sweep
 grid, the item that was measured and **rejected**, and the 32 GB array that
 stops this path at 284 atoms in GPU4PySCF and here alike.
 
+**And the fourth item is the one-time build itself**, `df/df.py:_cholesky_eri`
+-- 39 % of a 15-cycle taxol DF SCF and every density-fitted run's first
+expense.  The work list's lead was the metric contraction as a sparse gather
+and a triangular *solve*, with its own falsification attached ("`dtrsm` at
+less than half of `dgemm`"), and that is exactly what cuBLAS does: swept from
+256 to 5598 auxiliary functions, `dtrsm` never exceeds **0.66** of `dgemm`.
+The same algebra against an explicit `L^{-1}` with a triangular **multiply**
+runs at GEMM throughput for half the arithmetic -- **1.9x-2.1x** on the
+contraction -- and the contraction coefficients, which are 0.01-0.28 % dense,
+go through a one-pass kernel instead of the dense matrix.  With the shell-pair
+aggregation of the item above applied to the build's own integral kernel
+(1.19x-1.50x on the block loop):
+
+| cderi build, one A100 | GPU4PySCF 1.8.1 | + Electrolites | |
+|---|---|---|---|
+| penicillin V/def2-TZVPP, cderi on the device | 590 ms | **340 ms** | **1.74x** |
+| 113-atom taxol/def2-SVP, cderi on the device | 3.21 s | **1.75 s** | **1.83x** |
+| 113-atom taxol/def2-SVP, cderi on the **host** | 12.76 s | **3.99 s** | **3.20x** |
+| ↳ the whole SCF that build sits in | 24.27 s | **17.69 s** | **1.37x** |
+| 284-atom PfPMT/def2-SVP, cderi on the host | 87.1 s | **29.5 s** | **2.95x** |
+
+The host column is three times faster for a reason that is not in the work
+list at all: **65 %** of a host-resident 113-atom build is `cudaHostAlloc`.
+`empty_mapped` page-locks the cderi's buffer at 2.09 GB/s, which is 6.8 s for
+taxol's 14.3 GB and **41.5 s of a 72.5 s** build for PfPMT's 86.4 GB.
+Page-locking *pre-allocated* memory with `cudaHostRegister` gives the same
+mapped, pinned buffer at **8.6 GB/s**: it is the allocation that is slow, not
+the page-locking.
+`docs/README_fastdfcderi.md` has the stage tables, the ladder that places the
+`dtrsm` rejection, the size threshold below which the dense product is kept,
+and the three items the round found rather than closed.
+
 ## Install
 
 ```bash
@@ -365,6 +397,7 @@ separate processes; that is the only honest way to A/B them.
 | `fastfnlc` | `hessian.rks.nr_rks_fnlc_mo` **and the `hessian.uks` binding of the same name** | the **VV10 non-local-correlation response**, which is 80 % of a wB97M-V polarizability: the ground-state half of it -- including an `O(n_grid^2)` double sum -- computed once per coupled-perturbed solve instead of once per iteration, and the potential contraction batched over the perturbed densities.  Restricted or unrestricted: `V_munu` is spin-free, so the unrestricted case is the same body on the summed density with an MO-basis answer projected once per spin.  Reaches CPKS, NMR, C6 and the analytic Hessian -- and, on an **unrestricted** reference only, TDA/TDDFT: `tdscf/rhf.py` sets `exclude_nlc = True` and `tdscf/uhf.py` sets nothing, so an open-shell TDDFT pays this term and a closed-shell one does not (`docs/VV10_OPENSHELL.md` §1) |
 | `fastdf` | `df.df_jk.get_jk` | the **density-fitted** Coulomb and exchange build -- the two-electron half of every RI/DF calculation, which is a *fourth* code path that `fastj`, `fastk` and `fastjk` are all off: `df/df.py:117` contracts the three-index cderi tensor and never touches a four-centre integral.  Restricted or unrestricted, any number of densities, `hermi` 0 or 1, the cderi on the device or streamed from the host.  Catalogue **A13**, two of whose four claims 1.8.x closed upstream (`docs/README_fastdf.md` §1) |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` (and `_DFHF.Gradients`, for one warning) | **RIJONX** -- `density_fit(only_dfj=True)`, density-fitted J with *exact* exchange -- which **cannot run at all on GPU4PySCF 1.8.1**: the branch passes `mol` where `DF.get_jk` expects the density (`df/df_jk.py:211`) and dies with `'Mole' object has no attribute 'shape'`.  Repaired, the configuration builds **no cderi**, so it has none of `fastdf`'s 86 GB at 284 atoms, and its exchange is `fastk`.  Restricted or unrestricted, hybrid, range-separated or pure; a GHF object keeps GPU4PySCF's own branch, which is already correct.  `docs/README_fastdfj.md`, and `docs/DF_WORK_LIST.md` W1 |
+| `fastdfcderi` | `df.df._cholesky_eri` | the **one-time cderi build** -- 39 % of a 15-cycle taxol DF SCF, and the first thing any density-fitted run pays.  Three things: the metric contraction as a sparse apply of the contraction coefficients and a triangular *multiply* against an explicit `L^{-1}` (**1.9x-2.1x**, where the *solve* the work list proposes is a loss -- cuBLAS's `dtrsm` never reaches 0.66 of its `dgemm`); the same `nsp_per_block*4` shell-pair aggregation `fastdfgrad` found, here on the build's own integral kernel (**1.19x-1.50x** on the block loop); and the host buffer page-locked with `cudaHostRegister` rather than allocated with `cudaHostAlloc` (**2.09 -> 8.6 GB/s**, which is 65 % of a host-resident 113-atom build).  Below a measured threshold on the contraction's size the dense product is kept; a multi-device build, a linearly dependent auxiliary basis and an `only_dfj` object all fall through.  `docs/README_fastdfcderi.md`, and `docs/DF_WORK_LIST.md` W4 |
 | `fastdfgrad` | `df.grad.{rhf,rks,uhf,uks}.Gradients.jk_energy_per_atom` | the **two-electron derivative of a density-fitted gradient** -- 72-97 % of one, depending on the basis, and a fifth code path.  Two things, neither a rearrangement: the three-centre integrals of its first loop are taken from the cderi the SCF already built (`_decompose_j2c`'s matrix satisfies `aux_coef @ aux_coef.T == metric`, so the pseudo-density comes out of it exactly), and the derivative kernel is launched with a quarter as many shell pairs per thread block, which is **1.26x-3.15x** on that kernel and the fastest of the six values swept at every size measured.  Restricted or unrestricted, hybrid or range-separated -- both of an RSH functional's two calls reuse, which needs the `reset()` on the method's first line to be partial.  A pure functional never reaches this function, an `only_dfj` object has no cderi, and a TDDFT or NAC gradient's asymmetric factorisation falls through.  `docs/README_fastdfgrad.md`, and `docs/DF_WORK_LIST.md` W3 |
 
 **Limits, all of which fall through rather than fail.** An **open-shell ground
@@ -490,6 +523,7 @@ python tests/test_df.py                    # the density-fitted J and K build:
                                            # energy and gradient, closed and
                                            # open shell
 python tests/test_dfj.py                   # the RIJONX branch fastdfj
+python tests/test_dfcderi.py               # the cderi build fastdfcderi
                                            # repairs: its J against a DF
                                            # J-only call and its K against a
                                            # direct SCF's, element-wise, plus

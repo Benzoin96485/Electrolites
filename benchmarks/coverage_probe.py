@@ -165,6 +165,14 @@ if 'fastdf' in active:
     # SCF and is the only two-electron row that moves on a DF one.
     _ENTRIES.append(
         ('fastdf  df get_jk', _dfjk, 'get_jk', _dfjk, '_get_jk_orig'))
+if 'fastdfcderi' in active:
+    from gpu4pyscf.df import df as _dfmod                    # noqa: E402
+    # the cderi build.  Exactly one call per density-fitted SCF -- and per
+    # range-separated `range_coulomb` object, which builds its own -- so a
+    # row reading `1` is the whole of this module's coverage and a `(-)` on a
+    # DF run means the build never happened
+    _ENTRIES.append(('fastdfcderi cholesky_eri', _dfmod, '_cholesky_eri',
+                     _dfmod, '_cholesky_eri_orig'))
 if 'fastdfgrad' in active:
     from gpu4pyscf.df.grad import rks as _dfgrks             # noqa: E402
     from gpu4pyscf.df.grad import uks as _dfguks             # noqa: E402
@@ -262,7 +270,7 @@ extra = {}
 # are handed straight back to GPU4PySCF.  `only_dfj` in this line is the
 # number that actually took the repaired branch.
 for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc', 'fastdfj',
-           'fastdfgrad'):
+           'fastdfgrad', 'fastdfcderi'):
     if _m in active:
         _mod = __import__(f'electrolites.{_m}', fromlist=['x'])
         if hasattr(_mod, 'stats'):
