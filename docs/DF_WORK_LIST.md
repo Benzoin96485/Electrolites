@@ -9,8 +9,8 @@ rediscovering it.
 Companion documents: `docs/README_fastdf.md` is the round that produced this
 list (what changed, why, and the full tables); `docs/README_fastdfj.md` is the
 round that closed **W1**, which is where the biggest number on this page now
-is; `docs/README_fastdfgrad.md` closed **W3** and `docs/README_fastdfcderi.md`
-**W4**; `docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
+is; `docs/README_fastdfgrad.md` closed **W3**, `docs/README_fastdfcderi.md`
+**W4** and `docs/README_fastdfblock.md` **W5**; `docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
 `instructions/06`'s catalogue.
 
 ---
@@ -223,6 +223,16 @@ integrals the SCF's cderi already holds, and a launch constant.  What it could
 *not* do is run at 284 atoms: `j3c_oo` is a dense `(naux, nocc, nocc)` array,
 32.0 GB there, and neither upstream nor this repository batches it.  That is
 **W10**.
+
+**W5 is done, and W14 and W15 are what it found.**  The block-sparse exchange
+contraction is **1.09x** on the exchange block at 284 atoms and **1.20x** at
+545 and **does not pay on the call** — 0.85x to 1.02x over five paired
+readings — so it ships off behind `FASTDF_STEP1=auto`.  The 4.5x the item
+priced was never available: the pair fill it quoted is the product of an
+atom-pair factor a tile can address and a shell-structure factor no AO tile
+can, and the tile fill is 69.4 % at 284 atoms
+(`docs/README_fastdfblock.md`).  Its own falsification criterion fires at 113
+atoms exactly as written.
 
 The ordering before the 284-atom run put the capacity items first, because the
 size ladder in §3.2 looked like a wall.  It is not one on this hardware, so
@@ -518,30 +528,84 @@ module on it is worth the share it holds: 8 % of a small def2-SVP SCF and
   284 atoms (**W12**), and `_decompose_j2c`'s 20–62 ms of cuSOLVER latency at
   the small end (**W13**).
 
-### W5 — A block-sparse exchange contraction
+### W5 — A block-sparse exchange contraction — **done, and it does not pay**
 
-*(§3.3 raised this one too, and it is now the largest lever on DF-K itself.)*
+`electrolites/_dfblock.py` and `FASTDF_STEP1` in `electrolites/fastdf.py`,
+probes in `benchmarks/df_block_probe.py` and `benchmarks/df_block_bench.py`,
+write-up in `docs/README_fastdfblock.md`.
 
-The prize is §3.2's fill: **4.5x** the arithmetic at 284 atoms, growing with
-system size.  §3.3 measures the two contractions at **12.1 s of a 12.38 s** K
-build there, so unlike at 42 atoms there is nothing else left to blame.  It
-also removes the dense `(nao, nao, blksize)` work buffer, which is 7 GB at
-PfPMT's measured `blksize` of 128 and 14 GB at 256.
+**The item's premise was wrong, and the measurement that shows it is cheaper
+than the implementation was.**  This entry priced the prize at the **4.5x**
+reciprocal of §3.2's 22.2 % pair fill.  A GEMM cannot address a pair; it
+addresses a tile, and the fraction of `nao x nao` covered by AO tiles holding
+at least one stored pair is **69.4 %** at 284 atoms and **66.1 %** at 545 —
+a ceiling of 1.44x and 1.51x on the first contraction, not 4.5x, and
+**98.2 %** at 113 atoms, which is no ceiling at all.
 
-This is a real project, not a rearrangement: the pattern has to be built from
-the shell-pair list, the unpack has to write tiles rather than a dense block,
-and the second contraction (`vk = R Rᵀ`) stays dense either way — so the
-ceiling is a bit under half the build, times the fill factor.
+The reason is the one fact this list did not have.  **The cderi's sparsity is
+the product of two factors and only one of them is spatial:**
 
-* **Do**: AO tiles (32 or 64) rather than shell pairs, so the block GEMMs are
-  a usable shape; a tile-pair pattern computed once per `dfobj`; a tiled
-  unpack; then either `cuSPARSE` BSRMM per auxiliary function or a custom
-  batched GEMM over present tile pairs.
-* **Success**: step 1 faster than the dense contraction at 113 atoms *and*
-  at 284, with the crossover reported.
-* **Falsified if**: the tile GEMMs at 50 % fill (taxol) are slower than one
-  dense contraction at 15.8 TF/s — likely, which is why the acceptance
-  criterion names two sizes.  This may be a large-system-only win.
+| | atoms | pair fill | = atom-pair fill | x AO density inside a surviving atom block |
+|---|---|---|---|---|
+| taxol | 113 | 50.6 % | 90.3 % | 56.0 % |
+| PfPMT | 284 | 22.2 % | 52.0 % | 43.7 % |
+| HcgC | 545 | 16.5 % | 45.0 % | 38.5 % |
+
+A tile of 32 AOs is three and a half atoms, so it can reach the atom-pair
+factor and nothing else.  The second factor is shell structure — which
+exponent and which angular momentum — at one-to-five-AO granularity, and no
+AO tile of any size addresses it.  Four AO reorderings were measured (`rcm`,
+`rcb`, `morton`, and a shell-class-major one); **the best is worth three
+points of fill and the worst minus two.**
+
+**The item's own falsification criterion fires.**  At taxol's fill the tile
+contraction is **0.91x** of the dense one and the whole exchange block
+**0.72x**, so the acceptance criterion — faster at 113 atoms *and* at 284 —
+cannot be met.
+
+**What was built**, above a measured crossover: the first contraction
+**1.31x** at 284 atoms and **1.38x** at 545, the exchange block **1.09x** and
+**1.20x** — and **no gain at all on the call those kernels are part of**.  A
+whole `get_jk` at 284 atoms reads **0.85x, 0.86x, 0.90x, 1.02x and 1.02x**
+across five paired round robins in two jobs, against a microbenchmark of the
+same three kernels on the same pattern that says 1.09x.  Three explanations
+for the ~1.5 s gap were checked and none accounts for it — the block size the
+real call runs at (worth part of it), a cached-buffer reallocation (the fix is
+in and made it *slower*), and the resident cderi prefix (worth half a per cent
+on this call either way).  What is left, and is a candidate rather than a
+result, is that the tiled path issues ~5400 kernel launches per call against
+the dense path's ~130, interleaved with a saturated PCIe stream and its
+events; **that needs a profile of the block loop, not another wall clock**,
+and it is the first thing to do for anyone reopening this.
+
+So it **ships off** — `FASTDF_STEP1=auto` opts in.  When it is on it is gated
+on the measured tile fill (`FASTDF_TILE_MAX_FILL`, default 0.75) and **not**
+on the system size, because a size gate is demonstrably wrong: taxol in
+def2-TZVPP has 2636 basis functions against PfPMT's 2697 in def2-SVP and a
+tile fill of **98.9 %** against 72.3 %.  Going up a basis set moves the two
+factors in opposite directions — the atom-pair fill *rises* (52.0 → 63.5 %)
+as the diffuse functions reach further, the within-block density falls
+(43.7 → 31.3 %) — and the tile fill, which is the only one a tile sees, does
+not move.
+
+* **Correctness** is `tests/test_df.py --ablate`, which now runs the tiled
+  contraction at two tile sizes: **3.0e-16 (J) / 1.5e-14 (K)**, and the
+  tiled and dense contractions are bit-identical up to 2697 AOs.
+* **Two things it found rather than closed**: the tiled unpack is a CuPy
+  fancy-index scatter where GPU4PySCF's is a CUDA kernel and costs 8.4 ms
+  against 2.0 at 284 atoms, which is the whole gap between the contraction's
+  ratio and the block's — **W14**; and the route to the factor a tile cannot
+  see is a localised occupied basis, which `vk = rhok rhokᵀ` admits *exactly*
+  — **W15**.
+* **And one measurement rule**, §5.7, learned the hard way here: an
+  end-to-end ratio for a variant with a multi-gigabyte working set moved by
+  0.16x between two jobs and by 0.16x between two tile sizes that the kernel
+  benchmark puts 0.03x apart.  One reading of it is not a result.
+* **One thing it does not deliver** that the entry promised: the dense
+  `(nao, nao, blksize)` buffer does shrink by `fill` (7.45 → 4.61 GB at 284
+  atoms), but the density factor has to be gathered onto the tile rows and
+  that array is as large as the saving at 545 atoms.  Net footprint is a
+  wash.
 
 ### W6 — Local / pair-atomic fitting
 
@@ -677,6 +741,53 @@ That is latency, not arithmetic: the same three operations at 5598 rows cost
   atoms, so this is the least valuable item on this page — it is here
   because it is the only stage of the build nothing has looked at.
 
+### W14 — A CUDA kernel for the tiled unpack
+
+*(Found by W5, which measured it rather than closed it.)*
+
+The block-sparse contraction scatters the packed block into a row-compressed
+buffer with a CuPy fancy-index assignment, where GPU4PySCF's dense unpack is
+`libcupy_helper.decompress_and_transpose`.  It costs **8.37 ms against 2.01**
+at 284 atoms and 3.61 against 1.31 at 545, and that difference is the whole
+gap between W5's contraction ratio and its block ratio.
+
+* **Do**: the same kernel GPU4PySCF has, with a destination table instead of
+  a `divmod`.  `RowCompressed` already computes the two destination offsets
+  per stored pair (`electrolites/_dfblock.py`), and the access pattern is the
+  same shape as upstream's — contiguous in `L`, one row of `nL` doubles per
+  pair — so §2's "2.65x slower than GPU4PySCF's" result, which was about an
+  `(L,i,j)` *layout*, does not apply.
+* **Success**: the tiled unpack within 25 % of the dense one, which takes the
+  284-atom exchange block from **1.09x to 1.18x** and the 545-atom one from
+  1.20x to 1.22x.
+* **Falsified if**: the scatter is already bandwidth-bound.  1.65 GB in
+  8.37 ms is 197 GB/s against the dense unpack's 1.43 TB/s, so it is not.
+
+### W15 — Localised occupied orbitals
+
+*(Found by W5, which measured the factor a tile cannot reach.)*
+
+`vk[i,j] = sum_{k,L} rhok[i,k,L] rhok[j,k,L]` is **exactly** invariant under
+an orthogonal rotation of the density factor's second index — `rhok -> rhok U`
+leaves the sum over `k` alone — so the factor may be replaced by a localised
+one for free and to round-off.  `rhok` is then sparse in `(i, k)` as well as
+`(i, j)`, which is what every linear-scaling exchange implementation exploits
+and the only route to W5's §1.1 second factor that does not need a
+shell-granular GEMM.
+
+* **Do**: read the occ-RI-K / linear-scaling-K literature first.  A pivoted
+  Cholesky of the density matrix gives localised vectors and is exact; the
+  hard part is not the localisation but batching orbitals into groups with a
+  common support so the GEMMs stay large.
+* **Success**: an exchange matrix at the `tests/test_df.py` tolerance with a
+  contraction cost that is visibly sub-quadratic on the §3.2 ladder.
+* **Falsified if**: the per-orbital supports at 284 atoms are not small —
+  measure the support of a Cholesky-localised occupied set *before* writing
+  anything, the way `df_block_probe.py` measures the tile fill.  That probe is
+  an afternoon and this item is not.
+* The AO-permutation machinery in `electrolites/_dfblock.py` is reusable here:
+  it is the half of the problem that already exists and is tested.
+
 ### Not on this list
 
 **Seminumerical exchange (sn-K / COSX)**, which would avoid the cderi
@@ -708,6 +819,33 @@ four are cheap to avoid and none is detectable from the number itself.
    copy's stays `None`.  Every wB97M-V DF run died in `get_jk` with
    `'NoneType' object is not subscriptable`, patched and unpatched alike.
    Wrap the class.
+
+5. **Take the whole node and then hide three of its GPUs.**  `--qos=debug`
+   gives four, `multi_gpu.num_devices` is then 4, and every module in
+   `electrolites/` asserts a single device and hands every call back — a whole
+   job reads as "no change" with nothing else wrong, and `stats()` says
+   `declined_reasons: {'more than one device': N}`.  `export
+   CUDA_VISIBLE_DEVICES=0` in the job script is the fix
+   (`docs/OPENSHELL_TMC.md` §5 records the same trap).  It also changes what
+   is being measured: on four devices GPU4PySCF splits the cderi, so a
+   taxol/def2-SVP tensor reads 3.58 GB per device rather than the 14.3 GB
+   §3.2 quotes.
+6. **The debug nodes are not all the same card.**  The rows in
+   `docs/README_fastdfblock.md` were taken on A100-SXM4-**80GB** nodes, where
+   `fastdf._blksize` chooses 241 auxiliary functions at 284 atoms against the
+   128 §3.3 records on a 40 GB one.  Fix the block size explicitly in any
+   comparison that is meant to be read next to an older table.
+
+7. **A variant with a multi-gigabyte working set needs more than one job.**
+   Rule 2 says to interleave variants, and W5 found where that stops being
+   enough: `fastdf._blksize` derives the auxiliary block from
+   `get_avail_mem()` on every call, so a variant holding 8.8 GB changes the
+   block the *next* one picks and the state its own cached buffer is sized
+   for.  The same 284-atom pair read **1.02x** in one job and **0.90x** in
+   another, and two tile sizes the kernel benchmark puts 0.03x apart read
+   0.16x apart end to end.  Take the reading twice, in two jobs, before
+   believing a ratio for anything that holds gigabytes — and note that
+   pinning the block size, which looked like the fix, made it *slower*.
 
 And one that is not about timing: **a patch target is not a code path.**
 Three rounds in this repository have now shipped a module that was loaded,
@@ -745,6 +883,13 @@ python benchmarks/df_cderi_probe.py --xyz ... --skip-metric --sp-mults 4 \
 python benchmarks/df_cderi_bench.py  --xyz ... [--cpu-cderi] [--scf]
 ```
 
+```bash
+python benchmarks/df_block_probe.py --breakdown --hist   # W5's pattern, no GPU
+python benchmarks/df_block_probe.py --basis def2-tzvpp   # why the gate is fill
+python benchmarks/df_block_bench.py --check --cases taxol:0:0,PfPMT:0:-1
+python benchmarks/df_jk_bench.py --xyz ... --tiled 32 --tile-orders native
+```
+
 `fastdfcderi`'s switches (`FASTDFCDERI_OFF`, `FASTDFCDERI_METRIC`,
 `FASTDFCDERI_SPMULT`, `FASTDFCDERI_MIN_WORK`, `FASTDFCDERI_PIN`,
 `FASTDFCDERI_HUGEPAGE`) are listed at the top of
@@ -752,6 +897,7 @@ python benchmarks/df_cderi_bench.py  --xyz ... [--cpu-cderi] [--scf]
 `docs/README_fastdfcderi.md` is measured with.
 
 `fastdf`'s switches (`FASTDF_OFF`, `FASTDF_STEP1`, `FASTDF_STEP2`,
-`FASTDF_JPASS`, `FASTDF_SYRK_MIN_NAO`, `FASTDF_BLK`, `FASTDF_RESIDENT_FRAC`)
+`FASTDF_JPASS`, `FASTDF_SYRK_MIN_NAO`, `FASTDF_BLK`, `FASTDF_RESIDENT_FRAC`,
+and W5's `FASTDF_TILE`, `FASTDF_TILE_ORDER`, `FASTDF_TILE_MAX_FILL`)
 are listed with their meanings at the top of `electrolites/fastdf.py` and are
 what every ablation column in `docs/README_fastdf.md` is measured with.

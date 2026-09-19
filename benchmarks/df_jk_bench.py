@@ -50,6 +50,12 @@ ap.add_argument('--resident-fracs', default='',
                      'of fixing the fraction rather than the memory budget '
                      'is that the payoff curve is then measured on one '
                      'molecule instead of needing a different one per point.')
+ap.add_argument('--tiled', default='',
+                help='also time the block-sparse first contraction '
+                     '(`DF_WORK_LIST.md` W5) at these AO tile sizes, e.g. '
+                     '32,64.  Each is timed in the same round robin as the '
+                     'rest, and `--tile-orders` chooses the AO orderings.')
+ap.add_argument('--tile-orders', default='native,rcm')
 ap.add_argument('--cpu-cderi', action='store_true',
                 help='force the cderi onto host memory, which is what '
                      'GPU4PySCF does once it no longer fits -- the regime '
@@ -149,8 +155,8 @@ def _densities(n_dm):
 
 NDMS = [int(x) for x in a.ndm.split(',')]
 print(f'{"":24s} {"stock":>9s} {"fastdf":>9s} {"ratio":>7s} '
-      f'{"s2=gemm":>9s} {"s2=syrk":>9s} {"s1=bgemm":>9s} {"j=tensor":>9s} '
-      f'{"no-resid":>9s}')
+      f'{"s2=gemm":>9s} {"s2=syrk":>9s} {"s1=bgemm":>9s} {"s1=dense":>9s} '
+      f'{"j=tensor":>9s} {"no-resid":>9s}')
 
 
 def _variant(dms, **flags):
@@ -180,11 +186,14 @@ for n_dm in NDMS:
         (f'n_dm={n_dm} gemm', _variant(dms, _STEP2='gemm')),
         (f'n_dm={n_dm} syrk', _variant(dms, _STEP2='syrk')),
         (f'n_dm={n_dm} bgemm', _variant(dms, _STEP1='bgemm')),
+        (f'n_dm={n_dm} s1tensor', _variant(dms, _STEP1='tensor')),
         (f'n_dm={n_dm} jtensor', _variant(dms, _JPASS='tensor')),
     ]
     if not on_gpu:
         variants.append((f'n_dm={n_dm} no-resident',
                          _variant(dms, _RESIDENT_FRAC=0.)))
+    tiled = [(t, o) for t in (a.tiled.split(',') if a.tiled else [])
+             for o in a.tile_orders.split(',')]
     interleave(variants)
     rj, rk = fastdf._orig_get_jk(dfobj, dms, 1, True, True)
     gj, gk = fastdf.get_jk(dfobj, dms, 1, True, True)
@@ -202,8 +211,31 @@ for n_dm in NDMS:
                  f'{fastdf.STATS["resident_rows"] + fastdf.STATS["streamed_rows"]}')
     print(f'{f"get_jk  n_dm={n_dm}":24s} {t0*1e3:9.2f} {t1*1e3:9.2f} '
           f'{ratio:6.2f}x {_ms("gemm")} {_ms("syrk")} '
-          f'{_ms("bgemm")} {_ms("jtensor")} {_ms("no-resident")}  '
+          f'{_ms("bgemm")} {_ms("s1tensor")} {_ms("jtensor")} '
+          f'{_ms("no-resident")}  '
           f'relK={rel:.1e}{extra}', flush=True)
+    # Each (tile, order) is timed in a round robin of its **own**, paired
+    # against the default first contraction.  Only one tile pattern fits on
+    # the object at a time -- it is several GB at 284 atoms -- so putting them
+    # all in one round robin would make every timed call rebuild the pattern
+    # the previous variant evicted, and time the rebuild.
+    for t, o in tiled:
+        # the reference is the *dense* first contraction, forced: `fastdf`'s
+        # own default is `auto`, which takes the tiled one wherever the fill
+        # test passes, and would otherwise be compared against itself
+        pair = [(f'n_dm={n_dm} ref{t}/{o}', _variant(dms, _STEP1='tensor')),
+                (f'n_dm={n_dm} tiled{t}/{o}',
+                 _variant(dms, _STEP1='tiled', TILE=int(t), TILE_ORDER=o))]
+        interleave(pair)
+        gj, gk = pair[1][1]()
+        rel_t = float(cp.abs(gk - rk).max()) / scale
+        ref, v = R[f'n_dm={n_dm} ref{t}/{o}'], R[f'n_dm={n_dm} tiled{t}/{o}']
+        print(f'{"  tiled " + t + "/" + o:24s} {ref*1e3:9.2f} {v*1e3:9.2f} '
+              f'{ref/v:6.2f}x   fill={fastdf.STATS["tile_fill"]:.3f}  '
+              f'blk={fastdf.STATS["blocks"]}  relK={rel_t:.1e}', flush=True)
+        if hasattr(dfobj, '_fastdf_tiles'):
+            del dfobj._fastdf_tiles
+        cp.get_default_memory_pool().free_all_blocks()
 
 if a.resident_fracs and not on_gpu:
     print()

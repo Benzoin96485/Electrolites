@@ -12,7 +12,8 @@ So with ``patch_all()`` loaded a DF run's J and K are stock GPU4PySCF, and
 this module is what puts them on the same footing as the direct path.  It is
 catalogue **A13**, whose evidence is a 1.7.0 reading; ``docs/README_fastdf.md``
 §1 says which of its four claims survive on 1.8.1 and which upstream closed in
-the interval.
+the interval.  Item 5 below is ``docs/DF_WORK_LIST.md`` W5 and its write-up is
+``docs/README_fastdfblock.md``.
 
 What changes.  The integrals, the metric, the screening and every symmetry
 factor are GPU4PySCF's -- only the arrangement of the work changes, so the
@@ -94,6 +95,28 @@ entry is about.
    an ordinary host-resident one, so the knob is the answer rather than a
    heuristic.
 
+5. **The first contraction on the AO tiles the screening kept, above a
+   measured sparsity.**
+   ``DF_WORK_LIST.md`` W5 priced this at the reciprocal of the 22.2 % AO-pair
+   fill at 284 atoms.  A GEMM addresses a tile and not a pair, and the
+   fraction of ``nao x nao`` covered by tiles holding at least one stored pair
+   is **69.4 %** there, **66.1 %** at 545 atoms and **98.2 %** at 113 -- the
+   cderi's sparsity is the product of an atom-pair factor a tile can reach and
+   a shell-structure factor at one-to-five-AO granularity that no AO tile can
+   (``docs/README_fastdfblock.md`` §1.1).  What is left is real but small: the
+   contraction is **1.31x** at 284 atoms and **1.38x** at 545 and the exchange
+   block **1.09x** and **1.20x** -- and a whole ``get_jk`` call at 284 atoms,
+   the only end-to-end size that runs, reads **0.85x to 1.02x** over five
+   paired measurements, i.e. no gain at all.  ``docs/README_fastdfblock.md``
+   §4.1 has the three explanations that were checked and do not account for
+   the gap.  So this is **off by default**: ``FASTDF_STEP1=auto`` opts in.
+   The AO index is permuted freely to cut the tiles -- ``vk = rhok rhok^T``
+   comes back as ``P vk P^T`` and one scatter undoes it -- and the gate is the
+   **measured tile fill**, not ``nao``: taxol in def2-TZVPP has 2636 basis
+   functions against PfPMT's 2697 in def2-SVP and a tile fill of 98.9 %
+   against 72.3 %, so a size threshold of the kind ``SYRK_MIN_NAO`` uses would
+   switch this on exactly where it loses.
+
 Coverage is a real ``float64`` density, ``hermi`` 0 or 1, any number of
 densities, restricted or unrestricted, the cderi resident on the device or on
 the host, the full-range or long-range operator, and J and K together or J
@@ -124,10 +147,19 @@ Ablations, for the tables in ``docs/README_fastdf.md``:
     FASTDF_JPASS=blas|tensor
                       the Coulomb pass over the packed block: explicit
                       GEMV/GEMM (default) or GPU4PySCF's two `contract` calls
-    FASTDF_STEP1=tensor|bgemm
-                      GPU4PySCF's cuTENSOR contraction (default) or the cuBLAS
-                      batch over the AO index; item 2 says why the default is
-                      the one it is
+    FASTDF_STEP1=tensor|auto|bgemm|tiled
+                      the first contraction: `tensor` (default) is
+                      GPU4PySCF's cuTENSOR contraction, `auto` takes item 5's
+                      block-sparse one wherever the tile fill passes the gate,
+                      and `bgemm` and `tiled` force one branch each.  Items 2
+                      and 5 say what the alternatives are worth and where
+    FASTDF_TILE=<n>   item 5's AO tile size (default 32)
+    FASTDF_TILE_ORDER=native|rcm|rcb|morton
+                      the AO ordering item 5's tiles are cut in; `native` is
+                      the order the cderi's own addresses use
+    FASTDF_TILE_MAX_FILL=<f>
+                      the tile fill above which `auto` keeps the dense
+                      contraction (default 0.75)
     FASTDF_BLK=<n>    override the auxiliary block size, which GPU4PySCF
                       derives from free memory and then caps at 256
     FASTDF_RESIDENT_FRAC=<f>
@@ -151,10 +183,32 @@ _OFF = bool(os.environ.get('FASTDF_OFF'))
 #: 'auto' (a measured size threshold), 'syrk' or 'gemm' for the exchange
 #: contraction; see `_use_syrk`.
 _STEP2 = os.environ.get('FASTDF_STEP2', 'auto')
-#: 'tensor' (GPU4PySCF's cuTENSOR contraction) or 'bgemm' (the cuBLAS batch
-#: over the AO index).  `tensor` by default, and the module docstring's item 2
-#: says why the cuBLAS one is carried and not used.
+#: 'tensor' (GPU4PySCF's cuTENSOR contraction, the default), 'auto' (the
+#: block-sparse contraction wherever `_use_tiled`'s fill test passes),
+#: 'bgemm' (the cuBLAS batch over the AO index) or 'tiled' (the block-sparse
+#: one unconditionally).  The module docstring's items 2 and 5 say what the
+#: alternatives are worth and why neither is the default: item 5 wins the
+#: kernel it replaces and loses the call it is part of (0.85x-1.02x at 284
+#: atoms), for a 10 GB buffer held on the `DF` object.
 _STEP1 = os.environ.get('FASTDF_STEP1', 'tensor')
+#: AO tile size for the block-sparse contraction.  32 of 16/32/64 measured:
+#: 16 has the lowest fill and the most calls and ties with 32 at 284 atoms;
+#: 64 loses about ten points of fill and is behind both everywhere
+#: (`docs/README_fastdfblock.md` §3).
+TILE = int(os.environ.get('FASTDF_TILE', 32))
+#: 'native' (the AO order the cderi's pair addresses already use, which is the
+#: order the geometry file lists the atoms in) or one of the reorderings
+#: `_dfblock.atom_order` knows -- 'rcm', 'rcb', 'morton'.  Measured, the best
+#: reordering is worth three points of tile fill at 284 atoms and *costs* two
+#: at 545, which is inside the noise of the block ratio either way.
+TILE_ORDER = os.environ.get('FASTDF_TILE_ORDER', 'native')
+#: Above this tile fill the block-sparse contraction is slower than the dense
+#: one and `auto` keeps the dense one.  The tiled contraction runs at 0.82-0.93
+#: of the dense one's flop rate and its unpack is a fancy-index scatter rather
+#: than a CUDA kernel, so it needs roughly a quarter of the arithmetic removed
+#: before it is ahead.  Measured break-even is a fill near 0.80
+#: (`docs/README_fastdfblock.md` §3); 0.75 leaves margin.
+TILE_MAX_FILL = float(os.environ.get('FASTDF_TILE_MAX_FILL', 0.75))
 #: 'blas' (explicit GEMV/GEMM) or 'tensor' (GPU4PySCF's two `contract` calls)
 #: for the Coulomb pass over the packed cderi.
 _JPASS = os.environ.get('FASTDF_JPASS', 'blas')
@@ -191,8 +245,9 @@ DFJK._get_jk_orig = _orig_get_jk
 
 #: counters, so an ablation or a coverage claim can be read off a run.
 STATS = {'calls': 0, 'declined': 0, 'syrk': 0, 'gemm': 0,
-         'bgemm': 0, 'tensor': 0, 'blocks': 0,
-         'resident_rows': 0, 'streamed_rows': 0}
+         'bgemm': 0, 'tensor': 0, 'tiled': 0, 'blocks': 0,
+         'resident_rows': 0, 'streamed_rows': 0, 'tile_fill': 0.0,
+         'blksize': 0}
 DECLINED = {}
 
 
@@ -344,7 +399,7 @@ def _use_syrk(nao):
     return nao >= SYRK_MIN_NAO
 
 
-def _blksize(nao, nocc, nbuf, on_gpu, naux_slice):
+def _blksize(nao, nocc, nbuf, on_gpu, naux_slice, fill=1.0, extra=0):
     """How many auxiliary functions one pass may unpack at a time.
 
     The dense block is ``blk*nao^2`` words and each ``rhok`` is
@@ -358,8 +413,8 @@ def _blksize(nao, nocc, nbuf, on_gpu, naux_slice):
         return max(1, min(_BLK, naux_slice))
     mem = get_avail_mem()
     frac = .4 if on_gpu else .2
-    words = int(mem * frac / 8)
-    blk = words // (nao * nao + nbuf * nao * nocc)
+    words = int(mem * frac / 8) - extra
+    blk = max(words, 0) // (int(fill * nao * nao) + nbuf * nao * nocc)
     blk = min(max(blk, 1), MAX_BLK, naux_slice)
     return blk
 
@@ -398,6 +453,78 @@ def _resident_prefix(dfobj, cderi_sparse, reserve_words):
     STATS['resident_rows'] = 0 if buf is None else int(buf.shape[0])
     STATS['streamed_rows'] = naux_slice - STATS['resident_rows']
     return buf
+
+
+def _tile_fill(dfobj, nao):
+    """What fraction of ``nao x nao`` the tiled pattern would cover.
+
+    This is the whole of `_use_tiled`'s decision and it is cheap -- a
+    ``unique`` over the pair list, no allocation and no device work -- so it
+    is measured rather than guessed from the size.  Guessing from the size is
+    specifically wrong: taxol in def2-TZVPP has 2636 basis functions, within
+    three per cent of PfPMT's 2697 in def2-SVP, and a tile fill of **98.9 %**
+    against PfPMT's 72.3 % (`docs/README_fastdfblock.md` §2.1).
+    """
+    from electrolites import _dfblock
+    key = (dfobj._cderi_idx[0], TILE, TILE_ORDER)
+    cached = getattr(dfobj, '_fastdf_tile_fill', None)
+    if (cached is not None and cached[0][0] is key[0]
+            and cached[0][1:] == key[1:]):
+        return cached[1]
+    addr = dfobj._cderi_idx[0]
+    addr = addr.get() if hasattr(addr, 'get') else np.asarray(addr)
+    rows, cols = addr // nao, addr % nao
+    if TILE_ORDER != 'native':
+        perm = _dfblock.ao_perm(
+            dfobj.mol, _dfblock.atom_order(dfobj.mol, rows, cols, TILE_ORDER))
+        rows, cols = perm[rows], perm[cols]
+    fill = _dfblock.tile_stats(rows, cols, nao, TILE)['fill']
+    dfobj._fastdf_tile_fill = (key, fill)
+    return fill
+
+
+def _use_tiled(dfobj, nao):
+    """Whether the block-sparse first contraction is the faster one here."""
+    if _STEP1 == 'tiled':
+        return True
+    if _STEP1 != 'auto':
+        return False
+    fill = _tile_fill(dfobj, nao)
+    STATS['tile_fill'] = fill
+    return fill <= TILE_MAX_FILL
+
+
+def _tiles(dfobj, nao, blksize):
+    """The tile pattern of this cderi, built once and kept on the object.
+
+    Keyed on the pair-address array itself rather than on ``id(dfobj)``:
+    ``reset()`` replaces the index array and ``range_coulomb`` hands a
+    *copy* of the object a different one, and a cache that could not tell
+    those apart would scatter one tensor's block through another's
+    destinations.
+
+    **The block size is fixed at the first call and the caller takes it
+    back**, rather than being recomputed per call the way the dense path's
+    is.  The buffer this holds is 10.8 GB at 284 atoms; ``_blksize`` reads
+    ``get_avail_mem()``, which moves by a few per cent between calls, and
+    re-deriving the block each time would reallocate and re-zero all of it
+    for a block that differs by one.  The destination tables themselves do
+    not depend on the block size -- they are offsets in units of whole ``L``
+    rows -- so nothing else has to be rebuilt either way.
+    """
+    from electrolites._dfblock import RowCompressed
+    key = (dfobj._cderi_idx[0], TILE, TILE_ORDER)
+    cached = getattr(dfobj, '_fastdf_tiles', None)
+    if (cached is None or cached[0][0] is not key[0]
+            or cached[0][1:] != key[1:]):
+        rc = RowCompressed.for_dfobj(dfobj, nao, TILE, blksize,
+                                     order=TILE_ORDER).to_device()
+        dfobj._fastdf_tiles = (key, rc)
+    else:
+        rc = cached[1]
+    STATS['tile_fill'] = rc.fill
+    STATS['blksize'] = rc.ldL
+    return rc
 
 
 def _blocks(cderi_sparse, blksize, on_gpu, resident=None):
@@ -573,8 +700,10 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
 
     use_syrk = (mode == 0) and _use_syrk(nao)
     use_bgemm = _STEP1 == 'bgemm'
+    use_tiled = _use_tiled(dfobj, nao)
     STATS['syrk' if use_syrk else 'gemm'] += 1
-    STATS['bgemm' if use_bgemm else 'tensor'] += 1
+    STATS['tiled' if use_tiled else
+          ('bgemm' if use_bgemm else 'tensor')] += 1
 
     # --- J: GPU4PySCF's packed contraction, unchanged ---------------------
     rows = cols = dm_sparse = vj_sparse = None
@@ -592,19 +721,41 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
     # block that fits so much smaller there.
     nbuf = 1 if mode == 0 else 2
     nbuf_live = nbuf if use_bgemm else nbuf * n_dm
-    blksize = _blksize(nao, nocc, nbuf_live, on_gpu, naux_slice)
+    fill, extra = 1.0, 0
+    if use_tiled:
+        # the tiled buffer is `fill` times the dense one, so the block that
+        # fits is correspondingly larger.  Against that, the gathered density
+        # factor is `fill * nao / TILE` times as tall as the factor itself and
+        # does not shrink with the block -- at 545 atoms and tile 32 it is as
+        # large as the buffer, which is why it is subtracted from the budget
+        # rather than divided into it.
+        fill = _tile_fill(dfobj, nao)
+        extra = int(fill * nao * nao / TILE) * nocc * nbuf * nspin * n_dm
+    blksize = _blksize(nao, nocc, nbuf_live, on_gpu, naux_slice, fill, extra)
+    tiles = None
+    if use_tiled:
+        # the pattern owns its block size; see `_tiles`
+        tiles = _tiles(dfobj, nao, blksize)
+        blksize = tiles.ldL
     vk = cp.zeros((nspin, n_dm, nao, nao))
     log.debug1('fastdf: nao=%d nocc=%d n_dm=%d nspin=%d blksize=%d mode=%d '
                'syrk=%s bgemm=%s', nao, nocc, n_dm, nspin, blksize, mode,
                use_syrk, use_bgemm)
 
-    work = cp.zeros((nao, nao, blksize))
+    work = None if use_tiled else cp.zeros((nao, nao, blksize))
     rbuf = cp.empty(nbuf_live * blksize * nao * nocc)
+    if use_tiled:
+        fl = tiles.factor(fl.reshape(-1, nao, nocc)).reshape(
+            nspin, n_dm, -1, nocc)
+        if fr is not None:
+            fr = tiles.factor(fr.reshape(-1, nao, nocc)).reshape(
+                nspin, n_dm, -1, nocc)
     auxbuf = cp.empty(n_dm * nspin * blksize) if with_j else None
 
     resident = None
     if not on_gpu:
-        reserve = work.size + rbuf.size + 2 * blksize * cderi_sparse.shape[1]
+        reserve = ((tiles.buf.size if use_tiled else work.size) + rbuf.size
+                   + 2 * blksize * cderi_sparse.shape[1])
         resident = _resident_prefix(dfobj, cderi_sparse, reserve)
 
     for cderi_blk, nL in _blocks(cderi_sparse, blksize, on_gpu, resident):
@@ -624,6 +775,27 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
         # transposed half of a symmetric fill is coalesced in that layout and
         # is not in this one; `docs/README_fastdf.md` §3.4 has the measurement
         # and why the layout turned out not to be needed.
+        if use_tiled:
+            # `_dfblock` says why the AO index may be permuted and where it
+            # comes back; everything between here and `unpermute` below is in
+            # the reordered basis, including `vk`.
+            tiles.unpack(cderi_blk, nL)
+            for s in range(nspin):
+                rl = ndarray((n_dm, nao, nocc, nL), buffer=rbuf)
+                tiles.step1(fl[s], rl, nL)
+                if mode == 0:
+                    if use_syrk:
+                        for i in range(n_dm):
+                            _syrk(rl[i], vk[s, i], nao, nocc * nL)
+                    else:
+                        contract('nikL,njkL->nij', rl, rl, beta=1, out=vk[s])
+                else:
+                    rr = ndarray((n_dm, nao, nocc, nL),
+                                 buffer=rbuf[n_dm * nao * nocc * blksize:])
+                    tiles.step1(fr[s], rr, nL)
+                    contract('nikL,njkL->nij', rl, rr, beta=1, out=vk[s])
+            continue
+
         dense = fill_symmetric(cderi_blk.T, pair_idx, nao, 0, nL,
                                out=work[:, :, :nL])
         if use_bgemm:
@@ -659,6 +831,8 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
 
     if use_syrk:
         vk = _fill_from_triangle(vk)
+    if use_tiled:
+        vk = tiles.unpermute(vk)
 
     vj = None
     if with_j:

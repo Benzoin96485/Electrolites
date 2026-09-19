@@ -44,7 +44,8 @@ ap.add_argument('--no-scf', action='store_true', help='skip the end-to-end pair'
 ap.add_argument('--ablate', action='store_true',
                 help='also check the two paths the default configuration does '
                      'not take on these molecules: the cuBLAS first '
-                     'contraction, and GPU4PySCF\'s Coulomb pass')
+                     'contraction, GPU4PySCF\'s Coulomb pass, and the '
+                     'block-sparse first contraction at two tile sizes')
 ap.add_argument('--verbose', action='store_true')
 a = ap.parse_args()
 
@@ -142,7 +143,14 @@ def main():
     for cfg in CONFIGS:
         DEFAULTS.update({k: getattr(fastdf, k) for k in cfg})
     if a.ablate:
-        CONFIGS.extend([{'_STEP1': 'bgemm'}, {'_JPASS': 'tensor'}])
+        # `tiled` twice: once as it ships, and once at a tile small enough
+        # that these molecules' patterns are genuinely sparse at it, with a
+        # reordering on top -- otherwise every tile pair is present, the
+        # compression is the identity and the permutation is never tested.
+        CONFIGS.extend([{'_STEP1': 'bgemm'}, {'_JPASS': 'tensor'},
+                        {'_STEP1': 'tiled'},
+                        {'_STEP1': 'tiled', 'TILE': 8,
+                         'TILE_ORDER': 'rcm'}])
         for cfg in CONFIGS:
             DEFAULTS.update({k: getattr(fastdf, k) for k in cfg})
     print(f'# gpu4pyscf {electrolites.gpu4pyscf_version()}  '
