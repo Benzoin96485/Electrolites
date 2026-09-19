@@ -345,6 +345,7 @@ def nr_uks_nlc(ni, mol, grids, xc_code, nlc_code, dms, hermi=1, verbose=None):
 _PATCHED = False
 _ORIG_GET_VEFF = None
 _ORIG_GET_VEFF_U = None
+_ORIG_GET_VEFF_DF = None
 
 #: How many `get_veff` calls took the fused pass and how many handed the case
 #: back, counted separately for a restricted and an unrestricted ground
@@ -361,12 +362,24 @@ def stats():
     return dict(STATS)
 
 
-def _fused_xc_nlc(ks, mol, dm, hermi):
+def _fused_xc_nlc(ks, mol, dm, hermi, allow_df=False):
     """(nelec, exc, vxc) from one grid pass, or None if this case is not it."""
     if _OFF or num_devices != 1 or hermi != 1:
         return None
-    if getattr(ks, 'with_df', None) is not None:
-        return None                       # density fitting has its own get_veff
+    if (not allow_df and getattr(ks, 'with_df', None) is not None
+            and not getattr(ks, 'only_dfj', False)):
+        # density fitting has its own `get_veff`; `get_veff_df` is the wrapper
+        # that is on it, and it is the only caller that passes allow_df.
+        #
+        # `only_dfj` is the exception, and it has to be named here or a RIJONX
+        # wB97M-V run loses the fused grid pass: `fastdfj` hands such an object
+        # to `RKS.get_veff` on purpose (its exchange is the four-centre build,
+        # so it wants the incremental Fock that `_DFHF.get_veff` refuses), and
+        # that is this function's restricted caller.  `_DFHF.get_veff` will
+        # not run for it, so there is nothing to double.  Without `fastdfj`
+        # loaded the clause is unreachable -- `_DFHF.get_veff` precedes
+        # `RKS.get_veff` in a density-fitted object's method resolution order.
+        return None
     if not getattr(ks, 'do_nlc', lambda: False)():
         return None                       # nothing to fuse with
     dm = cupy.asarray(dm) if not hasattr(dm, 'ndim') else dm
@@ -420,12 +433,12 @@ def get_veff(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
             ks.__dict__.pop('do_nlc', None)
 
 
-def _fused_xc_nlc_u(ks, mol, dm, hermi):
+def _fused_xc_nlc_u(ks, mol, dm, hermi, allow_df=False):
     """The unrestricted twin of ``_fused_xc_nlc``."""
     if _OFF or num_devices != 1 or hermi != 1:
         return None
-    if getattr(ks, 'with_df', None) is not None:
-        return None                       # density fitting has its own get_veff
+    if not allow_df and getattr(ks, 'with_df', None) is not None:
+        return None                       # see `_fused_xc_nlc`
     if not getattr(ks, 'do_nlc', lambda: False)():
         return None                       # nothing to fuse with
     dm = cupy.asarray(dm)
@@ -497,9 +510,86 @@ def get_veff_u(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
             ks.__dict__.pop('do_nlc', None)
 
 
+def get_veff_df(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
+    """``_DFHF.get_veff`` with the XC and NLC builds sharing one grid pass.
+
+    ``density_fit()`` builds the object's class as
+    ``lib.set_class(mf, (_DFHF, mf.__class__))``, so ``_DFHF.get_veff``
+    (``df/df_jk.py:270``) comes *before* ``RKS.get_veff`` and ``UKS.get_veff``
+    in the method resolution order and **neither of the two wrappers above is
+    on a density-fitted run's path at all** -- `benchmarks/coverage_probe.py
+    --density-fit` reads ``(-)`` on that row for every functional.  A DF
+    wB97M-V or B97M-V calculation therefore walked the grid twice per
+    iteration where a direct-SCF one walks it once.  Found while measuring
+    `fastdf`; ``docs/README_fastdf.md`` §5 has the account.
+
+    The body is the same as the other two wrappers: compute the fused pass,
+    then let upstream's own ``get_veff`` run with ``nr_rks``/``nr_uks``
+    answering from it, so the DF Coulomb and exchange builds, the ``ecoul``
+    bookkeeping and the returned ``tag_array`` stay upstream's code.
+    """
+    if mol is None:
+        mol = ks.mol
+    if dm is None:
+        dm = ks.make_rdm1()
+    fused = None
+    unrestricted = getattr(dm, 'ndim', 2) == 3
+    if _usable_df(ks, dm):
+        try:
+            # `_DFHF.get_veff`'s own first step, so the grids exist before the
+            # fused pass reads them
+            _rks.initialize_grids(ks, mol, dm[0] + dm[1] if unrestricted
+                                  else dm)
+            fn = _fused_xc_nlc_u if unrestricted else _fused_xc_nlc
+            fused = fn(ks, mol, dm, hermi, allow_df=True)
+        except Exception:                    # never fail closed
+            fused = None
+    key = 'fused_u' if unrestricted else 'fused'
+    STATS[key if fused is not None else ('declined_u' if unrestricted
+                                         else 'declined')] += 1
+    if fused is None:
+        return _ORIG_GET_VEFF_DF(ks, mol, dm, dm_last, vhf_last, hermi)
+
+    ni = ks._numint
+    name = 'nr_uks' if unrestricted else 'nr_rks'
+    had = name in ni.__dict__
+    old = ni.__dict__.get(name)
+    had_do_nlc = 'do_nlc' in ks.__dict__
+    old_do_nlc = ks.__dict__.get('do_nlc')
+    try:
+        setattr(ni, name, lambda *args, **kwargs: fused)
+        ks.do_nlc = lambda: False
+        return _ORIG_GET_VEFF_DF(ks, mol, dm, dm_last, vhf_last, hermi)
+    finally:
+        if had:
+            ni.__dict__[name] = old
+        else:
+            ni.__dict__.pop(name, None)
+        if had_do_nlc:
+            ks.__dict__['do_nlc'] = old_do_nlc
+        else:
+            ks.__dict__.pop('do_nlc', None)
+
+
+def _usable_df(ks, dm):
+    """Only the two branches of ``_DFHF.get_veff`` this wrapper reproduces.
+
+    ``_DFHF.get_veff`` also serves ROHF -- where it *rewrites* the density
+    into a two-row array before calling ``nr_uks``, so a fused pass computed
+    on the density handed in would answer for a different matrix -- and GHF,
+    which calls ``ni.get_vxc`` rather than either of the two names this
+    wrapper redirects.  Both fall through.
+    """
+    from gpu4pyscf.scf import rohf as _rohf, ghf as _ghf
+    if isinstance(ks, (_rohf.ROHF, _ghf.GHF)):
+        return False
+    ndim = getattr(dm, 'ndim', 2)
+    return ndim in (2, 3)
+
+
 def apply_patch():
     """Fuse the XC and NLC grid passes on 1.8.x, where fastrsh stands down."""
-    global _PATCHED, _ORIG_GET_VEFF, _ORIG_GET_VEFF_U
+    global _PATCHED, _ORIG_GET_VEFF, _ORIG_GET_VEFF_U, _ORIG_GET_VEFF_DF
     if _PATCHED:
         return
     if not g4pcompat.NEW_JK_ABI:
@@ -517,6 +607,19 @@ def apply_patch():
     # this module loaded.  `dft/ukspu.py` calls the module-level name.
     _ORIG_GET_VEFF_U = _uks.UKS.get_veff
     _uks.UKS.get_veff = _uks.get_veff = get_veff_u
+    # and the density-fitted class, which overrides both of the above.
+    # Guarded: a GPU4PySCF without `df` would otherwise take the whole module
+    # down over an entry point that only a `density_fit()` run reaches.
+    try:
+        from gpu4pyscf.df import df_jk as _dfjk
+    except ImportError:
+        _PATCHED = True
+        return
+    _ORIG_GET_VEFF_DF = _dfjk._DFHF.get_veff
+    # the original stays on this module, as the other two do: putting it on
+    # `_DFHF` would make it an attribute of the class the patch replaced and
+    # `tests/test_patch_aliases.py` would read it as a stale alias
+    _dfjk._DFHF.get_veff = get_veff_df
     _PATCHED = True
 
 

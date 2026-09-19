@@ -160,6 +160,74 @@ pass, a saving that is linear in the grid and independent of the functional
 where `fastxc`'s grouped `nr_uks` saves latency that is neither, so the two
 compete rather than compose and §4b says which wins where.
 
+This round took the **density-fitting** path, which until now nothing here was
+on at all -- a `density_fit()` run routes its whole two-electron half through
+`df/df_jk.py:get_jk`, a fourth code path that `fastj`, `fastk` and `fastjk`
+are all off.  On one A100, penicillin V, DF/def2-SVP, level-3 grids, whole SCF
+wall clocks (the second of two repetitions in each case, because the first
+process of a job pays a cold start worth 2.7x on its own):
+
+| DF SCF, 42 atoms | GPU4PySCF 1.8.1 | + Electrolites | |
+|---|---|---|---|
+| B3LYP, cderi on the device | 4.05 s | **3.62 s** | **1.12x** |
+| B3LYP, cderi on the host | 4.57 s | **3.73 s** | **1.22x** |
+| **wB97M-V** | 22.01 s | **14.19 s** | **1.55x** |
+| **B97M-V** | 22.83 s | **14.70 s** | **1.55x** |
+| 113-atom taxol, B3LYP, cderi on the host | 25.75 s | **22.39 s** | **1.15x** |
+
+and the J and K build itself, both implementations in one process on one cderi
+tensor: **1.09x-1.41x** with the tensor on the device on the rows where its
+items apply and 1.00x-1.01x on the rows where a measured size threshold keeps
+GPU4PySCF's arrangement instead, and **1.64x-4.53x** with the tensor on the
+host, which is the regime GPU4PySCF's own README calls "bounded by CPU
+memory".
+
+Two things about that table are worth more than the ratios.  The **wB97M-V and
+B97M-V rows are not `fastdf`**: `density_fit()` puts `_DFHF.get_veff` ahead of
+`RKS.get_veff` in the method resolution order, so `fastxcnlc` was inert on
+every density-fitted run and the VV10 grid pass -- **77-80 %** of those two
+runs -- was walking the grid twice per iteration with every module loaded.
+Patching that third binding is worth **1.13x** of the 1.55x; the rest was
+already there, because `fastnlc` replaces a name `_DFHF.get_veff` does reach.
+That is the third time a patch target has turned out not to be a code path
+here, and only `benchmarks/coverage_probe.py` finds it.  And the **B3LYP rows
+are small on purpose**: `docs/README_fastdf.md` §3.4 measures the DF build at
+71 % of memory bandwidth and 15.8/17.8 TF/s of an A100's 19.5 stage by stage,
+so unlike every direct-SCF round before it there was no rearrangement left to
+collect -- three were written, measured and rejected, one of them a CUDA
+kernel.  What is left is to make the arithmetic smaller: the screening stores
+**22 %** of the AO-pair space at 284 atoms and the contraction is dense over
+all of it (§3.6).  `docs/DF_WORK_LIST.md` is that list: nine candidate
+projects with what each rests on, what would count as success and what would
+falsify it, plus the four ways a measurement on this path silently goes
+wrong.
+
+**The first of those nine is done, and it is the largest number on this
+path.**  `only_dfj=True` -- ORCA's RIJONX, density-fitted J with *exact*
+exchange -- **cannot run on GPU4PySCF 1.8.1 at all**: `_DFHF.get_jk` passes
+`mol` where `DF.get_jk` expects the density, and every such run dies with
+`'Mole' object has no attribute 'shape'`.  `fastdfj` repairs it, and the
+configuration turns out to be the fastest way this repository can build a
+large hybrid, because a Coulomb-only DF build **never constructs a cderi**:
+
+| PfPMT, 284 atoms, B3LYP/def2-SVP | full DF | **RIJONX** | direct |
+|---|---|---|---|
+| whole SCF, 18 cycles | 300.5 s | **64.1 s** | 65.4 s |
+| one Fock build, fixed density | 10.64 s | **4.01 s** | 4.51 s |
+| before the first Fock matrix | **88.7 s / 86.4 GB** | **1.08 s / nothing** | — |
+
+**4.69x** end to end, and the crossing against full DF is between 42 and 113
+atoms in this basis.  Two further results came out of measuring it.
+`df/j_engine_3c2e.py`, the three-centre Coulomb engine a *pure* DF functional
+already runs on, turns out to be the **fastest** Coulomb build here at every
+size -- 1.67x the direct four-centre one at 284 atoms and 2.43x at 42.  And
+`_DFHF.get_veff` rebuilds the Fock matrix from the whole density every cycle,
+which is right for a cderi contraction and wrong for a four-centre exchange
+build: **1.33x** once an `only_dfj` object drives its own class's `get_veff`
+instead.  It is a different approximation, not a faster route to the same
+number, and a *larger* error than full DF's (§5 of `docs/README_fastdfj.md`
+has both columns on seven systems).
+
 ## Install
 
 ```bash
@@ -246,7 +314,7 @@ separate processes; that is the only honest way to A/B them.
 | `fastxc` | `dft.numint.NumInt.nr_rks` **and** `NumInt.nr_uks` | LDA and GGA, so hybrids too -- and, on the unrestricted side only, meta-GGA.  The unrestricted build is the one an open-shell ground state takes, which is 83 % of a transition-metal set (`docs/OPENSHELL_TMC.md`); `dft/uks.py` calls `nr_uks`, so patching `nr_rks` never reached it |
 | `fastnlc` | `dft.numint._vv10nlc` | the VV10 / VV10-family `O(n_grid^2)` double sum |
 | `fastrsh` | `dft.rks.RKS.get_veff` | range-separated hybrids on GPU4PySCF **1.7.x only**: the two exchange builds fused into one. 1.8.0 does that fusion itself, so this module stands down there |
-| `fastxcnlc` | `dft.rks.RKS.get_veff` **and `dft.uks.UKS.get_veff`** | the XC potential and the VV10 non-local correlation from **one** sweep of the grid instead of two, on 1.8.x (on 1.7.x `fastrsh` drives it). LDA falls back; GGA and meta-GGA are covered, so wB97M-V is. Restricted or unrestricted -- `dft/uks.py` binds its own `get_veff`, so patching `dft.rks`'s left an open-shell wB97M-V walking the grid four times per iteration (`docs/VV10_OPENSHELL.md`) |
+| `fastxcnlc` | `dft.rks.RKS.get_veff`, **`dft.uks.UKS.get_veff`** and **`df.df_jk._DFHF.get_veff`** | the XC potential and the VV10 non-local correlation from **one** sweep of the grid instead of two, on 1.8.x (on 1.7.x `fastrsh` drives it). LDA falls back; GGA and meta-GGA are covered, so wB97M-V is. Restricted or unrestricted -- `dft/uks.py` binds its own `get_veff`, so patching `dft.rks`'s left an open-shell wB97M-V walking the grid four times per iteration (`docs/VV10_OPENSHELL.md`) -- and **density-fitted or not**: `density_fit()` puts `_DFHF.get_veff` ahead of both in the method resolution order, so until this round a DF wB97M-V run reached neither patch (`docs/README_fastdf.md` §5).  An `only_dfj` object is the one exception to that binding's guard: `fastdfj` routes it to `RKS.get_veff` on purpose, so the restricted wrapper has to serve it or a RIJONX wB97M-V run loses the fused sweep |
 | `fast1e` | `gto.int3c1e.get_int3c1e{,_density_contracted,_charge_contracted}` | the three-centre one-electron integrals -- **PCM, QM/MM, ESP, CHELPG** -- every angular-momentum class up to g, contracted with a density, with charges, or neither |
 | `fastejk` | `grad.rhf._jk_energy_per_atom` | the per-atom derivative of `j*J - k*K`, every class an spdf basis reaches, full-range and long-range, for a **restricted or an unrestricted** reference: the exchange contraction runs over the density matrices and the Coulomb one over their sum.  A **g** shell falls through here too, and more of it -- 26 % of the class blocks of a def2-TZVPP gradient |
 | `fastgrad` | `grad.rks.Gradients.energy_ee` | range-separated-hybrid gradients: the long-range operator in place of GPU4PySCF's short-range one |
@@ -257,6 +325,8 @@ separate processes; that is the only honest way to A/B them.
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` and its `type3` twin -- the block shape of the **second-derivative ERI** kernels, which GPU4PySCF derives from the shared-memory budget alone and never measured | **1.13x** on that stage of an analytic Hessian for two lines of Python.  The module also carries a lift of the kernels themselves (every fp64 division out of the primitive and Rys-root loops, a register cap), correct to 1e-13 but measured at 1.02x and 0.58x respectively -- so that half is **off unless `FASTEJK2_KERNELS=1`**.  `docs/README_fastejk2.md` says why, and why the catalogue's B3 entry expects the opposite |
 | `fastjk` | `scf.jk._VHFOpt.get_jk` | the **fused** Coulomb-and-exchange build -- the two-electron half of **every response property**, which is a third code path the SCF does not take and neither `fastj` nor `fastk` is on: 61-82 % of a polarizability or a TDDFT run.  Every angular-momentum class an spdf basis reaches, `hermi` 0 and 1, any number of densities, J and K accumulated from one pass over the Rys integrals |
 | `fastfnlc` | `hessian.rks.nr_rks_fnlc_mo` **and the `hessian.uks` binding of the same name** | the **VV10 non-local-correlation response**, which is 80 % of a wB97M-V polarizability: the ground-state half of it -- including an `O(n_grid^2)` double sum -- computed once per coupled-perturbed solve instead of once per iteration, and the potential contraction batched over the perturbed densities.  Restricted or unrestricted: `V_munu` is spin-free, so the unrestricted case is the same body on the summed density with an MO-basis answer projected once per spin.  Reaches CPKS, NMR, C6 and the analytic Hessian -- and, on an **unrestricted** reference only, TDA/TDDFT: `tdscf/rhf.py` sets `exclude_nlc = True` and `tdscf/uhf.py` sets nothing, so an open-shell TDDFT pays this term and a closed-shell one does not (`docs/VV10_OPENSHELL.md` §1) |
+| `fastdf` | `df.df_jk.get_jk` | the **density-fitted** Coulomb and exchange build -- the two-electron half of every RI/DF calculation, which is a *fourth* code path that `fastj`, `fastk` and `fastjk` are all off: `df/df.py:117` contracts the three-index cderi tensor and never touches a four-centre integral.  Restricted or unrestricted, any number of densities, `hermi` 0 or 1, the cderi on the device or streamed from the host.  Catalogue **A13**, two of whose four claims 1.8.x closed upstream (`docs/README_fastdf.md` §1) |
+| `fastdfj` | `df.df_jk._DFHF.get_jk` (and `_DFHF.Gradients`, for one warning) | **RIJONX** -- `density_fit(only_dfj=True)`, density-fitted J with *exact* exchange -- which **cannot run at all on GPU4PySCF 1.8.1**: the branch passes `mol` where `DF.get_jk` expects the density (`df/df_jk.py:211`) and dies with `'Mole' object has no attribute 'shape'`.  Repaired, the configuration builds **no cderi**, so it has none of `fastdf`'s 86 GB at 284 atoms, and its exchange is `fastk`.  Restricted or unrestricted, hybrid, range-separated or pure; a GHF object keeps GPU4PySCF's own branch, which is already correct.  `docs/README_fastdfj.md`, and `docs/DF_WORK_LIST.md` W1 |
 
 **Limits, all of which fall through rather than fail.** An **open-shell ground
 state** is now covered through the SCF and the gradient: `fastk`, `fastj`,
@@ -306,7 +376,17 @@ a reason worth reading before extending it: GPU4PySCF's LDA branch of the same
 function uses different factor conventions term by term (they agree with the
 GGA branch's -- `docs/README_fastxchess.md` §5 has the algebra), and its
 meta-GGA branch is not reproducible run to run. Shells with `l > 4` go through
-GPU4PySCF's CPU path. Density fitting is untouched. Single GPU only —
+GPU4PySCF's CPU path. **Density fitting** is covered where its J and K are
+built from the cderi tensor (`fastdf`), and not elsewhere in that path: a
+*pure* functional's DF Coulomb build goes through a separate three-centre
+J engine and never reaches it, and the cderi build, the DF gradient's
+two-electron derivative and the DF Hessian's MO-basis CPHF build are three
+further DF code paths that nothing here is on --
+`docs/README_fastdf.md` §5 sizes each.  The **RIJONX** configuration
+(`only_dfj=True`) is a separate matter: it cannot run on stock 1.8.1 at all,
+`fastdfj` repairs it, and its exchange is then the direct path's, which is
+covered.  Its *gradient* is not: `df/grad/` ignores `only_dfj` and returns the
+full-DF derivative, so `fastdfj` warns once rather than pretending otherwise. Single GPU only —
 GPU4PySCF 1.8.x runs these builds through `multi_gpu.run`, and every module
 here asserts one device.  `fast1e` is the exception: GPU4PySCF does not
 distribute the `int3c1e` path, and the module keys its compiled kernels and
@@ -363,6 +443,19 @@ python tests/test_jk.py                    # 6 molecule/basis combinations x
                                            # density shapes: the multi-density
                                            # exchange build and the fused J+K
                                            # build against GPU4PySCF's
+python tests/test_df.py                    # the density-fitted J and K build:
+                                           # 6 cases x both density
+                                           # factorisations x hermi 0,1 x
+                                           # n_dm 1,2,4 x every internal
+                                           # configuration, plus a DF-B3LYP
+                                           # energy and gradient, closed and
+                                           # open shell
+python tests/test_dfj.py                   # the RIJONX branch fastdfj
+                                           # repairs: its J against a DF
+                                           # J-only call and its K against a
+                                           # direct SCF's, element-wise, plus
+                                           # the incremental-Fock driver
+                                           # against the whole-density one
 ```
 
 They need a GPU and take a few minutes (`test_patch_aliases.py` does not: it
@@ -424,6 +517,21 @@ the Hessian's second-derivative ERI stage by angular-momentum class and by
 whether GPU4PySCF has an unrolled kernel for it -- use it before taking
 catalogue B3, whose "same shape as B1" describes seven of the sixty-five
 classes.
+
+`benchmarks/df_anatomy.py` is `scf_anatomy.py` for a **density-fitted** run,
+which is a different set of stages: it splits `with_df.get_jk` into the
+one-time cderi build, the per-block unpack and the contractions that consume
+the blocks.  `benchmarks/df_probe.py` times one auxiliary block stage by stage
+and reports each against the machine's roofline -- use it before assuming a DF
+build has a rearrangement left in it, because on 1.8.1 its three stages run at
+71 % of memory bandwidth and 15.8 and 17.8 TF/s of an A100's 19.5.
+`benchmarks/df_jk_bench.py` A/Bs the build against GPU4PySCF's in one process
+on one cderi tensor, **round robin** rather than one variant after the other,
+with a column per ablation; `benchmarks/df_fill_probe.py` needs no GPU time at
+all and reports how much of the AO-pair space the screening actually stores --
+22 % at 284 atoms, which is the ceiling on what a block-sparse exchange build
+could remove and the reason the density-fitted path cannot reach the sizes the
+direct one does.
 
 `benchmarks/response_anatomy.py` does the same for a polarizability and a TDA
 run -- use it before taking a response-property target from `instructions/06`,

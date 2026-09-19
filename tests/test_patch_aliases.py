@@ -53,7 +53,11 @@ for _m in ('gpu4pyscf.properties.shielding', 'gpu4pyscf.grad.rkspu',
            'gpu4pyscf.tdscf.uks',
            # the density-fitting Hessians reach the two XC Hessian terms by
            # a module-global lookup on hessian/{rks,uks}.py
-           'gpu4pyscf.df.hessian.rks', 'gpu4pyscf.df.hessian.uks'):
+           'gpu4pyscf.df.hessian.rks', 'gpu4pyscf.df.hessian.uks',
+           # the density-fitted J/K build and the drivers that reach it
+           'gpu4pyscf.df.df_jk', 'gpu4pyscf.df.df', 'gpu4pyscf.df.grad.rhf',
+           'gpu4pyscf.df.grad.rks', 'gpu4pyscf.df.grad.uks',
+           'gpu4pyscf.df.hessian.rhf', 'gpu4pyscf.df.hessian.uhf'):
     try:
         importlib.import_module(_m)
     except ImportError:
@@ -73,6 +77,7 @@ ORIGINALS = [
     ('fastxcfxc', 'gpu4pyscf.dft.numint', '_nr_uks_fxc_orig'),
     ('fastxcnlc', 'electrolites.fastxcnlc', '_ORIG_GET_VEFF'),
     ('fastxcnlc', 'electrolites.fastxcnlc', '_ORIG_GET_VEFF_U'),
+    ('fastxcnlc', 'electrolites.fastxcnlc', '_ORIG_GET_VEFF_DF'),
     ('fastejk', 'gpu4pyscf.grad.rhf', '_jk_energy_per_atom_orig'),
     ('fastgradh', 'gpu4pyscf.grad.rhf', '_get_hcore_orig'),
     ('fastgrad', 'gpu4pyscf.grad.rks', 'Gradients._energy_ee_orig'),
@@ -84,6 +89,10 @@ ORIGINALS = [
     ('fastxchess', 'gpu4pyscf.hessian.uks', '_get_vxc_deriv1_orig'),
     ('fastxchess', 'gpu4pyscf.hessian.uks', '_get_vxc_deriv2_orig'),
     ('fastfnlc', 'gpu4pyscf.hessian.rks', '_nr_rks_fnlc_mo_orig'),
+    ('fastdf', 'gpu4pyscf.df.df_jk', '_get_jk_orig'),
+    ('fastdfj', 'gpu4pyscf.df.df_jk', '_DFHF._get_jk_orig'),
+    ('fastdfj', 'gpu4pyscf.df.df_jk', '_DFHF._get_k_orig'),
+    ('fastdfj', 'gpu4pyscf.df.df_jk', '_DFHF._Gradients_orig'),
 ]
 
 #: aliases that are known and deliberate: (holder, attribute) -> why

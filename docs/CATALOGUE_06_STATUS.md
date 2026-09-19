@@ -75,6 +75,52 @@ at the `n_dm` a response solve asks for and 1.16x at the `n_dm = 126` a
 Hessian's CPHF asks for, and no further work on the integral side can change
 that.  `C` is what §7 now nominates.
 
+**A13 is not in §5's ranking at all**, and the round that took it (`fastdf`,
+`docs/README_fastdf.md`) ended with its largest result outside the module it
+was written for.  The module itself is the first here to end in a mostly
+negative result worth stating as one.  A density-fitted run is a *fourth* two-electron code
+path that no module here was on, so the coverage gap was real; but the build
+on that path is already at **71 % of memory bandwidth and 15.8/17.8 TF/s of an
+A100's 19.5 TF/s** stage by stage, which is not what any of the direct-SCF
+rounds found.  The only structural saving left in it is that a symmetric
+exchange matrix need not have both of its triangles computed — worth
+**1.11x–1.17x** at a thousand basis functions and nothing at four hundred,
+because cuBLAS's `dsyrk` gives the factor of two back there.  Everything past
+that has to make the arithmetic smaller rather than rearrange it, and
+`benchmarks/df_fill_probe.py` sizes what is available: the screening stores
+**22 %** of the AO-pair space at 284 atoms and the contraction is dense over
+all of it.  `docs/DF_WORK_LIST.md` ranks the nine candidates that follow from
+that, including the two that are capacity fixes rather than speedups.
+
+> **W1 of that list has since been taken, and it changes the conclusion above
+> without contradicting it** (`electrolites/fastdfj.py`,
+> `docs/README_fastdfj.md`).  The *contraction* is still at the machine's
+> limits — nothing below rearranges it.  What the round found is that at 284
+> atoms the contraction should not be happening at all: `only_dfj=True`
+> (ORCA's RIJONX — fitted J, exact K) builds **no cderi**, was **broken in
+> GPU4PySCF 1.8.1** by an argument-order bug, and once repaired runs the whole
+> SCF of the 284-atom case in **64.1 s** against full DF's **300.5 s**,
+> **4.69x**, level with the direct path.  88.7 s of full DF's time is
+> `_cholesky_eri` alone, for a tensor RIJONX never makes.  Two further
+> measurements came with it: the three-centre Coulomb engine
+> (`df/j_engine_3c2e.py`), which a *pure* DF functional already runs on, is
+> the **fastest** Coulomb build measured here at every size — 1.67x the direct
+> four-centre one at 284 atoms — and `_DFHF.get_veff` rebuilds the Fock matrix
+> from the whole density every cycle, worth **1.33x** once an `only_dfj`
+> object drives its own class's instead.
+
+What the round *did* find is a coverage bug of the kind
+`docs/OPENSHELL_TMC.md` and `docs/VV10_OPENSHELL.md` each found once before.
+`density_fit()` builds its class as `set_class(mf, (_DFHF, cls))`, so
+`_DFHF.get_veff` precedes `RKS.get_veff` and `UKS.get_veff` in the method
+resolution order and **`fastxcnlc` was inert on every density-fitted run**.
+A DF wB97M-V walked the grid twice per iteration with `patch_all()` loaded,
+and `nr_nlc_vxc` is 77-80 % of such a run.  Patching that third binding takes a DF wB97M-V SCF on penicillin V from
+16.0 s to 14.2 s, **1.13x** -- and the whole patched set from 22.0 s to
+14.2 s, 1.55x, the rest of which `fastnlc` was already reaching.  Three
+rounds, three patch targets that were not code paths; the only thing that has
+ever found one is `benchmarks/coverage_probe.py`.
+
 ---
 
 ## 2. Section A — single-point energy (SCF)
@@ -93,7 +139,7 @@ that.  `C` is what §7 now nominates.
 | **A10** libxc dispatch and reduction | **open** | Still `[?]` in the catalogue and still not separately instrumented here |
 | **A11** locality in the Becke partition weights | **open** | Catalogue Q6: measured at 0.1 % on 42/113 atoms and never measured at 500+.  This repository's `benchmarks/scf_anatomy.py` on `PfPMT` puts grid construction inside the 1.9 % that DIIS, the diagonalisation and grid construction share (`docs/ROUND2_1.8.1.md` §2), so it is still a tail at 284 atoms |
 | **A12** ECP task generation has no screening | **open** | One of the catalogue's four low-contamination entries |
-| **A13** the density-fitting (RI) path | **open** | Density fitting is untouched by every module here (`README.md`, "Limits") |
+| **A13** the density-fitting (RI) path | **partial, and two of its four claims closed upstream** | `fastdf` replaces `df/df_jk.py:get_jk`, the build every RI/DF calculation's two-electron half goes through -- a *fourth* code path that `fastj`, `fastk` and `fastjk` are all off.  **1.09x-1.41x** on that build with the cderi on the device and **1.64x-4.53x** with it on the host -- the regime the entry's own headline is about, where GPU4PySCF streams the whole tensor across PCIe every cycle and this module holds as much of it resident as fits.  Whole DF SCF runs: 1.12x-1.22x on B3LYP and **1.55x** on wB97M-V/B97M-V, the second of which is not this module at all (see below).  Of the entry's four pieces of evidence, the CPU `int2c2e` and the `synchronize` that defeated the prefetch were **closed upstream** in 1.8.x, the "two fancy-index scatters" are a CUDA kernel on 1.8.1, and the RSH duplication does not happen.  What the entry does not mention is where the time actually is, and `docs/README_fastdf.md` §3.4 measures those three stages at **71 % of memory bandwidth and 15.8/17.8 TF/s of an A100's 19.5** -- there is no rearrangement left.  **Left**: the arithmetic is dense where the screening stores only 22 % of the AO-pair space at 284 atoms (§3.6); the one-time cderi build, which is **39 %** of a 15-cycle taxol DF SCF; the DF gradient's two-electron derivative, **83 %** of a def2-TZVPP DF gradient; and the DF Hessian's own MO-basis CPHF build, a fifth code path.  **Since**: `fastdfj` repairs `only_dfj=True`, which does not run at all on 1.8.1, and a 284-atom hybrid is then **4.69x** faster than full DF end to end with no cderi built (`docs/README_fastdfj.md`) |
 
 ### Two SCF-side results this repository added that the catalogue does not have
 
@@ -128,7 +174,7 @@ that.  `C` is what §7 now nominates.
 | **B8** Hessian 1e integrals on the CPU | **open** | Catalogue flags this as an Amdahl tail (0.1 % at 42 atoms) listed for re-measurement, not for fixing |
 | **B9** grid-response kernels | **open** | `fastxcgrad` **declines** the grid-response path and hands it to GPU4PySCF (`docs/README_fastxcgrad.md`) |
 | **B10** third and higher derivatives | **n/a** | Greenfield, no incumbent |
-| **B11** DF-Hessian auxiliary integrals on the CPU | **open** | Density fitting untouched |
+| **B11** DF-Hessian auxiliary integrals on the CPU | **upstream** | The entry's four `auxmol.intor` calls are gone on 1.8.1: `df/hessian/rhf.py` takes `int2c2e` and `int2c2e_ip1` from `df/int3c2e_bdiv.py` (which forwards to `pbc/df/int2c2e.py`'s GPU kernels) and the second derivatives from `libvhf_rys.e_int2c2e_ip2` (`:1144-1185`).  Nothing for this repository to do, and the same correction A13's first row needs |
 
 One item outside the catalogue's B list was done: **`fastgradh`** puts the
 nuclear-attraction part of the one-electron derivative on the GPU.  The

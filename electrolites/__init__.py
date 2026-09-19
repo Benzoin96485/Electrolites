@@ -36,7 +36,7 @@ TESTED_GPU4PYSCF = ('1.7.0', '1.8.1')
 MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
-    'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2',
+    'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -57,7 +57,11 @@ _TARGETS = {
                ('gpu4pyscf.dft.numint', 'NumInt.nr_uks')),
     'fastrsh': ('gpu4pyscf.dft.rks', 'RKS.get_veff'),
     'fastxcnlc': (('gpu4pyscf.dft.rks', 'RKS.get_veff'),
-                  ('gpu4pyscf.dft.uks', 'UKS.get_veff')),
+                  ('gpu4pyscf.dft.uks', 'UKS.get_veff'),
+                  # `density_fit()` puts this one ahead of both of the above
+                  # in the method resolution order, so a DF run reaches
+                  # neither; see docs/README_fastdf.md 5
+                  ('gpu4pyscf.df.df_jk', '_DFHF.get_veff')),
     'fastnlc': ('gpu4pyscf.dft.numint', '_vv10nlc'),
     'fast1e': ('gpu4pyscf.gto.int3c1e', 'get_int3c1e_density_contracted'),
     'fastejk': ('gpu4pyscf.grad.rhf', '_jk_energy_per_atom'),
@@ -79,6 +83,17 @@ _TARGETS = {
     # this one replaces two CUDA symbols rather than a Python entry point, so
     # the target check only confirms the driver that looks them up still exists
     'fastejk2': ('gpu4pyscf.hessian.rhf', '_partial_ejk_ip2'),
+    # the density-fitting path.  `df/df.py:117` is the only caller of this
+    # function, and it looks it up on the module, so one target covers every
+    # DF entry point: the SCF, the response solve and a Hessian's CPHF
+    'fastdf': ('gpu4pyscf.df.df_jk', 'get_jk'),
+    # the `only_dfj` (RIJONX) branch of the driver above the one `fastdf`
+    # replaces.  It is a repair rather than a kernel: the branch passes `mol`
+    # where `DF.get_jk` expects the density and so cannot run at all on 1.8.1
+    'fastdfj': (('gpu4pyscf.df.df_jk', '_DFHF.get_jk'),
+                ('gpu4pyscf.df.df_jk', '_DFHF.get_k'),
+                ('gpu4pyscf.df.df_jk', '_DFHF.get_veff'),
+                ('gpu4pyscf.df.df_jk', '_DFHF.Gradients')),
 }
 
 _patched = []

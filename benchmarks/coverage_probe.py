@@ -35,6 +35,19 @@ from _common import apply_patch, build_mol, parser
 
 ap = parser(__doc__.splitlines()[0])
 ap.add_argument('--max-cycle', type=int, default=30)
+ap.add_argument('--density-fit', action='store_true',
+                help='run a density-fitted SCF instead of a direct one.  It '
+                     'is a different two-electron code path entirely: '
+                     '`fastj`, `fastk` and `fastjk` all read `(-)` there and '
+                     '`fastdf` is the only row that moves.')
+ap.add_argument('--auxbasis', default=None)
+ap.add_argument('--only-dfj', action='store_true',
+                help='density-fit J only and take K from the direct path '
+                     '(ORCA\'s RIJONX).  Implies --density-fit.  It is a '
+                     'different coverage picture again: `fastdf` reads `(-)` '
+                     'because no cderi is ever built, and `fastk` moves '
+                     'instead.  Needs `fastdfj`, without which the run cannot '
+                     'start at all on GPU4PySCF 1.8.1')
 ap.add_argument('--hessian', action='store_true',
                 help='run an analytic Hessian too.  Nothing else in this '
                      'script reaches the response or Hessian entry points, '
@@ -127,6 +140,31 @@ _ENTRIES = [
     ('fastxcnlc uks_veff',   _uks.UKS, 'get_veff',   _uks.UKS, '_never'),
     ('fastfnlc uks_fnlc',    _huks, 'nr_rks_fnlc_mo', _huks, '_never'),
 ]
+if 'fastxcnlc' in active:
+    from gpu4pyscf.df import df_jk as _dfjk0                 # noqa: E402
+    # The density-fitted `get_veff`, which comes before both `RKS.get_veff`
+    # and `UKS.get_veff` in a DF object's method resolution order.  No `stock`
+    # counter, and deliberately: this wrapper computes the fused grid pass and
+    # then calls the function it replaced *on every call*, with `nr_rks`
+    # answering from the result -- so counting that call would report `ours=0`
+    # on a run where every call fused.  `fastxcnlc.stats()`, printed below the
+    # table, is the authority for this row, as it is for `uks_veff`.
+    _ENTRIES.append(('fastxcnlc df_veff', _dfjk0._DFHF, 'get_veff',
+                     _dfjk0._DFHF, '_never'))
+if 'fastdfj' in active:
+    from gpu4pyscf.df import df_jk as _dfjk1                 # noqa: E402
+    # the `only_dfj` branch.  It reads `(-)` on any run that does not pass
+    # `--only-dfj`, and on one that does it is the row that says the exchange
+    # left the density-fitting path -- `fastdf` should then read `(-)` and
+    # `fastk` should carry the run.
+    _ENTRIES.append(('fastdfj dfhf get_jk', _dfjk1._DFHF, 'get_jk',
+                     _dfjk1._DFHF, '_get_jk_orig'))
+if 'fastdf' in active:
+    from gpu4pyscf.df import df_jk as _dfjk                  # noqa: E402
+    # the density-fitted build's only entry point.  It reads `(-)` on a direct
+    # SCF and is the only two-electron row that moves on a DF one.
+    _ENTRIES.append(
+        ('fastdf  df get_jk', _dfjk, 'get_jk', _dfjk, '_get_jk_orig'))
 for e in _ENTRIES:
     _entry(*e)
 
@@ -161,6 +199,8 @@ print(f'[{tag}] natm={mol.natm} nao={mol.nao} spin={mol.spin} '
       f'gpu4pyscf={gpu4pyscf.__version__}', flush=True)
 
 mf = (dft.UKS if mol.spin else dft.RKS)(mol, xc=a.xc)
+if a.density_fit or a.only_dfj:
+    mf = mf.density_fit(auxbasis=a.auxbasis, only_dfj=a.only_dfj)
 mf.conv_tol = a.conv_tol
 mf.direct_scf_tol = 1e-13
 mf.grids.level = a.grids
@@ -203,7 +243,11 @@ for lab in labels:
         print(f'{lab:26s} {calls:7d} {shown_ours:7d} {stock:7d}')
 
 extra = {}
-for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc'):
+# `fastdfj` is here for the same reason `fastxcnlc` is: its table row
+# counts every call into `_DFHF.get_jk`, and on a full-DF run all of them
+# are handed straight back to GPU4PySCF.  `only_dfj` in this line is the
+# number that actually took the repaired branch.
+for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc', 'fastdfj'):
     if _m in active:
         _mod = __import__(f'electrolites.{_m}', fromlist=['x'])
         if hasattr(_mod, 'stats'):

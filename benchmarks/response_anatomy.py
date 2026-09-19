@@ -35,6 +35,12 @@ ap = parser(__doc__.splitlines()[0])
 ap.add_argument('--prop', default='pol', choices=('pol', 'tda', 'tddft'))
 ap.add_argument('--nstates', type=int, default=5)
 ap.add_argument('--cphf-tol', type=float, default=1e-7)
+ap.add_argument('--density-fit', action='store_true',
+                help='density-fit the reference.  The two-electron half of '
+                     'the response solve is then `df/df_jk.py:get_jk` rather '
+                     'than the fused four-centre build, so `fastjk` reads '
+                     'zero calls and `fastdf` carries the row.')
+ap.add_argument('--auxbasis', default=None)
 a = ap.parse_args()
 apply_patch(a.patch)
 
@@ -147,10 +153,13 @@ for _mod in ((gtduhf, gtduks) if unrestricted else (gtdrhf, gtdrks)):
 _wrap(gcphf, 'solve', 'solve')
 
 tag = (f'{a.xyz.rsplit("/", 1)[-1]}/{a.basis}/{a.xc}/L{a.grids}/'
-       f'{"UKS" if unrestricted else "RKS"}/{a.prop}/{a.patch or "stock"}')
+       f'{"UKS" if unrestricted else "RKS"}/{a.prop}/{a.patch or "stock"}'
+       f'{"/DF" if a.density_fit else ""}')
 print(f'# {tag}  natm={mol.natm} nao={mol.nao} spin={mol.spin}', flush=True)
 
 mf = (dft.UKS if unrestricted else dft.RKS)(mol, xc=a.xc)
+if a.density_fit:
+    mf = mf.density_fit(auxbasis=a.auxbasis)
 mf.grids.level = a.grids
 mf.conv_tol = a.conv_tol
 _sync()
