@@ -211,6 +211,7 @@ class RowCompressed:
         assert colpos[tI, cols].min() >= 0 and colpos[tJ, rows].min() >= 0
 
         self.nao, self.T, self.ldL = nao, T, ldL
+        self.npair = len(rows)
         self.ntile, self.size, self.offs = nt, size, offs
         self.width, self.rowoff = width, rowoff
         self.cols_of = cols_of
@@ -239,16 +240,24 @@ class RowCompressed:
         # `cp.zeros` buffer started from.  Paid once per `get_jk` call, as
         # `fastdf`'s is -- every block writes the same positions.
         self.buf = cp.zeros(self.nrow * self.ldL)
+        # The staging buffer the packed block is transposed into.  It is
+        # allocated **once** and not per block, and that is not a tidiness
+        # point: `cp.ascontiguousarray` on a 763 MB temporary went to the
+        # driver every block, and `cudaFree` synchronises the device, so the
+        # double-buffered prefetch was drained 114 times a call and 2.33 s of
+        # the 11.73 s was GPU idle (`docs/README_fastdfblock.md` §4.1).
+        self.tbuf = cp.empty(self.npair * self.ldL)
         return self
 
     def nbytes(self):
-        return self.nrow * self.ldL * 8
+        return (self.nrow + self.npair) * self.ldL * 8
 
     def unpack(self, cderi_blk, nL):
         """``cderi_blk`` is ``(nL, npairs)``; scatter it and its mirror."""
         import cupy as cp
         flat = self.buf.reshape(self.nrow, self.ldL)
-        blk = cp.ascontiguousarray(cderi_blk.T)       # (npairs, nL)
+        blk = self.tbuf[:self.npair * nL].reshape(self.npair, nL)
+        cp.copyto(blk, cderi_blk.T)                   # into `tbuf`, no malloc
         flat[self.d1, :nL] = blk
         flat[self.d2, :nL] = blk
         return self.buf

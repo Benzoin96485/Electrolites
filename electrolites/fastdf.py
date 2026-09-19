@@ -104,12 +104,10 @@ entry is about.
    cderi's sparsity is the product of an atom-pair factor a tile can reach and
    a shell-structure factor at one-to-five-AO granularity that no AO tile can
    (``docs/README_fastdfblock.md`` §1.1).  What is left is real but small: the
-   contraction is **1.31x** at 284 atoms and **1.38x** at 545 and the exchange
-   block **1.09x** and **1.20x** -- and a whole ``get_jk`` call at 284 atoms,
-   the only end-to-end size that runs, reads **0.85x to 1.02x** over five
-   paired measurements, i.e. no gain at all.  ``docs/README_fastdfblock.md``
-   §4.1 has the three explanations that were checked and do not account for
-   the gap.  So this is **off by default**: ``FASTDF_STEP1=auto`` opts in.
+   contraction is **1.31x** at 284 atoms in isolation and **1.38x** at 545,
+   the exchange block **1.09x** and **1.20x**, and a whole ``get_jk`` call at
+   284 atoms **1.21x** -- and it is a *loss* at everything smaller, which is
+   what the gate is for.
    The AO index is permuted freely to cut the tiles -- ``vk = rhok rhok^T``
    comes back as ``P vk P^T`` and one scatter undoes it -- and the gate is the
    **measured tile fill**, not ``nao``: taxol in def2-TZVPP has 2636 basis
@@ -183,19 +181,18 @@ _OFF = bool(os.environ.get('FASTDF_OFF'))
 #: 'auto' (a measured size threshold), 'syrk' or 'gemm' for the exchange
 #: contraction; see `_use_syrk`.
 _STEP2 = os.environ.get('FASTDF_STEP2', 'auto')
-#: 'tensor' (GPU4PySCF's cuTENSOR contraction, the default), 'auto' (the
-#: block-sparse contraction wherever `_use_tiled`'s fill test passes),
-#: 'bgemm' (the cuBLAS batch over the AO index) or 'tiled' (the block-sparse
-#: one unconditionally).  The module docstring's items 2 and 5 say what the
-#: alternatives are worth and why neither is the default: item 5 wins the
-#: kernel it replaces and loses the call it is part of (0.85x-1.02x at 284
-#: atoms), for a 10 GB buffer held on the `DF` object.
-_STEP1 = os.environ.get('FASTDF_STEP1', 'tensor')
-#: AO tile size for the block-sparse contraction.  32 of 16/32/64 measured:
-#: 16 has the lowest fill and the most calls and ties with 32 at 284 atoms;
-#: 64 loses about ten points of fill and is behind both everywhere
-#: (`docs/README_fastdfblock.md` §3).
-TILE = int(os.environ.get('FASTDF_TILE', 32))
+#: 'auto' (the default: item 5's block-sparse contraction wherever
+#: `_use_tiled`'s fill test passes, GPU4PySCF's cuTENSOR contraction
+#: otherwise), 'tensor', 'bgemm' (the cuBLAS batch over the AO index) or
+#: 'tiled' (the block-sparse one unconditionally).  The module docstring's
+#: items 2 and 5 say what each is worth and where.
+_STEP1 = os.environ.get('FASTDF_STEP1', 'auto')
+#: AO tile size for the block-sparse contraction.  16 of 16/32/64 measured:
+#: it has the lowest tile fill, and end to end at 284 atoms it is **1.21x**
+#: against 32's 1.07x -- the extra calls cost nothing once the unpack stops
+#: allocating (`docs/README_fastdfblock.md` §4.1) and the fill is what is
+#: left.  64 loses ten points of fill and is behind both.
+TILE = int(os.environ.get('FASTDF_TILE', 16))
 #: 'native' (the AO order the cderi's pair addresses already use, which is the
 #: order the geometry file lists the atoms in) or one of the reorderings
 #: `_dfblock.atom_order` knows -- 'rcm', 'rcb', 'morton'.  Measured, the best
@@ -399,11 +396,17 @@ def _use_syrk(nao):
     return nao >= SYRK_MIN_NAO
 
 
-def _blksize(nao, nocc, nbuf, on_gpu, naux_slice, fill=1.0, extra=0):
+def _blksize(nao, nocc, nbuf, on_gpu, naux_slice, fill=1.0, extra=0,
+             npair=0):
     """How many auxiliary functions one pass may unpack at a time.
 
     The dense block is ``blk*nao^2`` words and each ``rhok`` is
-    ``blk*nao*nocc``.  The cap is GPU4PySCF's own (``df/df.py:37``), kept so
+    ``blk*nao*nocc``; ``fill`` shrinks the first for the tiled path, and
+    ``npair`` is that path's transposed staging buffer, which is also
+    per block.  ``extra`` is what does *not* scale with the block, and is
+    subtracted rather than divided.
+
+    The cap is GPU4PySCF's own (``df/df.py:37``), kept so
     that the default configuration differs from upstream only in what the four
     items in the module docstring change; measured, 256 is the best of
     64/128/256/512 on three of the four systems in
@@ -414,7 +417,8 @@ def _blksize(nao, nocc, nbuf, on_gpu, naux_slice, fill=1.0, extra=0):
     mem = get_avail_mem()
     frac = .4 if on_gpu else .2
     words = int(mem * frac / 8) - extra
-    blk = max(words, 0) // (int(fill * nao * nao) + nbuf * nao * nocc)
+    blk = max(words, 0) // (int(fill * nao * nao) + npair
+                            + nbuf * nao * nocc)
     blk = min(max(blk, 1), MAX_BLK, naux_slice)
     return blk
 
@@ -731,7 +735,8 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
         # rather than divided into it.
         fill = _tile_fill(dfobj, nao)
         extra = int(fill * nao * nao / TILE) * nocc * nbuf * nspin * n_dm
-    blksize = _blksize(nao, nocc, nbuf_live, on_gpu, naux_slice, fill, extra)
+    blksize = _blksize(nao, nocc, nbuf_live, on_gpu, naux_slice, fill, extra,
+                       npair=cderi_sparse.shape[1] if use_tiled else 0)
     tiles = None
     if use_tiled:
         # the pattern owns its block size; see `_tiles`

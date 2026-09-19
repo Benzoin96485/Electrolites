@@ -10,7 +10,8 @@ Companion documents: `docs/README_fastdf.md` is the round that produced this
 list (what changed, why, and the full tables); `docs/README_fastdfj.md` is the
 round that closed **W1**, which is where the biggest number on this page now
 is; `docs/README_fastdfgrad.md` closed **W3**, `docs/README_fastdfcderi.md`
-**W4** and `docs/README_fastdfblock.md` **W5**; `docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
+**W4**, `docs/README_fastdfblock.md` **W5** and `docs/README_dflocal.md`
+the two measurements **W6** asked for first; `docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
 `instructions/06`'s catalogue.
 
 ---
@@ -160,7 +161,10 @@ Four things follow, and three of them contradict what the smaller systems
 suggested.
 
 **It is not a capacity wall at this size.**  A 284-atom density-fitted
-calculation builds and runs.  GPU4PySCF's README limit ("~168 atoms with
+calculation builds and runs.  *(At the next size up it is: `HcgC`/def2-SVP,
+545 atoms, has 2 094 539 stored pairs and 24 722 auxiliary functions, so its
+global cderi is **414 GB** against the node's 251 — measured in
+`docs/README_dflocal.md` §1, and the reason W6 is no longer demoted.)*  GPU4PySCF's README limit ("~168 atoms with
 def2-tzvpd, bounded by CPU memory") is about a smaller-memory configuration;
 with 251 GB of host DRAM the binding constraint here is *speed*.
 
@@ -224,14 +228,23 @@ integrals the SCF's cderi already holds, and a launch constant.  What it could
 32.0 GB there, and neither upstream nor this repository batches it.  That is
 **W10**.
 
+**W6's two preconditions are measured, and both came out strongly.**  Robust
+(Dunlap) fitting is mandatory — non-robust pair-atomic fitting collapses
+variationally by **16.5 Eh** on butane and the collapse grows with the
+molecule — and robust fitting is **2.5e-5 Eh per atom** against global DF,
+flat with size.  Storage falls from **N^2.52 to N^1.53**: 86.4 GB to 0.79 at
+284 atoms, 414 GB to 1.98 at 545.  `docs/README_dflocal.md`; what is left is
+the implementation, and the hard part of that is that pair-atomic exchange
+does not factorise the way `vk = rhok rhok^T` does.
+
 **W5 is done, and W14 and W15 are what it found.**  The block-sparse exchange
-contraction is **1.09x** on the exchange block at 284 atoms and **1.20x** at
-545 and **does not pay on the call** — 0.85x to 1.02x over five paired
-readings — so it ships off behind `FASTDF_STEP1=auto`.  The 4.5x the item
-priced was never available: the pair fill it quoted is the product of an
-atom-pair factor a tile can address and a shell-structure factor no AO tile
-can, and the tile fill is 69.4 % at 284 atoms
-(`docs/README_fastdfblock.md`).  Its own falsification criterion fires at 113
+contraction is **1.21x on a whole 284-atom `get_jk` call** and ships on behind
+a measured tile-fill gate.  It read 0.90x until Nsight Systems found a 763 MB
+temporary allocated per block whose `cudaFree` drained the prefetch pipeline
+(`docs/README_fastdfblock.md` §4.1).  The 4.5x the item priced was never
+available — the pair fill it quoted is the product of an atom-pair factor a
+tile can address and a shell-structure factor no AO tile can, and the tile
+fill is 69.4 % at 284 atoms — and its falsification criterion fires at 113
 atoms exactly as written.
 
 The ordering before the 284-atom run put the capacity items first, because the
@@ -528,7 +541,7 @@ module on it is worth the share it holds: 8 % of a small def2-SVP SCF and
   284 atoms (**W12**), and `_decompose_j2c`'s 20–62 ms of cuSOLVER latency at
   the small end (**W13**).
 
-### W5 — A block-sparse exchange contraction — **done, and it does not pay**
+### W5 — A block-sparse exchange contraction — **done, 1.21x, and the last 30 % of it was an allocator**
 
 `electrolites/_dfblock.py` and `FASTDF_STEP1` in `electrolites/fastdf.py`,
 probes in `benchmarks/df_block_probe.py` and `benchmarks/df_block_bench.py`,
@@ -564,71 +577,110 @@ contraction is **0.91x** of the dense one and the whole exchange block
 cannot be met.
 
 **What was built**, above a measured crossover: the first contraction
-**1.31x** at 284 atoms and **1.38x** at 545, the exchange block **1.09x** and
-**1.20x** — and **no gain at all on the call those kernels are part of**.  A
-whole `get_jk` at 284 atoms reads **0.85x, 0.86x, 0.90x, 1.02x and 1.02x**
-across five paired round robins in two jobs, against a microbenchmark of the
-same three kernels on the same pattern that says 1.09x.  Three explanations
-for the ~1.5 s gap were checked and none accounts for it — the block size the
-real call runs at (worth part of it), a cached-buffer reallocation (the fix is
-in and made it *slower*), and the resident cderi prefix (worth half a per cent
-on this call either way).  What is left, and is a candidate rather than a
-result, is that the tiled path issues ~5400 kernel launches per call against
-the dense path's ~130, interleaved with a saturated PCIe stream and its
-events; **that needs a profile of the block loop, not another wall clock**,
-and it is the first thing to do for anyone reopening this.
+**1.31x** at 284 atoms in isolation and **1.38x** at 545, the exchange block
+**1.09x** and **1.20x**, and a whole `get_jk` call at 284 atoms — the only
+end-to-end size that runs — **10825 ms → 8916 ms, 1.21x** at tile 16.
 
-So it **ships off** — `FASTDF_STEP1=auto` opts in.  When it is on it is gated
-on the measured tile fill (`FASTDF_TILE_MAX_FILL`, default 0.75) and **not**
-on the system size, because a size gate is demonstrably wrong: taxol in
-def2-TZVPP has 2636 basis functions against PfPMT's 2697 in def2-SVP and a
-tile fill of **98.9 %** against 72.3 %.  Going up a basis set moves the two
-factors in opposite directions — the atom-pair fill *rises* (52.0 → 63.5 %)
-as the diffuse functions reach further, the within-block density falls
-(43.7 → 31.3 %) — and the tile fill, which is the only one a tile sees, does
-not move.
+**That last number was 0.90x until a profiler was pointed at it**, and the
+difference was not the algorithm.  `RowCompressed.unpack` allocated a 763 MB
+temporary per block; CuPy's pool went to the driver for it; and `cudaFree`
+**synchronises the device**, so the double-buffered prefetch was drained 114
+times a call and 2.33 s of an 11.73 s call was GPU idle while the tiled path
+was already doing 1.13x less GPU work.  Allocating the staging buffer once
+per pattern fixes it.  Three lessons, all in §5's rules now: a kernel
+benchmark cannot see an allocator, `cudaFree` is a synchronisation point, and
+a cached buffer must not be sized from free memory.
+
+**Tile 16, not 32.**  End to end they are 1.21x and 1.07x where the kernel
+benchmark puts them within 0.03x: once the per-block allocation is gone what
+is left is the fill, and 61.9 % against 72.3 % is the whole difference.
+
+It ships **on** (`FASTDF_STEP1=auto`), gated on the measured tile fill
+(`FASTDF_TILE_MAX_FILL`, default 0.75) and **not** on the system size,
+because a size gate is demonstrably wrong: taxol in def2-TZVPP has 2636 basis
+functions against PfPMT's 2697 in def2-SVP and a tile fill of **98.9 %**
+against 72.3 %.  Going up a basis set moves the two factors in opposite
+directions — the atom-pair fill *rises* (52.0 → 63.5 %) as the diffuse
+functions reach further, the within-block density falls (43.7 → 31.3 %) — and
+the tile fill, which is the only one a tile sees, does not move.
 
 * **Correctness** is `tests/test_df.py --ablate`, which now runs the tiled
   contraction at two tile sizes: **3.0e-16 (J) / 1.5e-14 (K)**, and the
   tiled and dense contractions are bit-identical up to 2697 AOs.
 * **Two things it found rather than closed**: the tiled unpack is a CuPy
-  fancy-index scatter where GPU4PySCF's is a CUDA kernel and costs 8.4 ms
-  against 2.0 at 284 atoms, which is the whole gap between the contraction's
-  ratio and the block's — **W14**; and the route to the factor a tile cannot
-  see is a localised occupied basis, which `vk = rhok rhokᵀ` admits *exactly*
-  — **W15**.
-* **And one measurement rule**, §5.7, learned the hard way here: an
-  end-to-end ratio for a variant with a multi-gigabyte working set moved by
-  0.16x between two jobs and by 0.16x between two tile sizes that the kernel
-  benchmark puts 0.03x apart.  One reading of it is not a result.
+  scatter where GPU4PySCF's is a CUDA kernel, and after the allocator fix it
+  is 0.752 s against 0.647 at 284 atoms — **W14**, now worth 0.1 s a call
+  rather than the 6 s it appeared to be; and the route to the factor a tile
+  cannot see is a localised occupied basis, which `vk = rhok rhokᵀ` admits
+  *exactly* — **W15**.
+* **And three measurement rules**, §5.7 to §5.9, all learned the hard way
+  here.
 * **One thing it does not deliver** that the entry promised: the dense
   `(nao, nao, blksize)` buffer does shrink by `fill` (7.45 → 4.61 GB at 284
   atoms), but the density factor has to be gathered onto the tile rows and
   that array is as large as the saving at 545 atoms.  Net footprint is a
   wash.
 
-### W6 — Local / pair-atomic fitting
+### W6 — Local / pair-atomic fitting — **decided and validated; the implementation is what is left**
 
-**The only item on this list that changes the storage exponent** — but §3.3
-demoted it: at 284 atoms on a 251 GB node capacity is not what binds, speed
-is.  Its value here is that `naux_local` also shrinks the *contractions*, not
-only the tensor.  It becomes urgent again at 500+ atoms or on a node with less
-DRAM.  Fit each AO
-pair in the auxiliary functions on its own two atoms (plus near neighbours)
-instead of all of them: storage goes from `npair × naux` to
-`npair × naux_local` with `naux_local` independent of system size.  On
-PfPMT's 808 156 pairs at, say, 300 auxiliary functions per pair that is
-**1.9 GB against 86.4 GB**.
+`benchmarks/df_local_probe.py`, `benchmarks/df_local_accuracy.py`, write-up in
+`docs/README_dflocal.md`.  This item attached two conditions before any code:
+decide robust vs non-robust first, and benchmark on *energies*.  Both are now
+measured, and both came out strongly.
 
-* **It is a different approximation, not a faster route to the same number.**
-  The fitting error is not the global one, some variants are non-variational,
-  and GPU4PySCF has none of it.  Anything built here must be benchmarked on
-  *energies* against global DF, not only on wall clocks.
-* **Do**: read the PARI / local-RI literature before writing anything; decide
-  robust vs non-robust fitting first, because it changes the whole data
-  structure.
-* **Success**: a total energy within a stated tolerance of global DF on the
-  §3.2 ladder, and a storage curve that is visibly sub-quadratic.
+**Robust (Dunlap) fitting, and it is not close.**  Non-robust pair-atomic
+fitting does not lose accuracy, it collapses variationally, and the collapse
+grows with the molecule: **-0.81 Eh** on ethane, **-6.50** on propane,
+**-16.5** on butane, **-10.6** on ammonia-borane, **-3.30** on ethanol.  The
+energy goes *below* exact and keeps going.  It is not inflated coefficients —
+the largest `|c|` is 2.41 for both the pair-atomic and the global fit, and the
+pair-atomic norm is the smaller of the two — it is that the non-robust form's
+error is **first order** in the fit residual where the robust form's is
+second, and that on the diagonal the non-robust value is a projection and can
+only underestimate.  Robust fitting on the same coefficients is
+**2.5e-5 Eh per atom** against global DF, and that number is **flat** from 5
+atoms to 14, which is the size-extensivity the approximation needs.  A 3 Å
+domain with robust fitting is **1e-7 Eh per atom**, i.e. global-DF quality.
+
+**The storage claim is real and bigger than this entry guessed.**  A pair
+domain holds **118-130** auxiliary functions on every system from 10 to 545
+atoms — not 300 — so it is measured, not assumed, that `naux_local` is
+independent of system size:
+
+| | atoms | stored pairs | global | pair-atomic | |
+|---|---|---|---|---|---|
+| taxol | 113 | 319 589 | 14.31 GB | 0.319 GB | 45x |
+| PfPMT | 284 | 808 156 | 86.41 GB | **0.789 GB** | 110x |
+| HcgC | 545 | 2 094 539 | **414.25 GB** | **1.975 GB** | 210x |
+
+Storage falls from **N^2.52 to N^1.53** over six systems.  Robust fitting
+stores two such arrays rather than one — the three-centre integrals on the
+domain as well as the coefficients — so 1.6 GB against 86.4 at 284 atoms.
+
+**And §3.3's demotion of this item is now wrong at the next size up.**  It
+says "at 284 atoms on a 251 GB node capacity is not what binds".  At 545 atoms
+it binds: a global cderi for `HcgC`/def2-SVP is **414 GB** against the node's
+251, which is why `docs/README_fastdfblock.md` could only microbenchmark that
+size and never run it.
+
+**A third thing, not predicted by the entry**: the local metrics are *better*
+conditioned than the global one — median 2e7 for pair domains against 2.2e8
+to 2.3e9 for the global metric, which grows with the molecule and the local
+ones do not.  Pair-atomic fitting replaces one badly conditioned `naux^3`
+factorisation (**W13**'s subject) with many small well conditioned ones.
+
+* **What is left** is the implementation, and the hard part of it is not the
+  fit.  Robust pair-atomic **exchange does not factorise** the way
+  `vk = rhok rhok^T` does: the coefficients depend on the pair, so the density
+  cannot be contracted first, and that identity is what the whole of `fastdf`
+  rests on.  PARI-K is a different contraction order and estimating its cost
+  is the next piece of work.
+* **Also left**: gradients.  A non-variational fit carries terms global DF
+  does not, and `fastdfgrad` assumes the global ones.
+* **Still open**: energies above 14 atoms.  The reference implementation is
+  `nao^4`; the flat per-atom error over a factor of three in size is the
+  evidence there is, and this entry's own "on the §3.2 ladder" needs the
+  implementation.
 
 ### W7 — fp32 cderi storage
 
@@ -745,11 +797,18 @@ That is latency, not arithmetic: the same three operations at 5598 rows cost
 
 *(Found by W5, which measured it rather than closed it.)*
 
-The block-sparse contraction scatters the packed block into a row-compressed
-buffer with a CuPy fancy-index assignment, where GPU4PySCF's dense unpack is
-`libcupy_helper.decompress_and_transpose`.  It costs **8.37 ms against 2.01**
-at 284 atoms and 3.61 against 1.31 at 545, and that difference is the whole
-gap between W5's contraction ratio and its block ratio.
+The block-sparse contraction reaches its row-compressed buffer in two kernels
+— a transpose into a staging buffer and a CuPy scatter — where GPU4PySCF's
+dense unpack is one hand-written `decompress_and_transpose`.  Profiled inside
+a real call at 284 atoms that is **0.457 + 0.295 = 0.752 s against 0.647**,
+so it is now 16 % behind rather than the four times it appeared to be before
+the allocator fix of `docs/README_fastdfblock.md` §4.1.  In
+`df_block_bench.py`'s isolated timing it still reads 7.8 ms against 2.2 per
+block, which §5.7 explains.
+
+**This is a small item now.**  It is kept because it also removes the staging
+buffer — `npair * blk` words, 0.67 GB at 284 atoms — which is the larger half
+of what it is worth.
 
 * **Do**: the same kernel GPU4PySCF has, with a destination table instead of
   a `divmod`.  `RowCompressed` already computes the two destination offsets
@@ -757,11 +816,12 @@ gap between W5's contraction ratio and its block ratio.
   same shape as upstream's — contiguous in `L`, one row of `nL` doubles per
   pair — so §2's "2.65x slower than GPU4PySCF's" result, which was about an
   `(L,i,j)` *layout*, does not apply.
-* **Success**: the tiled unpack within 25 % of the dense one, which takes the
-  284-atom exchange block from **1.09x to 1.18x** and the 545-atom one from
-  1.20x to 1.22x.
-* **Falsified if**: the scatter is already bandwidth-bound.  1.65 GB in
-  8.37 ms is 197 GB/s against the dense unpack's 1.43 TB/s, so it is not.
+* **Success**: the tiled unpack at or below the dense one's 0.647 s in a
+  profiled 284-atom call, and the staging buffer gone.  Worth perhaps 0.1 s
+  of an 8.9 s call, plus the block size the freed memory buys back.
+* **Falsified if**: the scatter is bandwidth-bound.  1.65 GB in the profiled
+  0.295 s of scatter is 5.6 GB/s of *useful* traffic, far under the dense
+  kernel's 1.43 TB/s, so it is not.
 
 ### W15 — Localised occupied orbitals
 
@@ -836,16 +896,33 @@ four are cheap to avoid and none is detectable from the number itself.
    128 §3.3 records on a 40 GB one.  Fix the block size explicitly in any
    comparison that is meant to be read next to an older table.
 
-7. **A variant with a multi-gigabyte working set needs more than one job.**
-   Rule 2 says to interleave variants, and W5 found where that stops being
-   enough: `fastdf._blksize` derives the auxiliary block from
-   `get_avail_mem()` on every call, so a variant holding 8.8 GB changes the
-   block the *next* one picks and the state its own cached buffer is sized
-   for.  The same 284-atom pair read **1.02x** in one job and **0.90x** in
-   another, and two tile sizes the kernel benchmark puts 0.03x apart read
-   0.16x apart end to end.  Take the reading twice, in two jobs, before
-   believing a ratio for anything that holds gigabytes — and note that
-   pinning the block size, which looked like the fix, made it *slower*.
+7. **A kernel benchmark cannot see an allocator.**  W5's
+   `df_block_bench.py` reuses one device-resident block, so its timed region
+   allocates nothing; the real `get_jk` allocated a 763 MB temporary per
+   block.  The benchmark read 1.09x and the call read 0.90x, and no amount of
+   re-timing either would have found the difference.  When a kernel ratio and
+   a call ratio disagree, profile — `benchmarks/df_block_profile.py` is the
+   NVTX harness for this path and `docs/README_fastdfblock.md` §4.1 is what
+   it found.
+8. **`cudaFree` is a synchronisation point.**  A per-iteration temporary in a
+   loop that relies on a prefetch does not cost its own allocation time, it
+   costs the overlap: 114 of them drained GPU4PySCF's double-buffered stream
+   114 times and left 2.33 s of an 11.73 s call idle.  Anything allocated
+   inside a block loop belongs outside it.
+9. **A cached buffer must not be sized from free memory.**  `_blksize` derives
+   the auxiliary block from `get_avail_mem()` on every call, so a cached
+   buffer sized to that block is reallocated whenever a neighbouring variant's
+   footprint moves.  `_tiles` now fixes the block at the first call and
+   `get_jk` takes it back.  (This looked like the explanation for the 0.90x
+   and was not — it made that measurement *slower*.  It is kept because it is
+   right, not because it paid.)
+
+8. **Nsight Systems cannot write its report onto `$HOME`.**  `nsys profile`
+   runs, produces the `.qdstrm`, and then fails the import with
+   `errno 524` on the GPFS global home; the profile is not lost but it is not
+   readable either.  Point `-o` at `$SCRATCH`, or recover an existing
+   `.qdstrm` with `Nsight_Systems/host-linux-x64/QdstrmImporter -i` from a
+   directory on Lustre.
 
 And one that is not about timing: **a patch target is not a code path.**
 Three rounds in this repository have now shipped a module that was loaded,
@@ -888,6 +965,12 @@ python benchmarks/df_block_probe.py --breakdown --hist   # W5's pattern, no GPU
 python benchmarks/df_block_probe.py --basis def2-tzvpp   # why the gate is fill
 python benchmarks/df_block_bench.py --check --cases taxol:0:0,PfPMT:0:-1
 python benchmarks/df_jk_bench.py --xyz ... --tiled 32 --tile-orders native
+nsys profile -t cuda,nvtx -c cudaProfilerApi -o $SCRATCH/p \
+    python benchmarks/df_block_profile.py --xyz ... --cpu-cderi --tile 16
+python benchmarks/df_block_profile.py --stats $SCRATCH/p.nsys-rep  # the reports
+
+python benchmarks/df_local_probe.py --domains pair,pair+3.0   # W6, no GPU
+python benchmarks/df_local_accuracy.py --cases c1,c2,c3,c4    # W6's energies
 ```
 
 `fastdfcderi`'s switches (`FASTDFCDERI_OFF`, `FASTDFCDERI_METRIC`,

@@ -23,17 +23,23 @@ contraction" — measured, **0.91x** on the contraction and **0.72x** on the
 whole exchange block.  So W5's acceptance criterion, which requires a win at
 113 atoms *and* at 284, cannot be met.
 
-**And the crossover that does exist is a kernel-level one that does not reach
-the caller.**  Above a measured tile fill the first contraction is **1.31x**
-at 284 atoms and **1.38x** at 545, and the exchange block around it **1.09x**
-and **1.20x**.  A whole `get_jk` call at 284 atoms — the only end-to-end size
-that runs — reads **0.85x, 0.86x, 0.90x, 1.02x and 1.02x** across five paired
-measurements in two jobs.  §4 has the table and §4.1 the three explanations
-that were checked and did not account for the roughly 1.5 s gap.  **So it
-ships off**: `FASTDF_STEP1=auto` opts in, and the gate it then applies is the
-tile fill rather than the system size, because §2.1 shows a size threshold
-would be actively wrong (taxol in def2-TZVPP has 2636 basis functions against
-PfPMT's 2697 in def2-SVP and a tile fill of 98.9 % against 72.3 %).
+**And above a measured crossover it pays — 1.21x on a whole 284-atom J+K
+call — but only after a profiler.**  The first contraction is **1.31x** at 284
+atoms in isolation and the exchange block around it 1.09x, and for two jobs
+the whole call read **0.85x to 1.02x** instead.  Nsight Systems found why, and
+it was not the algorithm: `RowCompressed.unpack` allocated a 763 MB temporary
+**per block**, CuPy's pool went to the driver for it, and `cudaFree`
+synchronises the device — so the double-buffered prefetch was drained 114
+times a call and **2.33 s of an 11.73 s call was GPU idle**.  Allocating that
+buffer once instead of once per block turns the same measurement into
+**10825 ms → 8916 ms, 1.21x**, with the GPU 97.7 % busy.  §4.1 is the whole
+story, and its two transferable lessons are that a kernel benchmark cannot
+see an allocator, and that `cudaFree` is a synchronisation point.
+
+It ships **on**, gated on the tile fill rather than on the system size,
+because §2.1 shows a size threshold would be actively wrong: taxol in
+def2-TZVPP has 2636 basis functions against PfPMT's 2697 in def2-SVP and a
+tile fill of 98.9 % against 72.3 %.
 
 Everything here is one A100-SXM4-80GB of a whole `--qos=debug` node,
 `CUDA_VISIBLE_DEVICES=0`, GPU4PySCF 1.8.1, each basis with its own jkfit
@@ -107,8 +113,8 @@ The natural GPU shape here is a single batched contraction over tile rows,
 padded to a common width.  `--hist` reports the width distribution and kills
 that: the widest tile row is **93.7 %** of `nao` at PfPMT/T=32 and **96.6 %**
 at HcgC/T=32 in the best ordering, so padding to it throws away everything the
-tiling won.  The contraction has to be one call per tile row — 85 of them per
-block at PfPMT, 158 at HcgC.  §3 measures what that costs: the tiled
+tiling won.  The contraction has to be one call per tile row — at the shipped
+tile of 16, 169 of them per block at PfPMT and 315 at HcgC.  §3 measures what that costs: the tiled
 contraction reaches **0.82 to 0.93** of the dense one's flop rate.
 
 ---
@@ -223,49 +229,49 @@ unpack + step 1 + the `dsyrk` step 2 that is the same call in both:
 
 | | nao | tile | fill | step1 dense | tiled | TF/s | step1 | block |
 |---|---|---|---|---|---|---|---|---|
-| penicillin V, 42 | 430 | 32 | 100.0 % | 0.42 ms | 1.16 ms | 10.3 → 3.8 | 0.37x | 0.48x |
-| taxol, 113 | 1123 | 16 | 94.9 % | 5.02 | 6.59 | 14.5 → 10.5 | 0.76x | 0.66x |
-| taxol, 113 | 1123 | 32 | 98.2 % | 5.02 | 5.51 | 14.5 → 13.0 | **0.91x** | **0.72x** |
-| Co(II) sextet, 113 | 1059 | 32 | 100.0 % | 4.11 | 4.59 | 14.3 → 12.8 | 0.90x | 0.60x |
-| PfPMT, 284 | 2697 | 16 | 61.9 % | 56.26 | 42.44 | 18.1 → 14.9 | **1.33x** | **1.09x** |
-| PfPMT, 284 | 2697 | 32 | 72.3 % | 56.29 | 44.63 | 18.1 → 16.5 | 1.26x | 1.06x |
-| PfPMT, 284, `rcm` | 2697 | 32 | 69.4 % | 56.27 | 42.80 | 18.1 → 16.5 | 1.31x | 1.09x |
-| PfPMT, 284 | 2697 | 64 | 82.7 % | 56.27 | 52.76 | 18.1 → 16.0 | 1.07x | 0.97x |
+| penicillin V, 42 | 430 | 32 | 100.0 % | 0.47 ms | 1.24 ms | 9.2 → 3.5 | 0.38x | 0.48x |
+| taxol, 113 | 1123 | 16 | 94.9 % | 5.57 | 7.26 | 13.1 → 9.5 | 0.77x | 0.69x |
+| taxol, 113 | 1123 | 32 | 98.2 % | 4.53 | 5.04 | 16.1 → 14.2 | **0.90x** | **0.75x** |
+| Co(II) sextet, 113 | 1059 | 32 | 100.0 % | 4.08 | 4.55 | 14.4 → 12.9 | 0.90x | 0.74x |
+| PfPMT, 284 | 2697 | 16 | 61.9 % | 55.93 | 42.02 | 18.2 → 15.0 | **1.33x** | **1.10x** |
+| PfPMT, 284 | 2697 | 32 | 72.3 % | 55.94 | 44.22 | 18.2 → 16.7 | 1.27x | 1.07x |
+| PfPMT, 284, `rcm` | 2697 | 32 | 69.4 % | 55.94 | 42.47 | 18.2 → 16.7 | 1.32x | 1.10x |
+| PfPMT, 284 | 2697 | 64 | 82.7 % | 55.93 | 52.42 | 18.2 → 16.1 | 1.07x | 0.98x |
 
 and HcgC at block 32, which is what a dense `(nao, nao, blk)` buffer allows at
 that size:
 
 | | nao | tile | fill | step1 dense | tiled | TF/s | step1 | block |
 |---|---|---|---|---|---|---|---|---|
-| HcgC, 545 | 5037 | 32 | 67.4 % | 90.06 ms | 65.08 ms | 18.2 → 17.0 | **1.38x** | **1.20x** |
-| HcgC, 545 | 5037 | 64 | 78.2 % | 90.03 | 77.07 | 18.2 → 16.7 | 1.17x | 1.08x |
+| HcgC, 545 | 5037 | 16 | 55.5 % | 90.63 ms | 65.85 ms | 18.1 → 13.8 | 1.38x | 1.20x |
+| HcgC, 545 | 5037 | 32 | 67.4 % | 90.58 | 64.71 | 18.1 → 17.1 | **1.40x** | **1.21x** |
+| HcgC, 545 | 5037 | 64 | 78.2 % | 90.60 | 76.59 | 18.1 → 16.8 | 1.18x | 1.10x |
 
 Three things to read out of that.
 
 **The gain is the fill, divided by an efficiency the tiling costs.**  That
 relation is an identity — the flop counts differ by exactly the fill — so the
 only thing the clock adds is the value of the efficiency, and it is
-**0.82 to 0.93**: 85 to 158 cuTENSOR calls per block where there was one cost
-7 to 18 % of the dense contraction's flop rate, and nothing worse.  That is
-the good news in this table and it is why the result is a ceiling argument:
-the executor is close to as good as a tiled executor gets, so §1's fill is
-what decides, for this implementation and for the `cuSPARSE` BSRMM and custom
-batched-GEMM ones the item also proposed.
+**0.76 to 0.95**: 85 to 315 cuTENSOR contractions per block where there was
+one cost between 5 % and 24 % of the dense contraction's flop rate, and
+nothing worse.  That is why the result is a ceiling argument: the executor is
+close to as good as a tiled executor gets, so §1's fill is what decides, for
+this implementation and for the `cuSPARSE` BSRMM and custom batched-GEMM ones
+the item also proposed.
 
 **Bigger tiles lose more fill than they win back in efficiency.**  T=64 gains
-only 0.5–1.6 TF/s over T=32 and pays ten points of fill, and it is behind at
-both large sizes.  T=16 has the lowest fill and twice the calls, and it is
-0.03x *ahead* of T=32 at 284 atoms (1.09x against 1.06x in the native order,
-where T=32 needs the `rcm` reordering to reach 1.09x too).  **32** is the
-shipped default because it is the best of the three at 545 atoms and within
-0.03x of the best at 284; T=16 was not timed at 545.
+1-3 TF/s over T=32 and pays ten points of fill, and it is behind both at both
+large sizes.  Between T=16 and T=32 this table is nearly tied — 1.10x against
+1.07x at 284 atoms, 1.20x against 1.21x at 545 — and §4 breaks the tie the
+other way: **end to end** they are 1.21x and 1.07x, and 16 is what ships.
 
-**The unpack is the part that is not finished.**  The tiled scatter is a CuPy
-fancy-index assignment where GPU4PySCF's is a CUDA kernel, and it costs
-**8.4 ms against 2.0 ms** at PfPMT and 3.6 against 1.3 at HcgC.  That is the
-whole of the gap between the contraction's ratio and the block's: give the
-tiled unpack the dense one's cost and PfPMT/T=16 goes from 1.09x to **1.18x**
-and HcgC/T=32 from 1.20x to 1.22x.  `DF_WORK_LIST.md` **W14** is that kernel.
+**This table is the second version of itself.**  The first was taken before
+§4.1's allocator fix, and its tiled unpack column was inflated: the
+microbenchmark's own per-block temporary was being served out of CuPy's pool
+while the real call's went to the driver, so the benchmark saw a cost it could
+not attribute and the call paid one the benchmark could not see.  The
+conclusions here did not move; the reason to say it is that *no* re-run of
+this script would have found what §4.1 found.
 
 ### 3.1 Block size
 
@@ -290,98 +296,137 @@ explicitly rather than taking what the memory allows.
 
 ### 3.2 Memory
 
-The tiled buffer is exactly `fill` times the dense `(nao, nao, blk)` one:
-**4.61 GB against 7.45** at PfPMT/T=16 and **4.38 against 6.50** at
-HcgC/T=32.  Against that, the density factor has to be gathered onto the tile
-rows once per `get_jk` call, and that array is `fill * nao / TILE` times as
-tall as the factor — at 545 atoms and tile 32, as large as the buffer it
-saved.  `_blksize` subtracts it from the budget rather than dividing it into
-the block, because it does not shrink when the block does.  Net, the tiled
-path's peak footprint is roughly the dense path's; W5's "it also removes the
-dense work buffer" is true of one array and false of the pair.
+The unpacked buffer is exactly `fill` times the dense `(nao, nao, blk)` one,
+and the staging buffer of §4.1 adds `npair * blk`.  Together, against the
+dense path's single array: **5.44 GB against 7.45** at PfPMT/T=16 and
+**4.14 against 6.50** at HcgC/T=16.  Against that, the density factor has to
+be gathered onto the tile rows once per `get_jk` call, and that array is
+`fill * nao / TILE` times as tall as the factor.  `_blksize` counts the two
+per-block arrays in its divisor and subtracts the gathered factor from the
+budget, because that one does not shrink when the block does.  Net, the
+tiled path is about a quarter smaller per block than the dense one — W5's
+"it also removes the dense work buffer" is true, but by 1.4x and not by
+`1/fill`.
 
 ---
 
-## 4. What ships, and the end-to-end result that does not follow from §3
+## 4. What ships
 
-**It ships off.**  `FASTDF_STEP1` stays `tensor`; `auto` is the opt-in that
-applies §4.2's gate, and `tiled` forces the branch unconditionally.  The
-reason is not §1's ceiling — it is that **§3's block ratio does not survive
-the call it is a part of**, and this round could not find out why.
+`FASTDF_STEP1=auto` is the default: §4.2's fill test, then either the
+block-sparse first contraction or GPU4PySCF's dense one.  `TILE` is **16**,
+`TILE_ORDER` is `native`, and `tensor`, `bgemm` and `tiled` force one branch
+each for the ablation columns.
 
-Measured end to end, at a converged density, both implementations in one
-process on one cderi tensor, each row its own round robin of two
-(`benchmarks/df_jk_bench.py`):
+End to end, at a converged density, both implementations in one process on one
+cderi tensor, each row its own round robin of two
+(`benchmarks/df_jk_bench.py`), 284 atoms with the cderi on the host:
 
 | | tile | dense reference | tiled | |
 |---|---|---|---|---|
-| taxol, 113 atoms, cderi on the device | 32 | 382.02 ms | 469.93 ms | **0.81x** |
-| PfPMT, 284 atoms, cderi on the host | 16 | 10466.57 ms | 10261.91 ms | **1.02x** |
-| PfPMT, 284 atoms, `rcm` | 16 | 10468.78 | 10274.59 | **1.02x** |
-| PfPMT, 284 atoms | 32 | 9961.05 | 11625.47 | **0.86x** |
-| PfPMT, 284 atoms, second job | 16 | 10738.19 | 11896.06 | **0.90x** |
-| PfPMT, 284 atoms, second job | 32 | 10323.71 | 12214.31 | **0.85x** |
+| PfPMT, 284 atoms | 16 | 10824.87 ms | **8916.35 ms** | **1.21x** |
+| PfPMT, 284 atoms | 32 | 10799.20 | 10087.46 | 1.07x |
+| *before the §4.1 fix* | 16 | 10738.19 | 11896.06 | *0.90x* |
+| *before the §4.1 fix* | 32 | 10323.71 | 12214.31 | *0.85x* |
 
-Four of the five 284-atom readings are **below 1.0x**, the two that are above
-it are 1.02x and did not reproduce in a second job, and §3's microbenchmark of
-the same three kernels on the same pattern says 1.09x.  **So the block-sparse
-contraction does not pay in a real `get_jk` call at the largest size that
-runs**, and the honest summary of W5 is that it is a kernel-level win that
-does not reach the caller.
+and the single profiled call of `benchmarks/df_block_profile.py`, which is a
+different script and a different process and agrees: **10850 ms → 8808 ms**,
+1.23x.
 
-For scale, from the second job's eight-variant table on the same call: stock
-GPU4PySCF **12907.43 ms**, `fastdf` as shipped **10579.82** (1.22x, which is
-the four items the module already had), its `s1=dense` ablation 10575.78, and
-`no-resident` 10627.43.
+For scale, in the same script's eight-variant table stock GPU4PySCF reads
+**13091 ms** on that call and `fastdf` with the dense contraction **10684** —
+1.23x, which is the four items the module already had.  The two ratios are
+from different round robins and §4.1 says why they must not be divided into
+each other.
 
-### 4.1 The gap is about 1.5 s per call and is not explained
+**Tile 16 beats tile 32 end to end by 0.14x**, where §3's kernel benchmark
+puts them within 0.03x.  That is the same lesson as §4.1 from the other side:
+once the per-block allocation is gone, what is left is the fill, and T=16's
+61.9 % against T=32's 72.3 % is the whole difference.  T=16's extra calls —
+169 contractions a block against 85 — cost nothing measurable.
 
-The kernels §3 times — unpack, first contraction, `dsyrk` — sum to 1.09x
-tiled at 284 atoms and the call comes out at 0.85–1.02x.  Three explanations
-were checked and none of them accounts for it:
+### 4.1 The gap was an allocator, and Nsight Systems is what found it
 
-* **Block size.**  The real call runs near `MAX_BLK = 256` where §3.1 already
-  puts the block ratio at 1.04x rather than 1.09x.  That is part of the gap
-  and nowhere near all of it.
-* **Buffer churn.**  `_blksize` re-derives the auxiliary block from
-  `get_avail_mem()` on every call, and the tiled buffer is 8.8 GB, so a block
-  that moves by one between calls reallocates and re-zeroes all of it.  This
-  looked like the answer — it would have been about the right size — so the
-  pattern was made to own its block size (`_tiles` fixes `ldL` at the first
-  call and `get_jk` takes it back).  **It made the tiled path slower**, 10262
-  → 11896 ms at T=16, because the block is then frozen at whatever the memory
-  state was when the pattern was first built.  The fix is kept because a
-  cached multi-gigabyte buffer should not be resized from free memory, but it
-  is not the explanation.
-* **The resident cderi prefix.**  The tiled buffer competes with `fastdf`
-  item 4's resident rows (2298/13365 in one job, 1078/13365 in the other), so
-  more of the 86 GB streams.  But `no-resident` is 10627 against 10580 here —
-  half a per cent — so residency is worth nothing on this call to begin with,
-  exactly as `DF_WORK_LIST.md` §3.3 found.  Not the explanation either.
+The kernels §3 times summed to 1.09x tiled at 284 atoms and the call came out
+at 0.85-1.02x over two jobs.  Three explanations were checked from wall clocks
+and none accounted for it: the block size the real call runs at (worth part of
+it, §3.1), a cached-buffer reallocation (the fix is in `_tiles` and made the
+tiled path *slower*), and the resident cderi prefix (`no-resident` is within
+half a per cent of `fastdf` on this call, exactly as `DF_WORK_LIST.md` §3.3
+found).
 
-What is left, and is the leading candidate rather than a result: the
-microbenchmark runs its kernels on a block already on the device with nothing
-else in flight, and the real call runs them interleaved with a saturated PCIe
-stream on a second CUDA stream and its events.  The tiled path issues 85 to
-169 contractions and two scatters per block where the dense path issues one
-contraction and one kernel — about 5400 launches per call against 130 — and
-every one of them is scheduled against the prefetch.  **Measuring that needs a
-profile of the block loop, not another wall clock**, and it is the first thing
-to do for anyone who picks this up: if it is launch scheduling, `W14`'s unpack
-kernel and a batched contraction over tile rows of equal width would both
-attack it; if it is not, W5 is finished.
+`benchmarks/df_block_profile.py` annotates every stage of every block with
+NVTX and settles it in one table.  One `get_jk` per variant, PfPMT, host
+cderi, tile 16:
+
+| | GPU kernel time | wall | GPU busy | GPU ops | `cudaFree` calls |
+|---|---|---|---|---|---|
+| dense | 10.64 s | 10.66 s | 99.9 % | 1 130 | **4** |
+| tiled, before | **9.40 s** | **11.73 s** | **80.1 %** | 20 728 | **118** |
+| tiled, after | 8.61 s | 8.81 s | 97.7 % | 21 970 | 4 |
+
+The tiled path was already doing **1.13x less GPU work** and then leaving the
+GPU idle for **2.33 s**.  And the cause is the last column: one
+allocate-and-free pair **per block**.
+
+`RowCompressed.unpack` began with `cp.ascontiguousarray(cderi_blk.T)`, and at
+284 atoms that temporary is `blksize x npair x 8` = **763 MB**.  CuPy's pool
+went to the driver for it every block, and **`cudaFree` synchronises the
+device** — so the double-buffered prefetch `fastdf` inherits from GPU4PySCF
+was drained 114 times a call, and the host-to-device copy that
+`DF_WORK_LIST.md` §3.3 measures as *fully hidden* stopped being hidden.
+763 MB at 26.4 GB/s is 29 ms a block; 114 blocks of it partly exposed is the
+2.33 s, to the digit.
+
+The fix is three lines — the staging buffer is allocated once per pattern
+rather than once per block, and `_blksize` counts it — and the same
+measurement then reads 1.21x.
+
+Stage by stage after the fix, per variant (`cuda_gpu_kern_sum`):
+
+| | dense | tiled |
+|---|---|---|
+| step 1 | 6.497 s, 158 cuTENSOR GETT | **4.308 s**, 21 800 GETT |
+| step 2 (`dsyrk`) | 3.557 s | 3.403 s |
+| unpack | 0.647 s, `decompress_and_transpose` | 0.457 s transpose + 0.295 s scatter |
+| Coulomb pass | 0.134 s | 0.133 s |
+| **total** | **10.84 s** | **8.61 s** |
+
+The first contraction is **1.51x** inside the real call at this block size,
+and the tiled unpack — 0.752 s against the dense kernel's 0.647 — is now
+within 16 % of GPU4PySCF's hand-written one rather than four times it.
+**W14**, a CUDA kernel for the tiled scatter, is worth that remaining 0.1 s
+plus the staging buffer it would remove, and is no longer the headline it
+looked like.
+
+Three things to take from this beyond W5.  A **kernel benchmark cannot see an
+allocator**: `df_block_bench.py` reuses one device-resident block, so its
+timed region allocated once where the real call allocated 114 times — which
+is exactly why it read 1.09x where the call read 0.90x.  **`cudaFree` is a
+synchronisation point**, so a per-iteration temporary in a pipelined loop does
+not cost its own allocation time, it costs the pipeline.  And **a cached
+buffer must not be sized from free memory**, which is the `_tiles` change that
+came out of the wrong diagnosis and is kept on its own merits.
 
 ### 4.2 The gate
 
 `_use_tiled` takes the block-sparse contraction when the tile fill is at or
-below **`TILE_MAX_FILL = 0.75`**.  Over the 28 timed (system, tile, ordering)
-rows behind §3 — five systems, three tile sizes, two orderings, the 545-atom
-one at two tiles — that gate separates every win from every loss on the
-exchange block without a misclassification: it rejects penicillin V, both 113-atom
-systems at every tile, and PfPMT at T=64 (82.7 % fill, 0.97x); it accepts
-PfPMT at T=16 and T=32 and HcgC at T=32.  `rcm`'s 73.5 % at PfPMT/T=64 is the
-one marginal acceptance (1.02x on the block), and a gate of 0.70 would drop
-it.
+below **`TILE_MAX_FILL = 0.75`**.
+
+**At the shipped tile of 16 it separates all five systems exactly**: it
+rejects penicillin V (98.3 %), taxol (94.9 %) and the Co(II) sextet (98.9 %),
+where the tiled contraction is 0.33x to 0.69x on the block, and accepts PfPMT
+(61.9 %) and HcgC (55.5 %), where it is 1.10x and 1.20x.  End to end, both
+sides of that are measured: at taxol `fastdf` reads **403.54 ms** and its
+`s1=dense` ablation 404.48 — the gate declined, as it should, because forcing
+the tiled contraction there costs 0.88x — and at PfPMT it accepts and reads
+1.21x.
+
+Over all 30 timed (system, tile, ordering) rows behind §3 the gate makes no
+false *accept*: every row it lets through is 1.04x or better on the block.  It
+does make two conservative rejects, both at 545 atoms and tile 64 (78.2 % and
+77.9 % fill, 1.10x on the block), where it falls back to the dense
+contraction and forgoes a gain.  Since 16 is the shipped tile that case does
+not arise by default, and a gate that declines a win is the right way round.
 
 The gate is on the fill and not on `nao` for the reason §2.1 measures, and
 that is the part of this round with a life beyond W5: **the tile fill is not
@@ -399,9 +444,10 @@ of 5.4e-16 / 3.6e-15; `test_dfj`, `test_dfcderi` and `test_dfgrad` are
 unchanged and pass.
 
 Set against `DF_WORK_LIST.md` §3.3's framing — W5 as "the largest lever on
-DF-K itself", worth 12.1 s of a 12.38 s build — what the item actually buys is
-nothing on the call, and §1.1 is most of the reason: two thirds of the
-sparsity it priced is not addressable by a tile at all.
+DF-K itself", worth 12.1 s of a 12.38 s build — 1.21x on the call is a fifth
+of what the item priced.  §1.1 is most of the reason and it is a property of
+the basis rather than of the code: two thirds of the sparsity the item costed
+is not addressable by a tile of any size.
 
 ---
 
@@ -439,15 +485,22 @@ python benchmarks/df_block_probe.py --breakdown --hist        # §1, §2; no GPU
 python benchmarks/df_block_probe.py --basis def2-tzvpp        # §2.1
 python benchmarks/df_block_bench.py --check --cases taxol:0:0,PfPMT:0:-1
 python benchmarks/df_block_bench.py --cases PfPMT:0:-1 --nl 32,64,128,256
-python benchmarks/df_jk_bench.py --xyz ... --tiled 32 --tile-orders native
+python benchmarks/df_jk_bench.py --xyz ... --tiled 16 --tile-orders native
 python tests/test_df.py --ablate            # the correctness bar, tiled included
+
+nsys profile -t cuda,nvtx -c cudaProfilerApi -o $SCRATCH/p \
+    python benchmarks/df_block_profile.py --xyz ... --cpu-cderi --tile 16
+python benchmarks/df_block_profile.py --stats $SCRATCH/p.nsys-rep   # §4.1
 ```
+
+`nsys` cannot write its report onto the GPFS home (`errno 524`); point `-o` at
+`$SCRATCH`, or recover a stranded `.qdstrm` with
+`Nsight_Systems/host-linux-x64/QdstrmImporter -i` from a Lustre directory.
 
 | switch | effect |
 |---|---|
-| `FASTDF_STEP1=tensor` | default: GPU4PySCF's dense cuTENSOR contraction |
-| `FASTDF_STEP1=auto` | opt in: the block-sparse first contraction where the tile fill passes `TILE_MAX_FILL`, the dense one otherwise |
-| `FASTDF_STEP1=bgemm\|tiled` | force the cuBLAS batch over the AO index, or the block-sparse contraction unconditionally |
-| `FASTDF_TILE=<n>` | AO tile size (default 32; 16/32/64 measured) |
+| `FASTDF_STEP1=auto` | default: the block-sparse first contraction where the tile fill passes `TILE_MAX_FILL`, GPU4PySCF's dense cuTENSOR one otherwise |
+| `FASTDF_STEP1=tensor\|bgemm\|tiled` | force the dense contraction, the cuBLAS batch over the AO index, or the block-sparse one unconditionally |
+| `FASTDF_TILE=<n>` | AO tile size (default 16; 16/32/64 measured) |
 | `FASTDF_TILE_ORDER=native\|rcm\|rcb\|morton` | the AO ordering the tiles are cut in (default `native`) |
 | `FASTDF_TILE_MAX_FILL=<f>` | the gate (default 0.75); 1.0 takes the tiled contraction whenever the pattern is built |
