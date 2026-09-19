@@ -165,6 +165,20 @@ if 'fastdf' in active:
     # SCF and is the only two-electron row that moves on a DF one.
     _ENTRIES.append(
         ('fastdf  df get_jk', _dfjk, 'get_jk', _dfjk, '_get_jk_orig'))
+if 'fastdfgrad' in active:
+    from gpu4pyscf.df.grad import rks as _dfgrks             # noqa: E402
+    from gpu4pyscf.df.grad import uks as _dfguks             # noqa: E402
+    # the density-fitted gradient's two-electron derivative, on the two
+    # classes a DFT run actually instantiates.  Each binds its own copy of the
+    # function object at class-creation time, so a row that reads `(-)` while
+    # the other moves is the "a patch target is not a code path" failure this
+    # script exists for.  No `stock` counter: a declined call runs GPU4PySCF's
+    # `_jk_energy_per_atom` from inside the patched method, and
+    # `fastdfgrad.stats()` below is the authority for the split.
+    _ENTRIES.append(('fastdfgrad rks ejk', _dfgrks.Gradients,
+                     'jk_energy_per_atom', _dfgrks.Gradients, '_never'))
+    _ENTRIES.append(('fastdfgrad uks ejk', _dfguks.Gradients,
+                     'jk_energy_per_atom', _dfguks.Gradients, '_never'))
 for e in _ENTRIES:
     _entry(*e)
 
@@ -247,7 +261,8 @@ extra = {}
 # counts every call into `_DFHF.get_jk`, and on a full-DF run all of them
 # are handed straight back to GPU4PySCF.  `only_dfj` in this line is the
 # number that actually took the repaired branch.
-for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc', 'fastdfj'):
+for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc', 'fastdfj',
+           'fastdfgrad'):
     if _m in active:
         _mod = __import__(f'electrolites.{_m}', fromlist=['x'])
         if hasattr(_mod, 'stats'):

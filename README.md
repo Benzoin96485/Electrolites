@@ -228,6 +228,44 @@ instead.  It is a different approximation, not a faster route to the same
 number, and a *larger* error than full DF's (§5 of `docs/README_fastdfj.md`
 has both columns on seven systems).
 
+**The third item is done too, and the profile it asked for contradicted the
+item.**  `df/grad/rhf.py:_jk_energy_per_atom` -- the two-electron derivative
+of every density-fitted **gradient** -- is 72 % of a def2-SVP one, 93 % of a
+def2-TZVPP one and 97 % of a 113-atom one, and nothing here was on it.  The
+work list expected the cost to be in its two fancy-index scatters and its
+dense contractions.  Measured stage by stage (`benchmarks/df_grad_probe.py`,
+a traced clone checked against the real function on every run), **76-85 %**
+of it is two Rys kernels and the scatters are **1.0-1.5 %**, running at
+644-1821 GB/s against an A100's 1555.  So `fastdfgrad` is two things that are
+not rearrangements:
+
+| DF gradient, one A100 | GPU4PySCF 1.8.1 | + Electrolites | |
+|---|---|---|---|
+| penicillin V/def2-SVP, `jk_energy_per_atom` | 905 ms | **518 ms** | **1.75x** |
+| ↳ the whole gradient | 1.240 s | **0.858 s** | **1.45x** |
+| penicillin V/def2-TZVPP, whole gradient | 3.317 s | **1.651 s** | **2.01x** |
+| 113-atom taxol/def2-SVP, whole gradient | 8.172 s | **3.604 s** | **2.27x** |
+
+The first is that a quarter of the function is three-centre integrals **the
+SCF already computed**: the cderi holds them, and `jk_energy_per_atom` deletes
+it with a `with_df.reset()` on its first line.  `_decompose_j2c`'s own matrix
+satisfies `aux_coef @ aux_coef.T == metric` -- the very metric the gradient
+rebuilds -- so the pseudo-density comes out of the existing tensor exactly,
+and the reuse costs one half-transform the function was doing anyway.  The
+second is that GPU4PySCF launches the derivative kernel with **four shell
+pairs per thread block where one is faster**: swept over `{1,2,4,8,16,32}` and
+four `gout_width`s, `1` wins every cell, by **1.26x** at 42 atoms, 1.77x at
+def2-TZVPP and **3.15x** at 113 -- the same integrals in the same order, and
+the same answer in every cell of the grid.  That constant is also in the
+kernel `_cholesky_eri` builds the cderi through, which is a separate item.
+Patched against stock, element-wise: **1.5e-9 to 7e-8 relative** per atom and
+component, and `benchmarks/df_grad_metric_probe.py` shows that merely
+*associating* the metric contraction the other way round on GPU4PySCF's own
+intermediate moves it by more than that -- the fitting metric is conditioned
+at 2e9 to 2e10.  `docs/README_fastdfgrad.md` has the stage tables, the sweep
+grid, the item that was measured and **rejected**, and the 32 GB array that
+stops this path at 284 atoms in GPU4PySCF and here alike.
+
 ## Install
 
 ```bash
@@ -327,6 +365,7 @@ separate processes; that is the only honest way to A/B them.
 | `fastfnlc` | `hessian.rks.nr_rks_fnlc_mo` **and the `hessian.uks` binding of the same name** | the **VV10 non-local-correlation response**, which is 80 % of a wB97M-V polarizability: the ground-state half of it -- including an `O(n_grid^2)` double sum -- computed once per coupled-perturbed solve instead of once per iteration, and the potential contraction batched over the perturbed densities.  Restricted or unrestricted: `V_munu` is spin-free, so the unrestricted case is the same body on the summed density with an MO-basis answer projected once per spin.  Reaches CPKS, NMR, C6 and the analytic Hessian -- and, on an **unrestricted** reference only, TDA/TDDFT: `tdscf/rhf.py` sets `exclude_nlc = True` and `tdscf/uhf.py` sets nothing, so an open-shell TDDFT pays this term and a closed-shell one does not (`docs/VV10_OPENSHELL.md` §1) |
 | `fastdf` | `df.df_jk.get_jk` | the **density-fitted** Coulomb and exchange build -- the two-electron half of every RI/DF calculation, which is a *fourth* code path that `fastj`, `fastk` and `fastjk` are all off: `df/df.py:117` contracts the three-index cderi tensor and never touches a four-centre integral.  Restricted or unrestricted, any number of densities, `hermi` 0 or 1, the cderi on the device or streamed from the host.  Catalogue **A13**, two of whose four claims 1.8.x closed upstream (`docs/README_fastdf.md` §1) |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` (and `_DFHF.Gradients`, for one warning) | **RIJONX** -- `density_fit(only_dfj=True)`, density-fitted J with *exact* exchange -- which **cannot run at all on GPU4PySCF 1.8.1**: the branch passes `mol` where `DF.get_jk` expects the density (`df/df_jk.py:211`) and dies with `'Mole' object has no attribute 'shape'`.  Repaired, the configuration builds **no cderi**, so it has none of `fastdf`'s 86 GB at 284 atoms, and its exchange is `fastk`.  Restricted or unrestricted, hybrid, range-separated or pure; a GHF object keeps GPU4PySCF's own branch, which is already correct.  `docs/README_fastdfj.md`, and `docs/DF_WORK_LIST.md` W1 |
+| `fastdfgrad` | `df.grad.{rhf,rks,uhf,uks}.Gradients.jk_energy_per_atom` | the **two-electron derivative of a density-fitted gradient** -- 72-97 % of one, depending on the basis, and a fifth code path.  Two things, neither a rearrangement: the three-centre integrals of its first loop are taken from the cderi the SCF already built (`_decompose_j2c`'s matrix satisfies `aux_coef @ aux_coef.T == metric`, so the pseudo-density comes out of it exactly), and the derivative kernel is launched with a quarter as many shell pairs per thread block, which is **1.26x-3.15x** on that kernel and the fastest of the six values swept at every size measured.  Restricted or unrestricted, hybrid or range-separated -- both of an RSH functional's two calls reuse, which needs the `reset()` on the method's first line to be partial.  A pure functional never reaches this function, an `only_dfj` object has no cderi, and a TDDFT or NAC gradient's asymmetric factorisation falls through.  `docs/README_fastdfgrad.md`, and `docs/DF_WORK_LIST.md` W3 |
 
 **Limits, all of which fall through rather than fail.** An **open-shell ground
 state** is now covered through the SCF and the gradient: `fastk`, `fastj`,

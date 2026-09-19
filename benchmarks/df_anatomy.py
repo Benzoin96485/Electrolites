@@ -172,9 +172,18 @@ _wrap(gdiis.DIIS, 'update', '..diis.update')
 _GRAD_KEYS = []
 if not a.no_grad:
     from gpu4pyscf.df.grad import rhf as gdfgrad                # noqa: E402
+    from gpu4pyscf.df.grad import rks as gdfrks, uks as gdfuks   # noqa: E402
+    # The *method*, not the module-level function it calls.  Two reasons: the
+    # method is where `with_df.reset()` and the `SortedMole`/`Int3c2eOpt`
+    # rebuild happen, which `benchmarks/df_grad_probe.py` measures at 0.8-7 %
+    # of the term and the module-level wrap misses entirely; and `fastdfgrad`
+    # replaces the method, so wrapping the function would time only the calls
+    # it hands back.  Each class binds its own copy of the function object, so
+    # the one the run actually uses has to be named.
+    _cls = gdfuks.Gradients if mol.spin else gdfrks.Gradients
     for _obj, _name, _label in (
             (ggrhf, '_hcore_energy', 'grad hcore+ovlp'),
-            (gdfgrad, '_jk_energy_per_atom', 'grad df ejk'),
+            (_cls, 'jk_energy_per_atom', 'grad df ejk'),
             (gguks if mol.spin else ggrks, 'get_exc', 'grad xc'),
             (ggrks, 'get_nlc_exc', 'grad nlc')):
         if not hasattr(_obj, _name):

@@ -37,6 +37,7 @@ MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
+    'fastdfgrad',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -94,6 +95,17 @@ _TARGETS = {
                 ('gpu4pyscf.df.df_jk', '_DFHF.get_k'),
                 ('gpu4pyscf.df.df_jk', '_DFHF.get_veff'),
                 ('gpu4pyscf.df.df_jk', '_DFHF.Gradients')),
+    # the two-electron derivative of a density-fitted gradient.  Four classes,
+    # because each binds `jk_energy_per_atom` as a class attribute at
+    # class-creation time and so carries its own copy of the function object;
+    # `_decompose_j2c` is the identity the cderi reuse rests on
+    'fastdfgrad': (('gpu4pyscf.df.grad.rhf', 'Gradients.jk_energy_per_atom'),
+                   ('gpu4pyscf.df.grad.rks', 'Gradients.jk_energy_per_atom'),
+                   ('gpu4pyscf.df.grad.uhf', 'Gradients.jk_energy_per_atom'),
+                   ('gpu4pyscf.df.grad.uks', 'Gradients.jk_energy_per_atom'),
+                   ('gpu4pyscf.df.grad.rhf', '_jk_energy_per_atom'),
+                   ('gpu4pyscf.df.grad.uhf', '_jk_energy_per_atom'),
+                   ('gpu4pyscf.df.df', '_decompose_j2c')),
 }
 
 _patched = []

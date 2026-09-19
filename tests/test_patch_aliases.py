@@ -57,6 +57,8 @@ for _m in ('gpu4pyscf.properties.shielding', 'gpu4pyscf.grad.rkspu',
            # the density-fitted J/K build and the drivers that reach it
            'gpu4pyscf.df.df_jk', 'gpu4pyscf.df.df', 'gpu4pyscf.df.grad.rhf',
            'gpu4pyscf.df.grad.rks', 'gpu4pyscf.df.grad.uks',
+           'gpu4pyscf.df.grad.uhf', 'gpu4pyscf.df.grad.tdrhf',
+           'gpu4pyscf.df.grad.tduks',
            'gpu4pyscf.df.hessian.rhf', 'gpu4pyscf.df.hessian.uhf'):
     try:
         importlib.import_module(_m)
@@ -93,6 +95,12 @@ ORIGINALS = [
     ('fastdfj', 'gpu4pyscf.df.df_jk', '_DFHF._get_jk_orig'),
     ('fastdfj', 'gpu4pyscf.df.df_jk', '_DFHF._get_k_orig'),
     ('fastdfj', 'gpu4pyscf.df.df_jk', '_DFHF._Gradients_orig'),
+    # `fastdfgrad` replaces a *method* on four classes, and the restricted and
+    # unrestricted ones are different function objects -- `df/grad/uhf.py`
+    # defines its own in its class body.  A fifth class still holding either
+    # is a DF gradient that never reaches this module
+    ('fastdfgrad', 'electrolites.fastdfgrad', '_ORIG_METHOD_R'),
+    ('fastdfgrad', 'electrolites.fastdfgrad', '_ORIG_METHOD_U'),
 ]
 
 #: aliases that are known and deliberate: (holder, attribute) -> why

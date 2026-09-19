@@ -109,6 +109,14 @@ which 22.8 % is the one-time build).  On **taxol/def2-SVP**, host-resident,
 The **gradient** inverts with basis size: `df/grad/rhf.py:_jk_energy_per_atom`
 is **29 %** of a def2-SVP DF gradient and **83 %** of a def2-TZVPP one.
 
+> **Corrected upward since.**  Those two came from `df_anatomy.py`, which
+> wrapped the module-level function and so missed the `with_df.reset()` and
+> the `SortedMole` + `Int3c2eOpt` rebuild the *method* does on every call.
+> Timed at the method — where the work actually starts —
+> `benchmarks/df_grad_probe.py --whole` puts it at **72 %** of a def2-SVP
+> gradient, **93 %** of a def2-TZVPP one and **97 %** of a 113-atom
+> def2-SVP one.  `df_anatomy.py` now wraps the method.
+
 ### 3.2 Memory
 
 `benchmarks/df_fill_probe.py` (no GPU time; the screening is a property of the
@@ -195,6 +203,14 @@ Ranked by (value × confidence) / cost, **after** §3.3.  Each item gives what
 to change, the evidence it rests on, what would count as success, and what
 would falsify it.
 
+**W3 is done, and W10 is what it found.**  The DF gradient's two-electron
+derivative is 1.75x–2.59x faster and the gradient around it 1.24x–2.27x
+(`docs/README_fastdfgrad.md`), from two things the entry did not predict —
+integrals the SCF's cderi already holds, and a launch constant.  What it could
+*not* do is run at 284 atoms: `j3c_oo` is a dense `(naux, nocc, nocc)` array,
+32.0 GB there, and neither upstream nor this repository batches it.  That is
+**W10**.
+
 The ordering before the 284-atom run put the capacity items first, because the
 size ladder in §3.2 looked like a wall.  It is not one on this hardware, so
 the list now leads with the three that attack the 12.5 s per call §3.3
@@ -211,7 +227,8 @@ sixth for the same reason and will come back at 500+ atoms.
 > option when the fitted exchange is wanted (it is the more accurate of the
 > two approximations, `docs/README_fastdfj.md` §5) and is still what every
 > *pure* functional, every gradient and every Hessian on this path uses.  W3
-> and W4 are untouched by W1.  W9 is worth *less*: §3.1 of
+> and W4 were untouched by W1 — **W3 is now done**, and W4 inherits a
+> measurement from it (the shell-pair aggregation, below).  W9 is worth *less*: §3.1 of
 > `docs/README_fastdfj.md` measures the three-centre Coulomb engine at 1.67x
 > the direct four-centre build at 284 atoms, so the path it names is already
 > the faster of the two.
@@ -300,27 +317,100 @@ and entirely stock.  **That is this repository's limitation, not GPU4PySCF's.**
   the threads `multi_gpu.run` spawns.  Key it per device or it will hand one
   device another device's rows.
 
-### W3 — The DF gradient's two-electron derivative
+### W3 — The DF gradient's two-electron derivative — **done**
 
-`df/grad/rhf.py:_jk_energy_per_atom`: **83 %** of a def2-TZVPP DF gradient,
-29 % at def2-SVP — the one uncovered stage that grows with basis size instead
-of shrinking.  Nothing in this repository is on it.
+`electrolites/fastdfgrad.py`, `tests/test_dfgrad.py`,
+`benchmarks/df_grad_probe.py`, `benchmarks/df_grad_bench.py`,
+`benchmarks/df_grad_ip1_sweep.py`, `benchmarks/df_grad_metric_probe.py`,
+write-up in `docs/README_fastdfgrad.md`.
 
-It has the same shape as the SCF build and two of the same problems, plus one
-the SCF build does not have: the dense `(i,j,L)` expansion is built by **two
-fancy-index scatters** (`j3c[j_addr,i_addr] = j3c[i_addr,j_addr] = ...`)
-rather than by a kernel, and it happens twice — once to form `j3c_oo` and once
-to compress the pseudo-density back onto the pair list with `cp.take`.
+**The profile this item asked for contradicts the paragraph that motivated
+it.**  A traced clone of the function, stage by stage, puts **76–85 %** of it
+in two Rys kernels — the derivative three-centre integrals at 52–59 % and the
+plain ones at 24–26 % — at 42 atoms in two basis sets and at 113 atoms.  The
+"two fancy-index scatters" this entry singles out are **1.0–1.5 %** of it and
+run at 644–1821 GB/s against an A100's 1555.  All four contractions together
+are 2.7 %/5.5 %/14.4 % and run at 5–17 TF/s, the largest of them at 71 % of
+the machine.  §2's lesson held a second time, and the `(L,i,j)` note above is
+answered by arithmetic rather than by an experiment: a *perfect* version of
+every contraction in the function is worth under 5 % at 42 atoms.
 
-* **Do**: profile it first, stage by stage, the way
-  `benchmarks/df_probe.py` does the SCF build.  §2's lesson applies: do not
-  assume the contraction is the cost.
-* **Success**: a stage table with each stage against its roofline, then
-  whatever that table points at.
-* **Note**: unlike the SCF build, here the `(L,i,j)` layout *would* turn both
-  contraction pairs into clean batched GEMMs — §2's rejection of that layout
-  was measured on the SCF build's unpack, which is a different kernel and a
-  different input layout.  Re-measure, do not inherit the conclusion.
+**What the table pointed at, and what it is worth.**  Two things, neither a
+rearrangement:
+
+1. **A quarter of the function is integrals the SCF already computed.**  The
+   first loop evaluates `(pq|P)` from scratch; the **cderi** holds exactly
+   those, and `jk_energy_per_atom` deletes it with a `with_df.reset()` on its
+   first line.  `_decompose_j2c`'s own matrix satisfies `aux_coef @
+   aux_coef.T == metric` — the very metric the gradient rebuilds — so the
+   pseudo-density comes out of the existing tensor **exactly**, and the
+   half-transform it costs is one the function was doing anyway (on a
+   *smaller* basis: the cderi is contracted and spherical, 1007 functions
+   against the gradient's decontracted Cartesian 1146).  **1.22x–1.46x** on
+   the function.
+2. **The derivative kernel is launched four shell pairs deep where one is
+   faster.**  `df/grad/rhf.py:141` aggregates at `nsp_per_block*4`.  Swept
+   over `{1,2,4,8,16,32}` and four `gout_width`s, **1** is the fastest of the
+   six in every row of every table, by a margin that grows: **1.257x** on the
+   kernel at 42 atoms/def2-SVP, **1.769x** at def2-TZVPP, **3.153x** at 113
+   atoms.  Same integrals, same order, identical answer in every cell of the
+   grid — and `gout_width` above 54 is not a preference but a **ceiling**:
+   the kernel's answer changes there, by 89 at 72 and 1.8e3 at 108.
+
+Together, one `jk_energy_per_atom` call at fixed density, round robin in one
+process:
+
+| | stock | **fastdfgrad** | | whole gradient |
+|---|---|---|---|---|
+| penicillin V, def2-SVP, B3LYP | 905.1 ms | **518.4 ms** | **1.75x** | 1.240 → **0.858 s**, 1.45x |
+| penicillin V, def2-TZVPP, B3LYP | 2826.8 ms | **1314.7 ms** | **2.15x** | 3.317 → **1.651 s**, 2.01x |
+| penicillin V, def2-SVP, ωB97X-V | 910.9 ms | **519.5 ms** | **1.75x** | 3.406 → **2.743 s**, 1.24x |
+| taxol, def2-SVP, B3LYP (113 atoms) | 7369.0 ms | **2850.1 ms** | **2.59x** | 8.172 → **3.604 s**, 2.27x |
+| Ni dithiolene⁻ doublet, UKS (21 atoms) | 793.4 ms | **556.8 ms** | 1.43x | 1.254 → **0.982 s**, 1.28x |
+| Cu macrocycle²⁺ quartet, UKS (60 atoms) | 1868.5 ms | **973.1 ms** | **1.92x** | 2.664 → **1.771 s**, 1.50x |
+
+Patched against stock, element-wise in the same process: **1.5e-9 to 7.0e-8
+relative** per atom and component.  That is not the reuse:
+`benchmarks/df_grad_metric_probe.py` takes GPU4PySCF's *own* `j3c_oo` and
+merely associates the metric contraction the other way round, and it moves by
+**more** — 7.8e-07 against the term's 5.6e-08 at 42 atoms, 2.3e-05 against
+4.1e-06 at 113.  The fitting metric is conditioned at 2.3e9 and 1.9e10 on
+those two systems, and both disagreements track that rather than the reuse.
+
+**Two smaller results.**  Reusing the SCF's `Int3c2eOpt` — the same object
+`DF.build` makes, thrown away one line before the gradient rebuilds it — is
+worth 1.14x at 42 atoms/def2-SVP and nothing past it.  And building the
+Coulomb term of the pseudo-density on the compressed pair list, which does
+**strictly less work** than upstream's dense arrangement, is **0–1.4 %
+slower** on all five systems: it ships off, behind `FASTDFGRAD_JPAIR=1`.
+
+**A range-separated functional's two calls both reuse**, which needed
+upstream's `reset()` — which empties `_rsh_df` — to become a partial release.
+Without that the long-range call finds nothing and the whole-gradient ratio
+reads 1.12x instead of 1.24x.
+
+* **Success criterion met as stated**: the item asked for "a stage table with
+  each stage against its roofline, then whatever that table points at".  The
+  table is `docs/README_fastdfgrad.md` §2; what it pointed at was not on this
+  page.
+* **And a capacity wall the round found rather than closed.**  At 284 atoms
+  the DF gradient does **not run** on one A100-SXM4-40GB, patched or not:
+  `_jk_energy_per_atom` allocates `j3c_oo` as a dense `(naux, nocc, nocc)`
+  array, which is `13365 × 547² × 8` = **32.0 GB**, and dies a few lines
+  later in `cp.asarray(auxmol.ctr_coeff)`.  `fastdfgrad`'s `dm_oo` is the
+  same array, so it dies in the same place.  The SCF at that size *does* run
+  — §3.3 — because `_cholesky_eri` streams the cderi from the host; the
+  gradient has no equivalent, and batching the occupied index is **W10**
+  below.
+* **And one finding that belongs to W4, not here.**  The `nsp_per_block*4`
+  aggregation is not only in the gradient: the same constant is in
+  `df/int3c2e_bdiv.py:176`, which is what `_cholesky_eri` builds the cderi
+  through, and a `*16` is in `_j_energy_per_atom` and in
+  `Int3c2eOpt.contract_dm`.  Swept on the plain integral kernel, `1` is
+  **1.24x** at 42 atoms/def2-SVP, **1.46x** at def2-TZVPP and **3.19x** at
+  113 atoms against upstream's `*4` — 1567.8 ms → 491.4 ms on taxol.  W4 is
+  the cderi build, `_cholesky_eri` is **39.4 %** of a 15-cycle taxol DF SCF
+  (§3.1), and this is the cheapest thing anyone has measured on it.
 
 ### W4 — The cderi build
 
@@ -341,6 +431,31 @@ be separated cheaply.
 * **Falsified if**: `dtrsm` at these shapes runs at less than half of `dgemm`,
   which would eat the factor of two.  cuBLAS's triangular solve is not as well
   tuned as its GEMM — the same trap `dsyrk` fell into in §1 item 1.
+
+**And a second lead, handed over by W3 and much cheaper than the first.**
+`_cholesky_eri` evaluates its three-centre integrals through
+`int3c2e_evaluator`, which aggregates shell pairs at `nsp_per_block[0]*4`
+(`df/int3c2e_bdiv.py:176`) — the same constant W3 found costing the gradient's
+derivative kernel 1.26x–3.15x.  Swept on the *plain* integral kernel
+(`benchmarks/df_grad_ip1_sweep.py`, second table), `sp_mult = 1` is
+
+| | `*4` (GPU4PySCF) | `*1` | |
+|---|---|---|---|
+| penicillin V, def2-SVP | 188.4 ms | **151.9 ms** | 1.24x |
+| penicillin V, def2-TZVPP | 675.2 ms | **463.5 ms** | 1.46x |
+| taxol, def2-SVP | 1567.8 ms | **491.4 ms** | **3.19x** |
+
+and the answer is identical in every cell of the `sp_mult` column.  `*16` is
+in `_j_energy_per_atom` and in `Int3c2eOpt.contract_dm` and has not been
+swept.
+
+* **Do**: measure it end to end on `_cholesky_eri` rather than on the kernel
+  alone — the sweep above is the evaluator's kernel time, not a cderi build,
+  and the build has a metric contraction and a host transpose on top of it.
+* **Watch**: `gout_width` is a **ceiling**, not a preference.  Above 54 both
+  Rys kernels return a *different answer* — the plain one does so on taxol
+  and not on penicillin V, so a value that looks safe on one molecule is not
+  safe on the next.  Sweep `sp_mult` and leave `gout_width` where it is.
 
 ### W5 — A block-sparse exchange contraction
 
@@ -420,6 +535,30 @@ smarter exists.
 nothing in this repository.  It is a `fastj`-shaped generator project rather
 than a driver rewrite, and W1 makes it matter for hybrids too.
 
+### W10 — Batch the DF gradient's `(naux, nocc, nocc)` array
+
+*(Found by W3, which could not run at 284 atoms because of it.)*
+
+`df/grad/rhf.py:101` allocates `j3c_oo = cp.empty((naux, nocc, nocc))` and
+`_jk_energy_per_atom` never batches it.  At PfPMT/def2-SVP that is **32.0 GB**
+on a 40 GB card (naux 13365, nocc 547) and the function dies before it
+reaches an integral.  `fastdfgrad`'s `dm_oo` is the same array and hits the
+same wall.  This is the only thing standing between the density-fitted
+gradient and the size the rest of this page is written around — the SCF at
+284 atoms runs (§3.3), its gradient does not.
+
+* **Do**: slice the occupied index.  Both loops are already batched over the
+  auxiliary index; the missing one is `i`, and the ip1 kernel takes a
+  pseudo-density on the pair list that is a sum over `i` — so `nocc` slices
+  accumulate into the same `compressed` buffer with no extra integral work,
+  only extra passes over the cderi (or over `eval_j3c`, unpatched).
+* **Success**: a 284-atom DF-B3LYP gradient that completes on one A100, with
+  the per-atom derivative checked against the 113-atom route's tolerance.
+* **Falsified if**: the extra passes cost more than the slicing saves at 113
+  atoms, i.e. the batched version is slower where the unbatched one fits.
+  Guard it with a size threshold the way `fastdf`'s `SYRK_MIN_NAO` is
+  guarded, and measure the threshold rather than guessing it.
+
 ### Not on this list
 
 **Seminumerical exchange (sn-K / COSX)**, which would avoid the cderi
@@ -474,6 +613,12 @@ python benchmarks/df_jk_bench.py  --xyz ... --ndm 1,2,4 \
 python benchmarks/coverage_probe.py --xyz ... --density-fit [--only-dfj]
 python tests/test_dfj.py [--basis def2-tzvpp]           # W1's correctness bar
 python benchmarks/dfj_probe.py    --xyz ... --scf --scf-ablate   # W1
+
+python tests/test_dfgrad.py [--basis def2-tzvpp] [--no-fd]       # W3's bar
+python benchmarks/df_grad_probe.py --xyz ... --whole             # W3's profile
+python benchmarks/df_grad_bench.py --xyz ... --whole --with-rebuild
+python benchmarks/df_grad_ip1_sweep.py --xyz ...   # the launch configuration
+python benchmarks/df_grad_metric_probe.py --xyz ... [--omega 0.3]
 ```
 
 `fastdf`'s switches (`FASTDF_OFF`, `FASTDF_STEP1`, `FASTDF_STEP2`,
