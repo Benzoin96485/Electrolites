@@ -298,6 +298,35 @@ the page-locking.
 `dtrsm` rejection, the size threshold below which the dense product is kept,
 and the three items the round found rather than closed.
 
+**And one thing that is deliberately not a patch.**  `electrolites/dflocal.py`
+is **robust pair-atomic (PARI) fitting** -- every AO pair fitted in the
+auxiliary functions of its own two atoms instead of in all of them.  Every
+other module here computes the *same number* GPU4PySCF computes, to 1e-14;
+this one does not and cannot, because it is a different approximation: **2e-5
+to 8e-5 Eh per atom** away from global density fitting, flat in size (an
+alkane series to C20H42) and varying by a factor of three with the chemistry.
+So it is not in `patch_all()`, `dflocal.density_fit(mf)` is not
+`mf.density_fit()`, it warns once on stdout, and a gradient or Hessian of
+such an object raises rather than silently differentiating the global fit.
+
+What it is for is the two things a pair-atomic fit changes.  The **exchange**
+becomes one contraction instead of `fastdf`'s two -- the robust expansion's
+third term is symmetric, so `M = B - cJ/2` folded once at build time makes
+`vk = M X + (M X)^T` -- and what that is worth is set by how many AOs overlap
+an auxiliary function's own atom.  Screened at a threshold 4400x inside the
+approximation's own error, that number is flat with system size and the
+exchange is **2.93x** fewer flops than stock GPU4PySCF's at 284 atoms and
+**4.35x** at 545; measured at the last size where the tensor is
+device-resident, `get_jk` is **1.42x** at 113 atoms.  At 284 atoms it is 2.0x
+*slower*, and that row is the argument for the second half: the call is
+PCIe-bound on both sides, because a robust pair-atomic exchange build needs
+the same 86.4 GB of three-centre integrals global DF stores.  And the **storage**:
+the coefficients are 0.79 GB at 284 atoms against global DF's 86.4, and
+keeping the fit *residual* instead of the integrals carries that to the build
+-- 0.45 GB against 14.31 at 113 atoms, at a threshold costing 2.9e-5 relative
+on the exchange matrix.  `docs/README_dflocal_k.md` and
+`docs/README_dflocal.md`, and `docs/DF_WORK_LIST.md` W6.
+
 ## Install
 
 ```bash

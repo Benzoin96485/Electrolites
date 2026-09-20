@@ -10,8 +10,10 @@ Companion documents: `docs/README_fastdf.md` is the round that produced this
 list (what changed, why, and the full tables); `docs/README_fastdfj.md` is the
 round that closed **W1**, which is where the biggest number on this page now
 is; `docs/README_fastdfgrad.md` closed **W3**, `docs/README_fastdfcderi.md`
-**W4**, `docs/README_fastdfblock.md` **W5** and `docs/README_dflocal.md`
-the two measurements **W6** asked for first; `docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
+**W4**, `docs/README_fastdfblock.md` **W5**, and **W6** took two rounds --
+`docs/README_dflocal.md` is the two measurements it asked for first and
+`docs/README_dflocal_k.md` the implementation and the cost estimate;
+`docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
 `instructions/06`'s catalogue.
 
 ---
@@ -228,14 +230,20 @@ integrals the SCF's cderi already holds, and a launch constant.  What it could
 32.0 GB there, and neither upstream nor this repository batches it.  That is
 **W10**.
 
-**W6's two preconditions are measured, and both came out strongly.**  Robust
-(Dunlap) fitting is mandatory — non-robust pair-atomic fitting collapses
-variationally by **16.5 Eh** on butane and the collapse grows with the
-molecule — and robust fitting is **2.5e-5 Eh per atom** against global DF,
-flat with size.  Storage falls from **N^2.52 to N^1.53**: 86.4 GB to 0.79 at
-284 atoms, 414 GB to 1.98 at 545.  `docs/README_dflocal.md`; what is left is
-the implementation, and the hard part of that is that pair-atomic exchange
-does not factorise the way `vk = rhok rhok^T` does.
+**W6 is done, in two rounds, and the second contradicts the first's
+headline.**  Robust (Dunlap) fitting is mandatory — non-robust pair-atomic
+fitting collapses variationally by **16.5 Eh** on butane — and the
+coefficients fall from **N^2.52 to N^1.53** (`docs/README_dflocal.md`).  The
+implementation is `electrolites/dflocal.py` and it says three things the first
+round could not.  Pair-atomic exchange **does** factorise: it is one pass
+against `fastdf`'s two, and what changes is `fastdf`'s *second* contraction,
+not its first.  Its cost is `2 nocc / nlambda` with `nlambda` a quantity that
+*grows* — 1.09x at 284 atoms unscreened — until the fitting coefficients are
+screened, after which `nlambda` is flat with size and the ratio is **2.93x at
+284 atoms and 4.35x at 545**.  And the storage number is about the *fit*: the
+robust exchange build touches the same 86.4 GB global DF does, unless the fit
+residual is stored instead, which is measured (**31.5x at 113 atoms**) and not
+implemented.  `docs/README_dflocal_k.md`.
 
 **W5 is done, and W14 and W15 are what it found.**  The block-sparse exchange
 contraction is **1.21x on a whole 284-atom `get_jk` call** and ships on behind
@@ -621,76 +629,89 @@ the tile fill, which is the only one a tile sees, does not move.
   that array is as large as the saving at 545 atoms.  Net footprint is a
   wash.
 
-### W6 — Local / pair-atomic fitting — **decided and validated; the implementation is what is left**
+### W6 — Local / pair-atomic fitting — **done**
 
-`benchmarks/df_local_probe.py`, `benchmarks/df_local_accuracy.py`, write-up in
-`docs/README_dflocal.md`.  This item attached two conditions before any code:
-decide robust vs non-robust first, and benchmark on *energies*.  Both are now
-measured, and both came out strongly.
+`electrolites/dflocal.py`, `tests/test_dflocal.py`,
+`benchmarks/df_local_k_probe.py`, `benchmarks/df_local_k_bench.py`, write-up
+in `docs/README_dflocal_k.md`.  The two conditions this item attached before
+any code were measured first and are `docs/README_dflocal.md`: the fit has to
+be **robust** (non-robust pair-atomic fitting collapses variationally by
+16.5 Eh on butane and the collapse grows with the molecule), and a pair domain
+holds **118-130** auxiliary functions on every system from 10 to 545 atoms.
+What the item asked for next was the implementation and, inside it,
+*"estimating the cost of PARI-K"*.  Both are done, and three of the four
+results contradict something this entry used to say.
 
-**Robust (Dunlap) fitting, and it is not close.**  Non-robust pair-atomic
-fitting does not lose accuracy, it collapses variationally, and the collapse
-grows with the molecule: **-0.81 Eh** on ethane, **-6.50** on propane,
-**-16.5** on butane, **-10.6** on ammonia-borane, **-3.30** on ethanol.  The
-energy goes *below* exact and keeps going.  It is not inflated coefficients —
-the largest `|c|` is 2.41 for both the pair-atomic and the global fit, and the
-pair-atomic norm is the smaller of the two — it is that the non-robust form's
-error is **first order** in the fit residual where the robust form's is
-second, and that on the diagonal the non-robust value is a projection and can
-only underestimate.  Robust fitting on the same coefficients is
-**2.5e-5 Eh per atom** against global DF, and that number is **flat** from 5
-atoms to 14, which is the size-extensivity the approximation needs.  A 3 Å
-domain with robust fitting is **1e-7 Eh per atom**, i.e. global-DF quality.
+**It does factorise, and the density can be contracted first.**  The robust
+expansion `eri = B c^T + c B^T - T c^T`, `T = c J`, has a symmetric third
+term, so it splits evenly between the first two: with **`M = B - T/2` folded
+once at build time** the exchange is `vk = M X + (M X)^T`, **one** pass where
+global DF needs two, and `T` is never formed at run time.  Contracting the
+occupied factor first then gives `vk[m,l] = sum_{i,Q} rhok[m,i,Q] G[i,Q,l]`
+in which `rhok` is *exactly* the intermediate `fastdf` builds.  So what does
+not factorise is `fastdf`'s **second** contraction, not its first, and this
+entry's sentence about it was wrong in the useful direction.
 
-**The storage claim is real and bigger than this entry guessed.**  A pair
-domain holds **118-130** auxiliary functions on every system from 10 to 545
-atoms — not 300 — so it is measured, not assumed, that `naux_local` is
-independent of system size:
+**What it costs is `2 nocc / nlambda`, and `nlambda` is not `nlocal`.**
+`nlambda` — how many AOs overlap an auxiliary function's own atom — is the
+width of the exchange intermediate's second index, and unlike `nlocal` it
+**grows**, like N^0.68 against `nocc`'s N^0.99.  Unscreened, PARI-K is
+**0.42x** the arithmetic of stock global DF-K at 10 atoms, **1.09x** at 284
+and **1.36x** at 545.  But a `lambda` at the edge of the integral screening
+carries a fitting coefficient of 1e-8, and dropping it is an error in the
+exchange matrix rather than in the fit: measured on the matrix itself, a
+threshold of **1e-6** leaves 48 % of `nlambda` at taxol and changes `K` by
+**1.2e-7** relative, against the 5.4e-4 the approximation is already away from
+global DF.  Screened, `nlambda` is **236, 407, 374, 465** from 42 atoms to
+545 — *flat*, which is the property the whole item wanted — and PARI-K is
+**2.93x** stock global DF-K at 284 atoms and **4.35x** at 545.
 
-| | atoms | stored pairs | global | pair-atomic | |
-|---|---|---|---|---|---|
-| taxol | 113 | 319 589 | 14.31 GB | 0.319 GB | 45x |
-| PfPMT | 284 | 808 156 | 86.41 GB | **0.789 GB** | 110x |
-| HcgC | 545 | 2 094 539 | **414.25 GB** | **1.975 GB** | 210x |
+**The storage number does not carry to the exchange build as it stands, and
+does once the residual is thresholded.**  A robust expansion needs `(mn|Q)`
+for every stored pair against *every* auxiliary function, not only the domain
+ones, so the tensor a PARI exchange build touches is the same 86.4 GB at 284
+atoms that global DF stores — the 110x is a number about the *fit*.  Splitting
+`B = R + cJ` and storing only the residual recovers it: at 113 atoms a
+threshold costing **2.9e-5** relative on `K` leaves **0.45 GB against 14.31**,
+within 1.4x of the coefficient-count bound, and the ratio grows with the
+molecule (2.6x, 5.3x, 9.5x, 31.5x from 10 to 113 atoms).  **The container is
+not written**, and it is the largest thing left here: it is the one shape in
+which a 545-atom robust density-fitted calculation is possible at all, where
+global DF needs 414 GB against a node's 251.
 
-Storage falls from **N^2.52 to N^1.53** over six systems.  Robust fitting
-stores two such arrays rather than one — the three-centre integrals on the
-domain as well as the coefficients — so 1.6 GB against 86.4 at 284 atoms.
+**It is size-extensive, and the per-atom error is a range, not a constant.**
+The `nao^4` reference of the round before this one stopped at C4H10; this
+implementation takes the same homologous series to **C20H42, 62 atoms**, and
+the error per atom is flat and falling — 1.90e-5 at CH4, 2.51e-5 at C4H10,
+**2.22e-5** at C20H42.  What moves is composition: 3.3e-5 on glycine, 6.2e-5
+on penicillin V, **7.4e-5 on taxol**.  So the number to carry is **2e-5 to
+8e-5 Eh per atom**, and the single 2.5e-5 an alkane series gave is the bottom
+of it.  A `pair+3.0` domain is 1e-7 per atom and about eight times `nlambda`,
+so it is an accuracy reference and not an operating point.
 
-**And §3.3's demotion of this item is now wrong at the next size up.**  It
-says "at 284 atoms on a 251 GB node capacity is not what binds".  At 545 atoms
-it binds: a global cderi for `HcgC`/def2-SVP is **414 GB** against the node's
-251, which is why `docs/README_fastdfblock.md` could only microbenchmark that
-size and never run it.
-
-**A third thing, not predicted by the entry**: the local metrics are *better*
-conditioned than the global one — median 2e7 for pair domains against 2.2e8
-to 2.3e9 for the global metric, which grows with the molecule and the local
-ones do not.  Pair-atomic fitting replaces one badly conditioned `naux^3`
-factorisation (**W13**'s subject) with many small well conditioned ones.
-
-* **What is left** is the implementation, and the hard part of it is not the
-  fit.  Robust pair-atomic **exchange does not factorise** the way
-  `vk = rhok rhok^T` does: the coefficients depend on the pair, so the density
-  cannot be contracted first, and that identity is what the whole of `fastdf`
-  rests on.  PARI-K is a different contraction order and estimating its cost
-  is the next piece of work.
-* **Also left**: gradients.  A non-variational fit carries terms global DF
-  does not, and `fastdfgrad` assumes the global ones.
-* **Still open**: energies above 14 atoms.  The reference implementation is
-  `nao^4`; the flat per-atom error over a factor of three in size is the
-  evidence there is, and this entry's own "on the §3.2 ladder" needs the
-  implementation.
-* **And a constraint on where it can live.**  Every module in
-  `electrolites/` computes the *same number* as GPU4PySCF -- `README.md` says
-  so and `tests/` enforce it at 1e-14.  A pair-atomic module would not: it is
-  2.5e-5 Eh per atom away from global DF by construction.  So it cannot be
-  another drop-in replacement of an entry point; it has to be an explicitly
-  opt-in, explicitly labelled approximation of the kind **W7** describes for
-  fp32 storage, with its error reported on the §3.2 ladder in `README.md`'s
-  limits paragraph.  Anyone starting here should settle that before writing
-  the first kernel, because it decides whether the thing is a `patch_all()`
-  module at all.
+* **Measured, at the last size where the tensor is device-resident** (taxol,
+  113 atoms, one A100-SXM4-80GB, one side per process): `get_jk` **1.23x**
+  stock global DF and **1.42x** with the screened `lambda` list; the build
+  1.67x *slower*, which is implementation and not algebra — the fold it does
+  in place of the global metric contraction is 49x fewer flops.
+* **And at 284 atoms it is 2.0x slower, for a reason that is the point.**
+  There the tensor is 86.4 GB and host-resident on both sides, and the call
+  is **PCIe-bound**: 12.6 s of a 24.6 s `get_jk` is 86.4 GB off the host at
+  6.8 GB/s, against the 26.4 GB/s GPU4PySCF's mapped, double-buffered
+  prefetch reaches and hides entirely (§3.3).  The contraction itself is
+  10.6 s for 7.3e13 flops.  So the flop ratio cannot show at the size this
+  page is written around until the tensor stops crossing PCIe — which is the
+  residual container above — and two of the three things in the way are
+  already written in `electrolites/fastdfcderi.py`.
+* **And where it can live is settled by construction.**  It is not in
+  `patch_all()`, `density_fit()` here is not `mf.density_fit()`, it warns
+  once, and `nuc_grad_method`/`Gradients`/`Hessian` on such an object raise.
+* **Left**: the sparse residual container above; the host-memory paths
+  `fastdfcderi` already has (`cudaHostRegister` for the store, a prefetched
+  stream for the read), which are 24.9 s of a 43.6 s build and 12.6 s of a
+  24.6 s call at 284 atoms; **gradients**, which need the non-variational
+  fit's extra terms; and **range separation**, which a Coulomb-metric fit has
+  no form for and which is most of what this repository is benchmarked on.
 
 ### W7 — fp32 cderi storage
 
@@ -927,6 +948,19 @@ four are cheap to avoid and none is detectable from the number itself.
    and was not — it made that measurement *slower*.  It is kept because it is
    right, not because it paid.)
 
+10. **Two tensors of the same size do not fit on one card, and the loser goes
+   to the host silently.**  A converged `_DFHF` object holds a 14.3 GB cderi
+   at 113 atoms; building a second tensor of the same size in the same
+   process puts *it* on the host, and nothing warns.  Measured, that turned a
+   1.2x difference into a 6.4x one.  Run one variant per process and pass the
+   *same* converged density to both (`benchmarks/df_local_k_bench.py --only`,
+   `--dm-cache`), and print where each tensor actually lives.
+11. **`fill_symmetric` allocates its output if you let it.**  Without `out=`
+   it makes a `(nao, nao, nL)` zeroed buffer per call: **57 %** of a 113-atom
+   exchange pass, against a written volume that is 40 ms of the card's
+   bandwidth.  This is §5.8 in a second costume — the allocation is not the
+   cost, the `cudaFree` that ends it is.
+
 8. **Nsight Systems cannot write its report onto `$HOME`.**  `nsys profile`
    runs, produces the `.qdstrm`, and then fails the import with
    `errno 524` on the GPFS global home; the profile is not lost but it is not
@@ -981,7 +1015,22 @@ python benchmarks/df_block_profile.py --stats $SCRATCH/p.nsys-rep  # the reports
 
 python benchmarks/df_local_probe.py --domains pair,pair+3.0   # W6, no GPU
 python benchmarks/df_local_accuracy.py --cases c1,c2,c3,c4    # W6's energies
+
+python tests/test_dflocal.py                             # W6's bar
+python benchmarks/df_local_k_probe.py                    # nlambda, no GPU
+python benchmarks/df_local_k_probe.py --lam --cases taxol:0:0
+python benchmarks/df_local_k_probe.py --lam-fit --cases PfPMT:0:-1,HcgC:0:0
+python benchmarks/df_local_k_probe.py --residual --residual-k --cases taxol:0:0
+python benchmarks/df_local_k_bench.py --no-jk --scf --alkanes 1,2,4,8,16,20
+python benchmarks/df_local_k_bench.py --only pari --anatomy \
+    --dm-cache $SCRATCH/dm --cases taxol:0:0     # one side per process, §5.10
 ```
+
+`dflocal`'s switches (`DFLOCAL_DOMAIN`, `DFLOCAL_STORE`, `DFLOCAL_BLK`,
+`DFLOCAL_LAMBDA_TOL`, `DFLOCAL_KMODE`, `DFLOCAL_FOLD`) are listed at the top
+of `electrolites/dflocal.py`.  It is **not** in `patch_all()` and
+`dflocal.density_fit(mf)` is not `mf.density_fit()`: it is a different
+approximation and says so once, on stdout.
 
 `fastdfcderi`'s switches (`FASTDFCDERI_OFF`, `FASTDFCDERI_METRIC`,
 `FASTDFCDERI_SPMULT`, `FASTDFCDERI_MIN_WORK`, `FASTDFCDERI_PIN`,

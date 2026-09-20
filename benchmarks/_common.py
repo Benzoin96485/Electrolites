@@ -96,3 +96,27 @@ def make_timer(tag, results):
               flush=True)
         return out
     return timeit
+
+
+def alkane(n):
+    """An idealised all-anti C_nH_(2n+2), for a homologous series.
+
+    The geometry is built rather than optimised, because every expansion in
+    the table sees the same one and what is being compared is the expansion.
+    C-C 1.53 A at 112 degrees, C-H 1.09 A.  `nao` in def2-SVP is 24n + 10, so
+    n = 4 is the last one an `nao^4` reference can hold -- and
+    `benchmarks/df_local_k_bench.py --alkanes`, which drives the same series
+    through an implementation that is not `nao^4`, is why this lives here
+    rather than in `df_local_accuracy.py` where it was written.
+    """
+    dx, dy = 1.268, 0.428
+    cs = [(i * dx, dy if i % 2 else -dy, 0.0) for i in range(n)]
+    at = [('C',) + c for c in cs]
+    for i, c in enumerate(cs):
+        sy = 1 if i % 2 else -1
+        at += [('H', c[0], c[1] + sy * 0.63, 0.89),
+               ('H', c[0], c[1] + sy * 0.63, -0.89)]
+    at += [('H', cs[0][0] - 0.97, cs[0][1] - 0.50, 0.0),
+           ('H', cs[-1][0] + 0.97,
+            cs[-1][1] + (0.50 if (n - 1) % 2 else -0.50), 0.0)]
+    return '; '.join(f'{s} {x:.4f} {y:.4f} {z:.4f}' for s, x, y, z in at)
