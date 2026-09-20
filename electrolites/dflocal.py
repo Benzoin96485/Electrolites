@@ -131,7 +131,10 @@ from gpu4pyscf.gto.mole import SortedMole
 from gpu4pyscf.lib.cupy_helper import (
     contract, get_avail_mem, fill_symmetric, ndarray)
 from gpu4pyscf.lib import logger
-from electrolites.fastdfcderi import (
+# `_dfaux` and not `fastdfcderi`: importing that module patches
+# `_cholesky_eri`, and a module that only wants its kernels must not change
+# the build it is being measured against
+from electrolites._dfaux import (
     _contract_aux, _sparse_ctr_coeff, _spmult, _SPMULT)
 from cupyx import scatter_add
 from cupyx.scipy.sparse import csr_matrix

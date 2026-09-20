@@ -44,7 +44,7 @@ would store.
   screened, it is **236, 407, 374, 465** from 42 atoms to 545, and the ratio
   is **2.93x at 284 atoms** and **4.35x at 545**.  Those are flop ratios;
   measured end to end at the last size where the tensor is device-resident,
-  PARI's `get_jk` is **1.42x** stock global DF's at 113 atoms.  At 284 atoms,
+  PARI's `get_jk` is **1.39x** stock global DF's at 113 atoms.  At 284 atoms,
   where both tensors are on the host, it is **2.0x slower** and the call is
   PCIe-bound on both sides — §4.1, and it is the strongest argument for the
   bullet below.
@@ -397,35 +397,41 @@ MO order on every row here.
 
 | | atoms | build, global | build, PARI | `get_jk`, global | `get_jk`, PARI | | `relK` |
 |---|---|---|---|---|---|---|---|
-| glycine | 10 | 0.068 s | 0.079 s | 0.0040 s | 0.0090 s | 0.44x | 5.1e-4 |
-| alanine dipeptide | 22 | 0.086 | 0.138 | 0.0050 | 0.0170 | 0.29x | 5.2e-4 |
-| penicillin V | 42 | 0.193 | 0.363 | 0.0280 | 0.0330 | 0.85x | 2.5e-4 |
-| taxol | 113 | 1.018 | 1.694 | **0.643** | **0.522** | **1.23x** | 5.4e-4 |
-| taxol, `lambda` at 1e-6 | 113 | — | 1.732 | 0.643 | **0.452** | **1.42x** | 5.4e-4 |
+| glycine | 10 | 0.068 s | 0.078 s | 0.0040 s | 0.0090 s | 0.44x | 5.1e-4 |
+| alanine dipeptide | 22 | 0.088 | 0.137 | 0.0060 | 0.0170 | 0.35x | 5.2e-4 |
+| penicillin V | 42 | 0.236 | 0.361 | 0.0340 | 0.0330 | 1.03x | 2.5e-4 |
+| taxol | 113 | **1.984** | **1.712** | **0.642** | **0.533** | **1.20x** | 5.4e-4 |
+| taxol, `lambda` at 1e-6 | 113 | — | 1.758 | 0.642 | **0.463** | **1.39x** | 5.4e-4 |
+
+Against `fastdf`+`fastdfcderi` rather than stock GPU4PySCF the taxol row reads
+**1.015 s** and **0.633 s**, so the exchange ratios are 1.19x and 1.37x and
+the build ratio inverts: this repository's own cderi build is **1.69x** faster
+than the pair-atomic one, where upstream's is **1.16x slower** than it.
 
 **The exchange build tracks the model.**  §1 predicts `2 nao / (nao +
 nlambda)` for the MO order — 1.14x at taxol unscreened and 1.47x screened —
-and the measured 1.23x and 1.42x are that, against a `get_jk` that also
+and the measured 1.20x and 1.39x are that, against a `get_jk` that also
 carries the Coulomb pass and the unpack.  Below a hundred atoms the model
-predicts a loss and the measurement is a loss.  Against `fastdf` rather than
-stock GPU4PySCF the taxol row reads 0.634 s and the ratios are 1.21x and
-1.40x; `fastdf`'s `dsyrk` is worth less here than at 284 atoms because the
-second contraction it halves is the one PARI replaces.
+predicts a loss and the measurement is a loss; penicillin V's 1.03x is that
+loss inside the noise of a 33 ms call and not a win.  `fastdf`'s `dsyrk` is
+worth little here because the second contraction it halves is the one PARI
+replaces.
 
 **The build is the part that is implementation and not algebra.**  It is
-1.67x *slower* at 113 atoms, and that is a gap against what the arithmetic
-says: the fold that stands in for global DF's metric contraction is
+1.16x *faster* than upstream's and **1.69x slower** than this repository's
+own, and the second of those is a gap against what the arithmetic says: the
+fold that stands in for global DF's metric contraction is
 `npair nlocal naux` against upstream's `2 npair naux_sorted naux`, which is
 **49x** fewer flops.  Profiled with a synchronising timer between stages
-(`--anatomy`), the 1.69 s at taxol is
+(`--anatomy`), the 1.71 s at taxol is
 
 | stage | | what it is |
 |---|---|---|
-| `int3c2e` | 373 ms (24 %) | the three-centre integrals and the sparse contraction-coefficient gather, both upstream's |
-| `fit+fold` | 262 ms (17 %) | one batched solve per atom-pair domain, then `B -= cJ/2` |
-| `blocks` | 270 ms (18 %) | laying the coefficients out per auxiliary atom; a `numpy` loop over atoms, and the obvious thing to take next |
+| `int3c2e` | 370 ms (25 %) | the three-centre integrals and the sparse contraction-coefficient gather, both upstream's |
+| `fit+fold` | 249 ms (16 %) | one batched solve per atom-pair domain, then `B -= cJ/2` |
+| `blocks` | 272 ms (18 %) | laying the coefficients out per auxiliary atom; a `numpy` loop over atoms, and the obvious thing to take next |
 | `store` | 63 ms (4 %) | |
-| the `get_jk` pass, of which | 553 ms | |
+| the `get_jk` pass, of which | 554 ms | |
 | ↳ `unpack` | 108 ms | `fill_symmetric`, the same kernel `fastdf` calls |
 | ↳ `step1` | 237 ms | `rhok = M . C`, which *is* `fastdf`'s first contraction |
 | ↳ `step2` | 152 ms | `rhok G` in place of `rhok rhok^T` |
@@ -435,7 +441,7 @@ says: the fold that stands in for global DF's metric contraction is
 Two things in that table are worth carrying.  **`local` is 2 %** — the
 intermediate that makes this a different method costs almost nothing, and the
 whole argument is about `step2`, which is 152 ms against the 237 ms `step1`
-that PARI and global DF share.  And **the fold is 262 ms**, which took two
+that PARI and global DF share.  And **the fold is 249 ms**, which took two
 rewrites: as one cuSPARSE product per batch (`DFLOCAL_FOLD=csr`, kept
 runnable) the same stage is **1 513 ms**, and with a 269 MB temporary
 allocated per group the dense form was 835 ms.  The structure a sparse matrix throws
@@ -504,10 +510,10 @@ screened at 1e-6.  Three things in that line.
 
 ---
 
-## 5. Three measurement rules this round learned
+## 5. Four measurement rules this round learned
 
-The first two are corollaries of rules `docs/DF_WORK_LIST.md` §5 already has,
-and both cost a wrong number before they were found.  The third is an
+The first three are corollaries of rules `docs/DF_WORK_LIST.md` §5 already
+has, and each cost a wrong number before it was found.  The fourth is an
 observation about something else that this round tripped over.
 
 **5.1 Two tensors of the same size do not fit on one card, and the loser goes
@@ -535,7 +541,18 @@ belongs outside it" — and `docs/README_fastdfblock.md` §4.1 is the round that
 wrote the rule after losing 2.33 s of an 11.73 s call to it.  Every buffer a
 pass needs is now allocated once, before the loop.
 
-**5.3 And one that is not about this module.**  At 284 atoms, where both
+**5.3 A module that imports another module's kernels imports its patches.**
+`dflocal` takes three things from `electrolites/fastdfcderi.py` -- the sparse
+form of the auxiliary contraction coefficients, the kernel that applies it,
+and the shell-pair aggregation constant.  Importing that module **patches
+`df/df.py:_cholesky_eri`**, so for one round of measurements the "stock"
+global-DF build column was not stock: `benchmarks/df_local_k_bench.py`
+imports `dflocal` at the top, and that was enough.  The symptom was a
+patched column and an unpatched one agreeing to three digits.  The three
+pieces now live in `electrolites/_dfaux.py`, which patches nothing, and
+`fastdfcderi` imports them from there.
+
+**5.4 And one that is not about this module.**  At 284 atoms, where both
 tensors are host-resident, `get_jk` on the **patched** global-DF path is
 **15.94 s** against stock GPU4PySCF's **12.31 s** on the same node in the same
 job (`--reps 2`, one A100-SXM4-80GB).  `docs/README_fastdfblock.md` measures

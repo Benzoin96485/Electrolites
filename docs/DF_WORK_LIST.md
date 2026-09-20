@@ -690,10 +690,11 @@ of it.  A `pair+3.0` domain is 1e-7 per atom and about eight times `nlambda`,
 so it is an accuracy reference and not an operating point.
 
 * **Measured, at the last size where the tensor is device-resident** (taxol,
-  113 atoms, one A100-SXM4-80GB, one side per process): `get_jk` **1.23x**
-  stock global DF and **1.42x** with the screened `lambda` list; the build
-  1.67x *slower*, which is implementation and not algebra — the fold it does
-  in place of the global metric contraction is 49x fewer flops.
+  113 atoms, one A100-SXM4-80GB, one side per process): `get_jk` **1.20x**
+  stock global DF and **1.39x** with the screened `lambda` list; the build
+  1.16x *faster* than upstream's and 1.69x slower than this repository's own
+  `fastdfcderi`, which is implementation and not algebra — the fold it does in
+  place of the global metric contraction is 49x fewer flops.
 * **And at 284 atoms it is 2.0x slower, for a reason that is the point.**
   There the tensor is 86.4 GB and host-resident on both sides, and the call
   is **PCIe-bound**: 12.6 s of a 24.6 s `get_jk` is 86.4 GB off the host at
@@ -960,6 +961,14 @@ four are cheap to avoid and none is detectable from the number itself.
    exchange pass, against a written volume that is 40 ms of the card's
    bandwidth.  This is §5.8 in a second costume — the allocation is not the
    cost, the `cudaFree` that ends it is.
+
+12. **A module that imports another module's kernels imports its patches.**
+   `electrolites/dflocal.py` wanted three kernels out of
+   `electrolites/fastdfcderi.py`; importing that module patches
+   `_cholesky_eri`, so a benchmark that imports the first silently measures
+   the *patched* build in its "stock" column.  The symptom is a patched and
+   an unpatched column agreeing to three digits.  Shared kernels belong in a
+   module that patches nothing — `electrolites/_dfaux.py` is that.
 
 8. **Nsight Systems cannot write its report onto `$HOME`.**  `nsys profile`
    runs, produces the `.qdstrm`, and then fails the import with

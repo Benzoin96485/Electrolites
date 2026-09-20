@@ -317,7 +317,8 @@ an auxiliary function's own atom.  Screened at a threshold 4400x inside the
 approximation's own error, that number is flat with system size and the
 exchange is **2.93x** fewer flops than stock GPU4PySCF's at 284 atoms and
 **4.35x** at 545; measured at the last size where the tensor is
-device-resident, `get_jk` is **1.42x** at 113 atoms.  At 284 atoms it is 2.0x
+device-resident, `get_jk` is **1.39x** at 113 atoms and the build 1.16x
+against upstream's (and 1.69x *behind* `fastdfcderi`'s).  At 284 atoms it is 2.0x
 *slower*, and that row is the argument for the second half: the call is
 PCIe-bound on both sides, because a robust pair-atomic exchange build needs
 the same 86.4 GB of three-centre integrals global DF stores.  And the **storage**:
