@@ -681,6 +681,16 @@ factorisation (**W13**'s subject) with many small well conditioned ones.
   `nao^4`; the flat per-atom error over a factor of three in size is the
   evidence there is, and this entry's own "on the §3.2 ladder" needs the
   implementation.
+* **And a constraint on where it can live.**  Every module in
+  `electrolites/` computes the *same number* as GPU4PySCF -- `README.md` says
+  so and `tests/` enforce it at 1e-14.  A pair-atomic module would not: it is
+  2.5e-5 Eh per atom away from global DF by construction.  So it cannot be
+  another drop-in replacement of an entry point; it has to be an explicitly
+  opt-in, explicitly labelled approximation of the kind **W7** describes for
+  fp32 storage, with its error reported on the §3.2 ladder in `README.md`'s
+  limits paragraph.  Anyone starting here should settle that before writing
+  the first kernel, because it decides whether the thing is a `patch_all()`
+  module at all.
 
 ### W7 — fp32 cderi storage
 
