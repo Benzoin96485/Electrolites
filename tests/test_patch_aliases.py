@@ -105,6 +105,11 @@ ORIGINALS = [
     # the module, so a second holder of the original is a DF object whose
     # build this module never sees
     ('fastdfcderi', 'gpu4pyscf.df.df', '_cholesky_eri_orig'),
+    # W7's two: the block iterator, and the DF Hessian's CPHF build.  A
+    # second holder of either is a path that would read a single-precision
+    # tensor as double -- which does not fail, it returns a wrong answer
+    ('fastdffp32', 'gpu4pyscf.df.df', 'DF._loop_orig'),
+    ('fastdffp32', 'gpu4pyscf.df.hessian.rhf', '_get_jk_orig'),
 ]
 
 #: aliases that are known and deliberate: (holder, attribute) -> why

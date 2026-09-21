@@ -628,5 +628,9 @@ FASTDF_STEP1=tensor|bgemm    # the first contraction
 FASTDF_JPASS=blas|tensor     # the Coulomb pass
 FASTDF_BLK=<n>               # the auxiliary block size
 FASTDF_RESIDENT_FRAC=<f>     # item 4's share of free memory; 0 disables it
+FASTDF_FP32=1                # store the cderi in single precision.  Not an
+                             # ablation of this module: it changes the
+                             # answer, and `docs/README_fastdffp32.md` is
+                             # what it costs (DF_WORK_LIST W7)
 FASTXCNLC_OFF=1              # and, for the VV10 rows, the fused grid pass
 ```

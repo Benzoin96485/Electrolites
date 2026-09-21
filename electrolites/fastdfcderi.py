@@ -56,6 +56,10 @@ Ablations, for the tables in ``docs/README_fastdfcderi.md``:
     FASTDFCDERI_PIN=alloc    page-lock the host-resident cderi with
                              GPU4PySCF's `cudaHostAlloc` instead of with
                              `cudaHostRegister`
+    FASTDF_FP32=1            store the tensor in single precision, which is
+                             `docs/DF_WORK_LIST.md` W7 and is owned by
+                             `electrolites/_dffp32.py`.  It changes the answer
+                             and is off unless asked for
 """
 import ctypes
 import os
@@ -71,6 +75,7 @@ from gpu4pyscf.df.int3c2e_bdiv import int3c2e_scheme
 from gpu4pyscf.gto.mole import SortedMole
 from gpu4pyscf.lib import logger, multi_gpu
 from cupy_backends.cuda.api import runtime
+from electrolites import _dffp32 as FP32
 from electrolites._dfaux import (                     # noqa: F401
     _contract_aux, _sparse_ctr_coeff, _spmult, _orig_aggregate, _SPMULT)
 from gpu4pyscf.lib.cupy_helper import (
@@ -420,24 +425,43 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
     STATS['blocks'] += num_batches
     naux_per_device = min(naux, (naux + num_devices - 1) // num_devices)
 
+    # `docs/DF_WORK_LIST.md` W7.  Single precision halves the tensor and
+    # every PCIe copy of it, and it changes the answer, so it is off unless
+    # asked for; `electrolites/_dffp32.py` owns the switch and the layout.
+    # It is declined on more than one device for the reason every module in
+    # this repository declines that case -- nothing here has been measured
+    # there -- and because upstream's own consumers cannot read the result.
+    fp32 = FP32.enabled()
+    if fp32 and num_devices > 1:
+        _decline('fp32 on more than one device')
+        fp32 = False
+    itemsize = 4 if fp32 else 8
+
     cp.get_default_memory_pool().free_all_blocks()
     word_avail -= batch_size * naux_sorted
     if needs_recontraction:
         word_avail -= batch_size * naux_per_device
+    if fp32:
+        # the double-precision staging block the transpose reads from, which
+        # a double tensor does not need: the contraction writes into the
+        # tensor itself there
+        word_avail -= cderi_batch_size * naux_per_device
 
     on_gpu = True
     if use_gpu_memory is False:
         on_gpu = False
-    elif cderi_npairs * naux > word_avail * 0.95 * num_devices:
+    elif cderi_npairs * naux * itemsize > word_avail * 8 * 0.95 * num_devices:
         if use_gpu_memory:
-            cderi_size = cderi_npairs * naux / num_devices * 8e-9
+            cderi_size = cderi_npairs * naux / num_devices * itemsize * 1e-9
             raise MemoryError(
                 f'Not enough GPU memory. cderi size = {cderi_size:.2f} GB')
         on_gpu = False
     log.debug1('mem_avail=%.3f MB on_gpu=%s, nao_pairs=%d, naux_per_device=%d, '
-               'batch_size=%d, num_batches=%d, metric=%s, sp_mult=%d',
+               'batch_size=%d, num_batches=%d, metric=%s, sp_mult=%d, fp32=%s',
                mem_avail, on_gpu, cderi_npairs, naux_per_device, batch_size,
-               num_batches, 'sparse' if sparse else 'gemm', _SPMULT)
+               num_batches, 'sparse' if sparse else 'gemm', _SPMULT, fp32)
+    FP32.note_store((naux, cderi_npairs),
+                    np.float32 if fp32 else np.float64)
 
     #: rows of one block the metric contraction is done at a time.  The
     #: triangular multiply is out of place -- cuBLAS allows ``C == B`` but
@@ -469,7 +493,8 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
         return out
 
     if not on_gpu:
-        cderi_cpu = _empty_mapped((naux, cderi_npairs))
+        cderi_cpu = _empty_mapped((naux, cderi_npairs),
+                                  dtype=np.float32 if fp32 else np.float64)
 
         def proc(batch_iter):
             device_id = cp.cuda.device.get_device_id()
@@ -485,6 +510,12 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
             scratch = cp.empty(naux * min(chunk, batch_size)) if sparse else None
             if needs_recontraction:
                 work1 = cp.empty(naux * cderi_batch_size)
+            # W7: the transpose upstream does on the host, done on the device
+            # instead, because it has to narrow the block anyway.  One buffer
+            # for the whole loop -- a per-batch allocation in a loop that
+            # relies on a copy overlapping is `docs/DF_WORK_LIST.md` §5.8.
+            t32 = cp.empty((naux, cderi_batch_size),
+                           dtype=np.float32) if fp32 else None
 
             for batch_id in batch_iter:
                 log.debug1('processing cderi batch %d', batch_id)
@@ -498,6 +529,11 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
                     cderi_gpu = recontract(batch_id, cderi_gpu, out=work1)
 
                 p0, p1 = cderi_offsets[batch_id:batch_id+2]
+                if fp32:
+                    view = t32[:, :p1 - p0]
+                    FP32.transpose_cast(cderi_gpu, view)
+                    FP32.copy_2d_to_host(cderi_cpu[:, p0:p1], view)
+                    continue
                 err = libvhf_rys.transpose_write(
                     cderi_cpu.ctypes,
                     ctypes.cast(cderi_gpu.data.ptr, ctypes.c_void_p),
@@ -517,6 +553,7 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
             device_id = cp.cuda.device.get_device_id()
             aux0 = naux_per_device * device_id
             aux1 = min(naux, aux0 + naux_per_device)
+            naux_dev = aux1 - aux0
             c = None if sparse else cp.asarray(aux_coef[:, aux0:aux1])
 
             _eval_j3c = eval_j3c
@@ -525,24 +562,54 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
                     reorder_aux=True, clone_context=clone_context,
                     omega=omega)[0]
 
-            out = cp.empty((cderi_npairs, aux1-aux0))
+            # W7: the same layout in both precisions -- `(npairs, naux)`,
+            # handed back transposed -- because the widened block has to
+            # reach `fill_symmetric` on the branch upstream's layout puts it
+            # on.  `electrolites/_dffp32.py` has the measurement that says
+            # so; the first version of this stored the narrow tensor the
+            # other way round and cost 1.6x on a `get_jk` call for it.
+            out = cp.empty((cderi_npairs, naux_dev),
+                           dtype=np.float32 if fp32 else np.float64)
+            # W7's staging block: the contraction writes double and the
+            # tensor stores single, so the two cannot be the same buffer as
+            # they are in the double path.  A whole batch of it would be
+            # 14 GB at 284 atoms -- which is the memory the mode is trying
+            # to save -- so the pairs are walked in slices of about 512 MB
+            # instead.  The recontraction branch is the exception: it maps a
+            # whole batch at once and cannot be cut.
+            pchunk = (cderi_batch_size if needs_recontraction or not fp32
+                      else max(1, min(cderi_batch_size,
+                                      int(64e6) // max(naux_dev, 1))))
+            stage = cp.empty(pchunk * naux_dev) if fp32 else None
             work = cp.empty(naux_sorted * batch_size)
             scratch = cp.empty(naux * min(chunk, batch_size)) if sparse else None
             if needs_recontraction:
-                work1 = cp.empty((aux1-aux0) * batch_size)
+                work1 = cp.empty(naux_dev * batch_size)
 
             for batch_id in range(num_batches):
                 j3c = _eval_j3c(batch_id, out=work)
                 p0, p1 = cderi_offsets[batch_id:batch_id+2]
                 if needs_recontraction:
-                    tmp = ndarray((j3c.shape[0], aux1-aux0), buffer=work1)
+                    dst = (ndarray((p1 - p0, naux_dev), buffer=stage) if fp32
+                           else out[p0:p1])
+                    tmp = ndarray((j3c.shape[0], naux_dev), buffer=work1)
                     tmp = (contract(j3c, tmp, scratch) if sparse
                            else j3c.dot(c, out=tmp))
-                    recontract(batch_id, tmp, out=out[p0:p1])
-                elif sparse:
-                    contract(j3c, out[p0:p1], scratch)
-                else:
-                    j3c.dot(c, out=out[p0:p1])
+                    recontract(batch_id, tmp, out=dst)
+                    if fp32:
+                        cp.copyto(out[p0:p1], dst)
+                    continue
+                for c0 in range(0, p1 - p0, pchunk):
+                    c1 = min(p1 - p0, c0 + pchunk)
+                    dst = (ndarray((c1 - c0, naux_dev), buffer=stage) if fp32
+                           else out[p0 + c0:p0 + c1])
+                    src = j3c[c0:c1]
+                    if sparse:
+                        contract(src, dst, scratch)
+                    else:
+                        src.dot(c, out=dst)
+                    if fp32:
+                        cp.copyto(out[p0 + c0:p0 + c1], dst)
             return out.T
 
         cderi = multi_gpu.run(proc, non_blocking=True)

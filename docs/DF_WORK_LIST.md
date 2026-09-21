@@ -10,7 +10,8 @@ Companion documents: `docs/README_fastdf.md` is the round that produced this
 list (what changed, why, and the full tables); `docs/README_fastdfj.md` is the
 round that closed **W1**, which is where the biggest number on this page now
 is; `docs/README_fastdfgrad.md` closed **W3**, `docs/README_fastdfcderi.md`
-**W4**, `docs/README_fastdfblock.md` **W5**, and **W6** took two rounds --
+**W4**, `docs/README_fastdfblock.md` **W5**, `docs/README_fastdffp32.md`
+**W7**, and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
 `docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
@@ -244,6 +245,23 @@ screened, after which `nlambda` is flat with size and the ratio is **2.93x at
 robust exchange build touches the same 86.4 GB global DF does, unless the fit
 residual is stored instead, which is measured (**31.5x at 113 atoms**) and not
 implemented.  `docs/README_dflocal_k.md`.
+
+**W7 is done, and what it cost was not the cast.**  The cderi in single
+precision is exactly half the bytes and exactly half the PCIe, the
+arithmetic stays in double, and the switch is off by default
+(`docs/README_fastdffp32.md`).  What the item priced as "technically the
+least work on this list" took three patches, because a narrow tensor has
+**no fall-through**: `fill_symmetric` and `transpose_write` take a `void*`
+and are compiled for `double`, so every path that reaches the tensor either
+knows about the mode or reads past the end of it and returns a plausible
+wrong answer.  The error is the **Coulomb** energy's rather than the
+exchange matrix's the item asks about, it is flat at **3e-8 – 1e-7 Eh per
+atom** for organics and **1.3e-6 – 2.6e-6** on a 3d transition metal — where
+for FeCl4(-) it is the same size as the fitting error itself — and what the
+mode is really for is neither: at 284 atoms the tensor stops being 86.4 GB
+on the host and becomes **43.2 GB on the card**, and at 545 atoms a 414 GB
+tensor that does not fit in a 251 GB node becomes a 207 GB one that builds
+in 129 s.
 
 **W5 is done, and W14 and W15 are what it found.**  The block-sparse exchange
 contraction is **1.21x on a whole 284-atom `get_jk` call** and ships on behind
@@ -714,16 +732,74 @@ so it is an accuracy reference and not an operating point.
   fit's extra terms; and **range separation**, which a Coulomb-metric fit has
   no form for and which is most of what this repository is benchmarked on.
 
-### W7 — fp32 cderi storage
+### W7 — fp32 cderi storage — **done**
 
-Exactly 2x on storage and 2x on PCIe, and the arithmetic can stay fp64 by
-accumulating in double.  Technically the least work on this list.
+`electrolites/_dffp32.py` (the mode), `electrolites/fastdffp32.py` (the two
+consumers that are not `get_jk`), `tests/test_dffp32.py`,
+`benchmarks/df_fp32_probe.py`, `benchmarks/df_fp32_bench.py`, write-up in
+`docs/README_fastdffp32.md`.  `FASTDF_FP32=1`, off by default, named in
+`README.md`'s limits paragraph.  Every condition this item attached is met
+and three of its sentences turn out to be wrong in an interesting direction.
 
-**It changes the answer**, and this repository's correctness tables are at
-1e-14.  So it is a measured, explicitly-labelled switch or it is nothing:
-report the error it introduces in the total energy and in the exchange matrix
-on the §3.2 ladder, default it off, and say so in `README.md`'s limits
-paragraph.
+**"Technically the least work on this list" is wrong, and the reason is
+worth carrying to anything else that changes a storage format.**  The cast
+is four lines.  What is not is that **a narrow tensor has no
+fall-through**: `fill_symmetric` and `transpose_write` take a `void*` and
+are compiled for `double`, so handed a `float32` tensor they do not fail,
+they read past the end of it and return a plausible wrong answer.  Three
+paths reach the tensor — `df_jk.get_jk`, `DF.loop` (which is how the DF
+gradient and the DF Hessian's CPHF reach it) and one line of
+`df/hessian/rhf.py:_get_jk` — and all three had to be covered before the
+switch could exist.  Every call `fastdf` *declines* now raises rather than
+handing the tensor back to GPU4PySCF.
+
+**The error is the Coulomb energy's, not the exchange matrix's.**  This
+entry asks for the error "in the total energy and in the exchange matrix".
+Measured at a fixed density, the Coulomb energy's share is **five to ten
+times** the exchange energy's in every row of the ladder, and it is the
+whole of the total-energy difference — the SCF's own relaxation contributes
+nothing, as a variational energy should, and the iteration count never
+moves.  Organics: **2e-7 – 2e-5 Eh**, flat at **3e-8 – 1e-7 Eh per atom**
+over an alkane series from CH4 to C24H50 and 1.70e-5 Eh at taxol; the
+matrices themselves at **8e-9 – 6e-8 relative**, which is single precision
+and no amplification; gradients at **5e-9 – 7e-7 Eh/bohr**.
+
+**And it is not uniformly cheap across chemistry**, which is the result
+that decides how the switch is described.  On an open-shell 3d complex the
+per-atom error is **1.3e-6 – 2.6e-6 Eh**, twenty to sixty times the
+organics', because the largest cderi elements are core-region integrals and
+the rounding is relative to those.  For **FeCl4(-)** the narrowing error is
+**1.30e-5 Eh against a fitting error of 1.301e-5** — single precision costs
+as much as density fitting itself.  For organics the same ratio is 6x–151x
+in the other direction.  A Pt complex, whose core is an ECP, is back at the
+organics' level, so it is the hard 3d core and not the open shell.
+
+**"2x on PCIe" is exactly right, and mostly already taken.**  The link runs
+at **26.7 GB/s in every configuration** — both precisions, every block
+size, matched byte counts — so halving the bytes halves the transfer and
+nothing more; a J-only call, which is the PCIe-bound one, is **1.90x–1.98x**
+at 42 and 113 atoms and **2.60x** at 284.  But a J+K call at these sizes is
+**1.10x–1.72x**, because §3.3's finding holds: the prefetch already hides
+most of the transfer behind the exchange contractions.  And on a
+*device-resident* tensor there is no transfer to halve at all — J+K is
+**0.99x**, J-only **0.67x**, and what the mode buys there is the memory.
+
+**What it is really for is capacity.**  At 284 atoms the double tensor is
+86.4 GB and cannot go on an 80 GB card; the single one is **43.2 GB and
+does**, which is a configuration GPU4PySCF cannot reach: the build goes from
+29.1 s to **13.2 s** and a J-only call from 2.65 s to **0.19 s**.  At
+**545 atoms** (HcgC) the double tensor is 414 GB against a node's 251 and
+**cannot be built at all**; the single one is **207 GB and builds in
+130 s**.  That is the same wall W6 is about, reached from the other side and
+for one bit of precision rather than a different approximation.
+
+**Left**: the error is J's, so a mixed scheme that keeps the Coulomb pass
+in double (or keeps a narrow *residual* alongside a coarse double part)
+would buy most of the storage at a tenth of the error, and nothing here
+tries it; and `DF.loop` allocates its two staging buffers **per call**
+(1.3 GB at taxol), which the ablation in `docs/README_fastdffp32.md` §3.2
+prices at 6 % of the stream when the pool is warm and much more when it is
+not — that one is upstream's and is §5.8 and §5.11 again.
 
 ### W8 — The DF Hessian's own CPHF build
 
@@ -1035,6 +1111,17 @@ python benchmarks/df_local_k_bench.py --only pari --anatomy \
     --dm-cache $SCRATCH/dm --cases taxol:0:0     # one side per process, §5.10
 ```
 
+```bash
+python tests/test_dffp32.py [--basis def2-tzvpp] [--no-scf]   # W7's bars
+python benchmarks/df_fp32_probe.py --cases glycine,penicillinV --exact
+python benchmarks/df_fp32_probe.py --alkanes 1,2,4,8,16,24    # does it grow
+python benchmarks/df_fp32_probe.py --cases tmc_fecl4:-1:5 --exact
+python benchmarks/df_fp32_bench.py --xyz ... --dm-cache $SCRATCH/fp32dm \
+    [--cpu-cderi --resident-frac 0] [--scf] [--pcie] [--loop-ablate]
+python benchmarks/df_fp32_bench.py --xyz ... --only fp32 --stages loop,jk,j \
+    --guess-dm --cpu-cderi        # the sizes where one tensor is the budget
+```
+
 `dflocal`'s switches (`DFLOCAL_DOMAIN`, `DFLOCAL_STORE`, `DFLOCAL_BLK`,
 `DFLOCAL_LAMBDA_TOL`, `DFLOCAL_KMODE`, `DFLOCAL_FOLD`) are listed at the top
 of `electrolites/dflocal.py`.  It is **not** in `patch_all()` and
@@ -1046,6 +1133,13 @@ approximation and says so once, on stdout.
 `FASTDFCDERI_HUGEPAGE`) are listed at the top of
 `electrolites/fastdfcderi.py` and are what every ablation column in
 `docs/README_fastdfcderi.md` is measured with.
+
+`FASTDF_FP32=1` is W7's, and it is the one switch here that changes the
+answer: `electrolites/_dffp32.py` owns it, `electrolites/fastdffp32.py`
+carries the two consumers that are not `get_jk`, and
+`docs/README_fastdffp32.md` is what it costs and what it buys.  With it set
+there is no fall-through — a call `fastdf` declines raises, because
+GPU4PySCF's own build would read the narrow tensor as a wide one.
 
 `fastdf`'s switches (`FASTDF_OFF`, `FASTDF_STEP1`, `FASTDF_STEP2`,
 `FASTDF_JPASS`, `FASTDF_SYRK_MIN_NAO`, `FASTDF_BLK`, `FASTDF_RESIDENT_FRAC`,

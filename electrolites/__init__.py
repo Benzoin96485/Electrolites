@@ -37,7 +37,7 @@ MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
-    'fastdfgrad', 'fastdfcderi',
+    'fastdfgrad', 'fastdfcderi', 'fastdffp32',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -116,6 +116,14 @@ _TARGETS = {
                     ('gpu4pyscf.gto.mole', 'SortedMole.mat_dot_C'),
                     ('gpu4pyscf.gto.mole', 'SortedMole.aggregate_shl_pairs'),
                     ('gpu4pyscf.df.int3c2e_bdiv', 'int3c2e_scheme')),
+    # the two consumers of a **single-precision** cderi that are not
+    # `df_jk.get_jk`: the block iterator everything else reaches the tensor
+    # through, and the one line of the DF Hessian's CPHF build that moves the
+    # tensor to the host with a double-precision transpose.  Both are
+    # upstream's own function unchanged while the tensor is double, so this
+    # module is inert unless `FASTDF_FP32` is set (`docs/DF_WORK_LIST.md` W7)
+    'fastdffp32': (('gpu4pyscf.df.df', 'DF.loop'),
+                   ('gpu4pyscf.df.hessian.rhf', '_get_jk')),
 }
 
 _patched = []

@@ -163,6 +163,11 @@ Ablations, for the tables in ``docs/README_fastdf.md``:
     FASTDF_RESIDENT_FRAC=<f>
                       item 3's share of free device memory; 0 turns it off
                       and streams the whole tensor, as GPU4PySCF does
+    FASTDF_FP32=1     store the cderi in **single precision** -- half the
+                      bytes, half the PCIe, and an answer that differs.
+                      `docs/DF_WORK_LIST.md` W7, owned by
+                      `electrolites/_dffp32.py` and measured in
+                      `docs/README_fastdffp32.md`; off unless asked for
 """
 import os
 
@@ -176,6 +181,7 @@ from gpu4pyscf.lib.cupy_helper import (
     contract, transpose_sum, get_avail_mem, ndarray, fill_symmetric)
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib import multi_gpu
+from electrolites import _dffp32 as FP32
 
 _OFF = bool(os.environ.get('FASTDF_OFF'))
 #: 'auto' (a measured size threshold), 'syrk' or 'gemm' for the exchange
@@ -379,6 +385,38 @@ def _decline(reason):
     return reason
 
 
+def _fall_through(dfobj, dms, hermi, with_j, with_k, omega, reason):
+    """Hand the call back to GPU4PySCF -- unless the tensor is narrow.
+
+    Every decline in this module is a fall-through to a build that computes
+    the same J and K, which is the property `benchmarks/coverage_probe.py`
+    exists to check.  A **single-precision** cderi (`docs/DF_WORK_LIST.md`
+    W7) breaks it: ``fill_symmetric`` takes a ``void*`` and is compiled for
+    ``double``, so upstream's ``get_jk`` would not fail on one, it would read
+    past the end of it and return a plausible wrong answer.  There is no
+    quiet option here -- narrowing the tensor is a choice the caller made by
+    name, and this says which call it does not cover.
+    """
+    _decline(reason)
+    cderi = None
+    store = getattr(dfobj, '_cderi', None)
+    if store is not None:
+        # a list on the host branch and whatever `multi_gpu.run` returned on
+        # the device one; indexed by device id either way
+        try:
+            cderi = store[cp.cuda.Device().id]
+        except (KeyError, IndexError):
+            cderi = None
+    if cderi is not None and cderi.dtype == np.float32 and cderi.size:
+        raise RuntimeError(
+            f'FASTDF_FP32: the cderi is float32 and `fastdf` declined this '
+            f'call ({reason}).  GPU4PySCF\'s own get_jk reads it as float64 '
+            f'and would return a wrong answer rather than fail, so the mode '
+            f'stops here instead.  Rebuild in double precision, or see '
+            f'docs/README_fastdffp32.md §4 for what the mode covers.')
+    return _orig_get_jk(dfobj, dms, hermi, with_j, with_k, omega=omega)
+
+
 def _use_syrk(nao):
     """Whether the symmetric rank-k update is the faster of the two here.
 
@@ -431,6 +469,7 @@ def _resident_prefix(dfobj, cderi_sparse, reserve_words):
     ``reserve_words`` is what this call still has to allocate on top of it.
     """
     naux_slice = cderi_sparse.shape[0]
+    itemsize = cderi_sparse.dtype.itemsize
     buf = None
     if _RESIDENT_FRAC > 0:
         # keyed on the tensor object itself rather than on its id: a Hessian's
@@ -443,13 +482,18 @@ def _resident_prefix(dfobj, cderi_sparse, reserve_words):
             buf = cached[1]
         else:
             npairs = cderi_sparse.shape[1]
-            words = int(get_avail_mem() * _RESIDENT_FRAC / 8) - reserve_words
-            rows = min(naux_slice, max(0, words // npairs))
+            # `reserve_words` is what the *call* still has to allocate, and
+            # those buffers are double whatever the tensor is; the prefix
+            # itself is in the tensor's own precision, which is where W7's
+            # second effect is -- a single-precision tensor puts twice as
+            # many rows on the device for the same memory.
+            nbytes = int(get_avail_mem() * _RESIDENT_FRAC) - reserve_words * 8
+            rows = min(naux_slice, max(0, nbytes // (npairs * itemsize)))
             if RESIDENT_MAX_ROWS:
                 rows = min(rows, RESIDENT_MAX_ROWS)
             if rows >= 8:
                 try:
-                    buf = cp.empty((rows, npairs))
+                    buf = cp.empty((rows, npairs), dtype=cderi_sparse.dtype)
                     buf.set(np.ascontiguousarray(cderi_sparse[:rows]))
                 except Exception:                           # noqa: BLE001
                     buf = None
@@ -532,30 +576,45 @@ def _tiles(dfobj, nao, blksize):
 
 
 def _blocks(cderi_sparse, blksize, on_gpu, resident=None):
-    """Yield ``(block, nL)`` with the block on the device.
+    """Yield ``(block, nL)`` with the block on the device, in ``float64``.
 
     On a host-resident cderi the rows `resident` already holds are yielded
     without a copy, and the rest keep GPU4PySCF's double-buffered prefetch:
     the copy of block ``n+1`` runs on a second stream while block ``n`` is
     being contracted.
+
+    A **single-precision** tensor (`docs/DF_WORK_LIST.md` W7) is widened here
+    and nowhere else: one buffer for the whole loop, allocated before the
+    first block rather than per block (§5.8), carrying the layout the
+    tensor itself has, and every contraction downstream sees exactly the
+    operand it would have seen from a double tensor -- including the branch
+    of `fill_symmetric` it takes.  That is what keeps the arithmetic in
+    double: the mode is about the bytes the tensor occupies and the bytes
+    that cross PCIe, and the widening pass costs 12 bytes of device
+    bandwidth per element against the several hundred flops the element is
+    then part of.
     """
     naux_slice = cderi_sparse.shape[0]
+    npairs = cderi_sparse.shape[1]
+    fp32 = cderi_sparse.dtype == np.float32
+    widen = FP32.BlockWidener(cderi_sparse, blksize, on_gpu) if fp32 else None
     if on_gpu:
         for p0, p1 in lib.prange(0, naux_slice, blksize):
-            yield cderi_sparse[p0:p1], p1 - p0
+            blk = cderi_sparse[p0:p1]
+            yield (widen(blk, p1 - p0) if fp32 else blk), p1 - p0
         return
 
     start = 0
     if resident is not None:
         start = int(resident.shape[0])
         for p0, p1 in lib.prange(0, start, blksize):
-            yield resident[p0:p1], p1 - p0
+            blk = resident[p0:p1]
+            yield (widen(blk, p1 - p0) if fp32 else blk), p1 - p0
     if start >= naux_slice:
         return
 
-    npairs = cderi_sparse.shape[1]
     nstream = min(blksize, naux_slice - start)
-    buf = cp.empty((nstream, npairs))
+    buf = cp.empty((nstream, npairs), dtype=cderi_sparse.dtype)
     buf_prefetch = cp.empty_like(buf)
     comput_stream = cp.cuda.get_current_stream()
     compute_event = cp.cuda.Event()
@@ -575,7 +634,8 @@ def _blocks(cderi_sparse, blksize, on_gpu, resident=None):
             io_stream.wait_event(compute_event)
             buf_prefetch[:p2 - p1].set(cderi_sparse[p1:p2], stream=io_stream)
             io_event.record(io_stream)
-        yield buf[:p1 - p0], p1 - p0
+        blk = buf[:p1 - p0]
+        yield (widen(blk, p1 - p0) if fp32 else blk), p1 - p0
 
 
 def _sparse_dm(dms_3d, pair_addresses, diags, nao, hermi):
@@ -617,11 +677,18 @@ def _get_j(dfobj, dms, hermi, omega):
     # nothing here allocates the dense `(nao, nao, blk)` buffer the exchange
     # build needs, so the block this path can afford is set by the staging
     # buffers alone and is much larger
+    fp32 = cderi_sparse.dtype == np.float32
     if _BLK:
         blksize = max(1, min(_BLK, naux_slice))
     else:
         words = int(get_avail_mem() * (.4 if on_gpu else .2) / 8)
-        per = n_dm + (0 if on_gpu else 2 * npairs)
+        # the per-block buffers, in double words: the two staging buffers a
+        # host-resident tensor streams through (half as wide in single
+        # precision) and, in single precision, the widened block `_blocks`
+        # hands on
+        per = n_dm + (npairs if fp32 else 0)
+        if not on_gpu:
+            per += npairs if fp32 else 2 * npairs
         blksize = max(1, min(MAX_BLK, naux_slice, words // max(per, 1)))
     auxbuf = cp.empty(n_dm * blksize)
     resident = None
@@ -648,23 +715,23 @@ def _get_j(dfobj, dms, hermi, omega):
 def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
     """``df/df_jk.py:get_jk`` with its three stages rearranged."""
     if _OFF:
-        _decline('FASTDF_OFF')
-        return _orig_get_jk(dfobj, dms, hermi, with_j, with_k, omega=omega)
+        return _fall_through(dfobj, dms, hermi, with_j, with_k, omega,
+                             'FASTDF_OFF')
     if multi_gpu.num_devices != 1:
-        _decline('more than one device')
-        return _orig_get_jk(dfobj, dms, hermi, with_j, with_k, omega=omega)
+        return _fall_through(dfobj, dms, hermi, with_j, with_k, omega,
+                             'more than one device')
     if getattr(dms, 'dtype', None) != np.float64:
         # the GHF/DHF spin-free build hands this function a complex density
-        _decline('complex density')
-        return _orig_get_jk(dfobj, dms, hermi, with_j, with_k, omega=omega)
+        return _fall_through(dfobj, dms, hermi, with_j, with_k, omega,
+                             'complex density')
 
     log = logger.new_logger(dfobj.mol, dfobj.verbose)
     t0 = log.init_timer()
     if dfobj._cderi is None:
         dfobj.build(omega=omega)
     if dfobj._cderi[cp.cuda.Device().id].shape[0] == 0:
-        _decline('empty cderi slice')
-        return _orig_get_jk(dfobj, dms, hermi, with_j, with_k, omega=omega)
+        return _fall_through(dfobj, dms, hermi, with_j, with_k, omega,
+                             'empty cderi slice')
     if not with_k:
         STATS['calls'] += 1
         return _get_j(dfobj, dms, hermi, omega)
@@ -685,8 +752,8 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
     else:
         # `_aggregate_dm_factor_l` stacks one factor against many of the other;
         # only the TDDFT gradient and NAC drivers produce it
-        _decline('asymmetric density factorisation')
-        return _orig_get_jk(dfobj, dms, hermi, with_j, with_k, omega=omega)
+        return _fall_through(dfobj, dms, hermi, with_j, with_k, omega,
+                             'asymmetric density factorisation')
 
     nao, nocc = factor_l.shape[-2:]
     dms_3d = cp.asarray(dms).reshape(-1, nao, nao)
@@ -735,8 +802,12 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
         # rather than divided into it.
         fill = _tile_fill(dfobj, nao)
         extra = int(fill * nao * nao / TILE) * nocc * nbuf * nspin * n_dm
+    # `npair` counts the per-block buffers that are a whole pair row wide:
+    # the tiled path's transposed staging buffer, and W7's widened block
+    npair_buf = ((1 if use_tiled else 0)
+                 + (1 if cderi_sparse.dtype == np.float32 else 0))
     blksize = _blksize(nao, nocc, nbuf_live, on_gpu, naux_slice, fill, extra,
-                       npair=cderi_sparse.shape[1] if use_tiled else 0)
+                       npair=npair_buf * cderi_sparse.shape[1])
     tiles = None
     if use_tiled:
         # the pattern owns its block size; see `_tiles`

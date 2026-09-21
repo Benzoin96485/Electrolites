@@ -429,6 +429,7 @@ separate processes; that is the only honest way to A/B them.
 | `fastdfj` | `df.df_jk._DFHF.get_jk` (and `_DFHF.Gradients`, for one warning) | **RIJONX** -- `density_fit(only_dfj=True)`, density-fitted J with *exact* exchange -- which **cannot run at all on GPU4PySCF 1.8.1**: the branch passes `mol` where `DF.get_jk` expects the density (`df/df_jk.py:211`) and dies with `'Mole' object has no attribute 'shape'`.  Repaired, the configuration builds **no cderi**, so it has none of `fastdf`'s 86 GB at 284 atoms, and its exchange is `fastk`.  Restricted or unrestricted, hybrid, range-separated or pure; a GHF object keeps GPU4PySCF's own branch, which is already correct.  `docs/README_fastdfj.md`, and `docs/DF_WORK_LIST.md` W1 |
 | `fastdfcderi` | `df.df._cholesky_eri` | the **one-time cderi build** -- 39 % of a 15-cycle taxol DF SCF, and the first thing any density-fitted run pays.  Three things: the metric contraction as a sparse apply of the contraction coefficients and a triangular *multiply* against an explicit `L^{-1}` (**1.9x-2.1x**, where the *solve* the work list proposes is a loss -- cuBLAS's `dtrsm` never reaches 0.66 of its `dgemm`); the same `nsp_per_block*4` shell-pair aggregation `fastdfgrad` found, here on the build's own integral kernel (**1.19x-1.50x** on the block loop); and the host buffer page-locked with `cudaHostRegister` rather than allocated with `cudaHostAlloc` (**2.09 -> 8.6 GB/s**, which is 65 % of a host-resident 113-atom build).  Below a measured threshold on the contraction's size the dense product is kept; a multi-device build, a linearly dependent auxiliary basis and an `only_dfj` object all fall through.  `docs/README_fastdfcderi.md`, and `docs/DF_WORK_LIST.md` W4 |
 | `fastdfgrad` | `df.grad.{rhf,rks,uhf,uks}.Gradients.jk_energy_per_atom` | the **two-electron derivative of a density-fitted gradient** -- 72-97 % of one, depending on the basis, and a fifth code path.  Two things, neither a rearrangement: the three-centre integrals of its first loop are taken from the cderi the SCF already built (`_decompose_j2c`'s matrix satisfies `aux_coef @ aux_coef.T == metric`, so the pseudo-density comes out of it exactly), and the derivative kernel is launched with a quarter as many shell pairs per thread block, which is **1.26x-3.15x** on that kernel and the fastest of the six values swept at every size measured.  Restricted or unrestricted, hybrid or range-separated -- both of an RSH functional's two calls reuse, which needs the `reset()` on the method's first line to be partial.  A pure functional never reaches this function, an `only_dfj` object has no cderi, and a TDDFT or NAC gradient's asymmetric factorisation falls through.  `docs/README_fastdfgrad.md`, and `docs/DF_WORK_LIST.md` W3 |
+| `fastdffp32` | `df.df.DF.loop` and `df.hessian.rhf._get_jk` — both **inert while the cderi is `float64`**, which it is unless `FASTDF_FP32=1` | the three-index tensor stored in **single precision**: exactly half the bytes on the device or the host, exactly half the PCIe, and the arithmetic unchanged — each block is widened back to `float64` before any contraction touches it.  It is **off by default and it changes the answer**: 2e-7–2e-5 Eh on the total energy for organics (3e-8–1e-7 per atom, flat with size, and 6x–151x *below* the fitting error the calculation already carries), but 1.3e-6–2.6e-6 per atom on a 3d transition-metal complex, where for FeCl4(-) it is the same size as the fitting error itself.  The error is the **Coulomb** energy's, not the exchange matrix's.  What it is for is capacity: at 284 atoms an 86.4 GB tensor becomes a 43.2 GB one that fits on the card, and at 545 atoms a 414 GB one that does not fit in a 251 GB node becomes a 207 GB one that builds.  `docs/README_fastdffp32.md`, and `docs/DF_WORK_LIST.md` W7 |
 
 **Limits, all of which fall through rather than fail.** An **open-shell ground
 state** is now covered through the SCF and the gradient: `fastk`, `fastj`,
@@ -484,7 +485,17 @@ built from the cderi tensor (`fastdf`), and not elsewhere in that path: a
 J engine and never reaches it, and the cderi build, the DF gradient's
 two-electron derivative and the DF Hessian's MO-basis CPHF build are three
 further DF code paths that nothing here is on --
-`docs/README_fastdf.md` §5 sizes each.  The **RIJONX** configuration
+`docs/README_fastdf.md` §5 sizes each.  **Single-precision cderi storage**
+(`FASTDF_FP32=1`, `fastdffp32`) is the one thing in this repository that
+**changes the answer on purpose**, so it is off unless it is asked for by
+name: it is 2e-7–2e-5 Eh on a total energy and 5e-9–7e-7 Eh/bohr on a
+gradient for organics — one to two orders of magnitude *below* the
+density-fitting error the calculation already accepts — and about the same
+size as that fitting error on a first-row transition metal, which
+`docs/README_fastdffp32.md` §2.3 measures rather than estimates.  With it
+on there is **no fall-through**: a call `fastdf` declines raises, because
+GPU4PySCF's own build would read a narrow tensor as a wide one and return a
+plausible wrong answer.  The **RIJONX** configuration
 (`only_dfj=True`) is a separate matter: it cannot run on stock 1.8.1 at all,
 `fastdfj` repairs it, and its exchange is then the direct path's, which is
 covered.  Its *gradient* is not: `df/grad/` ignores `only_dfj` and returns the
@@ -553,6 +564,11 @@ python tests/test_df.py                    # the density-fitted J and K build:
                                            # energy and gradient, closed and
                                            # open shell
 python tests/test_dfj.py                   # the RIJONX branch fastdfj
+python tests/test_dffp32.py                # the single-precision cderi: what
+                                           # must not change while the mode
+                                           # is off, what stays exact while
+                                           # it is on, and the error it
+                                           # introduces where it does not
 python tests/test_dfcderi.py               # the cderi build fastdfcderi
                                            # repairs: its J against a DF
                                            # J-only call and its K against a
