@@ -59,7 +59,12 @@ for _m in ('gpu4pyscf.properties.shielding', 'gpu4pyscf.grad.rkspu',
            'gpu4pyscf.df.grad.rks', 'gpu4pyscf.df.grad.uks',
            'gpu4pyscf.df.grad.uhf', 'gpu4pyscf.df.grad.tdrhf',
            'gpu4pyscf.df.grad.tduks',
-           'gpu4pyscf.df.hessian.rhf', 'gpu4pyscf.df.hessian.uhf'):
+           'gpu4pyscf.df.hessian.rhf', 'gpu4pyscf.df.hessian.uhf',
+           # W9's: the three-centre Coulomb engine, the Rys engine beside it,
+           # and the two other consumers of the recontraction kernels
+           'gpu4pyscf.df.j_engine_3c2e', 'gpu4pyscf.df.int3c2e_bdiv',
+           'gpu4pyscf.gto.mole', 'gpu4pyscf.scf.hf', 'gpu4pyscf.x2c.x2c',
+           'gpu4pyscf.x2c.sfx2c1e'):
     try:
         importlib.import_module(_m)
     except ImportError:
@@ -110,6 +115,20 @@ ORIGINALS = [
     # tensor as double -- which does not fail, it returns a wrong answer
     ('fastdffp32', 'gpu4pyscf.df.df', 'DF._loop_orig'),
     ('fastdffp32', 'gpu4pyscf.df.hessian.rhf', '_get_jk_orig'),
+    # W9's: the three-centre Coulomb build a pure density-fitted functional
+    # runs on.  `df/df.py:113` looks `get_j` up on the module, and the two
+    # contractions are methods, so all three see the patch -- but the four
+    # recontraction kernels are methods on `SortedGTO` that four other
+    # modules of GPU4PySCF reach (`int3c2e_bdiv`, `df/df.py`, `scf/hf.py`'s
+    # `get_hcore` and `x2c`), which is exactly the shape a stale alias takes
+    ('fastdfj3c', 'gpu4pyscf.df.df_jk', '_get_j_orig'),
+    ('fastdfj3c', 'gpu4pyscf.df.j_engine_3c2e', 'Int3c2eOpt._contract_dm_orig'),
+    ('fastdfj3c', 'gpu4pyscf.df.j_engine_3c2e',
+     'Int3c2eOpt._contract_auxvec_orig'),
+    ('fastdfj3c', 'gpu4pyscf.gto.mole', '_CT_dot_mat_orig'),
+    ('fastdfj3c', 'gpu4pyscf.gto.mole', '_C_dot_mat_orig'),
+    ('fastdfj3c', 'gpu4pyscf.gto.mole', '_mat_dot_C_orig'),
+    ('fastdfj3c', 'gpu4pyscf.gto.mole', '_mat_dot_CT_orig'),
     # W8's: the DF Hessian's CPHF build.  `fastdffp32` wraps the same entry
     # point for one line of it, so what this module saves is that wrapper and
     # not upstream's function -- the two save slots are deliberately distinct

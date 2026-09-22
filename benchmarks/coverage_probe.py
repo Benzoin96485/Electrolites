@@ -165,6 +165,20 @@ if 'fastdf' in active:
     # SCF and is the only two-electron row that moves on a DF one.
     _ENTRIES.append(
         ('fastdf  df get_jk', _dfjk, 'get_jk', _dfjk, '_get_jk_orig'))
+if 'fastdfj3c' in active:
+    from gpu4pyscf.df import df_jk as _dfjk2                 # noqa: E402
+    from gpu4pyscf.df import j_engine_3c2e as _j3cmod        # noqa: E402
+    # W9's three-centre Coulomb build.  It is the row that separates a *pure*
+    # density-fitted functional from a hybrid one: a pure run never builds a
+    # cderi, so `fastdf` reads `(-)` and this reads one call per cycle, and a
+    # hybrid full-DF run is the other way round.  `contract_auxvec` counting
+    # zero while `get_j` counts is the Rys fall-back, which is what
+    # `fastdfj3c.stats()['get_j_rys']` names.
+    _ENTRIES.append(('fastdfj3c get_j', _dfjk2, 'get_j', _dfjk2,
+                     '_get_j_orig'))
+    _ENTRIES.append(('fastdfj3c contract_auxvec', _j3cmod.Int3c2eOpt,
+                     'contract_auxvec', _j3cmod.Int3c2eOpt,
+                     '_contract_auxvec_orig'))
 if 'fastdfcderi' in active:
     from gpu4pyscf.df import df as _dfmod                    # noqa: E402
     # the cderi build.  Exactly one call per density-fitted SCF -- and per
@@ -269,7 +283,7 @@ extra = {}
 # counts every call into `_DFHF.get_jk`, and on a full-DF run all of them
 # are handed straight back to GPU4PySCF.  `only_dfj` in this line is the
 # number that actually took the repaired branch.
-for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc', 'fastdfj',
+for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc', 'fastdfj', 'fastdfj3c',
            'fastdfgrad', 'fastdfcderi', 'fastdfhess'):
     if _m in active:
         _mod = __import__(f'electrolites.{_m}', fromlist=['x'])

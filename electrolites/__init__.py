@@ -37,7 +37,7 @@ MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
-    'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
+    'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -95,6 +95,17 @@ _TARGETS = {
                 ('gpu4pyscf.df.df_jk', '_DFHF.get_k'),
                 ('gpu4pyscf.df.df_jk', '_DFHF.get_veff'),
                 ('gpu4pyscf.df.df_jk', '_DFHF.Gradients')),
+    # the three-centre Coulomb build a *pure* density-fitted functional runs
+    # on, and the Coulomb half of every RIJONX run.  The two contractions are
+    # the target; the four `SortedGTO` recontraction kernels are named because
+    # this module caches their device tables, and they are reached by the
+    # cderi build and by `get_hcore` as well as by `get_j`
+    'fastdfj3c': (('gpu4pyscf.df.j_engine_3c2e', 'Int3c2eOpt.contract_dm'),
+                  ('gpu4pyscf.df.j_engine_3c2e', 'Int3c2eOpt.contract_auxvec'),
+                  ('gpu4pyscf.gto.mole', 'SortedGTO.CT_dot_mat'),
+                  ('gpu4pyscf.gto.mole', 'SortedGTO.C_dot_mat'),
+                  ('gpu4pyscf.gto.mole', 'SortedGTO.mat_dot_C'),
+                  ('gpu4pyscf.gto.mole', 'SortedGTO.mat_dot_CT')),
     # the two-electron derivative of a density-fitted gradient.  Four classes,
     # because each binds `jk_energy_per_atom` as a class attribute at
     # class-creation time and so carries its own copy of the function object;

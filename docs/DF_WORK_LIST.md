@@ -13,6 +13,7 @@ is; `docs/README_fastdfgrad.md` closed **W3**, `docs/README_fastdfcderi.md`
 **W4**, `docs/README_fastdfblock.md` **W5**, `docs/README_fastdffp32.md`
 **W7**, `docs/README_fastdfhess.md` **W8** (whose result is that its own
 target cannot be made faster, and whose *finding* is W16, W17 and W18),
+`docs/README_fastdfj3c.md` **W9** (whose findings are W19 and W20),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -238,6 +239,24 @@ first anatomy of a density-fitted Hessian in this repository, and that
 anatomy says the time is in three functions no entry on this page named
 (`docs/README_fastdfhess.md`).
 
+**W9 is done, and W19 and W20 are what it found.**  The three-centre Coulomb
+build a *pure* density-fitted functional runs on is **2.32x** at 10 atoms,
+1.78x at 42, 1.13x at 113 and 1.03x at 284 at one density -- and **4.45x** at
+two densities, **2.55x-2.73x** from four to thirty-two, and **13.2x** on a
+21-atom open-shell 3d complex, where def2-SVP reaches an f shell on the
+auxiliary set and `df_jk.get_j`'s engine choice for `n_dm > 1` is worst.  A
+whole DF-PBE SCF is **1.16x** at 42 atoms against a `patch_all()` baseline.
+**None of it is arithmetic**: every kernel launched is GPU4PySCF's own with
+GPU4PySCF's own arguments, and `tests/test_dfj3c.py` compares element-wise at
+**1.6e-16**.  The two things that carry it are that the call re-uploads about
+thirty host arrays per Coulomb matrix, and that `Int3c2eOpt.build` gives the
+auxiliary-vector kernel **372 thread blocks on a 108-SM card** with the
+angular-momentum groups differing in size by seventy times.  What the round
+found rather than closed is that after it the build is **85 % two integral
+kernels at 42 atoms and 97 % at 284** (`docs/README_fastdfj3c.md`), and the
+three things still inside them are **W19**; the fourth, which is not inside
+them, is **W20**.
+
 **W3 is done, and W10 is what it found.**  The DF gradient's two-electron
 derivative is 1.75x–2.59x faster and the gradient around it 1.24x–2.27x
 (`docs/README_fastdfgrad.md`), from two things the entry did not predict —
@@ -309,7 +328,13 @@ sixth for the same reason and will come back at 500+ atoms.
 > on a whole build).  W9 is worth *less*: §3.1 of
 > `docs/README_fastdfj.md` measures the three-centre Coulomb engine at 1.67x
 > the direct four-centre build at 284 atoms, so the path it names is already
-> the faster of the two.
+> the faster of the two.  *(**W9 is now done and that ranking was half
+> right.**  The engine is good and nothing in that round changed its
+> arithmetic; what nobody had done was time the **stages** of the call around
+> it, and at ten atoms three quarters of a Coulomb build is not integrals at
+> all.  1.03x-2.32x at one density, 1.5x-4.5x at more than one, and 13.2x on
+> an open-shell 3d complex where GPU4PySCF picks the wrong engine
+> altogether.)*
 
 ### W1 — `only_dfj` fixed, and RIJONX measured — **done**
 
@@ -884,12 +909,76 @@ branch, where the 9.0x is.
 anatomy of a density-fitted Hessian in this repository says the time is in
 three functions no entry on this page names.
 
-### W9 — The pure-functional DF Coulomb build
+### W9 — The pure-functional DF Coulomb build — **done**
 
-`df/j_engine_3c2e.py`, a McMurchie–Davidson three-centre kernel in
-`libvhf_md`.  A DF-PBE run spends its two-electron time here and reaches
-nothing in this repository.  It is a `fastj`-shaped generator project rather
-than a driver rewrite, and W1 makes it matter for hybrids too.
+`electrolites/fastdfj3c.py`, `electrolites/_j3c.py`, `tests/test_dfj3c.py`,
+`benchmarks/df_j3c_{probe,bench,sweep}.py`, write-up in
+`docs/README_fastdfj3c.md`.
+
+The entry called this "a `fastj`-shaped generator project rather than a driver
+rewrite".  **It is the other way round.**  The kernels were left untouched and
+the round is entirely in the driver, because the thing nobody had done was
+time the *stages* of `df_jk.get_j`: unpatched, the two integral kernels are
+**24 %** of a 10-atom Coulomb build, 63 % at 22 atoms, 85 % at 42, 93 % at 113
+and 97 % at 284.  Everything else is host-side setup and density
+transformations that do not grow.
+
+**What it is worth**, one density, def2-SVP, A100-SXM4-40GB:
+
+| | GPU4PySCF | fastdfj3c | |
+|---|---|---|---|
+| glycine, 10 atoms | 3.275 ms | **1.411 ms** | **2.32x** |
+| alanine dipeptide, 22 | 7.057 ms | **3.240 ms** | **2.18x** |
+| penicillin V, 42 | 26.23 ms | **14.70 ms** | **1.78x** |
+| taxol, 113 | 157.5 ms | **139.6 ms** | 1.13x |
+| PfPMT, 284 | 731.4 ms | **708.3 ms** | 1.03x |
+| penicillin V, def2-TZVPP | 69.07 ms | **53.49 ms** | **1.29x** |
+
+and **more than one density**, which is every response property of a pure
+density-fitted functional: **4.45x** at two, 2.73x at four, 2.58x at eight and
+**2.55x at thirty-two** on penicillin V; 2.65x/1.61x/1.50x on taxol.  On an
+open-shell 3d complex it is **13.2x** (Ni dithiolene, 21 atoms, 317.8 ms →
+24.0 ms) and **6.7x** (Cu macrocycle, 60 atoms).  A whole DF-PBE SCF is
+**1.16x** at 42 atoms and 1.05x at 113 against a `patch_all()` baseline.
+
+**Five host-side items, no arithmetic.**  The largest two:
+
+* `Int3c2eOpt.build` makes **one** thread-block range per angular-momentum
+  group, and the auxiliary-vector kernel's grid is
+  `(groups × auxiliary-shell batches)` — **372 blocks on a 108-SM card** at 42
+  atoms, with the groups differing in size by seventy times.  Both kernels
+  read their `(li,lj)` from the first pair of their range and stride the rest,
+  so a range may be any sub-interval of a group: this is a launch
+  configuration change, the same shape as W3's `nsp_per_block*4`.  The swept
+  optimum moves by **thirty-two times** across the size ladder, so the block
+  size is *derived* from the molecule and the basis and not fixed — within
+  1.7 % of the swept optimum on seven systems in three bases, where a fixed
+  1024 would have given up 29 % on glycine.  The *other* kernel is left alone:
+  splitting is monotonically worse for it, down to 0.37x.
+* `df_jk.get_j` sends every `n_dm > 1` call to the **Rys** `int3c2e_bdiv`
+  engine, which carries the density index inside one launch where the
+  McMurchie–Davidson engine loops and rebuilds the integrals per density.
+  That is the wrong choice at every count up to 32, by 1.36x–2.54x, and two
+  densities is the worst because the Rys kernel batches densities in fours.
+
+The other three are the per-call uploads (thirty host-to-device copies and six
+NumPy cumsums per Coulomb matrix, in `SortedGTO`'s four recontraction kernels
+and the two contractions), the Hermite scratch (§5.8's `cudaFree`), and
+`ao_loc`.  All are cached per **device** as well as per object, because
+`multi_gpu.run` hands one `SortedMole` to a thread per device — W2's trap,
+avoided rather than found.
+
+**Two ideas measured and rejected**, both kept runnable: a smaller
+shared-memory budget (the launch asks for **91 KB per block**, one block per
+A100 SM, and cutting it is monotonically slower — these kernels want shell
+pairs in flight, not blocks per SM) and one launch per angular-momentum class
+with that class's own shared memory (**0.42x–0.44x**: thirty small grids
+serialise on the legacy default stream).  And one measured and *not taken*:
+32 auxiliary shells per block instead of GPU4PySCF's 16 is worth 0.9–1.7 % of
+one kernel, and moving it would invalidate the seven-system audit of the block
+size it feeds.
+
+**What it found rather than closed is W19 and W20.**
 
 ### W10 — Batch the DF gradient's `(naux, nocc, nocc)` array
 
@@ -1085,6 +1174,72 @@ shape — both build a density-fitted quantity per atom out of
 `Int3c2eOpt` — so the two are one project rather than two, and W17 is the
 half worth measuring first.
 
+### W19 — The three-centre Coulomb kernels themselves
+
+*(Found by W9, which measured them rather than changed them.)*
+
+After W9 the Coulomb build of a pure density-fitted functional is **85 % two
+integral kernels at 42 atoms and 97 % at 284**, and all three of the things
+inside them need the CUDA source
+(`gvhf-md/contract_int3c2e.cu`).  This is the `fastj`-shaped generator project
+the old W9 entry described; what has changed is that it is now the *only*
+thing left on this path, and that its two halves are known to cost the same.
+
+* **Six double-precision divisions and a square root per (shell pair,
+  auxiliary shell).**  `contract_int3c2e_kernel` recomputes every shell pair's
+  Gaussian product centre — `xij = (ai*ri[0] + aj*rj[0]) / aij` and its two
+  partners — inside both the auxiliary-primitive loop and the pair loop,
+  although it is a property of the pair alone; then `theta = aij*ak/(aij+ak)`
+  and `fac = ck/(aij*ak*sqrt(aij+ak))`.  `fastj` removed exactly this family
+  from the four-centre MD J kernel by caching `1/aij` beside the product
+  centre and letting one `rsqrt(aij+akl)` supply both reciprocals
+  (`docs/README_fastj.md`).  Here the pair data is a `(npair, 4)` device array
+  built once at `Int3c2eOpt.build()` — which is the shape `electrolites/_j3c.py`
+  already is.
+* **The Hermite index table is a global-memory read per term.**  The
+  contraction is `vj_xyz[k] += Rt[p1_ij[k*nf3ij + i] * nsp] * dm_ij` with
+  `p1_ij` a `uint16_t*` into `Rt2_kl_ij`, and the kernels template on `lk`
+  alone — so `nf3ij`, `order` and every index is a runtime value.  Templating
+  on `lij` as well makes them compile-time constants.
+* **`omega == 0` is a runtime test** inside `boys_fn`, on the innermost path.
+
+* **Do**: `codegen/gen_j_kernels.py` is the precedent and the 1.8.1 source is
+  the input.  Start with the pair data, which is the cheapest of the three and
+  needs no templating.
+* **Success**: the two kernels move by what `fastj`'s scaffolding was worth on
+  the four-centre one.
+* **Falsified if**: the low angular-momentum classes — which hold most of the
+  shell pairs — turn out to be bandwidth-bound on the Hermite density rather
+  than instruction-bound.  Profile one class before writing a generator;
+  W9 did not, because it never touched the kernels.
+* **Not** a route to the `nsp_per_block`/shared-memory trade: W9 swept that
+  from the host and it is monotone the way GPU4PySCF has it
+  (`docs/README_fastdfj3c.md` §8).
+
+### W20 — The three-centre Coulomb build does not screen on the density
+
+*(Also from W9.)*
+
+`J` is linear in `D`, so `J(D) = J(D_last) + J(D - D_last)` **exactly**, and
+`D - D_last` near convergence is small almost everywhere.
+`scf/j_engine.py`'s four-centre MD J engine screens on `qd_ij_max`, a
+density-weighted Schwarz bound.  The three-centre one has **no density
+screening of any kind**: it walks every stored shell pair against every
+auxiliary shell on every cycle, 330 612 × 5 817 of them at 284 atoms.
+
+* **Do**: filter `shl_pair_idx` on `max|ΔD_ij| · q_ij` and rebuild `pair_loc`
+  for the filtered list, which is a host-side change of exactly the kind W9 is
+  made of — and hand the *difference* Coulomb matrix back to an accumulating
+  driver.  `_DFHF.__init__` sets `direct_scf = False`, so the driver half is
+  `fastdfj`'s §1.2 in a second costume.
+* **Success**: the pair count falls through an SCF, and the last cycles of a
+  284-atom DF-PBE run cost a fraction of the first.
+* **Falsified if**: the filtered list costs more to rebuild each cycle than
+  the pairs it removes save — it is a *different* list per cycle, so it gives
+  back exactly the caching W9's §2.1 is about, and `Int3c2eConstants` would
+  need a two-tier cache.  Measure the pair count first: a probe over an SCF
+  trajectory is an afternoon and this item is not.
+
 ### Not on this list
 
 **Seminumerical exchange (sn-K / COSX)**, which would avoid the cderi
@@ -1182,6 +1337,15 @@ four are cheap to avoid and none is detectable from the number itself.
    `.qdstrm` with `Nsight_Systems/host-linux-x64/QdstrmImporter -i` from a
    directory on Lustre.
 
+13. **A benchmark that imports a module imports its patches -- including its
+   own.**  §5.12 is about one module importing *another*'s kernels;
+   `benchmarks/df_j3c_probe.py` did it to itself.  It grew a module-level
+   `from electrolites import fastdfj3c` so that a patched run could charge the
+   Hermite transforms to the right row, and that turned every "GPU4PySCF's
+   own" column it printed into a patched one -- silently, because the patched
+   numbers are plausible.  The import belongs inside the `--patch` branch.  The
+   symptom, again, is a stock column that agrees with the patched one.
+
 And one that is not about timing: **a patch target is not a code path.**
 Three rounds in this repository have now shipped a module that was loaded,
 correct, and never called — `dft/uks.py`, `hessian/uks.py`, and now
@@ -1251,6 +1415,20 @@ python benchmarks/df_fp32_bench.py --xyz ... --only fp32 --stages loop,jk,j \
     --guess-dm --cpu-cderi        # the sizes where one tensor is the budget
 ```
 
+```bash
+python tests/test_dfj3c.py [--basis def2-tzvpp] [--no-scf]        # W9's bar
+CUDA_VISIBLE_DEVICES=0,1 python tests/test_dfj3c.py --no-scf  # the device key
+python benchmarks/df_j3c_probe.py --cases glycine,penicillinV,taxol  # W9's §3
+python benchmarks/df_j3c_probe.py --cases penicillinV --shapes    # no GPU time
+python benchmarks/df_j3c_probe.py --cases ... --patch fastdfj3c   # the after
+python benchmarks/df_j3c_bench.py --cases ... [--ndm 1,2,4] [--scf] [--patch ...]
+python benchmarks/df_j3c_sweep.py --cases ...     # the block size, and the two
+python benchmarks/df_j3c_sweep.py --cases ... --shm-fracs 1.0,0.5 --per-class \
+    --ksh-chunks 4,8,16,32,64                     # ideas W9 measured and rejected
+python benchmarks/coverage_probe.py --xyz ... --xc pbe --density-fit
+    # `fastdf` reads 0 on a pure functional and `fastdfj3c` one call per cycle
+```
+
 `dflocal`'s switches (`DFLOCAL_DOMAIN`, `DFLOCAL_STORE`, `DFLOCAL_BLK`,
 `DFLOCAL_LAMBDA_TOL`, `DFLOCAL_KMODE`, `DFLOCAL_FOLD`) are listed at the top
 of `electrolites/dflocal.py`.  It is **not** in `patch_all()` and
@@ -1269,6 +1447,15 @@ carries the two consumers that are not `get_jk`, and
 `docs/README_fastdffp32.md` is what it costs and what it buys.  With it set
 there is no fall-through — a call `fastdf` declines raises, because
 GPU4PySCF's own build would read the narrow tensor as a wide one.
+
+`fastdfj3c`'s switches (`FASTDFJ3C_OFF`, `FASTDFJ3C_NO_CTR`,
+`FASTDFJ3C_NO_OPT`, `FASTDFJ3C_NO_MDM`, `FASTDFJ3C_SP_CHUNK_AUX`,
+`FASTDFJ3C_SP_CHUNK_DM`, `FASTDFJ3C_KSH_CHUNK`, `FASTDFJ3C_MDM_MAX_NDM`,
+`FASTDFJ3C_TARGET_BLOCKS`, `FASTDFJ3C_CHUNK_MIN`, `FASTDFJ3C_CHUNK_MAX`,
+`FASTDFJ3C_SHM_FRAC`, `FASTDFJ3C_PER_CLASS`) are listed with their meanings at
+the top of `electrolites/fastdfj3c.py`.  The last two are the two ideas
+`docs/README_fastdfj3c.md` §8 measured and rejected, kept runnable rather than
+described.
 
 `fastdf`'s switches (`FASTDF_OFF`, `FASTDF_STEP1`, `FASTDF_STEP2`,
 `FASTDF_JPASS`, `FASTDF_SYRK_MIN_NAO`, `FASTDF_BLK`, `FASTDF_RESIDENT_FRAC`,
