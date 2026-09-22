@@ -270,7 +270,7 @@ extra = {}
 # are handed straight back to GPU4PySCF.  `only_dfj` in this line is the
 # number that actually took the repaired branch.
 for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc', 'fastdfj',
-           'fastdfgrad', 'fastdfcderi'):
+           'fastdfgrad', 'fastdfcderi', 'fastdfhess'):
     if _m in active:
         _mod = __import__(f'electrolites.{_m}', fromlist=['x'])
         if hasattr(_mod, 'stats'):

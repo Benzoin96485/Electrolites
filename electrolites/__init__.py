@@ -37,7 +37,7 @@ MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
-    'fastdfgrad', 'fastdfcderi', 'fastdffp32',
+    'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -124,6 +124,16 @@ _TARGETS = {
     # module is inert unless `FASTDF_FP32` is set (`docs/DF_WORK_LIST.md` W7)
     'fastdffp32': (('gpu4pyscf.df.df', 'DF.loop'),
                    ('gpu4pyscf.df.hessian.rhf', '_get_jk')),
+    # the DF Hessian's own MO-basis CPHF build -- the fifth two-electron
+    # path, which `df/df_jk.py:get_jk` is not on, so `fastdf` is not either.
+    # `df/hessian/{rks,uhf,uks}.py` all bind `_get_jk_mo` as a class
+    # attribute and that function looks `_get_jk` up on this module, so one
+    # target covers the restricted and unrestricted Hessians both.
+    # `_balance_batch_size` is upstream's own helper, which this module uses
+    # rather than replaces
+    'fastdfhess': (('gpu4pyscf.df.hessian.rhf', '_get_jk'),
+                   ('gpu4pyscf.df.hessian.rhf', '_get_jk_mo'),
+                   ('gpu4pyscf.df.hessian.rhf', '_balance_batch_size')),
 }
 
 _patched = []

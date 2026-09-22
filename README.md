@@ -32,6 +32,23 @@ grids, `conv_tol_cpscf = 1e-6`):
 | ↳ its two XC terms, at fixed density | 15.5 s | **2.11 s** | **7.34x** |
 | 113-atom Hessian (taxol), its two XC terms | 117.8 s | **22.2 s** | **5.30x** |
 
+and, for a **density-fitted** Hessian, which is a different set of functions
+again (B3LYP/def2-SVP, level-3 grids, one A100-SXM4-80GB):
+
+| | GPU4PySCF 1.8.1 | + Electrolites | |
+|---|---|---|---|
+| 42-atom DF Hessian (penicillin V), whole run | 34.6 s | **21.2 s** | **1.63x** |
+| ↳ its two XC terms | 15.5 s | **2.31 s** | **6.72x** |
+| 42-atom DF Hessian, def2-TZVPP | **cannot be run** | **70.4 s** | — |
+
+The last row is not a ratio: GPU4PySCF sizes one cuTENSOR contraction in the
+CPHF build from free memory alone, and past a certain shape cuTENSOR refuses
+the plan -- so that calculation raises `CUTENSOR_STATUS_NOT_SUPPORTED` with
+73.7 GB free, as does a 113-atom def2-SVP one with 65.5 GB free.
+`docs/README_fastdfhess.md` is the round, and its other result is that the
+build in question is already at 78 % of the card's fp64 peak and 15 % of the
+run, so there is no speedup in it at all.
+
 and, for the **response properties** -- whole runs, penicillin V/def2-SVP,
 level-3 grids, five roots for TDA.  The `fastxcfxc`/`fastfnlc` column is what
 the previous round reached; `+ fastjk` is this one, which adds the *fused*
@@ -429,6 +446,7 @@ separate processes; that is the only honest way to A/B them.
 | `fastdfj` | `df.df_jk._DFHF.get_jk` (and `_DFHF.Gradients`, for one warning) | **RIJONX** -- `density_fit(only_dfj=True)`, density-fitted J with *exact* exchange -- which **cannot run at all on GPU4PySCF 1.8.1**: the branch passes `mol` where `DF.get_jk` expects the density (`df/df_jk.py:211`) and dies with `'Mole' object has no attribute 'shape'`.  Repaired, the configuration builds **no cderi**, so it has none of `fastdf`'s 86 GB at 284 atoms, and its exchange is `fastk`.  Restricted or unrestricted, hybrid, range-separated or pure; a GHF object keeps GPU4PySCF's own branch, which is already correct.  `docs/README_fastdfj.md`, and `docs/DF_WORK_LIST.md` W1 |
 | `fastdfcderi` | `df.df._cholesky_eri` | the **one-time cderi build** -- 39 % of a 15-cycle taxol DF SCF, and the first thing any density-fitted run pays.  Three things: the metric contraction as a sparse apply of the contraction coefficients and a triangular *multiply* against an explicit `L^{-1}` (**1.9x-2.1x**, where the *solve* the work list proposes is a loss -- cuBLAS's `dtrsm` never reaches 0.66 of its `dgemm`); the same `nsp_per_block*4` shell-pair aggregation `fastdfgrad` found, here on the build's own integral kernel (**1.19x-1.50x** on the block loop); and the host buffer page-locked with `cudaHostRegister` rather than allocated with `cudaHostAlloc` (**2.09 -> 8.6 GB/s**, which is 65 % of a host-resident 113-atom build).  Below a measured threshold on the contraction's size the dense product is kept; a multi-device build, a linearly dependent auxiliary basis and an `only_dfj` object all fall through.  `docs/README_fastdfcderi.md`, and `docs/DF_WORK_LIST.md` W4 |
 | `fastdfgrad` | `df.grad.{rhf,rks,uhf,uks}.Gradients.jk_energy_per_atom` | the **two-electron derivative of a density-fitted gradient** -- 72-97 % of one, depending on the basis, and a fifth code path.  Two things, neither a rearrangement: the three-centre integrals of its first loop are taken from the cderi the SCF already built (`_decompose_j2c`'s matrix satisfies `aux_coef @ aux_coef.T == metric`, so the pseudo-density comes out of it exactly), and the derivative kernel is launched with a quarter as many shell pairs per thread block, which is **1.26x-3.15x** on that kernel and the fastest of the six values swept at every size measured.  Restricted or unrestricted, hybrid or range-separated -- both of an RSH functional's two calls reuse, which needs the `reset()` on the method's first line to be partial.  A pure functional never reaches this function, an `only_dfj` object has no cderi, and a TDDFT or NAC gradient's asymmetric factorisation falls through.  `docs/README_fastdfgrad.md`, and `docs/DF_WORK_LIST.md` W3 |
+| `fastdfhess` | `df.hessian.rhf._get_jk` | the **density-fitted Hessian's own CPHF build** -- a *fifth* two-electron code path, which `df_jk.get_jk` is not on and so neither is `fastdf`.  This one is **not a speedup and does not claim to be**: the function already runs at **15.2 TF/s of an A100's 19.5** (78 % of fp64 peak, its dominant contraction at 81 %), every one of its four contractions is within 1.14x of a plain `dgemm` at its own shape and two are ahead of one, and three rearrangements of it measure 0.90x-1.00x and are kept only as runnable ablations.  What it is for is that GPU4PySCF **cannot run the function at all** past a certain shape: the density batch is sized from free memory alone and cuTENSOR then refuses the plan with `CUTENSOR_STATUS_NOT_SUPPORTED`, so a 42-atom def2-TZVPP DF Hessian dies with 73.7 GB free and a 113-atom def2-SVP one with 65.5 GB free.  Capping the batch makes both run -- 4.05 s and 110.3 s a call, at 16.2 and 15.7 TF/s -- for 0.7 % at the sizes that already worked.  `docs/README_fastdfhess.md`, and `docs/DF_WORK_LIST.md` W8 |
 | `fastdffp32` | `df.df.DF.loop` and `df.hessian.rhf._get_jk` — both **inert while the cderi is `float64`**, which it is unless `FASTDF_FP32=1` | the three-index tensor stored in **single precision**: exactly half the bytes on the device or the host, exactly half the PCIe, and the arithmetic unchanged — each block is widened back to `float64` before any contraction touches it.  It is **off by default and it changes the answer**: 2e-7–2e-5 Eh on the total energy for organics (3e-8–1e-7 per atom, flat with size, and 6x–151x *below* the fitting error the calculation already carries), but 1.3e-6–2.6e-6 per atom on a 3d transition-metal complex, where for FeCl4(-) it is the same size as the fitting error itself.  The error is the **Coulomb** energy's, not the exchange matrix's.  What it is for is capacity: at 284 atoms an 86.4 GB tensor becomes a 43.2 GB one that fits on the card, and at 545 atoms a 414 GB one that does not fit in a 251 GB node becomes a 207 GB one that builds.  `docs/README_fastdffp32.md`, and `docs/DF_WORK_LIST.md` W7 |
 
 **Limits, all of which fall through rather than fail.** An **open-shell ground
@@ -569,6 +587,11 @@ python tests/test_dffp32.py                # the single-precision cderi: what
                                            # is off, what stays exact while
                                            # it is on, and the error it
                                            # introduces where it does not
+python tests/test_dfhess.py                # the DF Hessian's CPHF J and K,
+                                           # all three arrangements, RHF and
+                                           # UHF, the long-range operator,
+                                           # and a whole Hessian patched
+                                           # against unpatched
 python tests/test_dfcderi.py               # the cderi build fastdfcderi
                                            # repairs: its J against a DF
                                            # J-only call and its K against a
@@ -651,6 +674,22 @@ all and reports how much of the AO-pair space the screening actually stores --
 22 % at 284 atoms, which is the ceiling on what a block-sparse exchange build
 could remove and the reason the density-fitted path cannot reach the sizes the
 direct one does.
+
+`benchmarks/df_hess_probe.py` is the same idea one level up: a traced clone of
+the **density-fitted Hessian's CPHF build** stage by stage against its own
+roofline, and -- with `--whole` -- the first anatomy of a density-fitted
+Hessian in this repository, which is what says that build is 15 % of the run
+and `hessian/rks.py:nr_rks_fxc_mo` is 25 % of a patched one.  Use the anatomy
+before taking a DF-Hessian target from anywhere: the two top-level terms are
+bound as *class attributes* and a patch of the module global never reaches
+them, which is why an earlier version of that probe reported them as zero.
+`benchmarks/df_hess_bench.py` A/Bs the build round robin and tolerates a
+variant that **raises**, because at two of the four sizes measured GPU4PySCF's
+own function does; `benchmarks/df_hess_cutensor_limit.py` says where, with no
+SCF at all -- it walks shapes and asks whether `cutensor.createPlan` will take
+them; and `benchmarks/df_hess_krylov_probe.py` counts the Krylov cycles a CPHF
+actually takes (five) and measures the subspace upstream's 0.4-of-free-memory
+rule is reserving 31 GB for (0.37 GB).
 
 `benchmarks/response_anatomy.py` does the same for a polarizability and a TDA
 run -- use it before taking a response-property target from `instructions/06`,
@@ -757,6 +796,9 @@ starting point, not an optimum.
 | `FASTEJK2_OFF`, `FASTEJK2_NO_SCHEME`, `FASTEJK2_SHIFT` | hand the Hessian's second-derivative ERI stage back whole, or only its launch-scheme half; and the quartets-per-block halving (1 is what was measured) |
 | `FASTEJK2_KERNELS` | **opt in** to the lifted ip2 kernels, which are correct and measured not to pay -- the one switch here that is off by default |
 | `ELECTROLITES_LIBMYEJK2` | use a prebuilt copy of the second-derivative ERI library instead of building |
+| `FASTDFHESS_MAX_PLAN`, `FASTDFHESS_ARRANGE` | the DF Hessian's CPHF build: the largest intermediate handed to one cuTENSOR contraction (5e8 elements, measured -- past it `createPlan` refuses the contraction outright and GPU4PySCF cannot run the calculation at all), and which of `upstream` (default, and the measured best), `fused` or `blasvk` arranges the four contractions |
+| `FASTDFHESS_HOST`, `FASTDFHESS_KRYLOV_CYCLES` | whether the cderi goes to the host against a computed Krylov reserve (`auto`, default) or a fraction of free memory (upstream's is `0.4`), and how many cycles the reserve assumes -- five is what a CPHF measurably takes |
+| `FASTDFHESS_OFF`, `FASTDFHESS_JPASS`, `FASTDFHESS_BALANCE`, `FASTDFHESS_POOLMEM`, `FASTDFHESS_BLK`, `FASTDFHESS_DM_BATCH` | hand every CPHF build back; the Coulomb-only pass as BLAS or cuTENSOR; and the three shape knobs (`docs/README_fastdfhess.md` §3) |
 | `FASTXCFXC_MODE`, `FASTXCFXC_TIME` | `blocked` (default), `nokernel` or `grouped` for the XC response kernel -- the last is catalogue B4d as written and is the slowest of the three; and its per-stage timing split |
 
 ## License

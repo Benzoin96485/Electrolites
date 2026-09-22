@@ -110,6 +110,10 @@ ORIGINALS = [
     # tensor as double -- which does not fail, it returns a wrong answer
     ('fastdffp32', 'gpu4pyscf.df.df', 'DF._loop_orig'),
     ('fastdffp32', 'gpu4pyscf.df.hessian.rhf', '_get_jk_orig'),
+    # W8's: the DF Hessian's CPHF build.  `fastdffp32` wraps the same entry
+    # point for one line of it, so what this module saves is that wrapper and
+    # not upstream's function -- the two save slots are deliberately distinct
+    ('fastdfhess', 'gpu4pyscf.df.hessian.rhf', '_hess_get_jk_orig'),
 ]
 
 #: aliases that are known and deliberate: (holder, attribute) -> why

@@ -11,7 +11,9 @@ list (what changed, why, and the full tables); `docs/README_fastdfj.md` is the
 round that closed **W1**, which is where the biggest number on this page now
 is; `docs/README_fastdfgrad.md` closed **W3**, `docs/README_fastdfcderi.md`
 **W4**, `docs/README_fastdfblock.md` **W5**, `docs/README_fastdffp32.md`
-**W7**, and **W6** took two rounds --
+**W7**, `docs/README_fastdfhess.md` **W8** (whose result is that its own
+target cannot be made faster, and whose *finding* is W16, W17 and W18),
+and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
 `docs/CATALOGUE_06_STATUS.md` §2 row **A13** is where this sits in
@@ -222,6 +224,19 @@ arithmetic: `cudaHostAlloc`, which page-locks the host buffer at 2.09 GB/s
 and is 41.5 s of a 72.5 s 284-atom build.  Made 4.1x faster here; the
 remaining 10 s, the host store and `_decompose_j2c`'s latency are **W12**,
 **W11** and **W13**.
+
+**W8 is done, it is a capacity item rather than a speed one, and W16, W17
+and W18 are what it found.**  `df/hessian/rhf.py:_get_jk` — the fifth
+two-electron code path — turns out to be **78 % of an A100's fp64 peak**
+already and **15 % of the Hessian it sits in**, and three rearrangements of
+it were written and measured at 0.90x–1.00x.  What the round is for is that
+the function **does not run at all** past a certain shape: cuTENSOR refuses
+the plan for its dominant contraction with tens of GB free, so a 42-atom
+def2-TZVPP DF Hessian and a 113-atom def2-SVP one cannot be run by GPU4PySCF
+and can be by `electrolites/fastdfhess.py`.  The round also produced the
+first anatomy of a density-fitted Hessian in this repository, and that
+anatomy says the time is in three functions no entry on this page named
+(`docs/README_fastdfhess.md`).
 
 **W3 is done, and W10 is what it found.**  The DF gradient's two-electron
 derivative is 1.75x–2.59x faster and the gradient around it 1.24x–2.27x
@@ -801,17 +816,73 @@ tries it; and `DF.loop` allocates its two staging buffers **per call**
 prices at 6 % of the stream when the pool is warm and much more when it is
 not — that one is upstream's and is §5.8 and §5.11 again.
 
-### W8 — The DF Hessian's own CPHF build
+### W8 — The DF Hessian's own CPHF build — **done, and it is a capacity item, not a speed one**
+
+`electrolites/fastdfhess.py`, `tests/test_dfhess.py`,
+`benchmarks/df_hess_probe.py` (the anatomy),
+`benchmarks/df_hess_bench.py` (the A/B),
+`benchmarks/df_hess_krylov_probe.py` (the memory),
+`benchmarks/df_hess_cutensor_limit.py` (the plan boundary), write-up in
+`docs/README_fastdfhess.md`.
 
 `df/hessian/rhf.py:_get_jk` is a **fifth** two-electron code path: it builds J
 and K directly in the MO basis and does not go through `df_jk.get_jk`, so
-`fastdf` is not on it.  Same `(i,j,L)` expansion, same cuTENSOR contractions.
+`fastdf` is not on it.  This entry assumed there was a factor in it.  There
+is not, and the round found something else.
 
-It also moves the cderi to the host mid-run on purpose (`:1258-1273`, "Leave
-space for storing Krylov subspace vectors") — so `fastdf`'s item 4 would take
-back half of what it just freed.  Anyone working here should know that
-`FASTDF_RESIDENT_FRAC=0` is the setting for a DF Hessian until something
-smarter exists.
+**The function is already at the machine, and the entry never said how big it
+was.**  One call is 15.53 Tflop in **1015 ms** on one A100-SXM4-80GB —
+**15.2 TF/s of 19.5, 78 % of fp64 peak** — its dominant contraction at
+**81 %**, and each of its four contractions is within **1.14x** of a plain
+`dgemm` at its own shape, two of them *faster* than one.  §2's headline for
+`df_jk.get_jk` holds here too, and was reached independently.  Three
+rearrangements were written and measured: grouping the algebra by the
+perturbed density so the several-GB intermediate is written once and read
+once is **0.90x–0.94x**; giving the two contractions that write into `vk` one
+accumulator each in their own GEMM's layout is **0.91x–1.00x**; upstream's
+ordering through this module's loop is **0.97x–1.00x**.  All three are still
+runnable (`FASTDFHESS_ARRANGE`).
+
+**And it is 15 % of the Hessian it sits in** — 5.19 s of a 34.6 s 42-atom
+DF-B3LYP/def2-SVP Hessian, 6.3 % of a 22-atom def2-TZVPP one, 24 % after
+`patch_all()`.  Even deleting it is 1.18x.
+
+**What the round is for is that the function does not run past a certain
+shape.**  GPU4PySCF sizes the density batch from free memory alone and hands
+the whole batch to one cuTENSOR contraction; past about 5e8 output elements
+`cutensor.createPlan` refuses `Lpq,snqi->snpiL` outright with
+**`CUTENSOR_STATUS_NOT_SUPPORTED`**, raised out of `estimateWorkspaceSize`,
+so it is the *descriptor* that is rejected and free memory does not help.
+A **42-atom def2-TZVPP** DF Hessian dies there with 73.7 GB free on an 80 GB
+card and 34.0 GB free on a 40 GB one; a **113-atom def2-SVP** one dies with
+65.5 GB free.  Capping the batch and halving-and-retrying behind the cap
+makes both run: **4.05 s** and **110.3 s** per call, at 16.2 and 15.7 TF/s.
+The cap costs **0.7 %** at 42 atoms on an 80 GB card and is a small *gain* on
+a 40 GB one.
+
+**The "Leave space for storing Krylov subspace vectors" comment
+(`:1258-1273`) is guarding 0.37 GB with 31 GB.**  Measured, a CPHF converges
+in **five** Krylov cycles and its subspace is 0.37 GB at 42 atoms, against a
+cderi of 0.99 GB, a whole-Hessian peak of about 2 GB, and a
+0.4-of-free-memory reserve of 31 GB.  The module computes the reserve
+instead.  **And the residency does not matter for the exchange call at all**:
+with the tensor forced onto the host that call is **1017 ms against 1024**
+device-resident, because the prefetch hides the stream behind the
+contractions (§3.3 again).  It matters **9.0x** for a Coulomb-only call
+(81.8 ms against 9.1), which is what a pure functional's CPHF takes —
+so this entry's standing advice, *`FASTDF_RESIDENT_FRAC=0` is the setting for
+a DF Hessian*, is right about the memory and irrelevant to the speed of a
+hybrid's CPHF.
+
+**Left**: the plan boundary is a measured number with no model behind it —
+bisected, the largest planable `dm_batch` is 530 at (nao 430, nocc 92), 224 at
+(478, 39), 22 at (1007, 92) and 8 at (1123, 226), which is not a clean
+function of the shape; and a partially resident cderi for the Coulomb-only
+branch, where the 9.0x is.
+
+**What the round found rather than closed is W16, W17 and W18**: the first
+anatomy of a density-fitted Hessian in this repository says the time is in
+three functions no entry on this page names.
 
 ### W9 — The pure-functional DF Coulomb build
 
@@ -955,6 +1026,64 @@ shell-granular GEMM.
   an afternoon and this item is not.
 * The AO-permutation machinery in `electrolites/_dfblock.py` is reusable here:
   it is the half of the problem that already exists and is tested.
+
+### W16 — `nr_rks_fxc_mo`, the CPHF's grid half, which `fastxcfxc` is not on
+
+*(Found by W8's anatomy, which is the first profile of a density-fitted
+Hessian in this repository.)*
+
+`electrolites/fastxcfxc.py` replaces `dft/numint.py:nr_rks_fxc`, which is what
+a TDDFT or polarizability response solve calls.  A **Hessian's** CPHF calls
+`hessian/rks.py:nr_rks_fxc_mo` — a different function, in a different module,
+with the MO-basis transformation folded in — and that row does not move under
+`patch_all()`: **5.36 s unpatched, 5.40 s patched**, on a 42-atom
+DF-B3LYP/def2-SVP Hessian.  It is then the **single largest stage of a
+patched density-fitted Hessian, 25 %** of 21.24 s.
+
+* **Do**: read `hessian/rks.py:nr_rks_fxc_mo` against `dft/numint.py:nr_rks_fxc`
+  first — `fastxcfxc`'s kernel may transplant, in which case this is a
+  binding job and not a kernel one, which is the shape `fastxcnlc`'s
+  `_DFHF.get_veff` finding had (§1).  The unrestricted twin is
+  `hessian/uks.py`'s.
+* **Success**: the row moves by what `fastxcfxc` is worth elsewhere
+  (2.1x–3.7x inside a response run), i.e. a patched 42-atom DF Hessian at
+  about 18 s rather than 21.2.
+* **Falsified if**: the two functions differ in more than the basis the
+  density is expressed in — the `_mo` variant evaluates the perturbed density
+  from `mo1` on the grid rather than from a density matrix, and if that is
+  where its time is then `fastxcfxc`'s kernel is not the thing to move.
+
+### W17 — `df/hessian/rhf.py:_jk_energy_per_atom`, the DF Hessian's ip2 term
+
+*(Also from W8's anatomy.)*
+
+**21 %** of a patched 42-atom DF Hessian (4.50 s of 21.24), and **13 %**
+unpatched.  It is the two-electron half of `partial_hess_elec` and it is a
+**sixth** code path: it is not `df/grad/rhf.py:_jk_energy_per_atom`, which
+`fastdfgrad` replaces (that one is the ip1 gradient term), and it is not
+`hessian/rhf.py:_partial_ejk_ip2`, which `fastejk2` replaces (that one is the
+direct path's).  Nothing in this repository is on it.
+
+* **Do**: profile it the way W3 profiled the gradient's — stage by stage, and
+  do not assume the contraction is the cost.  `fastdfgrad`'s two findings
+  (integrals the SCF's cderi already holds, and the `nsp_per_block*4` launch
+  constant) both apply to a function of this shape and neither was
+  predictable from the source.
+* **Success**: the row moves by what `fastdfgrad` was worth on its sibling,
+  1.75x–2.59x on the function.
+* **Falsified if**: the derivative integrals dominate and are already at the
+  machine, which is what `docs/README_fastdfgrad.md` found for the
+  contraction and not for the kernel.
+
+### W18 — `df/hessian/rhf.py:_get_veff`, the DF Hessian's h1 term
+
+*(Also from W8's anatomy.)*
+
+**10 %** of a patched 42-atom DF Hessian (2.13 s), the two-electron half of
+`make_h1`, and a **seventh** code path.  Smaller than W17 and of the same
+shape — both build a density-fitted quantity per atom out of
+`Int3c2eOpt` — so the two are one project rather than two, and W17 is the
+half worth measuring first.
 
 ### Not on this list
 
