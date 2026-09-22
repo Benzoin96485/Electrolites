@@ -13,6 +13,18 @@ component (15 SCF + gradient pairs in separate processes), **1.0e-14** relative
 on an exchange matrix and **2.1e-14** on a fused Coulomb one at any number of
 densities, and **6.2e-11** on a whole analytic Hessian.
 
+If you have not written GPU code, start with the
+[Chinese guided tour](docs/INTRO_FROM_HF.md). It starts from Hartree–Fock SCF
+and J/K construction, explains GPU concepts with concrete examples, and follows
+the optimizations through XC, VV10, gradients, Hessians and response properties.
+It distinguishes rearrangements of the same calculation from mixed-precision
+and error-budgeted approximations, and explains coverage, compilation costs and
+benchmark interpretation. A [five-chapter companion](docs/intro/README.md) expands
+the arithmetic, architecture dependence, XC data flow, error bounds, response
+equations and AO screening, with links to the corresponding implementations.
+The per-module `docs/README_*.md` files provide the
+detailed measurements and implementation notes.
+
 On one A100-SXM4-40GB, GPU4PySCF 1.8.1, B3LYP-D3(BJ)/6-31G\*, level-3 grids,
 `OMP_NUM_THREADS=32`:
 

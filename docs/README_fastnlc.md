@@ -1,5 +1,7 @@
 # fastnlc — a faster VV10 non-local-correlation build for GPU4PySCF
 
+> **Reading note:** For a derivation and the limits of the trimming estimate, see the [error-bound companion chapter](intro/04-error-and-response.md). The numerical bounds below are historical order-of-magnitude estimates: a rigorous fixed-density bound must use the actual VV10 parameters, actual dropped weight, and both inner/outer trimming where applicable. Current `_trim` accepts a dropped weight up to `4*BUDGET` after threshold ties; the budget alone does not establish a bound on potential matrices or response properties.
+
 ωB97M-V, ωB97X-V, B97M-V and VV10 add a non-local correlation term whose
 potential is a double sum over the quadrature grid,
 
