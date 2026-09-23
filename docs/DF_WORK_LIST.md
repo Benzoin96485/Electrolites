@@ -265,6 +265,23 @@ integrals the SCF's cderi already holds, and a launch constant.  What it could
 32.0 GB there, and neither upstream nor this repository batches it.  That is
 **W10**.
 
+**W10 is done, and W21 is what it found.**  The array is 37.7 GB rather than
+32.0 — the allocation is on the Cartesian sorted auxiliary dimension, not the
+spherical one — and GPU4PySCF holds **two** of them.  Neither is necessary:
+the second is never allocated, because the only step that needs the whole
+auxiliary index at once is the metric multiply and that one slices the
+*occupied* index and runs in place; and the first goes to page-locked host
+memory when it still will not fit.  The **284-atom DF-B3LYP gradient now
+runs**, 68.8 s whole and 64.5 s for the two-electron derivative that is 96 %
+of it, where GPU4PySCF cannot run it at all.  What the item priced in —
+extra passes over the cderi — is not needed at all, because the array was
+already built a block at a time and only ever *held* whole; slicing is free
+(0.991x at eight slices) and what costs is the host store (1.087x at 42
+atoms, 1.294x at 113, and exactly four PCIe traversals plus one
+page-locking).  `docs/README_fastdfgradoo.md`.  Its finding is that freeing
+the array makes the ip1 loop's block bigger and re-opens the cuTENSOR plan
+wall **W8** hit from the other side, which is **W21**.
+
 **W6 is done, in two rounds, and the second contradicts the first's
 headline.**  Robust (Dunlap) fitting is mandatory — non-robust pair-atomic
 fitting collapses variationally by **16.5 Eh** on butane — and the
@@ -980,29 +997,67 @@ size it feeds.
 
 **What it found rather than closed is W19 and W20.**
 
-### W10 — Batch the DF gradient's `(naux, nocc, nocc)` array
+### W10 — Batch the DF gradient's `(naux, nocc, nocc)` array — **done**
 
 *(Found by W3, which could not run at 284 atoms because of it.)*
 
-`df/grad/rhf.py:101` allocates `j3c_oo = cp.empty((naux, nocc, nocc))` and
-`_jk_energy_per_atom` never batches it.  At PfPMT/def2-SVP that is **32.0 GB**
-on a 40 GB card (naux 13365, nocc 547) and the function dies before it
-reaches an integral.  `fastdfgrad`'s `dm_oo` is the same array and hits the
-same wall.  This is the only thing standing between the density-fitted
-gradient and the size the rest of this page is written around — the SCF at
-284 atoms runs (§3.3), its gradient does not.
+`electrolites/fastdfgrad.py` (`_OOStore`, `_metric_pass`, `_fill_from_j3c`),
+`tests/test_dfgrad.py` §5, `benchmarks/df_grad_oo_sweep.py`, write-up in
+`docs/README_fastdfgradoo.md`.
 
-* **Do**: slice the occupied index.  Both loops are already batched over the
-  auxiliary index; the missing one is `i`, and the ip1 kernel takes a
-  pseudo-density on the pair list that is a sum over `i` — so `nocc` slices
-  accumulate into the same `compressed` buffer with no extra integral work,
-  only extra passes over the cderi (or over `eval_j3c`, unpatched).
-* **Success**: a 284-atom DF-B3LYP gradient that completes on one A100, with
-  the per-atom derivative checked against the 113-atom route's tolerance.
-* **Falsified if**: the extra passes cost more than the slicing saves at 113
-  atoms, i.e. the batched version is slower where the unbatched one fits.
-  Guard it with a size threshold the way `fastdf`'s `SYRK_MIN_NAO` is
-  guarded, and measure the threshold rather than guessing it.
+**The success criterion is met.**  A 284-atom DF-B3LYP gradient completes on
+one A100-SXM4-40GB: the whole analytic gradient in **68.8 s**, of which
+`jk_energy_per_atom` is 66.1 s — **96 %**, which is the 97 % §1 measures on
+taxol and is why this item was the only thing in the way.  GPU4PySCF cannot
+run it at all.  Priced against the same function without the cderi reuse
+(itself only runnable because of this round), **80.8 s against 64.5**, and
+the two agree to 2.0e-6 Eh/Bohr on an `|ejk|max` of 52.9 — **3.8e-8
+relative**, which is where the 1.5e-9 at 42 atoms and 7.0e-8 at 113 of
+`docs/README_fastdfgrad.md` §5 were heading.
+
+**And the array is bigger than this entry said.**  32.0 GB is
+`13365 × 547² × 8`, and 13365 is `mf.with_df.naux`, the *spherical*
+auxiliary dimension.  The allocation is on `int3c2e_opt.auxmol.nao`, the
+**Cartesian sorted** one, which is **15762**: `j3c_oo` is **37.7 GB**,
+`dm_oo` is a second one, and what `_jk_energy_per_atom` asks a 40 GB card
+for is **75.5 GB**.
+
+**What the item got wrong is the useful part.**  It prices the slicing at
+"extra passes over the cderi", and there are none.  The array is *built* one
+auxiliary block at a time in both routes — that is what the block loop
+already is — and it was only ever *held* whole.  The one step that needs the
+whole auxiliary index at once is `coef @ oo`, and that one slices the
+**occupied** index and runs **in place**.  So the second copy is gone
+unconditionally, the ip1 loop is untouched, and the slicing is free: one
+slice against eight is 1.000x at 42 atoms and 0.991x at 113.
+
+**The falsification therefore does not fire, and the threshold it asks for
+is not the one that was needed.**  What costs is not the slicing but *where
+the array lives*: a host-resident store is 1.087x at 42 atoms and 1.294x at
+113, and that is exactly four traversals of it over PCIe plus one
+page-locking (47.0 ms predicted against 45.3 measured, 721 against 719.5).
+Walked up a ballast ladder on taxol until the device store would no longer
+allocate, the device store is ahead at **every** rung — 1.34x with 22 GB
+withheld, 1.18x with 24, 1.04x with 24.5 — so there is no crossover to place
+a threshold at.  `FASTDFGRAD_OOFRAC` is set at 0.8 and the thing that decides
+the hard cases is that the allocation is attempted and falls back to the host
+on `OutOfMemoryError`.
+
+**Three things only the host store needs, and all three pay**: the
+double-buffered prefetch under the ip1 kernel (1.029x / 1.038x), page-locking
+at all (1.077x / 1.206x), and page-locking with `cudaHostRegister` rather
+than `cudaHostAlloc` (**1.200x / 1.437x**) — **W12**'s 8.6 GB/s against 2.09
+turning up in a second module, on an array a thirtieth the size of the one it
+was measured on.
+
+**And what the round found rather than closed is W21.**  Freeing the second
+array makes `mem_avail` larger, the ip1 loop's block bigger, and the gradient
+reachable by the *same* cuTENSOR plan wall `docs/README_fastdfhess.md` found
+on the DF Hessian: `CUTENSOR_STATUS_NOT_SUPPORTED` with tens of GB free.  A
+halve-and-retry around the ip1 loop is the fix, and pinning the block says
+why it has to be: the refusal does not depend on free memory and is **not
+monotonic in the block** — 1096 is refused where 1240, 1456, 2048 and 3072
+are accepted — so no element cap of the kind W8 carries can describe it.
 
 ### W11 — The host store, and the thread it runs on
 
@@ -1240,6 +1295,48 @@ auxiliary shell on every cycle, 330 612 × 5 817 of them at 284 atoms.
   need a two-tier cache.  Measure the pair count first: a probe over an SCF
   trajectory is an afternoon and this item is not.
 
+### W21 — Two modules have now hit the same cuTENSOR plan wall
+
+*(Found by W8 on the DF Hessian's CPHF build and by W10 on the DF gradient's
+ip1 loop, from opposite directions.)*
+
+`cutensor.createPlan` answers `CUTENSOR_STATUS_NOT_SUPPORTED` with tens of GB
+free, and the call fails rather than running slowly.
+`docs/README_fastdfhess.md` is where it stops a 42-atom def2-TZVPP DF Hessian
+and a 113-atom def2-SVP one from running at all; `docs/README_fastdfgradoo.md`
+§4.1 is where it reappears in the gradient's `contract('iqr,pi->pqr')` the
+moment W10 stops reserving for an array that is no longer allocated and the
+block grows.  W8 guards it with a measured element cap and a halve-and-retry;
+W10 carries only the retry, because it measured the boundary and **a cap
+cannot describe it**.
+
+**What the measurement says** (taxol/def2-SVP on an 80 GB card, the ip1
+block pinned with `FASTDFGRAD_BLK`, `docs/README_fastdfgradoo.md` §4.1):
+
+* it does **not** depend on free memory — a block of 1096 is refused at 70.3,
+  62.2, 54.2, 50.2 and 46.2 GB free alike, and 1240 is accepted at all five;
+* it is **not monotonic in the block** — 8, 128, 512, 1240, 1456, 2048 and
+  3072 are all accepted and only **1096** is refused, and the largest
+  accepted puts **4.3e9 elements** in the output, twice 2³¹;
+* so no threshold of the form "keep the output under N elements" describes
+  it, and what clears a refusal is *changing the extent*, which is what
+  halving does.
+
+* **Do**: re-run `benchmarks/df_hess_cutensor_limit.py` with the block pinned
+  and the memory varied independently, the way §4.1 of the gradient write-up
+  does, and find out whether W8's `MAX_PLAN_ELEMENTS = 5e8` is a real
+  boundary or a coincidence of the shapes it was bisected on.  If it is a
+  coincidence, the cap should go and the retry is the whole answer in both
+  modules.
+* **Success**: one statement about what cuTENSOR actually refuses, and one
+  fewer constant in the repository.  It is also the first thing to re-run on
+  a different cuTENSOR or a different card — §5 of this page has a rule about
+  constants measured on one machine.
+* **Falsified if**: the refused extents turn out to be reproducible and
+  predictable after all (1096 = 2³·137, and a large prime factor in the
+  extent is the obvious thing to test next), in which case a cheap test
+  beats a retry and both modules should carry it.
+
 ### Not on this list
 
 **Seminumerical exchange (sn-K / COSX)**, which would avoid the cderi
@@ -1369,11 +1466,22 @@ python benchmarks/coverage_probe.py --xyz ... --density-fit [--only-dfj]
 python tests/test_dfj.py [--basis def2-tzvpp]           # W1's correctness bar
 python benchmarks/dfj_probe.py    --xyz ... --scf --scf-ablate   # W1
 
-python tests/test_dfgrad.py [--basis def2-tzvpp] [--no-fd]       # W3's bar
+python tests/test_dfgrad.py [--basis def2-tzvpp] [--no-fd]       # W3 and W10
 python benchmarks/df_grad_probe.py --xyz ... --whole             # W3's profile
 python benchmarks/df_grad_bench.py --xyz ... --whole --with-rebuild
 python benchmarks/df_grad_ip1_sweep.py --xyz ...   # the launch configuration
 python benchmarks/df_grad_metric_probe.py --xyz ... [--omega 0.3]
+
+python benchmarks/df_grad_oo_sweep.py --xyz ... --reps 2 --extras   # W10
+python benchmarks/df_grad_oo_sweep.py --xyz ... --stores device,host \
+    --slices auto --ballast 0,8,14,17,19,20.5,21.5,22,23,24,24.5
+    # the threshold, measured by withholding memory rather than guessed
+python benchmarks/df_grad_bench.py --xyz benchmarks/molecules/PfPMT.xyz \
+    --charge -1 --basis def2-svp --cycles 1 --reps 1 \
+    --variants stock,fastdfgrad --with-rebuild      # the 284-atom gradient
+python benchmarks/df_grad_bench.py --xyz ... \
+    --variants stock,fastdfgrad,'old sizing','old fill buf'
+    # the two ablations that account for W10 being faster than W3's table
 
 python tests/test_dfcderi.py [--basis def2-tzvpp]        # W4's bar
 python benchmarks/df_cderi_probe.py --xyz ... [--cpu-cderi] [--no-check]
@@ -1456,6 +1564,17 @@ GPU4PySCF's own build would read the narrow tensor as a wide one.
 the top of `electrolites/fastdfj3c.py`.  The last two are the two ideas
 `docs/README_fastdfj3c.md` §8 measured and rejected, kept runnable rather than
 described.
+
+`fastdfgrad`'s switches (`FASTDFGRAD_OFF`, `FASTDFGRAD_CDERI`,
+`FASTDFGRAD_JPAIR`, `FASTDFGRAD_SPMULT`, `FASTDFGRAD_GOUT`,
+`FASTDFGRAD_INTOPT`, and W10's `FASTDFGRAD_OOSTORE`, `FASTDFGRAD_OOFRAC`,
+`FASTDFGRAD_OOSLICE`, `FASTDFGRAD_OOPREFETCH`, `FASTDFGRAD_OOPIN`,
+`FASTDFGRAD_J3CBATCH`, `FASTDFGRAD_OOSIZING`, `FASTDFGRAD_FILLBUF`,
+`FASTDFGRAD_BLK`) are
+listed with their meanings at the top of `electrolites/fastdfgrad.py`.  The
+last two are ablations rather than settings: they put back what W3's code did
+and are how `docs/README_fastdfgradoo.md` §5 accounts for the difference
+between the two rounds.
 
 `fastdf`'s switches (`FASTDF_OFF`, `FASTDF_STEP1`, `FASTDF_STEP2`,
 `FASTDF_JPASS`, `FASTDF_SYRK_MIN_NAO`, `FASTDF_BLK`, `FASTDF_RESIDENT_FRAC`,

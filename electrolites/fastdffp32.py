@@ -19,7 +19,7 @@ cannot be switched on at all.  Three do:
    misread the tensor.
 2. ``df/df.py:DF.loop`` -- the block iterator **everything else** goes
    through: the DF gradient's two-electron derivative
-   (``electrolites/fastdfgrad.py``'s ``_rhok_from_cderi``) and the DF
+   (``electrolites/fastdfgrad.py``'s ``_fill_from_cderi``) and the DF
    Hessian's own MO-basis CPHF build (``df/hessian/rhf.py:_get_jk``, the
    fifth two-electron path, which is ``docs/DF_WORK_LIST.md`` W8).  Patched
    here to widen each block, which is the same buffer-allocated-once

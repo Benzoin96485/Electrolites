@@ -38,6 +38,17 @@ ap.add_argument('--with-rebuild', action='store_true',
                 help='also report the untimed cderi rebuild')
 ap.add_argument('--whole', action='store_true',
                 help='also time the whole gradient per variant')
+ap.add_argument('--grad-verbose', type=int, default=0,
+                help="the gradient object's verbosity.  5 prints the stage "
+                     'timers inside `_ejk`, which is the only stage table '
+                     'available at a size where the traced clone in '
+                     'df_grad_probe.py cannot allocate')
+ap.add_argument('--oostore', default='auto',
+                help="where the (naux, nocc, nocc) array goes -- 'auto', "
+                     "'device' or 'host'.  docs/DF_WORK_LIST.md W10")
+ap.add_argument('--ooslice', type=int, default=0,
+                help='occupied columns per slice of the metric pass; 0 takes '
+                     'as many as fit')
 ap.add_argument('--variants', default='',
                 help='comma separated subset of the variants below, for a '
                      'system where the untimed cderi rebuild between rows is '
@@ -53,6 +64,9 @@ import gpu4pyscf                                              # noqa: E402
 from gpu4pyscf import dft                                     # noqa: E402
 from electrolites import fastdfgrad                           # noqa: E402
 
+fastdfgrad._OOSTORE = a.oostore
+fastdfgrad._OOSLICE = a.ooslice
+
 _sync = cp.cuda.Stream.null.synchronize
 
 mol = build_mol(a)
@@ -67,7 +81,7 @@ mf.kernel()
 dm = mf.make_rdm1()
 omega, alpha, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
 g = mf.nuc_grad_method()
-g.verbose = 0
+g.verbose = a.grad_verbose
 
 cderi = mf.with_df._cderi[cp.cuda.Device().id]
 tag = (f'{a.xyz.rsplit("/", 1)[-1]}/{a.basis}/{a.auxbasis or "auto"}/{a.xc}')
@@ -76,12 +90,19 @@ print(f'[{tag}] natm={mol.natm} nao={mol.nao} naux={mf.with_df.naux} '
       f'on_gpu={isinstance(cderi, cp.ndarray)} '
       f'gpu4pyscf={gpu4pyscf.__version__}', flush=True)
 
+_BASE = dict(_JPAIR=False, _OOSIZING='new', _FILLBUF=True)
 VARIANTS = (
-    ('stock', dict(_CDERI=False, _JPAIR=False, _INTOPT=False, _SPMULT=4)),
-    ('cderi only', dict(_CDERI=True, _JPAIR=False, _INTOPT=False, _SPMULT=4)),
-    ('+ spmult', dict(_CDERI=True, _JPAIR=False, _INTOPT=False, _SPMULT=1)),
-    ('fastdfgrad', dict(_CDERI=True, _JPAIR=False, _INTOPT=True, _SPMULT=1)),
-    ('+ jpair (off)', dict(_CDERI=True, _JPAIR=True, _INTOPT=True, _SPMULT=1)),
+    ('stock', dict(_BASE, _CDERI=False, _INTOPT=False, _SPMULT=4)),
+    ('cderi only', dict(_BASE, _CDERI=True, _INTOPT=False, _SPMULT=4)),
+    ('+ spmult', dict(_BASE, _CDERI=True, _INTOPT=False, _SPMULT=1)),
+    ('fastdfgrad', dict(_BASE, _CDERI=True, _INTOPT=True, _SPMULT=1)),
+    # the two ablations, both off in the shipped default
+    ('+ jpair (off)', dict(_BASE, _CDERI=True, _INTOPT=True, _SPMULT=1,
+                           _JPAIR=True)),
+    ('old sizing', dict(_BASE, _CDERI=True, _INTOPT=True, _SPMULT=1,
+                        _OOSIZING='upstream')),
+    ('old fill buf', dict(_BASE, _CDERI=True, _INTOPT=True, _SPMULT=1,
+                          _FILLBUF=False)),
 )
 if a.variants:
     want = [v.strip() for v in a.variants.split(',')]
@@ -90,7 +111,12 @@ if a.variants:
         raise SystemExit(f'unknown variant(s) {unknown}; '
                          f'known: {[n for n, _ in VARIANTS]}')
     VARIANTS = tuple((n, f) for n, f in VARIANTS if n in want)
-    assert VARIANTS[0][0] == 'stock', 'the first variant has to be `stock`'
+    if VARIANTS[0][0] != 'stock':
+        # a system where `stock` cannot be run at all -- or where the untimed
+        # cderi rebuild between rows is most of the wall clock -- still has a
+        # baseline, it is just the first row rather than upstream's
+        print(f'[note] `stock` is not in --variants; ratios and the '
+              f'agreement column are against `{VARIANTS[0][0]}`', flush=True)
 R = {name: {} for name, _ in VARIANTS}
 REBUILD = []
 ANS = {}
@@ -132,7 +158,11 @@ def timed(fn):
 
 
 def jk_call():
-    return g.jk_energy_per_atom(dm, j_factor=1, k_factor=hyb or 1., hermi=1)
+    # `verbose` explicitly, not `g.verbose`: the method takes its logger from
+    # this argument and falls back to `mol.verbose`, which is 0 here, so
+    # setting it on the gradient object alone prints nothing
+    return g.jk_energy_per_atom(dm, j_factor=1, k_factor=hyb or 1., hermi=1,
+                                verbose=a.grad_verbose or None)
 
 
 # one untimed pass of every variant first: the first call in a process pays a
@@ -156,7 +186,8 @@ for rep in range(a.reps):
             R[name].setdefault('grad', []).append(dt)
             ANS[name + '/grad'] = de
 
-base = min(R['stock']['jk'])
+BASE = VARIANTS[0][0]
+base = min(R[BASE]['jk'])
 print(f'\n{"variant":14s} {"jk_energy_per_atom":>20s} {"":>8s}'
       + (f' {"whole gradient":>16s} {"":>8s}' if a.whole else ''))
 for name, _ in VARIANTS:
@@ -164,21 +195,37 @@ for name, _ in VARIANTS:
     line = f'{name:14s} {t*1e3:17.1f} ms {base/t:7.3f}x'
     if a.whole:
         tg = min(R[name]['grad'])
-        line += f' {tg*1e3:13.1f} ms {min(R["stock"]["grad"])/tg:7.3f}x'
+        line += f' {tg*1e3:13.1f} ms {min(R[BASE]["grad"])/tg:7.3f}x'
     print(line, flush=True)
 
-print(f'\nagreement against stock, per atom and component:')
+print(f'\nagreement against {BASE}, per atom and component:')
 for name, _ in VARIANTS[1:]:
-    print(f'  {name:14s} {float(np.abs(ANS[name] - ANS["stock"]).max()):.3e} '
-          f'Eh/Bohr   (|ejk|max {np.abs(ANS["stock"]).max():.3e})', flush=True)
+    print(f'  {name:14s} {float(np.abs(ANS[name] - ANS[BASE]).max()):.3e} '
+          f'Eh/Bohr   (|ejk|max {np.abs(ANS[BASE]).max():.3e})', flush=True)
     if a.whole:
         print(f'  {name + "/grad":14s} '
-              f'{float(np.abs(ANS[name + "/grad"] - ANS["stock/grad"]).max()):.3e} '
+              f'{float(np.abs(ANS[name + "/grad"] - ANS[BASE + "/grad"]).max()):.3e} '
               f'Eh/Bohr', flush=True)
 
 if a.with_rebuild and REBUILD:
     print(f'\ncderi rebuild (untimed above, the SCF pays it): '
           f'{min(REBUILD):.3f} s, {len(REBUILD)} of them', flush=True)
+
+st = fastdfgrad.stats()
+if st['j3c_batched']:
+    # at a size where GPU4PySCF's own function cannot allocate its two dense
+    # (naux, nocc, nocc) arrays, the `stock` row is *this* module's batched
+    # clone of that function rather than the function -- same loop, same
+    # integrals, one array instead of two.  Saying so, because a column
+    # labelled `stock` that is not upstream's code is the kind of thing
+    # docs/DF_WORK_LIST.md §5 is a list of.
+    print(f'\n[note] {st["j3c_batched"]} call(s) ran the batched clone of '
+          f'GPU4PySCF\'s first loop: at this size upstream\'s own function '
+          f'cannot allocate. The `stock` row is that clone.', flush=True)
+if st['oo_host']:
+    print(f'[note] the (naux, nocc, nocc) array was host-resident on '
+          f'{st["oo_host"]} call(s), {st["oo_gb"]:.2f} GB, '
+          f'{st["oo_slices"]} metric slice(s).', flush=True)
 
 print(f'\nstats: {fastdfgrad.stats()}', flush=True)
 print('RESULT ' + json.dumps(dict(

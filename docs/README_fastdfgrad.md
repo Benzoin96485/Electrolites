@@ -67,6 +67,11 @@ The profile answers both at once, and the hypothesis is the one that loses.
   `j3c_oo` is a dense `(naux, nocc, nocc)` array and that is **32.0 GB**
   there.  The SCF at the same size runs; its gradient does not.  §6.2, and
   `docs/DF_WORK_LIST.md` **W10**.
+  *(**Taken since**, and it does run: `docs/README_fastdfgradoo.md`.  That
+  round also corrects the size — the allocation is on the Cartesian sorted
+  auxiliary dimension, not the spherical one, so the array is 37.7 GB and
+  upstream holds two of them.  The tables in §4 below moved with it, and §4.5
+  says by how much.)*
   What separates them is round-off in an ill-conditioned fitting metric, and
   §5 shows that merely *associating* the metric contraction the other way
   round on upstream's own `j3c_oo` moves the answer by as much.
@@ -330,7 +335,7 @@ two-electron derivative is 0.9 s of a 3.4 s gradient rather than 0.9 s of
 penicillin rows**, and their order flips between the per-call and the
 whole-gradient column at def2-TZVPP (1260.7/1756.0 against 1314.7/1650.6).
 Reusing the SCF's `Int3c2eOpt` cannot cost anything — it skips a rebuild —
-but it changes what the memory pool holds when `_ejk_from_rhok` asks
+but it changes what the memory pool holds when `_ejk` asks
 `get_avail_mem` how much is free, and therefore the block size it picks.  The
 honest reading of that pair is "1.14x at 42 atoms/def2-SVP, nothing to speak
 of past it", which is what a fixed setup cost against a growing term should
@@ -550,6 +555,11 @@ allocates `j3c_oo` as a dense `(naux, nocc, nocc)` array, which is
 
     13365 × 547 × 547 × 8 B  =  32.0 GB
 
+*(**Corrected since.**  13365 is `mf.with_df.naux`, the spherical auxiliary
+dimension; the allocation is on `int3c2e_opt.auxmol.nao`, the Cartesian
+sorted one, which is 15762.  The array is **37.7 GB** and there are two of
+them — `docs/README_fastdfgradoo.md` §4.)*
+
 on a 40 GB card, and dies a few lines later in `cp.asarray(auxmol.ctr_coeff)`
 with `cudaErrorMemoryAllocation` (`df/grad/rhf.py:116`).  This module needs
 the same array — `dm_oo` is exactly it — so it dies in the same place.  The
@@ -566,6 +576,17 @@ with one ip1 launch per slice — is a contained change and is the obvious next
 item.  It is recorded on the work list rather than done here, because it is
 the whole of what stands between this path and the 284-atom case the rest of
 `docs/DF_WORK_LIST.md` is written around.
+
+> **Done, in `docs/README_fastdfgradoo.md`, and not quite that way.**  One ip1
+> launch per slice would have cost one pass of the derivative kernel per
+> slice, which is 52–59 % of the function each time.  It is not needed: the
+> array is *built* one auxiliary block at a time already, and the only step
+> that needs the whole auxiliary index is the metric multiply — which slices
+> the occupied index and runs **in place**, so the second array is never
+> allocated and the ip1 loop is untouched.  Past that the array goes to
+> page-locked host memory.  At 284 atoms the gradient then runs, at **64.5 s**
+> against 80.8 s for the same function without the cderi reuse, and GPU4PySCF
+> still cannot run it at all.
 
 ### 6.3 What is left
 

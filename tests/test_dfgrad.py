@@ -25,7 +25,15 @@ function, in the same process, on the same converged density:
     it -- which is the only test here that can say the patched answer is not
     merely *close to* upstream's but closer to the derivative of the energy;
   * **§4** the declines, because a module that silently computed the wrong
-    thing on an uncovered case would pass §2.
+    thing on an uncovered case would pass §2;
+  * **§5** the store **W10** put that array in -- the raw-pointer round trip
+    on shapes the molecules here do not produce, and then the gradient
+    through every combination of the two knobs, including the batched clone
+    of GPU4PySCF's own first loop that the route with no cderi to reuse
+    takes.  A host-resident store is a second CUDA stream and a `cudaMemcpy`
+    per spin, and the failure mode is a *race*: the first version of it read
+    the array back before the metric pass had finished writing it and was
+    wrong by 1e-2, which nothing but an element-wise check finds.
 
     python tests/test_dfgrad.py
     python tests/test_dfgrad.py --basis def2-tzvpp
@@ -34,6 +42,7 @@ function, in the same process, on the same converged density:
 Needs one GPU.
 """
 import argparse
+import os
 import sys
 
 import numpy as np
@@ -266,6 +275,150 @@ declined = fastdfgrad.stats()['declined'] - before
 check('  only_dfj gradient is declined, not answered',
       float(declined == 0), 0.)
 print(f'  [|de| max {np.abs(de_dfj).max():.6f}]', flush=True)
+
+# ---------------------------------------------------------------------------
+print('\n=== 5. the store W10 put the (naux, nocc, nocc) array in ===',
+      flush=True)
+# `_OOStore` is the only thing in the module that knows which side of the PCIe
+# link that array is on, and every one of its transfers is raw pointer
+# arithmetic -- one `cudaMemcpy` per spin for an auxiliary row slab and one
+# `cudaMemcpy2D` per spin for a slice of the occupied index.  Nothing about a
+# wrong offset there shows up as anything but a wrong gradient, and the shapes
+# that break it are the ones the molecules below do not produce: two spin
+# channels, and a store whose allocated row count is larger than the number of
+# rows actually written (which is what the fitting dimension of the cderi is,
+# whenever the auxiliary basis is Cartesian on one side and spherical on the
+# other).  So the round trip is checked directly first.
+rng = np.random.default_rng(0)
+for nset, nrows, used, nocc in ((1, 7, 7, 5), (2, 7, 7, 5), (2, 9, 6, 4),
+                                (1, 4, 3, 11)):
+    ref = cp.asarray(rng.standard_normal((nset, used, nocc, nocc)))
+    for host in (False, True):
+        st = fastdfgrad._OOStore(nset, nrows, nocc, host)
+        for a0 in range(0, used, 2):                   # written in row slabs
+            a1 = min(used, a0 + 2)
+            slab = st.out_rows(a0, a1, cp.empty(nset * 2 * nocc * nocc))
+            slab[:] = ref[:, a0:a1]
+            st.commit_rows(a0, a1, slab)
+        back = cp.empty((nset, used, nocc, nocc))
+        for a0 in range(0, used, 3):                   # read back in others
+            a1 = min(used, a0 + 3)
+            back[:, a0:a1] = st.read_rows(a0, a1, cp.empty(nset * 3 * nocc * nocc))
+        e_rows = float(cp.abs(back - ref).max())
+        cols = cp.empty((nset, used, nocc, nocc))
+        for c0 in range(0, nocc, 2):                   # and in column slices
+            c1 = min(nocc, c0 + 2)
+            cols[:, :, c0:c1] = st.read_cols(
+                c0, c1, used, cp.empty(nset * used * 2 * nocc))
+        e_cols = float(cp.abs(cols - ref).max())
+        st.close()
+        check(f'  round trip nset={nset} rows={used}/{nrows} nocc={nocc} '
+              f'{"host" if host else "device"}', max(e_rows, e_cols), 0.)
+
+# and then the gradient itself, through every combination of the two knobs.
+# The `j3c` rows are our batched clone of GPU4PySCF's own first loop: it is the
+# same arithmetic in the same order, so it is checked against a much tighter
+# tolerance than the reuse is -- anything above round-off there is a batching
+# bug, not a conditioning one.
+STORE_CASES = [
+    ('device, one slice',    dict(_OOSTORE='device', _OOSLICE=0)),
+    ('device, 3 columns',    dict(_OOSTORE='device', _OOSLICE=3)),
+    ('host, one slice',      dict(_OOSTORE='host', _OOSLICE=0)),
+    ('host, 2 columns',      dict(_OOSTORE='host', _OOSLICE=2)),
+    ('host, no prefetch',    dict(_OOSTORE='host', _OOSLICE=2,
+                                  _OOPREFETCH=False)),
+    ('host, unpinned',       dict(_OOSTORE='host', _OOSLICE=2,
+                                  _OOPIN='none')),
+    ('host, cudaHostAlloc',  dict(_OOSTORE='host', _OOSLICE=0,
+                                  _OOPIN='alloc')),
+]
+DEFAULTS = dict(_OOSTORE='auto', _OOSLICE=0, _OOPREFETCH=True,
+                _OOPIN='register', _J3CBATCH='auto', _CDERI=True)
+
+
+def with_flags(**kw):
+    for k, v in {**DEFAULTS, **kw}.items():
+        setattr(fastdfgrad, k, v)
+
+
+for atom, spin, tag in ((ETHANOL, 0, 'ethanol'), (CH3, 1, 'CH3 doublet')):
+    mol, mf = build(atom, a.basis, 'b3lyp', spin)
+    dm = mf.make_rdm1()
+    g = mf.nuc_grad_method()
+    with mol.with_range_coulomb(0), mf.with_df.auxmol.with_range_coulomb(0):
+        opt = Int3c2eOpt(SortedMole.from_mol(mol, decontract=True),
+                         mf.with_df.auxmol).build()
+        mod = df_uhf_grad if spin else df_rhf_grad
+        ref = mod._jk_energy_per_atom(opt, dm, 1, 1., hermi=1,
+                                      auxbasis_response=True)
+    for name, flags in STORE_CASES:
+        for route, extra, tol in (('reuse', dict(), a.tol),
+                                  ('j3c  ', dict(_CDERI=False,
+                                                 _J3CBATCH='always'), 1e-11)):
+            with_flags(**flags, **extra)
+            if mf.with_df._cderi is None:
+                mf.with_df.build()
+            got = g.jk_energy_per_atom(dm, j_factor=1, k_factor=1., hermi=1)
+            check(f'  {route} {name:20s} {tag}',
+                  float(np.abs(got - ref).max()), tol)
+    with_flags()
+
+# the halve-and-retry.  The shape that actually makes `cutensor.createPlan`
+# answer CUTENSOR_STATUS_NOT_SUPPORTED is a 284-atom one -- W10 made it
+# reachable by freeing the array GPU4PySCF used to reserve for, which lets the
+# ip1 loop pick a bigger block than upstream would have -- so the failure is
+# injected here instead.  What is checked is that the retry restarts the loop
+# cleanly: `ejk` must not keep the half-accumulated contributions of the
+# attempt that failed, which is the only way this can go wrong quietly.
+with_flags()
+mol, mf = build(ETHANOL, a.basis, 'b3lyp')
+dm = mf.make_rdm1()
+g = mf.nuc_grad_method()
+ref_retry = g.jk_energy_per_atom(dm, j_factor=1, k_factor=1., hermi=1)
+_real_contract = fastdfgrad.contract
+_fired = []
+
+
+def _flaky(pattern, *args, **kw):
+    if pattern == 'rji,qj->iqr' and len(_fired) < 2:
+        _fired.append(pattern)
+        raise cp.cuda.memory.OutOfMemoryError(1 << 40, 1 << 30)
+    return _real_contract(pattern, *args, **kw)
+
+
+mf.with_df.build()
+before = fastdfgrad.stats()['plan_retries']
+fastdfgrad.contract = _flaky
+try:
+    got = g.jk_energy_per_atom(dm, j_factor=1, k_factor=1., hermi=1)
+finally:
+    fastdfgrad.contract = _real_contract
+retries = fastdfgrad.stats()['plan_retries'] - before
+check('  the ip1 loop restarts cleanly when a plan is refused',
+      float(np.abs(got - ref_retry).max()), a.tol)
+check(f'  ... and it took {retries} retries to get there',
+      float(retries != 2), 0.)
+
+# the threshold itself: `auto` has to put a small system on the card and a
+# large one on the host, and `stats()` has to say which, because nothing
+# numerical can.  Forcing `_OOFRAC` to zero is the same question the 284-atom
+# case asks by being 32 GB.
+with_flags()
+mol, mf = build(ETHANOL, a.basis, 'b3lyp')
+dm = mf.make_rdm1()
+g = mf.nuc_grad_method()
+before = fastdfgrad.stats()
+g.jk_energy_per_atom(dm, j_factor=1, k_factor=1., hermi=1)
+mid = fastdfgrad.stats()
+check('  auto keeps a 9-atom array on the card',
+      float(mid['oo_device'] - before['oo_device'] != 1), 0.)
+fastdfgrad._OOFRAC = 0.
+mf.with_df.build()
+g.jk_energy_per_atom(dm, j_factor=1, k_factor=1., hermi=1)
+after = fastdfgrad.stats()
+check('  auto sends an array it cannot fit to the host',
+      float(after['oo_host'] - mid['oo_host'] != 1), 0.)
+fastdfgrad._OOFRAC = float(os.environ.get('FASTDFGRAD_OOFRAC', 0.8))
 
 print(f'\nstats: {fastdfgrad.stats()}', flush=True)
 if FAIL:
