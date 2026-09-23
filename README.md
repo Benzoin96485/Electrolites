@@ -90,8 +90,8 @@ large hybrid, because a Coulomb-only DF build never constructs a cderi:
 
 `docs/README_fastdf.md`, `docs/README_fastdfj.md`, `docs/README_fastdfj3c.md`,
 `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md`,
-`docs/README_fastdfblock.md`, `docs/README_fastdffp32.md`, and
-`docs/DF_WORK_LIST.md` for what is left.
+`docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md`,
+`docs/README_fastdffp32.md`, and `docs/DF_WORK_LIST.md` for what is left.
 
 ### Response properties — penicillin V/def2-SVP, whole runs
 
@@ -211,7 +211,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastxcfxc` | `dft.numint.nr_{rks,uks}_fxc` — the grid half of every response property | `docs/README_fastxcfxc.md` |
 | `fastfnlc` | `hessian.{rks,uks}.nr_rks_fnlc_mo` — the VV10 response term | `docs/README_fastfnlc.md` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
-| `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md` |
+| `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |
 | `fastdfj3c` | `df.df_jk.get_j` and the three-centre Coulomb engine | `docs/README_fastdfj3c.md` |
 | `fastdfcderi` | `df.df._cholesky_eri` — the one-time cderi build — and `df.int3c2e_bdiv.int2c2e`, the two-centre metric integrals under it | `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md` |

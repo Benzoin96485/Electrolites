@@ -13,8 +13,16 @@ competing job's drift does not land on one variant (`DF_WORK_LIST.md` §5.2):
 
     unpack  dense   GPU4PySCF's `fill_symmetric` into `(nao, nao, nL)`
     step1   dense   `contract('Lij,njk->nikL')`, which is what `fastdf` runs
-    unpack  tiled   a scatter into `_dfblock.RowCompressed`'s buffer
+    unpack  tiled   W14's one-pass CUDA scatter into `_dfblock.RowCompressed`'s
+                    buffer, and (`--unpacks kernel,cupy`) the transpose into a
+                    staging buffer plus two fancy-index scatters it replaced
     step1   tiled   one `contract('ijL,jk->ikL')` per tile row
+
+`--check` compares both unpacks against `fill_symmetric`'s own output pair by
+pair, not just the two contractions against each other: the row-compressed
+buffer and the dense one have different shapes, and the only statement that
+means anything about a scatter is that every stored pair landed on the same
+number in both.
 
 No SCF and no cderi: the contraction's cost does not depend on the values, so
 the block is random and `nocc` is the molecule's own.  That is what lets the
@@ -45,6 +53,9 @@ ap.add_argument('--nocc', type=int, default=0, help='override nelec/2')
 ap.add_argument('--reps', type=int, default=3)
 ap.add_argument('--check', action='store_true',
                 help='also verify the tiled contraction against the dense one')
+ap.add_argument('--unpacks', default='kernel',
+                help='which tiled unpacks to time: `kernel` (W14), `cupy` '
+                     '(what it replaced), or both')
 a = ap.parse_args()
 
 import cupy as cp                                            # noqa: E402
@@ -52,8 +63,11 @@ from cupy.cuda import cublas                                 # noqa: E402
 from pyscf import gto                                        # noqa: E402
 from gpu4pyscf.lib.cupy_helper import (                      # noqa: E402
     contract, fill_symmetric, get_avail_mem)
+from electrolites import _dfblock                          # noqa: E402
 from electrolites._dfblock import (pair_indices,             # noqa: E402
     atom_order, ao_perm, RowCompressed)
+
+UNPACKS = a.unpacks.split(',')
 
 
 def timed(fn, reps):
@@ -144,38 +158,59 @@ for case in a.cases.split(','):
             rl_t = cp.empty((nao, nocc, nL))
             flop_tiled = 2 * rc.nrow * nocc * nL
 
-            def tiled_unpack():
+            def tiled_unpack(mode=UNPACKS[0]):
+                _dfblock.UNPACK = mode
                 rc.unpack(blk, nL)
 
             def tiled_step1():
                 rc.step1(fg, rl_t, nL)
 
-            for fn in (dense_unpack, dense_step1, tiled_unpack, tiled_step1,
-                       step2):
+            timing = ([('unpack_d', dense_unpack), ('step1_d', dense_step1)]
+                      + [(f'unpack_t:{m}', (lambda m=m: tiled_unpack(m)))
+                         for m in UNPACKS]
+                      + [('step1_t', tiled_step1), ('step2', step2)])
+            for _, fn in timing:
                 fn()                                   # warm the plans
             cp.cuda.Device().synchronize()
             t = {}
             for _ in range(a.reps):                    # round robin
-                for key, fn in (('unpack_d', dense_unpack),
-                                ('step1_d', dense_step1),
-                                ('unpack_t', tiled_unpack),
-                                ('step1_t', tiled_step1),
-                                ('step2', step2)):
+                for key, fn in timing:
                     t[key] = min(t.get(key, 1e9), timed(fn, 1))
+            t['unpack_t'] = t[f'unpack_t:{UNPACKS[0]}']
 
             if a.check:
-                dense_unpack(); dense_step1(); tiled_unpack(); tiled_step1()
+                # every stored pair, against `fill_symmetric`'s own output --
+                # the two buffers have different shapes, so the contraction
+                # agreeing is a weaker statement than the scatter agreeing
+                dense_unpack()
+                d1 = cp.asarray(rc._d1)
+                flat = rc.buf.reshape(rc.nrow, rc.ldL)
+                rows_d, cols_d = cp.asarray(rows), cp.asarray(cols)
+                for mode in UNPACKS:
+                    tiled_unpack(mode)
+                    worst = 0.
+                    for c0 in range(0, npair, 1 << 17):
+                        sl = slice(c0, min(c0 + (1 << 17), npair))
+                        ref = work[rows_d[sl], cols_d[sl], :nL]
+                        worst = max(worst, float(
+                            cp.abs(flat[d1[sl], :nL] - ref).max()))
+                    print(f'#   check {name}/{order}/T={T} unpack={mode}: '
+                          f'max |tiled - fill_symmetric| over stored pairs '
+                          f'= {worst:.2e}')
+                del d1, rows_d, cols_d
+                tiled_unpack(); dense_step1(); tiled_step1()
                 err = float(cp.abs(rl_d[0] - rl_t).max()
                             / cp.abs(rl_d).max())
                 print(f'#   check {name}/{order}/T={T}: '
-                      f'max relative deviation {err:.2e}')
+                      f'step 1 max relative deviation {err:.2e}')
 
             row = dict(name=name, order=order, tile=T, nao=nao, naux=naux,
                        nocc=nocc, nL=nL, fill=rc.fill,
                        buf_dense_gb=work.nbytes / 1e9,
-                       buf_tiled_gb=rc.nbytes() / 1e9,
+                       buf_tiled_gb=rc.nbytes(UNPACKS[0]) / 1e9,
                        tf_dense=flop_dense / t['step1_d'] / 1e9,
                        tf_tiled=flop_tiled / t['step1_t'] / 1e9,
+                       unpacks={m: t[f'unpack_t:{m}'] for m in UNPACKS},
                        step1_ratio=t['step1_d'] / t['step1_t'],
                        total_ratio=((t['unpack_d'] + t['step1_d'])
                                     / (t['unpack_t'] + t['step1_t'])),
@@ -190,7 +225,9 @@ for case in a.cases.split(','):
                   f'{t["step2"]:7.2f} '
                   f'{row["step1_ratio"]:5.2f}x {row["total_ratio"]:5.2f}x '
                   f'{row["block_ratio"]:5.2f}x '
-                  f'{row["buf_dense_gb"]:6.2f}G {row["buf_tiled_gb"]:6.2f}G',
+                  f'{row["buf_dense_gb"]:6.2f}G {row["buf_tiled_gb"]:6.2f}G'
+                  + (''.join(f'  {m}={t[f"unpack_t:{m}"]:.2f}'
+                             for m in UNPACKS) if len(UNPACKS) > 1 else ''),
                   flush=True)
             results.append(row)
             del rc, fg, rl_t

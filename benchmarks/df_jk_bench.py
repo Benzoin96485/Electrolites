@@ -56,6 +56,12 @@ ap.add_argument('--tiled', default='',
                      '32,64.  Each is timed in the same round robin as the '
                      'rest, and `--tile-orders` chooses the AO orderings.')
 ap.add_argument('--tile-orders', default='native,rcm')
+ap.add_argument('--tile-unpacks', default='kernel',
+                help='which scatter into the row-compressed buffer to time '
+                     'for each --tiled row: `kernel` (W14), `cupy` (what it '
+                     'replaced), or both.  Both run on the *same* pattern -- '
+                     'rebuilding a several-gigabyte pattern between two '
+                     'variants of a round robin would time the rebuild')
 ap.add_argument('--cpu-cderi', action='store_true',
                 help='force the cderi onto host memory, which is what '
                      'GPU4PySCF does once it no longer fits -- the regime '
@@ -69,6 +75,7 @@ import gpu4pyscf                                              # noqa: E402
 from gpu4pyscf import dft                                     # noqa: E402
 from gpu4pyscf.lib.cupy_helper import tag_array                # noqa: E402
 from electrolites import fastdf                               # noqa: E402
+from electrolites import _dfblock                             # noqa: E402
 
 _sync = cp.cuda.Stream.null.synchronize
 R = {}
@@ -223,16 +230,30 @@ for n_dm in NDMS:
         # the reference is the *dense* first contraction, forced: `fastdf`'s
         # own default is `auto`, which takes the tiled one wherever the fill
         # test passes, and would otherwise be compared against itself
-        pair = [(f'n_dm={n_dm} ref{t}/{o}', _variant(dms, _STEP1='tensor')),
-                (f'n_dm={n_dm} tiled{t}/{o}',
-                 _variant(dms, _STEP1='tiled', TILE=int(t), TILE_ORDER=o))]
+        def _tiled(u, t=t, o=o):
+            run = _variant(dms, _STEP1='tiled', TILE=int(t), TILE_ORDER=o)
+
+            def go():
+                old_u, _dfblock.UNPACK = _dfblock.UNPACK, u
+                try:
+                    return run()
+                finally:
+                    _dfblock.UNPACK = old_u
+            return go
+        pair = ([(f'n_dm={n_dm} ref{t}/{o}', _variant(dms, _STEP1='tensor'))]
+                + [(f'n_dm={n_dm} tiled{t}/{o}/{u}', _tiled(u))
+                   for u in a.tile_unpacks.split(',')])
         interleave(pair)
-        gj, gk = pair[1][1]()
-        rel_t = float(cp.abs(gk - rk).max()) / scale
-        ref, v = R[f'n_dm={n_dm} ref{t}/{o}'], R[f'n_dm={n_dm} tiled{t}/{o}']
-        print(f'{"  tiled " + t + "/" + o:24s} {ref*1e3:9.2f} {v*1e3:9.2f} '
-              f'{ref/v:6.2f}x   fill={fastdf.STATS["tile_fill"]:.3f}  '
-              f'blk={fastdf.STATS["blocks"]}  relK={rel_t:.1e}', flush=True)
+        ref = R[f'n_dm={n_dm} ref{t}/{o}']
+        for u in a.tile_unpacks.split(','):
+            gj, gk = _tiled(u)()
+            rel_t = float(cp.abs(gk - rk).max()) / scale
+            v = R[f'n_dm={n_dm} tiled{t}/{o}/{u}']
+            print(f'{"  tiled " + t + "/" + o + "/" + u:24s} {ref*1e3:9.2f} '
+                  f'{v*1e3:9.2f} '
+                  f'{ref/v:6.2f}x   fill={fastdf.STATS["tile_fill"]:.3f}  '
+                  f'blk={fastdf.STATS["blocks"]}  relK={rel_t:.1e}',
+                  flush=True)
         if hasattr(dfobj, '_fastdf_tiles'):
             del dfobj._fastdf_tiles
         cp.get_default_memory_pool().free_all_blocks()

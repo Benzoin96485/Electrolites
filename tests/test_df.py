@@ -134,25 +134,45 @@ def _cmp(got, ref):
 #: rank-k branch on them and forcing it is the only way this suite covers it.
 CONFIGS = [{'_STEP2': 'gemm'}, {'_STEP2': 'syrk'}]
 DEFAULTS = {}
+#: Which module each configuration key lives on.  `UNPACK` is the tiled
+#: scatter (`docs/DF_WORK_LIST.md` W14) and belongs to `_dfblock`; everything
+#: else is a `fastdf` switch.
+OWNER = {}
+
+
+def _owner(key):
+    return OWNER.get(key)
 
 
 def main():
     import electrolites
     electrolites.patch('fastdf')
     from electrolites import fastdf
-    for cfg in CONFIGS:
-        DEFAULTS.update({k: getattr(fastdf, k) for k in cfg})
+    from electrolites import _dfblock
+    OWNER.update({k: fastdf for k in ('_STEP1', '_STEP2', '_JPASS', 'TILE',
+                                      'TILE_ORDER')})
+    OWNER['UNPACK'] = _dfblock
+
+    def _snapshot(cfgs):
+        for cfg in cfgs:
+            DEFAULTS.update({k: getattr(_owner(k), k) for k in cfg})
+    _snapshot(CONFIGS)
     if a.ablate:
         # `tiled` twice: once as it ships, and once at a tile small enough
         # that these molecules' patterns are genuinely sparse at it, with a
         # reordering on top -- otherwise every tile pair is present, the
         # compression is the identity and the permutation is never tested.
+        # And once more on the `cupy` scatter W14's kernel replaced, which is
+        # still the fall-back and is the only thing that would catch the
+        # kernel writing the right values into the wrong rows.
         CONFIGS.extend([{'_STEP1': 'bgemm'}, {'_JPASS': 'tensor'},
                         {'_STEP1': 'tiled'},
+                        {'_STEP1': 'tiled', 'UNPACK': 'cupy'},
                         {'_STEP1': 'tiled', 'TILE': 8,
-                         'TILE_ORDER': 'rcm'}])
-        for cfg in CONFIGS:
-            DEFAULTS.update({k: getattr(fastdf, k) for k in cfg})
+                         'TILE_ORDER': 'rcm'},
+                        {'_STEP1': 'tiled', 'TILE': 8,
+                         'TILE_ORDER': 'rcm', 'UNPACK': 'cupy'}])
+        _snapshot(CONFIGS)
     print(f'# gpu4pyscf {electrolites.gpu4pyscf_version()}  '
           f'configurations: {CONFIGS}', flush=True)
 
@@ -190,10 +210,10 @@ def main():
                         case_fails += 1
                     for cfg in CONFIGS:
                         for attr, val in cfg.items():
-                            setattr(fastdf, attr, val)
+                            setattr(_owner(attr), attr, val)
                         gj, gk = fastdf.get_jk(dfobj, dms, hermi, True, True)
                         for attr in cfg:
-                            setattr(fastdf, attr, DEFAULTS[attr])
+                            setattr(_owner(attr), attr, DEFAULTS[attr])
                         relj, relk = _cmp(gj, rj), _cmp(gk, rk)
                         ok = relj <= a.tol and relk <= a.tol
                         worst['J'] = max(worst['J'], relj)

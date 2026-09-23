@@ -104,10 +104,17 @@ entry is about.
    cderi's sparsity is the product of an atom-pair factor a tile can reach and
    a shell-structure factor at one-to-five-AO granularity that no AO tile can
    (``docs/README_fastdfblock.md`` §1.1).  What is left is real but small: the
-   contraction is **1.31x** at 284 atoms in isolation and **1.38x** at 545,
-   the exchange block **1.09x** and **1.20x**, and a whole ``get_jk`` call at
-   284 atoms **1.21x** -- and it is a *loss* at everything smaller, which is
+   contraction is **1.33x** at 284 atoms in isolation and **1.38x** at 545,
+   the exchange block **1.19x** and **1.22x**, and a whole ``get_jk`` call at
+   284 atoms **1.28x** -- and it is a *loss* at everything smaller, which is
    what the gate is for.
+   The scatter into the row-compressed buffer is **one CUDA kernel**
+   (``docs/DF_WORK_LIST.md`` W14, ``docs/README_fastdfunpack.md``): 0.279 s
+   against GPU4PySCF's own dense unpack's 0.618 in a profiled 284-atom call,
+   and against the 0.786 s of the transpose-plus-two-scatters it replaced,
+   which is where 0.09x of that 1.28x comes from.  It also removes the
+   ``npair * blk`` staging buffer, so the per-block footprint is 4.61 GB
+   against the dense path's 7.45.
    The AO index is permuted freely to cut the tiles -- ``vk = rhok rhok^T``
    comes back as ``P vk P^T`` and one scatter undoes it -- and the gate is the
    **measured tile fill**, not ``nao``: taxol in def2-TZVPP has 2636 basis
@@ -158,6 +165,12 @@ Ablations, for the tables in ``docs/README_fastdf.md``:
     FASTDF_TILE_MAX_FILL=<f>
                       the tile fill above which `auto` keeps the dense
                       contraction (default 0.75)
+    FASTDF_TILE_UNPACK=kernel|cupy
+                      item 5's scatter into the row-compressed buffer:
+                      `kernel` (default) is the one-pass CUDA kernel of
+                      `docs/DF_WORK_LIST.md` W14, `cupy` the transpose into a
+                      staging buffer plus two fancy-index scatters it
+                      replaced.  `docs/README_fastdfunpack.md` measures them
     FASTDF_BLK=<n>    override the auxiliary block size, which GPU4PySCF
                       derives from free memory and then caps at 256
     FASTDF_RESIDENT_FRAC=<f>
@@ -181,6 +194,7 @@ from gpu4pyscf.lib.cupy_helper import (
     contract, transpose_sum, get_avail_mem, ndarray, fill_symmetric)
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib import multi_gpu
+from electrolites import _dfblock
 from electrolites import _dffp32 as FP32
 
 _OFF = bool(os.environ.get('FASTDF_OFF'))
@@ -206,11 +220,17 @@ TILE = int(os.environ.get('FASTDF_TILE', 16))
 #: at 545, which is inside the noise of the block ratio either way.
 TILE_ORDER = os.environ.get('FASTDF_TILE_ORDER', 'native')
 #: Above this tile fill the block-sparse contraction is slower than the dense
-#: one and `auto` keeps the dense one.  The tiled contraction runs at 0.82-0.93
-#: of the dense one's flop rate and its unpack is a fancy-index scatter rather
-#: than a CUDA kernel, so it needs roughly a quarter of the arithmetic removed
-#: before it is ahead.  Measured break-even is a fill near 0.80
-#: (`docs/README_fastdfblock.md` §3); 0.75 leaves margin.
+#: one and `auto` keeps the dense one.  What sets it is the tiled
+#: contraction's flop rate -- 0.76-0.95 of the dense one's, because `ntile`
+#: cuTENSOR calls per block cost more launch and less depth than one -- so it
+#: needs roughly a quarter of the arithmetic removed before it is ahead.
+#: **The unpack is no longer part of that argument**: W14's kernel
+#: (`docs/README_fastdfunpack.md`) makes the tiled scatter 1.13x *faster*
+#: than GPU4PySCF's dense one rather than 4x slower, and the gate did not
+#: move when it landed -- at taxol's 0.949 fill the tiled path is still
+#: 0.94x end to end with the kernel and was 0.90x without.  Measured
+#: break-even is a fill near 0.80 (`docs/README_fastdfblock.md` §3); 0.75
+#: leaves margin.
 TILE_MAX_FILL = float(os.environ.get('FASTDF_TILE_MAX_FILL', 0.75))
 #: 'blas' (explicit GEMV/GEMM) or 'tensor' (GPU4PySCF's two `contract` calls)
 #: for the Coulomb pass over the packed cderi.
@@ -258,6 +278,9 @@ def stats():
     """What this module did in this process.  Nothing numerical can say."""
     out = dict(STATS)
     out['declined_reasons'] = dict(DECLINED)
+    # which scatter the tiled path used; `kernel` is W14's and is the default,
+    # and the two are bit-identical, so this is the only place a run says so
+    out['tile_unpack'] = _dfblock.UNPACK
     return out
 
 
@@ -803,8 +826,10 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
         fill = _tile_fill(dfobj, nao)
         extra = int(fill * nao * nao / TILE) * nocc * nbuf * nspin * n_dm
     # `npair` counts the per-block buffers that are a whole pair row wide:
-    # the tiled path's transposed staging buffer, and W7's widened block
-    npair_buf = ((1 if use_tiled else 0)
+    # the tiled path's transposed staging buffer, which exists only under the
+    # `cupy` unpack (W14's kernel writes the row-compressed buffer straight
+    # from the packed block), and W7's widened block
+    npair_buf = ((1 if use_tiled and _dfblock.UNPACK != 'kernel' else 0)
                  + (1 if cderi_sparse.dtype == np.float32 else 0))
     blksize = _blksize(nao, nocc, nbuf_live, on_gpu, naux_slice, fill, extra,
                        npair=npair_buf * cderi_sparse.shape[1])
@@ -830,7 +855,9 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
 
     resident = None
     if not on_gpu:
-        reserve = ((tiles.buf.size if use_tiled else work.size) + rbuf.size
+        reserve = (((tiles.buf.size + (0 if _dfblock.UNPACK == 'kernel'
+                                       else tiles.npair * tiles.ldL))
+                    if use_tiled else work.size) + rbuf.size
                    + 2 * blksize * cderi_sparse.shape[1])
         resident = _resident_prefix(dfobj, cderi_sparse, reserve)
 

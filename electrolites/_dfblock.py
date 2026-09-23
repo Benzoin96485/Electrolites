@@ -30,7 +30,16 @@ Two facts set the shape of all of it.
   ``O(nao*nocc)`` and ``O(nao^2)`` against the contraction's
   ``O(nao^2 * nocc * naux)``, and is free in practice.
 """
+import os
+
 import numpy as np
+
+
+#: ``kernel`` (default) is W14's one-pass CUDA scatter; ``cupy`` is the
+#: transpose-into-a-staging-buffer plus two fancy-index scatters that
+#: `docs/README_fastdfblock.md` §4.1 shipped, kept as the ablation column
+#: `docs/README_fastdfunpack.md` measures against.
+UNPACK = os.environ.get('FASTDF_TILE_UNPACK', 'kernel')
 
 
 # --------------------------------------------------------------------------
@@ -139,6 +148,86 @@ def tile_stats(rows, cols, nao, T):
 
 
 # --------------------------------------------------------------------------
+# the unpack, as one kernel  (`docs/DF_WORK_LIST.md` W14)
+# --------------------------------------------------------------------------
+#: The scatter GPU4PySCF's `decompress_and_transpose` is, with a destination
+#: table in place of its `divmod`.  The packed block arrives as ``(nL, npair)``
+#: and every stored pair owns two whole rows of the row-compressed buffer, so
+#: the write is `nL` contiguous doubles per pair per destination and the read
+#: is one column of the block.  Which of the two is the strided one depends on
+#: the layout the block arrives in, and there are two of those:
+#:
+#: * **pair major** -- ``in[L*ldin + p]``, which is every block of a
+#:   host-staged tensor and of a device-resident ``float64`` one.  The read is
+#:   coalesced along `p` and the write along `L`, so the two disagree and the
+#:   transpose goes through a 32x32 shared tile.  The ``+1`` pad is the usual
+#:   one: unpadded, every thread of a store phase reads the same two shared
+#:   banks and the read serialises sixteen ways.
+#: * **auxiliary major** -- ``in[L + p*ldp]``, which is what W7's widener hands
+#:   back for a device-resident ``float32`` tensor.  Here the read is already
+#:   coalesced along `L`, which is the direction the write wants, so there is
+#:   no transpose and no shared memory at all.
+#:
+#: Both write `d1[p]` and `d2[p]`; for a diagonal pair those are the same row
+#: and the second store is a harmless repeat of the first, which is what the
+#: two fancy-index scatters this replaces also did.
+_UNPACK_SRC = r"""
+extern "C" __global__
+void unpack_pair_major(double *buf, const double *in,
+                       const long long *d1, const long long *d2,
+                       int npair, int nL, long long ldin, long long ldL)
+{
+    __shared__ double tile[32][33];
+    const int p0 = blockIdx.x * 32;
+    const int l0 = blockIdx.y * 32;
+    int p = p0 + threadIdx.x;
+    for (int k = 0; k < 32; k += 8) {
+        int L = l0 + threadIdx.y + k;
+        if (p < npair && L < nL)
+            tile[threadIdx.y + k][threadIdx.x] = in[(long long)L * ldin + p];
+    }
+    __syncthreads();
+    const int L = l0 + threadIdx.x;
+    if (L >= nL) return;
+    for (int k = 0; k < 32; k += 8) {
+        int q = p0 + threadIdx.y + k;
+        if (q < npair) {
+            double v = tile[threadIdx.x][threadIdx.y + k];
+            buf[d1[q] * ldL + L] = v;
+            buf[d2[q] * ldL + L] = v;
+        }
+    }
+}
+
+extern "C" __global__
+void unpack_aux_major(double *buf, const double *in,
+                      const long long *d1, const long long *d2,
+                      int npair, int nL, long long ldp, long long ldL)
+{
+    const int L = blockIdx.y * 32 + threadIdx.x;
+    if (L >= nL) return;
+    for (int k = 0; k < 32; k += 8) {
+        int q = blockIdx.x * 32 + threadIdx.y + k;
+        if (q < npair) {
+            double v = in[(long long)q * ldp + L];
+            buf[d1[q] * ldL + L] = v;
+            buf[d2[q] * ldL + L] = v;
+        }
+    }
+}
+"""
+_unpack_mod = None
+
+
+def _kernel(name):
+    global _unpack_mod
+    if _unpack_mod is None:
+        import cupy as cp
+        _unpack_mod = cp.RawModule(code=_UNPACK_SRC)
+    return _unpack_mod.get_function(name)
+
+
+# --------------------------------------------------------------------------
 # the row-compressed buffer a tiled contraction runs on
 # --------------------------------------------------------------------------
 class RowCompressed:
@@ -234,32 +323,97 @@ class RowCompressed:
             gather = inv[gather]
             self.permd = cp.asarray(self.perm)
         self.gather = cp.asarray(gather)
+        self.tbuf = None
         # zeroed, not empty: the AO pairs that sit inside a present tile
         # pair but were dropped by the screening are never written, and the
         # dense path leaves exactly the same positions at the zero its own
         # `cp.zeros` buffer started from.  Paid once per `get_jk` call, as
         # `fastdf`'s is -- every block writes the same positions.
         self.buf = cp.zeros(self.nrow * self.ldL)
-        # The staging buffer the packed block is transposed into.  It is
-        # allocated **once** and not per block, and that is not a tidiness
-        # point: `cp.ascontiguousarray` on a 763 MB temporary went to the
-        # driver every block, and `cudaFree` synchronises the device, so the
+        # The staging buffer the packed block is transposed into, which only
+        # the `cupy` unpack needs.  When it exists it is allocated **once**
+        # and not per block, and that is not a tidiness point:
+        # `cp.ascontiguousarray` on a 763 MB temporary went to the driver
+        # every block, and `cudaFree` synchronises the device, so the
         # double-buffered prefetch was drained 114 times a call and 2.33 s of
         # the 11.73 s was GPU idle (`docs/README_fastdfblock.md` §4.1).
-        self.tbuf = cp.empty(self.npair * self.ldL)
+        # W14's kernel writes the buffer straight from the packed block and
+        # the staging array goes away entirely -- 0.67 GB at 284 atoms, which
+        # `fastdf._blksize` gives back to the auxiliary block.
+        self.tbuf = None if UNPACK == 'kernel' else self._staging()
         return self
 
-    def nbytes(self):
-        return (self.nrow + self.npair) * self.ldL * 8
+    def _staging(self):
+        """The `cupy` unpack's transpose target, allocated once.
+
+        Eagerly in `to_device` when that is the shipped mode, and on first use
+        if the mode is flipped afterwards, which only
+        `benchmarks/df_block_bench.py` and `benchmarks/df_jk_bench.py` do --
+        they time both unpacks against one pattern, and rebuilding a
+        several-gigabyte pattern between two variants of a round robin would
+        put the rebuild in the measurement.  Never per block, which is
+        `docs/DF_WORK_LIST.md` §5.8.
+        """
+        import cupy as cp
+        if self.tbuf is None:
+            self.tbuf = cp.empty(self.npair * self.ldL)
+        return self.tbuf
+
+    def nbytes(self, unpack=None):
+        """Device footprint of the pattern's per-block buffers.
+
+        `unpack` names the scatter the footprint is for, because the staging
+        buffer is the whole difference between the two: `kernel` does not
+        have one.  It defaults to the shipped mode rather than to whether
+        `tbuf` happens to be allocated, so that a benchmark which has just
+        timed both does not report the other one's footprint.
+        """
+        mode = UNPACK if unpack is None else unpack
+        return (self.nrow + (0 if mode == 'kernel' else self.npair)) \
+            * self.ldL * 8
 
     def unpack(self, cderi_blk, nL):
         """``cderi_blk`` is ``(nL, npairs)``; scatter it and its mirror."""
         import cupy as cp
+        if UNPACK == 'kernel':
+            return self._unpack_kernel(cderi_blk, nL)
         flat = self.buf.reshape(self.nrow, self.ldL)
-        blk = self.tbuf[:self.npair * nL].reshape(self.npair, nL)
+        blk = self._staging()[:self.npair * nL].reshape(self.npair, nL)
         cp.copyto(blk, cderi_blk.T)                   # into `tbuf`, no malloc
         flat[self.d1, :nL] = blk
         flat[self.d2, :nL] = blk
+        return self.buf
+
+    def _unpack_kernel(self, cderi_blk, nL):
+        """W14: the transpose and the two scatters as one pass.
+
+        The block is ``(nL, npair)``; whichever of its two strides is unit
+        picks the kernel, and nothing else about the caller changes.  Both
+        layouts occur -- `fastdf._blocks` yields a row slice of a
+        ``(naux, npair)`` tensor for a ``float64`` cderi and W7's widener
+        yields the transpose of a ``(npair, blk)`` buffer for a ``float32``
+        device-resident one -- and a layout this does not recognise is a
+        programming error rather than a case to fall through, because the
+        fall-through would be a silent 763 MB temporary per block.
+        """
+        assert cderi_blk.dtype == np.float64 and cderi_blk.shape[0] >= nL
+        assert cderi_blk.shape[1] == self.npair
+        s0, s1 = (x // 8 for x in cderi_blk.strides)
+        if self.npair == 0 or nL == 0:
+            return self.buf
+        grid = ((self.npair + 31) // 32, (nL + 31) // 32)
+        if s1 == 1:
+            name, ld = 'unpack_pair_major', s0
+        elif s0 == 1:
+            name, ld = 'unpack_aux_major', s1
+        else:
+            raise ValueError(f'cderi block strides {cderi_blk.strides} are '
+                             'unit in neither index')
+        _kernel(name)(
+            grid, (32, 8),
+            (self.buf, cderi_blk, self.d1, self.d2,
+             np.int32(self.npair), np.int32(nL), np.int64(ld),
+             np.int64(self.ldL)))
         return self.buf
 
     def factor(self, f):

@@ -16,6 +16,9 @@ target cannot be made faster, and whose *finding* is W16, W17 and W18),
 `docs/README_fastdfj3c.md` **W9** (whose findings are W19 and W20),
 `docs/README_fastdfstore.md` closed **W11**, **W12** and **W13** together
 (they are three items on one function, and its finding is W22),
+`docs/README_fastdfunpack.md` closed **W14** and **W15** together (the two
+W5 left behind: one is a kernel that pays and one is a measurement that says
+not to write the code),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -317,8 +320,9 @@ tensor that does not fit in a 251 GB node becomes a 207 GB one that builds
 in 129 s.
 
 **W5 is done, and W14 and W15 are what it found.**  The block-sparse exchange
-contraction is **1.21x on a whole 284-atom `get_jk` call** and ships on behind
-a measured tile-fill gate.  It read 0.90x until Nsight Systems found a 763 MB
+contraction is **1.21x on a whole 284-atom `get_jk` call** — **1.28x** since
+W14 replaced its unpack with a kernel — and ships on behind a measured
+tile-fill gate.  It read 0.90x until Nsight Systems found a 763 MB
 temporary allocated per block whose `cudaFree` drained the prefetch pipeline
 (`docs/README_fastdfblock.md` §4.1).  The 4.5x the item priced was never
 available — the pair fill it quoted is the product of an atom-pair factor a
@@ -697,7 +701,13 @@ the tile fill, which is the only one a tile sees, does not move.
   is 0.752 s against 0.647 at 284 atoms — **W14**, now worth 0.1 s a call
   rather than the 6 s it appeared to be; and the route to the factor a tile
   cannot see is a localised occupied basis, which `vk = rhok rhokᵀ` admits
-  *exactly* — **W15**.
+  *exactly* — **W15**.  *(**Both are now done and both surprised this
+  sentence.**  W14 is not 0.1 s but 0.58 s, and the kernel is *faster* than
+  GPU4PySCF's dense one rather than level with it, which takes W5's headline
+  from 1.21x to **1.28x**.  W15 is a rejection: the localisation works and
+  the blocking does not, exactly as §1.1 of `README_fastdfblock.md` found
+  for the AO index, and at this repository's tolerance an **oracle** screen
+  removes 0.2 % of the blocks.)*
 * **And three measurement rules**, §5.7 to §5.9, all learned the hard way
   here.
 * **One thing it does not deliver** that the entry promised: the dense
@@ -1263,7 +1273,48 @@ the entry called it: it is worth 14–32 ms of a 30–170 ms build at the small
 end, and the same 14–32 ms again in every gradient and every Hessian that
 calls `_decompose_j2c` at a geometry already seen.
 
-### W14 — A CUDA kernel for the tiled unpack
+### W14 — A CUDA kernel for the tiled unpack — **done, and it is five times what this entry priced**
+
+`electrolites/_dfblock.py` (`unpack_pair_major`, `unpack_aux_major`),
+`FASTDF_TILE_UNPACK` in `electrolites/fastdf.py`, `--unpacks` in
+`benchmarks/df_block_bench.py`, `--tile-unpacks` in
+`benchmarks/df_jk_bench.py`, `--unpacks` in `benchmarks/df_block_profile.py`,
+the `cupy` configurations of `tests/test_df.py --ablate`, write-up in
+`docs/README_fastdfunpack.md`.
+
+**Success criterion cleared by 2.2x.**  The bar was the tiled unpack at or
+below the dense kernel's 0.647 s in a profiled 284-atom call; in that call it
+is **0.279 s against 0.618**, i.e. *faster* than GPU4PySCF's hand-written
+`decompress_and_transpose` rather than level with it.  The reason this entry
+did not see that coming is that it assumed the dense kernel does less work:
+both write `2 * npair * nL` doubles — `fill_symmetric` fills only the stored
+pairs and their mirrors — and the tiled destination is `fill` times smaller,
+so the same scattered writes land in a denser working set (1.42 TB/s against
+1.25).  The staging buffer is gone as asked.
+
+**Falsification criterion confirmed, in the useful direction.**  The scatter
+was not bandwidth-bound and now is: three passes at 7.43 ms per block became
+one at 1.76, 4.2x, and the kernel runs at the card's bandwidth.
+
+**Worth 577 ms of an 8.2 s call**, not the 0.1 s this entry priced — because
+the CuPy scatter's cost was *super*-linear in the auxiliary block (0.97, 2.57,
+7.36, 14.80 ms at 32/64/128/256) and the kernel's is exactly linear (0.45,
+0.88, 1.75, 3.51).  End to end at 284 atoms with the cderi on the host, the
+same round robin reads **8215.77 → 7638.62 ms**, so **W5's 1.21x is 1.28x**.
+
+**Two of W5's conclusions move with it**, both recorded in
+`docs/README_fastdfblock.md`: §3.1's "the ratio is best at an intermediate
+block" was a property of the scatter and is no longer true — the block ratio
+now rises monotonically to 1.25x at block 256 — and §4.2's break-even tile
+fill moves from 0.80 to **0.90**.  `TILE_MAX_FILL` is deliberately left at
+0.75: at the shipped tile of 16 not one of the five measured systems lands in
+the band that would open, so raising it would change no measured run.
+
+**And the footprint**: 5.44 → **4.61 GB** per block at 284 atoms and tile 16,
+against the dense path's 7.45.
+
+*The entry as it was written:*
+
 
 *(Found by W5, which measured it rather than closed it.)*
 
@@ -1293,7 +1344,44 @@ of what it is worth.
   0.295 s of scatter is 5.6 GB/s of *useful* traffic, far under the dense
   kernel's 1.43 TB/s, so it is not.
 
-### W15 — Localised occupied orbitals
+### W15 — Localised occupied orbitals — **done, and it is a rejection its own falsification criterion does not catch**
+
+`benchmarks/df_local_occ_probe.py`, write-up in
+`docs/README_fastdfunpack.md` §5.  No module: this item asked for a
+measurement before any code, and the measurement says not to write the code.
+
+**The premise is right.**  A pivoted Cholesky of the converged density to rank
+`nocc` reproduces it to **1.5e-15** at 284 atoms in **0.35 s**, and its columns
+are local and do not grow with the molecule: 160, 320 and **266** AOs of 430,
+1123 and 2697 at 42, 113 and 284 atoms, on **66 of 284** atoms.
+
+**So the falsification criterion — "the per-orbital supports at 284 atoms are
+not small" — does not fire, and the item fails anyway.**  What it failed on is
+something the criterion did not name: `rhok[i,k,:]` is nonzero wherever some
+*stored* AO pair `(i,j)` has `j` in orbital `k`'s support, and the 266 AOs of
+one localised orbital share a stored pair with **2697 of 2697**.  The row
+support is the whole basis for a single orbital, so `vk = rhok rhok^T` has no
+block structure: step 2 — 3.45 s of the 8.93 s call — is **1.000x** at every
+truncation measured.  Step 1 at (tile 16 x group 16) is 0.550x at a truncation
+that already costs three digits of the density matrix, against the **0.619**
+W5's block-sparse contraction delivers there for free.  This is
+`README_fastdfblock.md` §1.1 a second time, on the index that was supposed to
+be the way around it.
+
+**And it is not a "needs more work".**  Screened with an **oracle** — the real
+`rhok`, a magnitude threshold, no a-priori bound and no cost — at the
+threshold that just meets `tests/test_df.py`'s 1e-11, **99.8 % of the blocks
+survive**; halving the blocked cost costs `relK ~ 1e-4`.  Two controls close
+the escape routes: the canonical factor keeps 4.3x more elements at the same
+threshold, so the localisation genuinely works and it is the blocking that
+does not; and a *single* auxiliary function is no less blocked than 64 of them
+(0.995 against 0.998), so localising the auxiliary index is measured rather
+than left open.  **What would have to change is the accuracy bar, not the
+code**: a caller that accepts `relK ~ 1e-6` would see about 1.3x on the call,
+against the 1.28x W14 already delivers.
+
+*The entry as it was written:*
+
 
 *(Found by W5, which measured the factor a tile cannot reach.)*
 
@@ -1708,6 +1796,18 @@ python benchmarks/df_jk_bench.py --xyz ... --tiled 32 --tile-orders native
 nsys profile -t cuda,nvtx -c cudaProfilerApi -o $SCRATCH/p \
     python benchmarks/df_block_profile.py --xyz ... --cpu-cderi --tile 16
 python benchmarks/df_block_profile.py --stats $SCRATCH/p.nsys-rep  # the reports
+
+python benchmarks/df_block_bench.py --cases PfPMT:0:-1 --tiles 16 \
+    --unpacks kernel,cupy --nl 128 --check          # W14, both scatters
+python benchmarks/df_jk_bench.py --xyz ... --cpu-cderi --tiled 16 \
+    --tile-orders native --tile-unpacks kernel,cupy # W14 end to end
+python benchmarks/df_block_profile.py --xyz ... --cpu-cderi --tile 16 \
+    --unpacks kernel,cupy                           # W14's stage table
+
+python benchmarks/df_local_occ_probe.py --cases PfPMT:0:-1 --dm $SCRATCH/dm \
+    --groups 1,8,16,32,64 --hist                    # W15's supports, no cderi
+python benchmarks/df_local_occ_probe.py --cases PfPMT:0:-1 --dm $SCRATCH/dm \
+    --groups 8,16,32 --rhok --rhok-blocks 2         # W15's oracle screen
 
 python benchmarks/df_local_probe.py --domains pair,pair+3.0   # W6, no GPU
 python benchmarks/df_local_accuracy.py --cases c1,c2,c3,c4    # W6's energies

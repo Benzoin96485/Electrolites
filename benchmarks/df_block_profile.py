@@ -47,7 +47,7 @@ if '--stats' in sys.argv:              # print the post-processing and go
     for r in ('nvtx_pushpop_sum', 'nvtx_gpu_proj_sum', 'cuda_kern_exec_sum',
               'cuda_gpu_kern_sum'):
         print(f'nsys stats --report {r} {rep}')
-    for v in ('dense', 'tiled'):
+    for v in ('dense', 'tiled', 'tiled-kernel', 'tiled-cupy'):
         print(f'nsys stats --report cuda_gpu_kern_sum --filter-nvtx={v} {rep}')
         print(f'nsys stats --report cuda_kern_exec_sum '
               f'--filter-nvtx={v} {rep}')
@@ -59,6 +59,10 @@ ap = parser(__doc__.splitlines()[0])
 ap.add_argument('--auxbasis', default=None)
 ap.add_argument('--tile', type=int, default=16)
 ap.add_argument('--tile-order', default='native')
+ap.add_argument('--unpacks', default='kernel',
+                help='which scatters into the row-compressed buffer to '
+                     'profile, as their own NVTX variants: `kernel` (W14), '
+                     '`cupy` (what it replaced), or both')
 ap.add_argument('--cpu-cderi', action='store_true',
                 help='force the cderi onto host memory, which is the regime '
                      'the open question is about')
@@ -151,19 +155,22 @@ print(f'[{a.xyz.rsplit("/", 1)[-1]}/{a.basis}] natm={mol.natm} '
       f'tile={a.tile}/{a.tile_order}', flush=True)
 
 fastdf.TILE, fastdf.TILE_ORDER = a.tile, a.tile_order
-VARIANTS = (('dense', 'tensor'), ('tiled', 'tiled'))
+VARIANTS = ([('dense', 'tensor', 'kernel')]
+            + [(f'tiled-{u}' if len(a.unpacks.split(',')) > 1 else 'tiled',
+                'tiled', u) for u in a.unpacks.split(',')])
 
 
-def call(step1):
+def call(step1, unpack='kernel'):
     fastdf._STEP1 = step1
+    _dfblock.UNPACK = unpack
     return fastdf.get_jk(dfobj, dm, 1, True, True)
 
 
 # warm both: the tile pattern, the resident prefix and every cuTENSOR plan are
 # built on first use and none of them is what this is measuring
 ref = None
-for name, step1 in VARIANTS:
-    vj, vk = call(step1)
+for name, step1, unpack in VARIANTS:
+    vj, vk = call(step1, unpack)
     if ref is None:
         ref = vk
     else:
@@ -177,11 +184,11 @@ if not a.no_nvtx_stages:
     _patch_stages()
 
 profiler.start()
-for name, step1 in VARIANTS:
+for name, step1, unpack in VARIANTS:
     cp.cuda.Device().synchronize()
     nvtx.RangePush(name)
     t0 = time.perf_counter()
-    call(step1)
+    call(step1, unpack)
     cp.cuda.Device().synchronize()
     dt = time.perf_counter() - t0
     nvtx.RangePop()

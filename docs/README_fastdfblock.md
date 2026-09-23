@@ -398,6 +398,19 @@ within 16 % of GPU4PySCF's hand-written one rather than four times it.
 plus the staging buffer it would remove, and is no longer the headline it
 looked like.
 
+> **W14 is done, and it was worth five times that.**
+> `docs/README_fastdfunpack.md`.  Written as one kernel the scatter is
+> **0.279 s** in the same profiled call against this table's 0.786 for the
+> two CuPy passes and against the dense kernel's 0.618 — *faster* than
+> GPU4PySCF's own, because both write the same `2 * npair * nL` doubles and
+> the tiled destination is `fill` times smaller.  On a whole call it is
+> 8215.77 → 7638.62 ms, so **the 1.21x this write-up reports is 1.28x**.
+> Two of the conclusions below move with it: §3.1's "the ratio is best at an
+> intermediate block" was a property of the CuPy scatter's *super*-linear
+> cost and is no longer true, and §4.2's break-even fill goes from 0.80 to
+> 0.90 (the gate stays at 0.75 on purpose).  The staging buffer is gone, so
+> §3.2's 5.44 GB is now **4.61**.
+
 Three things to take from this beyond W5.  A **kernel benchmark cannot see an
 allocator**: `df_block_bench.py` reuses one device-resident block, so its
 timed region allocated once where the real call allocated 114 times — which
@@ -475,6 +488,16 @@ on the work list:
   different algorithm with its own screening and error budget, and the
   permutation machinery in `electrolites/_dfblock.py` is the half of it that
   already exists.
+
+  > **W15 is done and it is a rejection**, `docs/README_fastdfunpack.md` §5.
+  > The rotation is exact and the localisation works — a pivoted Cholesky
+  > reproduces the 284-atom density to 1.5e-15 and its columns touch 66 of
+  > 284 atoms — and §1.1's lesson then repeats itself on the new index: the
+  > sparsity is five to twenty times at element granularity and one to two
+  > at the granularity a GEMM addresses.  The *row* support of even one
+  > localised orbital is the whole basis, so `vk = rhok rhok^T` has no block
+  > structure and step 2 gets exactly nothing.  Screened with an oracle at
+  > the tolerance `tests/test_df.py` holds, **99.8 % of the blocks survive**.
 
 ---
 
