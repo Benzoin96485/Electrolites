@@ -23,7 +23,17 @@ build, both implementations in one process:
 * both residencies, because the host branch contracts into a work buffer and
   the device branch straight into the output;
 * both ``sp_mult`` values, since a launch configuration may only change how
-  the same integrals are distributed over threads.
+  the same integrals are distributed over threads;
+* and, on the host branch, **all three stores** -- upstream's synchronous
+  host transpose, the device transpose with a ``cudaMemcpy2DAsync`` on a
+  second stream, and the transpose that writes straight into the mapped
+  buffer (``docs/DF_WORK_LIST.md`` W11).  Those cannot change an element
+  either, and that is exactly why they need checking: an ordering mistake in
+  a two-buffer, two-stream store shows up as a *block* of the tensor being
+  the wrong one, which nothing but an element-wise comparison would catch.
+
+The page-locked buffer is checked twice over: that one is page-locked at all,
+and that a second build of the same size **reuses** it, which is W12.
 
 Then, end to end: a density-fitted SCF energy against the unpatched one,
 which is the only check that the whole path is still the same calculation.
@@ -108,6 +118,23 @@ def main():
     import electrolites
     electrolites.patch('fastdfcderi')
     from electrolites import fastdfcderi as F
+    from electrolites import _dfj2c as J2C
+    from electrolites import _dfpin as PIN
+    from electrolites import _dfstore as STORE
+
+    def ref(intopt, **kw):
+        """GPU4PySCF's own build, with GPU4PySCF's own two-centre integrals.
+
+        W13 replaces ``int3c2e_bdiv.int2c2e`` at the *module* level, and
+        ``_REF`` looks it up there at call time -- so without this the
+        reference and the patched build would share the very thing being
+        checked, which is `docs/DF_WORK_LIST.md` 5.13 exactly.
+        """
+        mode, J2C._J2C = J2C._J2C, 'stock'
+        try:
+            return _REF(intopt, **kw)
+        finally:
+            J2C._J2C = mode
     # Every molecule here is below `_MIN_WORK`, so the default
     # configuration would take the dense product on all of them and the
     # sparse path would never be checked at all.  Forcing the threshold to
@@ -128,27 +155,35 @@ def main():
                     else None, verbose=0)
         for on_gpu in (True, False):
             intopt = _intopt(mol, a.auxbasis)
-            ref = _REF(intopt, use_gpu_memory=None if on_gpu else False)[0][0]
-            ref = cp.asarray(ref)
+            reference = ref(
+                intopt, use_gpu_memory=None if on_gpu else False)[0][0]
+            reference = cp.asarray(reference)
+            stores = ('host',) if on_gpu else ('host', 'stage', 'direct')
             for metric in ('trmm', 'trsm', 'gemm'):
                 for sp_mult in (1, 4):
-                    F._METRIC, F._SPMULT = metric, sp_mult
-                    got, idx = F._cholesky_eri(
-                        intopt, use_gpu_memory=None if on_gpu else False)
-                    rel = _cmp(got[0], ref)
-                    ok = rel <= a.tol
-                    worst = max(worst, rel)
-                    fails += not ok
-                    if a.verbose or not ok:
-                        print(f'{"ok  " if ok else "FAIL"} {name:8s} '
-                              f'{basis:11s} gpu={on_gpu!s:5s} '
-                              f'metric={metric:5s} sp_mult={sp_mult} '
-                              f'naux={ref.shape[0]:5d}  {rel:.2e}', flush=True)
-            del ref
+                    for store in stores:
+                        F._METRIC, F._SPMULT = metric, sp_mult
+                        STORE._STORE = store
+                        got, idx = F._cholesky_eri(
+                            intopt, use_gpu_memory=None if on_gpu else False)
+                        rel = _cmp(got[0], reference)
+                        ok = rel <= a.tol
+                        worst = max(worst, rel)
+                        fails += not ok
+                        if a.verbose or not ok:
+                            print(f'{"ok  " if ok else "FAIL"} {name:8s} '
+                                  f'{basis:11s} gpu={on_gpu!s:5s} '
+                                  f'metric={metric:5s} sp_mult={sp_mult} '
+                                  f'store={store:6s} '
+                                  f'naux={reference.shape[0]:5d}  {rel:.2e}',
+                                  flush=True)
+            STORE._STORE = 'stage'
+            del reference
             cp.get_default_memory_pool().free_all_blocks()
         F._METRIC, F._SPMULT = 'trmm', 1
         print(f'{"ok  " if not fails else "    "} {name:8s} {basis:11s} '
-              f'both residencies, both metrics, both aggregations', flush=True)
+              f'both residencies, both metrics, both aggregations, '
+              f'all three stores', flush=True)
 
     print(f'\nworst relative difference on the cderi: {worst:.2e} '
           f'(tolerance {a.tol:.0e})', flush=True)
@@ -156,6 +191,15 @@ def main():
         if F.stats()[k] == 0:
             print(f'FAIL the {k} contraction never ran', flush=True)
             fails += 1
+    if STORE.stats()['async_stores'] == 0:
+        print('FAIL the asynchronous store never ran', flush=True)
+        fails += 1
+    if STORE.stats()['declined_reasons']:
+        # a decline here is not wrong, but every host case above is small
+        # enough that the second block fits ten times over, so one means the
+        # arrangement is being refused for a reason worth reading
+        print(f'#    store declined: {STORE.stats()["declined_reasons"]}',
+              flush=True)
     # and the threshold itself: at the module's own default every case here
     # declines, which is the point of it
     F._MIN_WORK = _DEFAULT_MIN_WORK
@@ -187,6 +231,7 @@ def main():
                 mf.with_df.use_gpu_memory = False
             e = mf.kernel()
             DFMOD._cholesky_eri = _REF
+            J2C._J2C = 'stock'          # the same trap as `ref` above
             mf2 = (dft.UKS if spin else dft.RKS)(mol, xc='b3lyp')
             mf2 = mf2.density_fit(auxbasis=a.auxbasis)
             mf2.conv_tol = 1e-11
@@ -194,6 +239,7 @@ def main():
             if host:
                 mf2.with_df.use_gpu_memory = False
             eref = mf2.kernel()
+            J2C._J2C = 'cache'
             DFMOD._cholesky_eri = F._cholesky_eri
             d = abs(e - eref)
             ok = d <= a.etol
@@ -203,9 +249,85 @@ def main():
                   f'E = {e:.10f}  unpatched {eref:.10f}  d = {d:.2e}',
                   flush=True)
 
-    if F._PIN == 'register' and F.stats()['host_registered_gb'] <= 0:
-        print('FAIL no host buffer was page-locked by this module', flush=True)
+    # W12: that the buffer is page-locked at all, and that a second build of
+    # the same size gets the first one's buffer back rather than locking a
+    # new one.  The tensor is compared again after the reuse, because a pool
+    # that hands out the wrong buffer is a pool that computes the wrong
+    # answer and nothing in the timings would say so.
+    if PIN._PIN == 'register':
+        if PIN.stats()['registered_gb'] <= 0:
+            print('FAIL no host buffer was page-locked by this module',
+                  flush=True)
+            fails += 1
+        print('\n--- W12: the buffer, built twice ---', flush=True)
+        PIN.free_pool()
+        mol = gto.M(atom=ETHANOL, basis='def2-SVP', verbose=0)
+        intopt = _intopt(mol, a.auxbasis)
+        reference = cp.asarray(ref(intopt, use_gpu_memory=False)[0][0])
+        before = PIN.stats()['reused']
+        first = F._cholesky_eri(intopt, use_gpu_memory=False)[0][0]
+        rel1 = _cmp(first, reference)
+        ptr1 = first.ctypes.data
+        del first
+        second = F._cholesky_eri(intopt, use_gpu_memory=False)[0][0]
+        rel2 = _cmp(second, reference)
+        ptr2 = second.ctypes.data
+        reused = PIN.stats()['reused'] - before
+        ok = reused == 1 and ptr1 == ptr2 and max(rel1, rel2) <= a.tol
+        fails += not ok
+        print(f'{"ok  " if ok else "FAIL"} ethanol  def2-SVP    second build '
+              f'reused the buffer: {reused == 1} (same address: '
+              f'{ptr1 == ptr2}), cderi {rel1:.2e} then {rel2:.2e}', flush=True)
+        del second, reference
+        PIN.free_pool()
+        # and that turning the pool off leaves the tensor right anyway
+        PIN._POOL = False
+        third = F._cholesky_eri(intopt, use_gpu_memory=False)[0][0]
+        rel3 = _cmp(third, cp.asarray(ref(intopt, use_gpu_memory=False)[0][0]))
+        fails += rel3 > a.tol
+        print(f'{"ok  " if rel3 <= a.tol else "FAIL"} ethanol  def2-SVP    '
+              f'FASTDFCDERI_POOL=0                    {rel3:.2e}', flush=True)
+        PIN._POOL = True
+        del third
+        cp.get_default_memory_pool().free_all_blocks()
+    # W13: the two-centre metric integrals, whose optimiser is now built
+    # once and kept.  The bar is the matrix itself against GPU4PySCF's, at
+    # omega = 0 and at omega != 0 -- the range-separated case is the one a
+    # kept optimiser can get wrong, because `_check_rsh_factors` falls back
+    # to `cell.omega` and a cached optimiser holds the cell of whichever
+    # build made it.
+    print('\n--- W13: the two-centre metric integrals ---', flush=True)
+    from gpu4pyscf.df import int3c2e_bdiv as _bdiv
+    J2C.free_cache()
+    # `def2-SVP` and `def2-TZVPP` share `def2-universal-jkfit`, so the second
+    # basis here is a different family: two auxiliary sets, not two orbital
+    # ones, is what this section needs
+    for basis in ('def2-SVP', 'cc-pVTZ'):
+        mol = gto.M(atom=ETHANOL, basis=basis, verbose=0)
+        saux = _intopt(mol, a.auxbasis).auxmol
+        for omega in (None, 0.3, -0.3):
+            saux.omega = 0. if omega is None else omega
+            J2C._J2C = 'stock'
+            want = _bdiv.int2c2e_orig(saux, omega=omega)
+            worst_j2c = 0.
+            for mode in ('build', 'cache', 'cache'):
+                J2C._J2C = mode
+                got = J2C.int2c2e(saux, omega=omega)
+                worst_j2c = max(worst_j2c, _cmp(got, want))
+            ok = worst_j2c <= a.tol
+            fails += not ok
+            print(f'{"ok  " if ok else "FAIL"} ethanol  {basis:11s} '
+                  f'omega={str(omega):5s} naux={want.shape[0]:5d}  '
+                  f'built, cached and cached again: {worst_j2c:.2e}',
+                  flush=True)
+        saux.omega = 0.
+    J2C._J2C = 'cache'
+    if J2C.stats()['reused'] == 0:
+        print('FAIL the optimiser cache never hit', flush=True)
         fails += 1
+    print(f'# {PIN.stats()}', flush=True)
+    print(f'# {STORE.stats()}', flush=True)
+    print(f'# {J2C.stats()}', flush=True)
     print(f'\n{"PASS" if not fails else f"FAIL ({fails})"}', flush=True)
     return 1 if fails else 0
 

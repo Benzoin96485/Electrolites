@@ -124,6 +124,10 @@ _TARGETS = {
     # launch configuration is changed through, and the scheme it is checked
     # against
     'fastdfcderi': (('gpu4pyscf.df.df', '_cholesky_eri'),
+                    # W13: the two-centre metric integrals, whose per-call
+                    # optimiser is 70-80 % of `_decompose_j2c` at the small
+                    # end.  `df/df.py:602` looks it up on the module
+                    ('gpu4pyscf.df.int3c2e_bdiv', 'int2c2e'),
                     ('gpu4pyscf.gto.mole', 'SortedMole.mat_dot_C'),
                     ('gpu4pyscf.gto.mole', 'SortedMole.aggregate_shl_pairs'),
                     ('gpu4pyscf.df.int3c2e_bdiv', 'int3c2e_scheme')),

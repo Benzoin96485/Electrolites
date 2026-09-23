@@ -14,6 +14,8 @@ is; `docs/README_fastdfgrad.md` closed **W3**, `docs/README_fastdfcderi.md`
 **W7**, `docs/README_fastdfhess.md` **W8** (whose result is that its own
 target cannot be made faster, and whose *finding* is W16, W17 and W18),
 `docs/README_fastdfj3c.md` **W9** (whose findings are W19 and W20),
+`docs/README_fastdfstore.md` closed **W11**, **W12** and **W13** together
+(they are three items on one function, and its finding is W22),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -1059,62 +1061,207 @@ why it has to be: the refusal does not depend on free memory and is **not
 monotonic in the block** — 1096 is refused where 1240, 1456, 2048 and 3072
 are accepted — so no element cap of the kind W8 carries can describe it.
 
-### W11 — The host store, and the thread it runs on
+### W11 — The host store, and the stream it runs on — **done, and it is not a host thread**
 
 *(Found by W4, which measured it rather than closed it.)*
 
-With the cderi on the host, `libvhf_rys.transpose_write` is **24 %** of a
-113-atom block loop (821 ms) and **16 %** of a 284-atom one (4.88 s).  It is
-a synchronous host-side transpose-and-copy on one thread, between two blocks
-of integrals, and nothing overlaps with it: the next block's `fill_int3c2e`
-cannot start until it returns.
+`electrolites/_dfstore.py` (`HostStore` and its two kernels), the host branch
+of `electrolites/fastdfcderi.py`, `tests/test_dfcderi.py` (all three stores on
+every host-resident case), `benchmarks/df_store_probe.py`, write-up in
+`docs/README_fastdfstore.md` §2.
 
-* **Do**: give it its own CUDA stream and a second work buffer, so block
-  `n`'s write overlaps block `n+1`'s integrals — the structure `DF.loop`
-  already uses for the read direction.  The TODO is in upstream's own source
-  (`df/df.py:551`, "async-write to host memory in another stream").
-* **Success**: `benchmarks/df_cderi_probe.py --cpu-cderi` shows the store
-  falling out of the block loop on taxol and PfPMT.
-* **Falsified if**: the transpose is bandwidth-bound on the host rather than
-  latency-bound, in which case overlapping it buys only the launch gap.
-  Measure the write's GB/s first; 14.31 GB in 821 ms is 17 GB/s, which is
-  well under a PCIe gen4 x16 link and suggests it is the transpose, not the
-  transfer.
+**The premise of this entry was wrong and its conclusion was exactly right.**
+The entry called `libvhf_rys.transpose_write` "a synchronous host-side
+transpose-and-copy on one thread" and asked for the write's GB/s first, on
+the theory that "it is the transpose, not the transfer".  Disassembled,
+`transpose_write` calls `cudaHostGetDevicePointer` and launches a CUDA kernel
+— grid `(naux,1,1)`, block `(512,1,1)` — **on the default stream**.  There is
+no host loop: it moves a 2.05 GB block in **117.8 ms at 17.37 GB/s**, and that
+number is the same to four digits at `OMP_NUM_THREADS` of 1, 4, 16 and 32.
 
-### W12 — A pinned-buffer pool
+**And it is not slow, either.**  What sets the kernel's rate is how long a
+contiguous run it writes into host memory, and that run is the block's *pair*
+count: 45683 pairs is a 365 kB row and gets 17.37 GB/s, 111000 pairs is
+888 kB and gets **24.61**, against a plain `cudaMemcpy` of the same bytes at
+26.28.  At 284 atoms upstream's store is already at 94 % of the link.  What
+it is, at every size, is **synchronous** — which is the one thing this entry
+got right and the only thing worth fixing.
+
+**So the fix is the entry's own, plus one half it does not name.**  The write
+goes on a `non_blocking` stream of its own, with **two** destination blocks so
+that the block being written is not the block being computed and an event
+that lets batch `n+2` reuse batch `n`'s buffer — and it is handed to a **copy
+engine** rather than to the SMs: the transpose is done on the device into a
+staging slice (2.7 ms of 117, 744 GB/s, free) and what is left is a
+`cudaMemcpy2DAsync` at 24.36 GB/s against the kernel's 17.37.
+
+On the block loop of the real function, which the module now times for itself:
+
+| block loop, cderi on the host | GPU4PySCF | upstream's kernel, own stream | + the copy engine |
+|---|---|---|---|
+| penicillin V, def2-SVP (42 atoms) | 181.4 ms | 182.5 ms (0.99x) | **163.8 ms (1.11x)** |
+| taxol, def2-SVP (113 atoms) | 2649.0 ms | 2631.9 ms (1.01x) | **2385.3 ms (1.11x)** |
+| PfPMT, def2-SVP (284 atoms) | 28768.4 ms | 28763.7 ms (1.00x) | **23787.1 ms (1.21x)** |
+
+and inside the whole module, where the rest of the loop is faster too, the
+store is worth **1.16x** at 42 atoms, **1.19x** at 113 and **1.41x** at 284
+(`all` 119.7 / 1406.3 / 11589.7 ms against `all -store` 139.2 / 1675.6 /
+16365.5).  The cost is one `(batch_pairs, naux)` buffer — 2.05 GB at 113
+atoms, 11.9 GB at 284 — and the object declines the arrangement, with a
+reason, if `get_avail_mem` says it will not fit.
+
+**The half that is not named is the half that pays, and a synthetic loop says
+the opposite.**  Moving upstream's own kernel to the store stream and
+changing nothing else is 1.00x on the real call: a store done by the SMs has
+nothing to overlap with, because `fill_int3c2e` and the metric contraction
+are what the SMs are already doing.  A *synthetic* block loop — a spin kernel
+of a known duration standing in for the integrals — reads it the other way,
+1886 ms against the staged route's 1937 at 113-atom shapes and 10262 against
+12520 at 284-atom ones, because a spin kernel occupies thread blocks without
+wanting the issue slots the integrals want.  §5.7 for the third time.  Both
+routes are kept runnable (`FASTDFCDERI_STORE=direct`, `=stage`).
+
+**Two more things measured and not used.**  Splitting the staged route's
+transposes and copies over two streams, so the copy engine is never behind a
+transpose, is *slower* (2177 against 1937 ms at 113-atom shapes).  And the
+staging slice has to be taken along the **auxiliary** index, not the pair
+index: a slice of pairs makes every row of the 2-D copy as narrow as the
+slice (45 kB at a 256 MB budget) and a copy that narrow does not reach the
+link, which cost 400 ms of a 2.6 s loop.  The same asymmetry is why the
+*tiled* transpose is the wrong kernel to point at host memory at all —
+writing 32-double runs it gets **6.48 GB/s** at 284-atom shapes, a quarter of
+upstream's.
+
+**And a measurement rule this round had to learn** (now §5.14): the round
+robin in `benchmarks/df_cderi_bench.py` drifts across the columns of one
+round on the *host* branch.  An `all` column repeated in the last position
+read **2218–2259 ms against 1479–1575** in three separate jobs, with an
+identical configuration.  A few hundred milliseconds between two adjacent
+columns there is not an item.  The same three jobs read the **block loop** of
+those two columns as 1406.3 / 1410.2 ms — four digits apart — so the drift is
+entirely outside the loop, and W11 is priced on the loop, which
+`electrolites/fastdfcderi.py` times for itself and reports as
+`stats()['loop_s']`.
+
+### W12 — A pinned-buffer pool — **done, and the range-separated half of this entry is not true**
 
 *(Also from W4, which made the allocation 4.1x faster and did not remove it.)*
 
-Page-locking the cderi's host buffer with `cudaHostRegister` runs at
-**8.6 GB/s** against `cudaHostAlloc`'s 2.09, but 86.41 GB is
-still **10.1 s** at 284 atoms, and it is paid again on every `DF.build`: a
-geometry optimisation pays it per step, and a range-separated functional
-pays it twice per SCF because `DF.range_coulomb` builds a second object.
+`electrolites/_dfpin.py`, the host branch of `electrolites/fastdfcderi.py`,
+`tests/test_dfcderi.py` (the buffer built twice, by address as well as by
+counter), `benchmarks/df_store_probe.py --pool`,
+`benchmarks/df_cderi_bench.py --steps`, write-up in
+`docs/README_fastdfstore.md` §3.
 
-* **Do**: keep the registered buffer in a module-level pool keyed by size,
-  and hand it back on `DF.reset()` instead of unregistering it.
-* **Success**: the second and later builds of one process pay nothing.
-* **Falsified if**: the pool holds 86 GB of the node's 251 across a
-  calculation that needs the DRAM for something else.  A pool that releases
-  under `get_avail_mem` pressure is the version to write.
+**The success criterion is met exactly as written.**  Taxol's 14.32 GB host
+tensor, built four times in one process: `cudaHostAlloc` 6709/6692/6860/6841
+ms (2.09–2.14 GB/s), `cudaHostRegister` 1622/1641/1645/1722 (8.31–8.83), and
+`cudaHostRegister` with the pool **1662 / 0.1 / 0.0 / 0.0 ms**.  The second
+and later builds of one process pay nothing.
 
-### W13 — `_decompose_j2c`'s latency at the small end
+**On `_cholesky_eri` itself**, cderi on the host, every column round robin
+in one process — and read the `all` column as a *repeat* and `all/cold` as a
+first build, because the pool is the one thing in this round a single SCF
+cannot use:
+
+| | GPU4PySCF | `pin` (W4) | `all/cold` | | `all` | |
+|---|---|---|---|---|---|---|
+| penicillin V, def2-SVP (42 atoms) | 961.6 ms | 2.47x | 341.5 ms | 2.82x | **169.5 ms** | **5.67x** |
+| taxol, def2-SVP (113) | 12035.4 ms | 2.55x | 3464.8 ms | 3.47x | **1574.7 ms** | **7.64x** |
+| PfPMT, def2-SVP (284) | 91278.6 ms | 2.18x | 24024.3 ms | **3.80x** | **12037.6 ms** | **7.58x** |
+
+`docs/README_fastdfcderi.md` §6.2 measured the last of those at 2.95x with
+W4 alone.
+
+**End to end, three `DF.build()` calls on displaced geometries** — which is
+the shape of a geometry-optimisation step loop, and the only caller that
+pays the page-locking more than once — taxol/def2-SVP, cderi on the host:
+
+| | step 1 | step 2 | step 3 | total |
+|---|---|---|---|---|
+| GPU4PySCF | 9.63 s | 9.59 s | 9.58 s | 28.80 s |
+| `cudaHostRegister` (W4) | 4.59 | 4.57 | 4.46 | 13.62 |
+| + the pool (W12) | 4.57 | **2.84** | **2.80** | **10.21** |
+| the whole module | 3.32 | **1.83** | **2.24** | **7.40 s** |
+
+**The falsification is what shaped the policy.**  The pressure that matters
+is *host* memory, not `get_avail_mem`'s device memory, so a buffer is
+retained only while `MemAvailable` stays above the larger of 8 GB and a
+tenth of the node, the pool is capped at 60 % of the node (or
+`FASTDFCDERI_POOL_GB`), and the least recently released buffer is evicted
+first.  The reuse window is narrow on purpose — capacity between the request
+and 1.25x it — so that a 14 GB build cannot be handed the 86 GB buffer of
+the last one and hold it for the rest of the process.
+
+**But the range-separated half of this entry is wrong.**  `DF.range_coulomb`
+does build a second `DF` object and does page-lock a second buffer, and it
+**keeps the first**: `df/df.py:245` stores the range-separated object in
+`self._rsh_df[key]` and both live until the SCF ends.  The two tensors are
+alive at the same time, so there is nothing for a pool to hand over and it
+correctly does nothing there.  That is worth recording for its own sake: at
+284 atoms a range-separated density-fitted SCF holds **two** 86.41 GB host
+tensors, 173 of the node's 251 GB, and nothing warns.  That is a capacity
+item, not a speed one, and it is **W22**.
+
+### W13 — `_decompose_j2c`'s latency at the small end — **done, and it is none of the three**
 
 *(From W4's stage table.)*
 
-`_decompose_j2c` is **20–62 ms** on every system from 10 to 42 atoms — 40 ms
-at 23 atoms against a 27 ms block loop — and it is two cuSOLVER calls
-(`int2c2e`, `potrf`) and a `trsm` on a matrix of one to two thousand rows.
-That is latency, not arithmetic: the same three operations at 5598 rows cost
-235 ms, eleven times the work for four times the time.
+`electrolites/_dfj2c.py`, `tests/test_dfcderi.py` §W13,
+`benchmarks/df_j2c_probe.py`, write-up in `docs/README_fastdfstore.md` §4.
+`fastdfcderi` now also replaces `df/int3c2e_bdiv.py:int2c2e`, which
+`df/df.py:602` looks up on the module and so reaches upstream's own
+`_decompose_j2c` as well as this repository's.
 
-* **Do**: find out which of the three it is (the probe prints the stage but
-  not its parts), and whether a batched or a CPU factorisation is faster at
-  those orders.
-* **Success**: the small-system end of `df_cderi_bench.py` moves.  It is
-  worth 20–40 ms of a 30–170 ms build there and nothing at all past 100
-  atoms, so this is the least valuable item on this page — it is here
-  because it is the only stage of the build nothing has looked at.
+**The item asks which of `int2c2e`, `potrf` and the solve the 20–62 ms is.
+It is none of them.**
+
+| | naux | `_decompose_j2c` | `int2c2e` | of which `Int2c2eOpt()` | the kernel | `cholesky` | `dtrsm` |
+|---|---|---|---|---|---|---|---|
+| glycine, def2-SVP | 471 | 18.9 ms | 17.1 | **14.1** | 2.9 | 0.70 | 0.40 |
+| alanine dipeptide | 974 | 20.2 | 17.4 | **14.3** | 2.9 | 1.67 | 0.92 |
+| Pt amine | 1358 | 42.4 | 38.1 | **32.3** | 5.9 | 2.51 | 1.46 |
+| Ni dithiolene | 1992 | 35.4 | 29.3 | **23.9** | 5.3 | 3.71 | 2.67 |
+| penicillin V | 2191 | 30.6 | 23.2 | **19.5** | 4.1 | 4.42 | 3.16 |
+| taxol | 5598 | 65.3 | 25.2 | **15.0** | 10.4 | 14.3 | 26.0 |
+
+70–80 % of the stage at the small end is the `Int2c2eOpt` object `int2c2e`
+constructs per call and drops when it returns, and it is **nearly flat in
+system size** — 14.1 ms at `naux` 471 and 15.0 at 5598 — which is the
+signature of launch latency rather than of work.  Inside it, `from_cell`
+costs **0.00 ms** (the auxiliary basis is already sorted), `_scale_sp_ctr_coeff`
+0.12–0.21 and `PBCIntEnvVars` 0.14; the whole of the rest is **one loop**
+building the shell-pair index table with about eight individual cupy calls
+per pair of angular-momentum classes — 66 pairs for glycine at 13.79 ms, 171
+for the Pt amine at 31.57, 0.21 ms a pair either way.
+
+Built with numpy and moved in one transfer it is **0.83–1.92 ms**, a
+10x–17x, and the probe checks on every row that it is the same table.  (At
+**284 atoms** that reverses: the numpy index arithmetic grows with the number
+of shells where upstream's launch latency grows with the number of
+angular-momentum classes, and building the table on the host is 17 ms
+*slower* there — 0.07 % of a first build, and paid back by the cache on every
+later one.)  The
+optimiser is then also **kept**, keyed on a fingerprint of `_atm`, `_bas`
+and `_env` with the one word that holds `omega` left out — `mol.omega` *is*
+`_env[PTR_RANGE_OMEGA]`, so a naive fingerprint would rebuild for the second
+of the two builds a range-separated functional makes, and leaving it out is
+safe because `fill_int2c2e` takes `omega` as an explicit argument (measured:
+an optimiser built at ω = 0 reproduces GPU4PySCF's matrices at ω = ±0.3 to
+**0.0**).
+
+**The CPU factorisation the item asks about is rejected by six to
+twenty-six times**, with both transfers charged to it: LAPACK `dpotrf`
+4.38 ms against cuSOLVER's 0.70 at naux 471, 55.22 against 4.42 at 2191, and
+373.32 against 14.26 at 5598 — and the gap *grows* with the order, which is
+the opposite of what a latency argument predicts.  The copy, the `tril` and
+the `dev_info[0]` read around `potrf` are 2–8 % of `cholesky`, so there is
+nothing there either.
+
+**This is no longer the least valuable item on this page**, which is what
+the entry called it: it is worth 14–32 ms of a 30–170 ms build at the small
+end, and the same 14–32 ms again in every gradient and every Hessian that
+calls `_decompose_j2c` at a geometry already seen.
 
 ### W14 — A CUDA kernel for the tiled unpack
 
@@ -1337,6 +1484,34 @@ block pinned with `FASTDFGRAD_BLK`, `docs/README_fastdfgradoo.md` §4.1):
   extent is the obvious thing to test next), in which case a cheap test
   beats a retry and both modules should carry it.
 
+### W22 — A range-separated DF run holds two host cderi tensors at once
+
+*(Found by W12, which went looking for a pool and found there is nothing to
+pool.)*
+
+`DF.range_coulomb` builds a second `DF` object for the long-range operator
+and **keeps** it: `df/df.py:245` stores it in `self._rsh_df[key]` and both
+objects live until the SCF ends.  So a range-separated density-fitted run
+holds two cderi tensors of the same size at the same time — at 284 atoms
+that is **two 86.41 GB host tensors, 173 of the node's 251 GB**, and nothing
+warns.  §3.2 sizes the tensor; this entry is about there being two of them.
+
+It is a capacity item rather than a speed one, and it is the reason W12's
+pool does nothing for a range-separated functional: there is no released
+buffer to hand over.
+
+* **Do**: find out whether the second tensor has to be a second *tensor*.
+  The long-range build differs from the full-range one only in `omega`, and
+  `electrolites/_dfj2c.py` already shows that the two share an
+  `Int2c2eOpt` exactly; whether they can share storage is a different
+  question and needs the three-centre integrals looked at, not assumed.
+  Failing that, the honest minimum is that `DF.build` should *say* how much
+  host memory the pair will take before it takes it.
+* **Success**: a wB97X-D3 DF SCF at 284 atoms that does not need 173 GB of
+  host memory, or that says it does.
+* **Falsified if**: the two tensors genuinely share no structure, in which
+  case the item is a warning message and nothing more.
+
 ### Not on this list
 
 **Seminumerical exchange (sn-K / COSX)**, which would avoid the cderi
@@ -1443,6 +1618,32 @@ four are cheap to avoid and none is detectable from the number itself.
    numbers are plausible.  The import belongs inside the `--patch` branch.  The
    symptom, again, is a stock column that agrees with the patched one.
 
+14. **A round robin is not enough on the host branch of the cderi build.**
+   §5.2's rule — time the variants round robin rather than one after the
+   other — stops a *drift over minutes* from landing on one variant.  It does
+   not stop a drift within one round, and there is one:
+   `benchmarks/df_cderi_bench.py` on a host-resident taxol build reads
+   **1479–1499 ms** for its `all` column and **2218–2238 ms** for the same
+   configuration repeated in the last position, in two separate jobs.  Nothing
+   about the columns between them explains it, and it is not the pool (the
+   counters say every one of those columns reused the same buffer).  The
+   consequence is practical: on that branch a difference of a few hundred
+   milliseconds between two adjacent columns is not an item, and W11 — which
+   is worth exactly that much — had to be priced on the **block loop**, which
+   `electrolites/fastdfcderi.py` now times for itself and reports as
+   `stats()['loop_s']`.  Add a repeat of the column you care about in the last
+   position before believing any small difference here.
+
+15. **`int2c2e` is replaced at the module level, so the "unpatched"
+   reference is not unpatched.**  W13 replaces
+   `df/int3c2e_bdiv.py:int2c2e`, and the reference every test and benchmark
+   here uses — `DFMOD._cholesky_eri` saved before patching — looks that
+   function up on the module at *call* time.  Both `tests/test_dfcderi.py`
+   and `benchmarks/df_cderi_bench.py` now force `FASTDFCDERI_J2C=stock`, and
+   every other switch back to GPU4PySCF's own value, around the reference.
+   This is §5.13 in a third costume and the symptom is the same: a stock
+   column that agrees with the patched one.
+
 And one that is not about timing: **a patch target is not a code path.**
 Three rounds in this repository have now shipped a module that was loaded,
 correct, and never called — `dft/uks.py`, `hessian/uks.py`, and now
@@ -1483,11 +1684,20 @@ python benchmarks/df_grad_bench.py --xyz ... \
     --variants stock,fastdfgrad,'old sizing','old fill buf'
     # the two ablations that account for W10 being faster than W3's table
 
-python tests/test_dfcderi.py [--basis def2-tzvpp]        # W4's bar
+python tests/test_dfcderi.py [--basis def2-tzvpp]        # W4, W11, W12, W13
 python benchmarks/df_cderi_probe.py --xyz ... [--cpu-cderi] [--no-check]
 python benchmarks/df_cderi_probe.py --xyz ... --skip-metric --sp-mults 4 \
     --trmm-ladder 256,512,1024,2048,3072,5598   # where dtrsm stops paying
 python benchmarks/df_cderi_bench.py  --xyz ... [--cpu-cderi] [--scf]
+python benchmarks/df_cderi_bench.py  --xyz ... --cpu-cderi --steps 3
+    # W12: `DF.build()` again and again, as an optimisation step loop
+
+python benchmarks/df_j2c_probe.py --cases glycine,tmc_pt_amine,penicillinV
+    # W13: `_decompose_j2c` taken apart, and the host factorisation rejected
+python benchmarks/df_store_probe.py --naux 5598 --blk 45683 --nblk 7 \
+    --threads 1,4,16,32 --compute-ms 250 --pool
+    # W11 and W12: the store's rates, the thread sweep that says there is no
+    # host loop at all, the overlap, and the page-locked buffer
 ```
 
 ```bash

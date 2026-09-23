@@ -89,8 +89,9 @@ large hybrid, because a Coulomb-only DF build never constructs a cderi:
 | before the first Fock matrix | 88.7 s / 86.4 GB | **1.08 s / nothing** | — |
 
 `docs/README_fastdf.md`, `docs/README_fastdfj.md`, `docs/README_fastdfj3c.md`,
-`docs/README_fastdfcderi.md`, `docs/README_fastdfblock.md`,
-`docs/README_fastdffp32.md`, and `docs/DF_WORK_LIST.md` for what is left.
+`docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md`,
+`docs/README_fastdfblock.md`, `docs/README_fastdffp32.md`, and
+`docs/DF_WORK_LIST.md` for what is left.
 
 ### Response properties — penicillin V/def2-SVP, whole runs
 
@@ -213,7 +214,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |
 | `fastdfj3c` | `df.df_jk.get_j` and the three-centre Coulomb engine | `docs/README_fastdfj3c.md` |
-| `fastdfcderi` | `df.df._cholesky_eri` — the one-time cderi build | `docs/README_fastdfcderi.md` |
+| `fastdfcderi` | `df.df._cholesky_eri` — the one-time cderi build — and `df.int3c2e_bdiv.int2c2e`, the two-centre metric integrals under it | `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md` |
 | `fastdfgrad` | `df.grad.{rhf,rks,uhf,uks}.Gradients.jk_energy_per_atom` | `docs/README_fastdfgrad.md`, `docs/README_fastdfgradoo.md` |
 | `fastdfhess` | `df.hessian.rhf._get_jk` — the DF Hessian's CPHF build | `docs/README_fastdfhess.md` |
 | `fastdffp32` | `DF.loop` and the DF Hessian's cderi transfer — carries `FASTDF_FP32=1`, which is inert unless set and **changes the answer** when it is | `docs/README_fastdffp32.md` |

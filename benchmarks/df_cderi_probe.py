@@ -460,18 +460,22 @@ if not a.skip_metric:
 # --------------------------------------------------------------------------
 if a.cpu_cderi:
     print('\n--- page-locking the host buffer ---', flush=True)
-    from electrolites import fastdfcderi as _FP               # noqa: E402
+    # `_dfpin` rather than `fastdfcderi`, because importing the latter
+    # patches the build this probe is measuring (docs/DF_WORK_LIST.md 5.12),
+    # and `pool=False` because the pool would make every repeat but the first
+    # measure a dict lookup instead of a page-locking
+    from electrolites import _dfpin as _FP                    # noqa: E402
     gb = naux * R['info']['cderi_npairs'] * 8e-9
     R['pin'] = {}
     for label, fn in (('cudaHostAlloc (GPU4PySCF)',
                        lambda: empty_mapped((naux, R['info']['cderi_npairs']))),
                       ('cudaHostRegister, 4 kB pages',
-                       lambda: _FP._empty_mapped(
+                       lambda: _FP.empty_mapped_pooled(
                            (naux, R['info']['cderi_npairs']),
-                           hugepage=False)),
+                           hugepage=False, pool=False)),
                       ('cudaHostRegister + MADV_HUGEPAGE',
-                       lambda: _FP._empty_mapped(
-                           (naux, R['info']['cderi_npairs'])))):
+                       lambda: _FP.empty_mapped_pooled(
+                           (naux, R['info']['cderi_npairs']), pool=False))):
         ts = []
         for _ in range(max(2, a.reps)):
             t = time.perf_counter()

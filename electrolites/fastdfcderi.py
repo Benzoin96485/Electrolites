@@ -33,6 +33,14 @@ more in a basis with more general contraction -- provided cuBLAS's ``dtrsm``
 does not give the factor back, the same trap ``dsyrk`` fell into in
 ``docs/README_fastdf.md`` 1.
 
+**Three more, from the same function and a later round.**  W4 measured the
+build stage by stage and left three items behind that are not arithmetic at
+all: a host store that overlaps nothing (**W11**), a page-locked buffer
+re-allocated on every build (**W12**), and a setup stage that is 70-80 %
+``cupy`` launch latency (**W13**).  Those are
+``electrolites/_dfstore.py``, ``electrolites/_dfpin.py`` and
+``electrolites/_dfj2c.py``, and ``docs/README_fastdfstore.md`` is the round.
+
 **Two.  The integral kernel is launched four shell pairs deep where one is
 faster.**  ``int3c2e_evaluator`` aggregates shell pairs at
 ``nsp_per_block*4`` (``df/int3c2e_bdiv.py:176``) -- the same constant W3
@@ -56,6 +64,14 @@ Ablations, for the tables in ``docs/README_fastdfcderi.md``:
     FASTDFCDERI_PIN=alloc    page-lock the host-resident cderi with
                              GPU4PySCF's `cudaHostAlloc` instead of with
                              `cudaHostRegister`
+    FASTDFCDERI_POOL=0       W12: do not keep the page-locked buffer for the
+                             next build.  `electrolites/_dfpin.py`
+    FASTDFCDERI_STORE=host   W11: move each block to the host with
+                             upstream's kernel on the default stream instead
+                             of on a second one.  `electrolites/_dfstore.py`
+    FASTDFCDERI_J2C=stock    W13: build the two-centre integrals' optimiser
+                             per call, as GPU4PySCF does, instead of once.
+                             `electrolites/_dfj2c.py`
     FASTDF_FP32=1            store the tensor in single precision, which is
                              `docs/DF_WORK_LIST.md` W7 and is owned by
                              `electrolites/_dffp32.py`.  It changes the answer
@@ -63,6 +79,7 @@ Ablations, for the tables in ``docs/README_fastdfcderi.md``:
 """
 import ctypes
 import os
+import time
 
 import numpy as np
 import cupy as cp
@@ -74,14 +91,14 @@ from gpu4pyscf.df import int3c2e_bdiv as bdiv
 from gpu4pyscf.df.int3c2e_bdiv import int3c2e_scheme
 from gpu4pyscf.gto.mole import SortedMole
 from gpu4pyscf.lib import logger, multi_gpu
-from cupy_backends.cuda.api import runtime
 from electrolites import _dffp32 as FP32
+from electrolites import _dfj2c as J2C
+from electrolites import _dfpin as PIN
+from electrolites import _dfstore as STORE
 from electrolites._dfaux import (                     # noqa: F401
     _contract_aux, _sparse_ctr_coeff, _spmult, _orig_aggregate, _SPMULT)
 from gpu4pyscf.lib.cupy_helper import (
-    asarray, cholesky, empty_mapped, get_avail_mem, ndarray)
-
-libvhf_rys = bdiv.libvhf_rys
+    asarray, cholesky, get_avail_mem, ndarray)
 
 _OFF = bool(os.environ.get('FASTDFCDERI_OFF'))
 #: how each block's metric contraction is done.
@@ -105,22 +122,17 @@ _METRIC = os.environ.get('FASTDFCDERI_METRIC', 'trmm')
 #: `docs/README_fastdfcderi.md` section 4.4.
 _MIN_WORK = float(os.environ.get('FASTDFCDERI_MIN_WORK', 4e10))
 
-#: how the host-resident cderi's buffer is page-locked.  'register' allocates
-#: ordinary memory, advises the kernel to back it with huge pages and pins it
-#: with `cudaHostRegister`; 'alloc' is GPU4PySCF's `empty_mapped`, a plain
-#: `cudaHostAlloc`.  Measured, the allocation alone is **68 %** of a
-#: host-resident 113-atom build -- `docs/README_fastdfcderi.md` section 5.
-_PIN = os.environ.get('FASTDFCDERI_PIN', 'register')
-#: whether the buffer is aligned to a transparent huge page and the kernel
-#: advised to back it with them.  Measured on a whole node it is worth
-#: **0.3 %** -- the factor comes from not going through `cudaHostAlloc` at
-#: all -- and on a shared login GPU it was worth 2.21 -> 2.94 GB/s, so it is
-#: kept: one `madvise` against a case where it does help.
-_HUGEPAGE = os.environ.get('FASTDFCDERI_HUGEPAGE', '1') != '0'
-
 #: counters, so a coverage claim can be read off a run rather than assumed.
+#: `loop_s` is the wall time of the host branch's block loop, store included
+#: and page-locking excluded.  It is here because the round robin in
+#: `benchmarks/df_cderi_bench.py` drifts by up to 25 % across the columns of
+#: one round on this branch -- an `all` column repeated in the last position
+#: read 2238 ms against 1499 -- so a difference of a few hundred milliseconds
+#: between two adjacent columns cannot be read as the item that separates
+#: them.  W11 is priced on this number instead, which is one loop measured
+#: against itself.
 STATS = {'builds': 0, 'trmm': 0, 'trsm': 0, 'gemm': 0, 'blocks': 0,
-         'host_registered_gb': 0.}
+         'loop_s': 0.}
 DECLINED = {}
 
 _ONE = np.ones(1)
@@ -142,82 +154,16 @@ def stats():
     """What this module did in this process.  Nothing numerical can say."""
     out = dict(STATS)
     out['declined_reasons'] = dict(DECLINED)
+    # the two halves of the host branch live in their own modules, because a
+    # probe has to be able to import them without patching a build
+    out['pin'] = PIN.stats()
+    out['store'] = STORE.stats()
+    out['j2c'] = J2C.stats()
     return out
 
 
 def _decline(reason):
     DECLINED[reason] = DECLINED.get(reason, 0) + 1
-
-
-# --------------------------------------------------------------------------
-# the host buffer the cderi is streamed from
-# --------------------------------------------------------------------------
-_PAGE = 4096
-#: a transparent huge page on x86-64.  See `_HUGEPAGE` for what it is worth.
-_HUGE = 2 * 1024 * 1024
-#: ``MADV_HUGEPAGE`` from ``asm-generic/mman-common.h``
-_MADV_HUGEPAGE = 14
-#: ``cudaHostRegisterMapped``; cupy does not export the enum
-_HOST_REGISTER_MAPPED = 2
-_libc = ctypes.CDLL('libc.so.6')
-
-
-class _Pinned:
-    """Page-locked host memory, pinned rather than allocated.
-
-    ``empty_mapped`` is one ``cudaHostAlloc``, which runs at **2.09 GB/s**
-    -- 6.8 s of a 113-atom host-resident build, **65 %** of it, and 41.5 s
-    of a 72.5 s 284-atom one.  Ordinary memory handed to
-    ``cudaHostRegister`` is the same page-locked, device-mapped buffer at
-    **8.6 GB/s**: it is the allocation that is slow, not the page-locking,
-    and `docs/README_fastdfcderi.md` section 5 separates the two.  The
-    registration has to be released when the buffer goes, which is what this
-    object is for: the array that owns it holds a reference, and every view
-    of that array holds the array.
-    """
-
-    def __init__(self, nbytes, hugepage=None):
-        hugepage = _HUGEPAGE if hugepage is None else hugepage
-        align = _HUGE if hugepage else _PAGE
-        self.raw = np.empty(nbytes + align, dtype=np.uint8)
-        base = self.raw.ctypes.data
-        self.offset = int((-base) % align)
-        self.ptr = base + self.offset
-        self.nbytes = (nbytes + _PAGE - 1) // _PAGE * _PAGE
-        if hugepage:
-            _libc.madvise(ctypes.c_void_p(self.ptr),
-                          ctypes.c_size_t(self.nbytes), _MADV_HUGEPAGE)
-        runtime.hostRegister(self.ptr, self.nbytes, _HOST_REGISTER_MAPPED)
-        self.registered = True
-
-    def __del__(self):
-        if getattr(self, 'registered', False):
-            self.registered = False
-            try:
-                runtime.hostUnregister(self.ptr)
-            except Exception:                                # noqa: BLE001
-                pass
-
-
-class _MappedArray(np.ndarray):
-    """An ndarray that can carry the registration its buffer depends on."""
-
-
-def _empty_mapped(shape, dtype=float, hugepage=None):
-    """``empty_mapped``, page-locked the cheaper way when that is available."""
-    if _PIN != 'register':
-        return empty_mapped(shape, dtype)
-    nbytes = int(np.prod(shape)) * int(np.dtype(dtype).itemsize)
-    try:
-        holder = _Pinned(nbytes, hugepage)
-    except Exception as exc:                                 # noqa: BLE001
-        _decline(f'cudaHostRegister failed ({type(exc).__name__})')
-        return empty_mapped(shape, dtype)
-    out = np.ndarray(shape, dtype=dtype, buffer=holder.raw.data,
-                     offset=holder.offset).view(_MappedArray)
-    out._pin = holder
-    STATS['host_registered_gb'] += nbytes * 1e-9
-    return out
 
 
 # --------------------------------------------------------------------------
@@ -232,7 +178,7 @@ def _decompose_j2c(auxmol, aux_sorting=None, omega=None, keep_factor=False):
     it, and rebuilding it would cost a second ``int2c2e`` and a second
     ``potrf``.
     """
-    j2c = bdiv.int2c2e(auxmol, omega=omega)
+    j2c = J2C.int2c2e(auxmol, omega=omega)
     cd_low = None
     try:
         cd_low = cholesky(j2c)
@@ -309,6 +255,15 @@ def _trmm_right_lowerT(x, cd_inv, out=None):
 _orig_cholesky_eri = DFMOD._cholesky_eri
 #: the original, under the name `benchmarks/coverage_probe.py` looks for
 DFMOD._cholesky_eri_orig = _orig_cholesky_eri
+
+# W13.  The two-centre metric integrals are replaced at the module level
+# rather than only inside this file's own `_decompose_j2c`, because
+# `df/df.py:_decompose_j2c` -- which the density-fitted *gradient* calls for
+# the identity its cderi reuse rests on -- looks the function up on
+# `int3c2e_bdiv` at call time and so is reached by the same patch.
+# `electrolites/_dfj2c.py` has the measurement and the fallbacks.
+bdiv.int2c2e_orig = J2C._orig_int2c2e
+bdiv.int2c2e = J2C.int2c2e
 
 
 def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
@@ -493,8 +448,12 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
         return out
 
     if not on_gpu:
-        cderi_cpu = _empty_mapped((naux, cderi_npairs),
-                                  dtype=np.float32 if fp32 else np.float64)
+        # W12: page-locked the cheap way, and kept for the next build.  A
+        # geometry optimisation builds this buffer once per step and a
+        # range-separated functional twice per SCF, and page-locking 86 GB is
+        # 10 s each time -- `electrolites/_dfpin.py`.
+        cderi_cpu = PIN.empty_mapped_pooled(
+            (naux, cderi_npairs), dtype=np.float32 if fp32 else np.float64)
 
         def proc(batch_iter):
             device_id = cp.cuda.device.get_device_id()
@@ -506,41 +465,38 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
                     omega=omega)[0]
 
             work = cp.empty(naux_sorted * batch_size)
-            work2 = cp.empty(naux * batch_size)
             scratch = cp.empty(naux * min(chunk, batch_size)) if sparse else None
             if needs_recontraction:
-                work1 = cp.empty(naux * cderi_batch_size)
-            # W7: the transpose upstream does on the host, done on the device
-            # instead, because it has to narrow the block anyway.  One buffer
-            # for the whole loop -- a per-batch allocation in a loop that
-            # relies on a copy overlapping is `docs/DF_WORK_LIST.md` §5.8.
-            t32 = cp.empty((naux, cderi_batch_size),
-                           dtype=np.float32) if fp32 else None
+                work2 = cp.empty(naux * batch_size)
+            # W11: the store, and the stream it runs on.  The object owns
+            # the block each batch contracts into -- two of them, so that
+            # block `n`'s write overlaps block `n+1`'s integrals -- and the
+            # transpose that upstream does with a kernel on stream 0.
+            # `electrolites/_dfstore.py`.
+            store = STORE.HostStore(
+                cderi_cpu, naux, cderi_npairs, cderi_batch_size, fp32=fp32)
 
+            cp.cuda.get_current_stream().synchronize()
+            t_loop = time.perf_counter()
             for batch_id in batch_iter:
                 log.debug1('processing cderi batch %d', batch_id)
                 j3c = _eval_j3c(shl_pair_batch_id=batch_id, out=work)
-                cderi_gpu = ndarray((j3c.shape[0], naux), buffer=work2)
-                if sparse:
-                    cderi_gpu = contract(j3c, cderi_gpu, scratch)
-                else:
-                    cderi_gpu = j3c.dot(c, out=cderi_gpu)
-                if needs_recontraction:
-                    cderi_gpu = recontract(batch_id, cderi_gpu, out=work1)
-
                 p0, p1 = cderi_offsets[batch_id:batch_id+2]
-                if fp32:
-                    view = t32[:, :p1 - p0]
-                    FP32.transpose_cast(cderi_gpu, view)
-                    FP32.copy_2d_to_host(cderi_cpu[:, p0:p1], view)
-                    continue
-                err = libvhf_rys.transpose_write(
-                    cderi_cpu.ctypes,
-                    ctypes.cast(cderi_gpu.data.ptr, ctypes.c_void_p),
-                    ctypes.c_int(naux), ctypes.c_int(cderi_npairs),
-                    ctypes.c_int(p0), ctypes.c_int(p1))
-                if err != 0:
-                    raise RuntimeError('transpose_write cderi_cpu failed')
+                dst = store.block(p1 - p0 if needs_recontraction
+                                  else j3c.shape[0])
+                if needs_recontraction:
+                    tmp = ndarray((j3c.shape[0], naux), buffer=work2)
+                    tmp = (contract(j3c, tmp, scratch) if sparse
+                           else j3c.dot(c, out=tmp))
+                    dst = recontract(batch_id, tmp, out=dst)
+                elif sparse:
+                    dst = contract(j3c, dst, scratch)
+                else:
+                    dst = j3c.dot(c, out=dst)
+                store.commit(dst, p0, p1)
+            store.finish()
+            cp.cuda.get_current_stream().synchronize()
+            STATS['loop_s'] += time.perf_counter() - t_loop
 
         batch_iter = iter(range(num_batches))
         multi_gpu.run(proc, args=(batch_iter,), non_blocking=True)
