@@ -88,9 +88,13 @@ A/B the issue order.
 The ``mo1`` path is worth being precise about, because it is *not* the same
 function on the two spin cases.  On a restricted reference the Hessian's CPHF
 solve does not come here at all -- 1.8.1 serves it from
-``hessian/rks.py:nr_rks_fxc_mo``, which ``docs/HESSIAN_1.8.1.md`` measures at
-a third of the card's fp64 peak, i.e. not launch-bound, so this treatment is
-not the one it wants.  On an **unrestricted** reference there is no
+``hessian/rks.py:nr_rks_fxc_mo``, which this module now also replaces
+(``_nr_rks_fxc_mo``, `docs/DF_WORK_LIST.md` W16): the density it is handed is
+a density matrix as well as a pair of orbital factors, so it is this
+module's blocked path on the matrix and upstream's ``_ao2mo`` after it, with
+the density taken from the factors in the grid blocks where that is cheaper
+(``docs/README_fastdfhessip.md`` 2).  Upstream's own function contracts
+``fxc`` in place and is wrong for meta-GGAs; this one is not.  On an **unrestricted** reference there is no
 ``nr_uks_fxc_mo``: ``hessian/uks.py:get_veff_resp_mo`` calls ``nr_uks_fxc``
 itself, and ``hessian/uhf.py:gen_vind`` tags the perturbed density with
 ``mo1``, so the open-shell Hessian's CPHF lands on the ``mo1`` branch *of
@@ -123,6 +127,10 @@ from ._paths import KERNEL_DIR as HERE
 #: asks for and it measures slower; see the module docstring.
 MODE = os.environ.get('FASTXCFXC_MODE', 'blocked')
 
+#: FASTXCFXC_MO=0 hands ``hessian/rks.py:nr_rks_fxc_mo`` back to GPU4PySCF
+#: (W16's binding off); it is read at call time, so a benchmark can A/B it
+#: in one process.
+#:
 #: FASTXCFXC_TIME=1 prints the per-stage split of each call.
 TIME = int(os.environ.get('FASTXCFXC_TIME', 0))
 
@@ -146,7 +154,7 @@ _T = {'prep': 0., 'gemm1': 0., 'rho1': 0., 'wv': 0., 'scale': 0.,
 #: unrestricted Hessian's CPHF) -- and they take different branches here.
 #: A decline returns the right answer too, so nothing numerical distinguishes
 #: the three; this counter does.  `benchmarks/coverage_probe.py` prints it.
-_S = {'ours_u': 0, 'ours_u_mo': 0, 'stock_u': 0}
+_S = {'ours_u': 0, 'ours_u_mo': 0, 'stock_u': 0, 'ours_mo': 0, 'stock_mo': 0}
 
 
 def stats():
@@ -284,7 +292,8 @@ def _prep(ni, mol, grids, dms, hermi, nspin=1):
 
 
 def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
-                 rho0, vxc, fxc, max_memory, verbose, kernels=True, nspin=1):
+                 rho0, vxc, fxc, max_memory, verbose, kernels=True, nspin=1,
+                 factors=None):
     """The shipped path, for one spin channel or two.
 
     The unrestricted case is the restricted one with the density matrices
@@ -350,6 +359,28 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
     # function, and this one is the same shape times `nsk`
     dm_buf = (None if mo1 is not None
               else cupy.empty(nsk * nsub_max * nsub_max))
+    # W16's second route to c0, for a density matrix that arrives with its
+    # factors: D = M O^T + O M^T, so D . ao_0 = M (O^T ao_0) + O (M^T ao_0),
+    # 3 nocc nsub flops per grid point per set against the matrix route's
+    # nsub^2.  Two of its three GEMMs have an inner dimension of nocc and run
+    # well below the matrix route's rate, so it is taken block by block where
+    # nsub > FASTXCFXC_FACTOR_RATIO * nocc (4, measured -- at 3, the flop
+    # break-even, it loses on def2-SVP), and only for LDA and GGA, whose
+    # density needs D . ao_0 alone.
+    fac = None
+    if (factors is not None and nspin == 1 and mo1 is None and nc0 == 1
+            and os.environ.get('FASTXCFXC_FACTORS', '1') != '0'):
+        m_all = opt.sort_orbitals(cupy.asarray(factors[0]), axis=[1])
+        o_all = opt.sort_orbitals(cupy.asarray(factors[1]), axis=[0])
+        nocc_f = o_all.shape[1]
+        ratio = float(os.environ.get('FASTXCFXC_FACTOR_RATIO', '4'))
+        if m_all.shape[0] == nset and ratio * nocc_f < nsub_max:
+            fac = (cupy.ascontiguousarray(m_all), cupy.ascontiguousarray(o_all),
+                   nocc_f, cupy.empty(nset * nsub_max * nocc_f),
+                   cupy.empty(nsub_max * nocc_f),
+                   cupy.empty(nset * nocc_f * blk), cupy.empty(nocc_f * blk),
+                   ratio)
+        m_all = o_all = None
     if TIME:
         cupy.cuda.Stream.null.synchronize()
         _T['prep'] += _time.perf_counter() - _t
@@ -369,7 +400,12 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
         ao0 = ao if lda else ao[0]
 
         # ---- rho1 = (D . ao_0) . ao, one GEMM for every set --------------
-        if mo1 is None:
+        if (fac is not None and fac[7] * fac[2] < nsub
+                and ao0.flags.c_contiguous):
+            c0 = ndarray((nc0, nsk * nsub, ng), buffer=c0_buf)
+            _c0_from_factors(fac, idx, ao0, c0[0], nset, nsub, ng)
+            _S['factor_blocks'] = _S.get('factor_blocks', 0) + 1
+        elif mo1 is None:
             dm_mask = take_last2d(dms, idx, out=dm_buf)
             dm2 = dm_mask.reshape(nsk * nsub, nsub)
             c0 = ndarray((nc0, nsk * nsub, ng), buffer=c0_buf)
@@ -519,6 +555,47 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
     log.timer_debug1(
         f'nr_{"u" if nspin == 2 else "r"}ks_fxc (fastxcfxc, blocked)', *t0)
     return cupy.asarray(vmat)
+
+
+#: FASTXCFXC_FACTORS=0 keeps W16's call on the density-matrix route in every
+#: block (the factor route is otherwise taken where FASTXCFXC_FACTOR_RATIO *
+#: nocc < nsub); both are read at call time
+_ONE = np.array(1.0)
+_ZERO = np.array(0.0)
+
+
+def _c0_from_factors(fac, idx, ao0, c0, nset, nsub, ng):
+    """``c0[i] = D_i . ao_0`` for ``D_i = M_i O^T + O M_i^T``, on one block.
+
+    Three cuBLAS calls, all row-major and expressed column-major below:
+    ``Y_i = M_i^T ao_0`` and ``c0_i += O Y_i`` are strided batches over the
+    sets with the shared operand at stride 0, and ``c0 = M (O^T ao_0)`` is a
+    single GEMM on the flattened ``(i, u)`` row index.
+    """
+    from cupy_backends.cuda.libs import cublas
+    m_all, o_all, nocc, m_buf, o_buf, y_buf, x_buf, _ = fac
+    handle = cupy.cuda.device.get_cublas_handle()
+    m = ndarray((nset, nsub, nocc), buffer=m_buf)
+    cupy.take(m_all, idx, axis=1, out=m)
+    o = ndarray((nsub, nocc), buffer=o_buf)
+    cupy.take(o_all, idx, axis=0, out=o)
+    x = ndarray((nocc, ng), buffer=x_buf)
+    cupy.dot(o.T, ao0, out=x)
+    y = ndarray((nset, nocc, ng), buffer=y_buf)
+    n_ = cublas.CUBLAS_OP_N
+    t_ = cublas.CUBLAS_OP_T
+    # Y_i (nocc x ng) = M_i^T ao_0  <=>  Y_i^T = ao_0^T M_i  (column-major)
+    cublas.dgemmStridedBatched(
+        handle, n_, t_, ng, nocc, nsub, _ONE.ctypes.data,
+        ao0.data.ptr, ng, 0, m.data.ptr, nocc, nsub * nocc,
+        _ZERO.ctypes.data, y.data.ptr, ng, nocc * ng, nset)
+    # c0 (nset nsub x ng) = M X
+    cupy.dot(m.reshape(nset * nsub, nocc), x, out=c0)
+    # c0_i += O Y_i  <=>  c0_i^T += Y_i^T O^T  (column-major)
+    cublas.dgemmStridedBatched(
+        handle, n_, n_, ng, nsub, nocc, _ONE.ctypes.data,
+        y.data.ptr, ng, nocc * ng, o.data.ptr, nocc, 0,
+        _ONE.ctypes.data, c0.data.ptr, ng, nsub * ng, nset)
 
 
 def _nr_rks_fxc_blocked(*a, **kw):
@@ -687,8 +764,63 @@ def _nr_rks_fxc_dispatch(ni, mol, grids, xc_code, dm0=None, dms=None,
                                hermi, rho0, vxc, fxc, max_memory, verbose)
 
 
+def _nr_rks_fxc_mo(ni, mol, grids, xc_code, dm0=None, dms=None,
+                   mo_coeff=None, relativity=0, hermi=0, rho0=None, vxc=None,
+                   fxc=None, max_memory=2000, verbose=None):
+    """``hessian/rks.py:nr_rks_fxc_mo`` -- a restricted Hessian's CPHF grid half.
+
+    `docs/DF_WORK_LIST.md` **W16**.  Upstream's function is ``nr_rks_fxc``'s
+    ``mo1`` branch with the MO transformation folded onto the end: per grid
+    block it evaluates the perturbed density from the orbitals
+    (``eval_rho4``, a ``contract`` per right-hand side), contracts ``fxc``,
+    and builds the potential with one ``ao . aow^T`` per right-hand side --
+    ``2 nset`` small cuBLAS calls and ``2 nset`` elementwise kernels per
+    block, which is what makes it launch-bound (`docs/README_fastxcfxc.md`
+    has the per-set loop; `docs/README_fastdfhessip.md` 2 the profile).
+
+    The perturbed density a CPHF cycle hands it is *also* a density matrix:
+    ``hessian/rhf.py:gen_vind`` builds ``dm1 = mo1 (2 C_o)^T + h.c.`` and
+    tags it with ``mo1`` and ``occ_coeff``.  So the whole function is the
+    blocked ``nr_rks_fxc`` of this module on the plain matrix, with
+    ``hermi = 1`` because ``dm1`` is symmetric by construction, followed by
+    upstream's own ``_ao2mo`` -- a binding and no new kernel.
+    """
+    if fxc is None:
+        raise RuntimeError('fxc was not initialized')
+    fn = _MODES.get(MODE) if MODE != 'grouped' else None
+    if os.environ.get('FASTXCFXC_MO', '1') == '0':
+        fn = None
+    plain = None
+    if fn is not None and hasattr(dms, 'occ_coeff'):
+        plain = cupy.asarray(dms).view(cupy.ndarray)
+        if not _usable(ni, xc_code, plain, 1, fxc):
+            plain = None
+    if plain is None:
+        _S['stock_mo'] += 1
+        from gpu4pyscf.hessian import rks as rks_hess
+        return rks_hess._nr_rks_fxc_mo_orig(ni, mol, grids, xc_code, dm0, dms,
+                                            mo_coeff, relativity, hermi, rho0,
+                                            vxc, fxc, max_memory, verbose)
+    _S['ours_mo'] += 1
+    from gpu4pyscf.hessian.rhf import _ao2mo
+    nao = plain.shape[-1]
+    kw = {}
+    if fn is _nr_rks_fxc_blocked and hasattr(dms, 'mo1'):
+        # the factors of `dm1 = mo1 (2 C_o)^T + h.c.` (`gen_vind`)
+        kw['factors'] = (dms.mo1, 2 * cupy.asarray(dms.occ_coeff))
+    v = fn(ni, mol, grids, xc_code, None, plain.reshape(-1, nao, nao), 0, 1,
+           rho0, vxc, fxc, max_memory, verbose, **kw)
+    v = _ao2mo(v, cupy.asarray(dms.occ_coeff), cupy.asarray(mo_coeff))
+    if plain.ndim == 2:
+        v = v[0]
+    return v
+
+
+_nr_rks_fxc_mo_orig = None
+
+
 def apply_patch():
-    global _PATCHED
+    global _PATCHED, _nr_rks_fxc_mo_orig
     if not _PATCHED:
         NI._nr_rks_fxc_orig = NI.nr_rks_fxc
         # the module attribute is the one `nr_rks_fxc_st` (TDA/TDDFT) calls;
@@ -705,6 +837,13 @@ def apply_patch():
         NI._nr_uks_fxc_orig = NI.nr_uks_fxc
         NI.nr_uks_fxc = _nr_uks_fxc_dispatch
         NI.NumInt.nr_uks_fxc = _nr_uks_fxc_dispatch
+        # W16: a restricted Hessian's CPHF does not come through
+        # `nr_rks_fxc` at all.  `hessian/rks.py:get_veff_resp_mo` looks this
+        # one up on its own module, and nothing else calls it.
+        from gpu4pyscf.hessian import rks as rks_hess
+        _nr_rks_fxc_mo_orig = rks_hess.nr_rks_fxc_mo
+        rks_hess._nr_rks_fxc_mo_orig = _nr_rks_fxc_mo_orig
+        rks_hess.nr_rks_fxc_mo = _nr_rks_fxc_mo
         _PATCHED = True
 
 

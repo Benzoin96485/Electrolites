@@ -38,6 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
+    'fastdfhessip',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -77,7 +78,12 @@ _TARGETS = {
                    ('gpu4pyscf.hessian.uks', '_get_vxc_deriv1'),
                    ('gpu4pyscf.hessian.uks', '_get_vxc_deriv2')),
     'fastxcfxc': (('gpu4pyscf.dft.numint', 'nr_rks_fxc'),
-                  ('gpu4pyscf.dft.numint', 'nr_uks_fxc')),
+                  ('gpu4pyscf.dft.numint', 'nr_uks_fxc'),
+                  # a restricted Hessian's CPHF grid half, which is not
+                  # `nr_rks_fxc` (docs/DF_WORK_LIST.md W16).  The
+                  # unrestricted Hessian has no such function and comes
+                  # through `nr_uks_fxc`'s `mo1` branch instead
+                  ('gpu4pyscf.hessian.rks', 'nr_rks_fxc_mo')),
     'fastfnlc': (('gpu4pyscf.hessian.rks', 'nr_rks_fnlc_mo'),
                  ('gpu4pyscf.hessian.uks', 'nr_rks_fnlc_mo')),
     'fastjk': ('gpu4pyscf.scf.jk', '_VHFOpt.get_jk'),
@@ -149,6 +155,17 @@ _TARGETS = {
     'fastdfhess': (('gpu4pyscf.df.hessian.rhf', '_get_jk'),
                    ('gpu4pyscf.df.hessian.rhf', '_get_jk_mo'),
                    ('gpu4pyscf.df.hessian.rhf', '_balance_batch_size')),
+    # the density-fitted Hessian's other two two-electron terms, the sixth
+    # and seventh code paths (docs/DF_WORK_LIST.md W17 and W18).
+    # `df/hessian/{rhf,rks}.py` look both up on this module at call time, so
+    # the module globals are the targets; the rest are what the copies
+    # import rather than replace
+    'fastdfhessip': (('gpu4pyscf.df.hessian.rhf', '_jk_energy_per_atom'),
+                     ('gpu4pyscf.df.hessian.rhf', '_get_veff'),
+                     ('gpu4pyscf.df.hessian.rhf', '_int2c2e_ip2_per_atom'),
+                     ('gpu4pyscf.df.hessian.rhf', 'int3c2e_scheme_ip2'),
+                     ('gpu4pyscf.df.int3c2e_bdiv', '_int3c2e_ip1_evaluator'),
+                     ('gpu4pyscf.df.int3c2e_bdiv', 'libvhf_rys')),
 }
 
 _patched = []

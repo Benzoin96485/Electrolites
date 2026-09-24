@@ -19,6 +19,8 @@ target cannot be made faster, and whose *finding* is W16, W17 and W18),
 `docs/README_fastdfunpack.md` closed **W14** and **W15** together (the two
 W5 left behind: one is a kernel that pays and one is a measurement that says
 not to write the code),
+`docs/README_fastdfhessip.md` closed **W16**, **W17** and **W18** together
+(W8's three findings, whose own findings are W23, W24 and W25),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -230,6 +232,20 @@ arithmetic: `cudaHostAlloc`, which page-locks the host buffer at 2.09 GB/s
 and is 41.5 s of a 72.5 s 284-atom build.  Made 4.1x faster here; the
 remaining 10 s, the host store and `_decompose_j2c`'s latency are **W12**,
 **W11** and **W13**.
+
+**W16, W17 and W18 are done, and W23, W24 and W25 are what they found.**
+The three functions W8's anatomy said the density-fitted Hessian's time was
+in are **2.66x**, **1.46x** and **1.29x** at 42 atoms and 2.23x, 1.89x and
+1.57x at 113, and a patched 42-atom DF-B3LYP Hessian goes **21.25 s →
+15.53 s** (DF-PBE 12.32 → 8.37 s, def2-TZVPP 58.37 → 46.62 s, 113 atoms
+789 → 701 s, where W8's `_get_jk` is now 72 % of the run).  W16 is the binding the entry guessed —
+the CPHF's perturbed density is a density matrix as well as a pair of
+orbital factors, so `nr_rks_fxc_mo` is `fastxcfxc`'s blocked `nr_rks_fxc`
+plus upstream's `_ao2mo` — and upstream's own function turns out to be
+**wrong for meta-GGAs** (an in-place cuTENSOR contraction).  W17's largest
+win is an array nobody needed: the per-atom occupied block, 18.7 GB at 42
+atoms and 775 GB at 113, is two `nao²` Gram matrices in disguise, and that
+stage goes 590 → 130 ms and 17.6 → 4.2 s.  `docs/README_fastdfhessip.md`.
 
 **W8 is done, it is a capacity item rather than a speed one, and W16, W17
 and W18 are what it found.**  `df/hessian/rhf.py:_get_jk` — the fifth
@@ -1406,7 +1422,31 @@ shell-granular GEMM.
 * The AO-permutation machinery in `electrolites/_dfblock.py` is reusable here:
   it is the half of the problem that already exists and is tested.
 
-### W16 — `nr_rks_fxc_mo`, the CPHF's grid half, which `fastxcfxc` is not on
+### W16 — `nr_rks_fxc_mo`, the CPHF's grid half, which `fastxcfxc` is not on — **done, a binding, and upstream's is wrong for meta-GGAs**
+
+`electrolites/fastxcfxc.py` (`_nr_rks_fxc_mo`, and `FASTXCFXC_MO=0` to hand
+it back), `tests/test_dfhessip.py`, `benchmarks/df_hess_terms_probe.py`,
+write-up in `docs/README_fastdfhessip.md` §2.
+
+It is the binding job this entry said it might be.  `gen_vind` hands the
+function a density matrix *and* its orbital factors, and the matrix path does
+less arithmetic than the orbital one at def2-SVP (`nsub` 214 against
+`4 nocc` = 368), so the falsification criterion does not fire.  **2.66x** on
+the function at 42 atoms (1084.9 → 408.3 ms, 11 133 GEMM launches → 86),
+2.23x at 113, **4.00x** and **3.42x** on a Pt(II) and a Ni(II) complex,
+1.48x at def2-TZVPP — where a second route to the same density, from the
+orbital factors, is taken in the blocks whose AO count is more than four
+times `nocc`; after it the call is 70 % two GEMMs at 14–15 TF/s.  In a
+whole Hessian the six calls go **5.62 → 2.14 s**, so the success line's
+"about 18 s rather than 21.2" came true for this item alone, and the round
+together took the Hessian to 15.53 s.  Upstream's `fxc` contraction is
+`contract('axg,xyg->ayg', rho1, fxc_w, out=rho1)`, which cuTENSOR gets wrong
+at five components: its meta-GGA CPHF potential is off by up to 2e-4
+relative on some right-hand sides, and this module's agrees with the
+AO-basis path to 8e-16.  That, and the rest of the meta-GGA Hessian's
+run-to-run noise, is **W23**.
+
+The original entry, for the record:
 
 *(Found by W8's anatomy, which is the first profile of a density-fitted
 Hessian in this repository.)*
@@ -1432,7 +1472,38 @@ patched density-fitted Hessian, 25 %** of 21.24 s.
   from `mo1` on the grid rather than from a density matrix, and if that is
   where its time is then `fastxcfxc`'s kernel is not the thing to move.
 
-### W17 — `df/hessian/rhf.py:_jk_energy_per_atom`, the DF Hessian's ip2 term
+### W17 — `df/hessian/rhf.py:_jk_energy_per_atom`, the DF Hessian's ip2 term — **done, 1.46x–1.89x, and the biggest stage was an array**
+
+`electrolites/fastdfhessip.py`, `tests/test_dfhessip.py`, write-up in
+`docs/README_fastdfhessip.md` §3.  Profiled stage by stage as asked, with a
+copy of upstream's single-device path that carries its own synchronised
+timers (`FASTDFHESSIP_TIME=1`) and agrees with upstream to 1.8e-13 with every
+change off.  Both of `fastdfgrad`'s findings apply and one does not:
+
+* the `nsp_per_block*4` launch constant is on **four** kernels here, and `*1`
+  is 1.17x of the function by itself at 42 atoms;
+* the auxiliary derivative integrals are walked once more than necessary —
+  the first `ipaux` pass is folded into the second pass's first chunk (380 ms
+  at 42 atoms);
+* the SCF's cderi cannot be reused: `partial_hess_elec` resets it before this
+  function is called.
+
+The criterion that would have falsified it — the derivative integrals
+dominate and are at the machine — is half true: after the round the `ip2`
+kernel is 44 % of the call at 42 atoms and 50 % on the two transition-metal
+complexes, which is why W17 is only 1.15x–1.20x there.  What the entry did
+not name is the stage that was largest at 113 atoms: the per-atom occupied
+block, `3 natm naux nocc²` doubles (**775 GB** over the auxiliary set at 113
+atoms), which upstream builds and then symmetrises with an uncoalesced
+transpose.  The same contraction follows from two `nao²` Gram matrices;
+**590 → 130 ms** at 42 atoms, **17.6 → 4.2 s** at 113.  The function is
+**1.46x** (4455 → 3056 ms) at 42 atoms, **1.89x** (63.0 → 33.4 s) at 113 and
+1.74x at def2-TZVPP; the success line's "1.75x–2.59x" is met at the two
+larger sizes and not at the smallest.  Upstream's `_j_energy_per_atom` — what
+a pure functional reaches — is covered too, at 1.27x.  What is left is
+**W24**.
+
+The original entry, for the record:
 
 *(Also from W8's anatomy.)*
 
@@ -1454,7 +1525,19 @@ direct path's).  Nothing in this repository is on it.
   machine, which is what `docs/README_fastdfgrad.md` found for the
   contraction and not for the kernel.
 
-### W18 — `df/hessian/rhf.py:_get_veff`, the DF Hessian's h1 term
+### W18 — `df/hessian/rhf.py:_get_veff`, the DF Hessian's h1 term — **done, 1.29x–1.57x**
+
+`electrolites/fastdfhessip.py`, write-up in `docs/README_fastdfhessip.md`
+§4.  The launch constant again, and the two per-atom loops inside the block
+loop: the Coulomb half's `2 natm` launches per block and direction become one
+row-wise contraction, one GEMM against the atom indicator and one update
+(422 → 34 ms at 42 atoms), and the exchange half's per-atom intermediate is
+hoisted out of the loop over atoms and directions (382 → 203 ms).  1.29x at
+42 atoms, **1.57x** at 113 (33.4 → 21.3 s), 1.49x at def2-TZVPP.  Forming the
+metric inverse once was measured and rejected: 1.4e-8 relative on the
+long-range operator.
+
+The original entry, for the record:
 
 *(Also from W8's anatomy.)*
 
@@ -1543,7 +1626,10 @@ and a 113-atom def2-SVP one from running at all; `docs/README_fastdfgradoo.md`
 moment W10 stops reserving for an array that is no longer allocated and the
 block grows.  W8 guards it with a measured element cap and a halve-and-retry;
 W10 carries only the retry, because it measured the boundary and **a cap
-cannot describe it**.
+cannot describe it**.  *(A third module has hit it since: W17's Gram form
+of the per-atom occupied block had `'xrui,yrvi->xyuv'` refused at 42 atoms
+when its chunk was the whole auxiliary set, and carries both a 1.2e8-element
+chunk bound and a halve-along-`r` retry, `fastdfhessip._accumulate_r`.)*
 
 **What the measurement says** (taxol/def2-SVP on an 80 GB card, the ip1
 block pinned with `FASTDFGRAD_BLK`, `docs/README_fastdfgradoo.md` §4.1):
@@ -1599,6 +1685,66 @@ buffer to hand over.
   host memory, or that says it does.
 * **Falsified if**: the two tensors genuinely share no structure, in which
   case the item is a warning message and nothing more.
+
+### W23 — A restricted meta-GGA Hessian is not reproducible
+
+*(Found by W16.)*
+
+Two things, one fixed.  `hessian/rks.py:_nr_rks_fxc_mo_task` contracts
+`fxc` in place — `contract('axg,xyg->ayg', rho1, fxc_w, out=rho1)` — which
+is exact at four density components and wrong at five: on random operands
+the in-place call is off by 0.27–0.94 of the largest element, and in the
+function one or two right-hand sides of a call come out wrong by 1e-7 to
+2e-4, a different one each run (`docs/README_fastdfhessip.md` §2.2).  W16's
+binding does not have that line, and it is on the direct path's Hessian too,
+which calls the same function.
+
+The other is not found.  An **unpatched** TPSS/def2-SVP DF Hessian of
+glycine gives four different traces in four runs, spread over 3e-5
+Eh/bohr², and a patched one — which no longer runs the in-place
+contraction — spreads just as far.  A B3LYP Hessian of penicillin V is
+reproducible to 5e-10 in the same harness.
+
+* **Do**: bisect the meta-GGA Hessian path with the patches off —
+  `_get_exc_deriv2`, `_get_vxc_deriv1`, `cache_xc_kernel` and the SCF's own
+  meta-GGA terms — for another in-place or atomic-order dependence; the
+  first thing to grep for is `out=` naming one of the operands.
+* **Success**: two runs of the same meta-GGA Hessian agree to the 1e-9 a
+  GGA one does.
+* **Falsified if**: the spread is the SCF's (a meta-GGA SCF converged to
+  1e-9 leaves a density whose Hessian moves by this much), in which case it
+  is a convergence setting and not a bug.
+
+### W24 — What is left in the density-fitted Hessian's ip2 term
+
+*(Found by W17.)*
+
+After W17, at 113 atoms, 13.4 s of the 33.3 s call is the same
+`2·3·naux²·nao·nocc`-flop contraction three times: `(10|0)` into the
+metric's eigenbasis (D3), back out of it (D5), and once more against
+`j2c_10v` (D5).  In the auxiliary AO basis with the metric's Cholesky factor
+one of the three disappears, but that needs the whole `(10|0)` block
+resident — 34 GB at 113 atoms — instead of one metric chunk.  And the `ip2`
+kernel is 44–50 % of the call wherever a transition metal's f shells are in
+the auxiliary set.
+
+* **Do**: price the resident-block formulation against the memory the
+  second pass already holds, and profile one class of the `ip2` kernel the
+  way W19 says to profile the three-centre Coulomb ones.
+* **Success**: D3 + D5 at two contractions' cost, or the kernel moved.
+* **Falsified if**: the block only fits where the chunked form is already
+  one chunk.
+
+### W25 — The unrestricted twins of W16–W18
+
+*(Left by W16–W18.)*
+
+`df/hessian/uhf.py` has its own `_jk_energy_per_atom` and `_get_veff`, and
+this round covers neither.  An open-shell Hessian's CPHF grid half is
+already covered — there is no `nr_uks_fxc_mo`, it comes through
+`fastxcfxc`'s `nr_uks_fxc` `mo1` branch — so this is two functions, of the
+same shape as W17 and W18, and `electrolites/fastdfhessip.py`'s items 1–5
+should transplant.
 
 ### Not on this list
 
@@ -1846,6 +1992,20 @@ python benchmarks/df_j3c_sweep.py --cases ... --shm-fracs 1.0,0.5 --per-class \
 python benchmarks/coverage_probe.py --xyz ... --xc pbe --density-fit
     # `fastdf` reads 0 on a pure functional and `fastdfj3c` one call per cycle
 ```
+
+```bash
+python tests/test_dfhessip.py [--basis def2-tzvpp] [--no-hessian]   # W16-W18
+python benchmarks/df_hess_terms_probe.py --xyz ... --xc b3lyp --patch all \
+    --terms fxc,ip2,h1 --variants stock,ours [--env 'x:FASTDFHESSIP_...=...']
+python benchmarks/df_hess_terms_probe.py --xyz ... --terms ip2,h1 \
+    --variants stock,stock_sp1,stock_sp2        # the launch constant, upstream's code
+FASTDFHESSIP_TIME=1 python benchmarks/df_hess_terms_probe.py ...  # stage tables
+python benchmarks/df_hess_anatomy.py --xyz ... --patch all --rounds 2
+FASTDFHESSIP_OFF=1 FASTXCFXC_MO=0 python benchmarks/df_hess_anatomy.py ...
+```
+
+`fastdfhessip`'s switches are listed at the top of
+`electrolites/fastdfhessip.py`; `FASTXCFXC_MO=0` is W16's.
 
 `dflocal`'s switches (`DFLOCAL_DOMAIN`, `DFLOCAL_STORE`, `DFLOCAL_BLK`,
 `DFLOCAL_LAMBDA_TOL`, `DFLOCAL_KMODE`, `DFLOCAL_FOLD`) are listed at the top

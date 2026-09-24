@@ -42,12 +42,19 @@ One A100-SXM4-40GB unless a row says otherwise, GPU4PySCF 1.8.1, level-3 grids.
 | 42-atom Hessian (penicillin V), whole run | 84.3 s | **53.9 s** | **1.56x** |
 | ↳ its two XC terms, at fixed density | 15.5 s | **2.11 s** | **7.34x** |
 | 113-atom Hessian (taxol), its two XC terms | 117.8 s | **22.2 s** | **5.30x** |
-| 42-atom **DF** Hessian, whole run (80 GB card) | 34.6 s | **21.2 s** | **1.63x** |
-| 42-atom DF Hessian, def2-TZVPP | **cannot be run** | **70.4 s** | — |
+| 42-atom **DF** Hessian, whole run (80 GB card) | 34.7 s | **15.5 s** | **2.23x** |
+| ↳ DF-PBE | 25.6 s | **8.37 s** | **3.06x** |
+| 42-atom DF Hessian, def2-TZVPP | **cannot be run** | **46.6 s** | — |
+| 113-atom DF Hessian | **cannot be run** | **701 s** | — |
 
-The last row is a capacity result, not a ratio: GPU4PySCF sizes one cuTENSOR
-contraction in the CPHF build from free memory alone and `createPlan` then
-refuses it with 73.7 GB free.  `docs/README_fastdfhess.md`,
+The last two rows are capacity results, not ratios: GPU4PySCF sizes one
+cuTENSOR contraction in the CPHF build from free memory alone and
+`createPlan` then refuses it with tens of GB free.  The DF rows' remaining time is mostly that
+same CPHF build, which is at 78 % of the card's fp64 peak; the three terms
+around it that nothing covered before (the CPHF's grid half, and the `ip2`
+and `h1` two-electron terms) are 2.6x, 1.4x and 1.4x inside a 42-atom run,
+and upstream's grid half is wrong for meta-GGAs.
+`docs/README_fastdfhess.md`, `docs/README_fastdfhessip.md`,
 `docs/HESSIAN_1.8.1.md`, `docs/README_fastxchess.md`.
 
 ### Density-fitted gradient — B3LYP/def2-SVP
@@ -208,7 +215,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastxcgrad` | `grad.{rks,uks}.get_exc`, `get_nlc_exc` | `docs/README_fastxcgrad.md` |
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | — |
 | `fastxchess` | `hessian.{rks,uks}._get_vxc_deriv{1,2}` | `docs/README_fastxchess.md` |
-| `fastxcfxc` | `dft.numint.nr_{rks,uks}_fxc` — the grid half of every response property | `docs/README_fastxcfxc.md` |
+| `fastxcfxc` | `dft.numint.nr_{rks,uks}_fxc` — the grid half of every response property — and `hessian.rks.nr_rks_fxc_mo`, a restricted Hessian's | `docs/README_fastxcfxc.md`, `docs/README_fastdfhessip.md` |
 | `fastfnlc` | `hessian.{rks,uks}.nr_rks_fnlc_mo` — the VV10 response term | `docs/README_fastfnlc.md` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
@@ -217,6 +224,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastdfcderi` | `df.df._cholesky_eri` — the one-time cderi build — and `df.int3c2e_bdiv.int2c2e`, the two-centre metric integrals under it | `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md` |
 | `fastdfgrad` | `df.grad.{rhf,rks,uhf,uks}.Gradients.jk_energy_per_atom` | `docs/README_fastdfgrad.md`, `docs/README_fastdfgradoo.md` |
 | `fastdfhess` | `df.hessian.rhf._get_jk` — the DF Hessian's CPHF build | `docs/README_fastdfhess.md` |
+| `fastdfhessip` | `df.hessian.rhf._jk_energy_per_atom` and `_get_veff` — the DF Hessian's `ip2` and `h1` two-electron terms | `docs/README_fastdfhessip.md` |
 | `fastdffp32` | `DF.loop` and the DF Hessian's cderi transfer — carries `FASTDF_FP32=1`, which is inert unless set and **changes the answer** when it is | `docs/README_fastdffp32.md` |
 
 `docs/CATALOGUE_06_STATUS.md` maps these onto the kernel-target catalogue,

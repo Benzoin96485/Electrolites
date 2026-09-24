@@ -130,6 +130,9 @@ _ENTRIES = [
      _huks, '_get_vxc_deriv2_orig'),
     ('fastfnlc fnlc_mo',     _hrks, 'nr_rks_fnlc_mo',
      _hrks, '_nr_rks_fnlc_mo_orig'),
+    # W16: a restricted Hessian's CPHF grid half, which is not `nr_rks_fxc`
+    ('fastxcfxc fxc_mo',     _hrks, 'nr_rks_fxc_mo',
+     _hrks, '_nr_rks_fxc_mo_orig'),
     # the unrestricted twins.  `dft/uks.py` and `hessian/uks.py` bind their own
     # copies of both of these, so each needs its own row: a run can reach the
     # unrestricted one thousands of times while the restricted row above still
@@ -151,6 +154,14 @@ if 'fastxcnlc' in active:
     # table, is the authority for this row, as it is for `uks_veff`.
     _ENTRIES.append(('fastxcnlc df_veff', _dfjk0._DFHF, 'get_veff',
                      _dfjk0._DFHF, '_never'))
+if 'fastdfhessip' in active:
+    from gpu4pyscf.df.hessian import rhf as _dfhess          # noqa: E402
+    # W17 and W18: the density-fitted Hessian's ip2 and h1 terms.  They read
+    # `(-)` on anything but a density-fitted Hessian
+    _ENTRIES.append(('fastdfhessip ip2', _dfhess, '_jk_energy_per_atom',
+                     _dfhess, '_jk_energy_per_atom_orig'))
+    _ENTRIES.append(('fastdfhessip h1', _dfhess, '_get_veff',
+                     _dfhess, '_get_veff_orig'))
 if 'fastdfj' in active:
     from gpu4pyscf.df import df_jk as _dfjk1                 # noqa: E402
     # the `only_dfj` branch.  It reads `(-)` on any run that does not pass
@@ -284,7 +295,7 @@ extra = {}
 # are handed straight back to GPU4PySCF.  `only_dfj` in this line is the
 # number that actually took the repaired branch.
 for _m in ('fastxcnlc', 'fastfnlc', 'fastxcfxc', 'fastdfj', 'fastdfj3c',
-           'fastdfgrad', 'fastdfcderi', 'fastdfhess'):
+           'fastdfgrad', 'fastdfcderi', 'fastdfhess', 'fastdfhessip'):
     if _m in active:
         _mod = __import__(f'electrolites.{_m}', fromlist=['x'])
         if hasattr(_mod, 'stats'):
