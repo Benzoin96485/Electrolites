@@ -87,10 +87,31 @@ and five host-to-device copies of tables that never change.
    ``scf/_response_functions.py`` asks for one density per right-hand side --
    and the RIJONX response solve with it.
 
-Everything here is a copy, not an approximation: the same kernels are launched
-with the same arguments in the same order, and ``tests/test_dfj3c.py`` checks
-the Coulomb matrix element-wise against an unpatched process rather than
-against a tolerance argued in prose.
+7. *The two integral kernels are this repository's* (`docs/DF_WORK_LIST.md`
+   W19).  After items 1-6 the call is 85-97 % two kernels, and
+   `electrolites/codegen/gen_j3c.py` writes both again, one function per
+   ``(lij, lk)`` class with one thread carrying one shell pair through a
+   batch of auxiliary shells in registers: the pair's product centre and
+   ``1/aij`` read from a table instead of recomputed per auxiliary shell (no
+   division is left), every Hermite index a literal, ``omega == 0`` compiled
+   in, and the auxiliary Hermite components of the wrong parity -- zero by
+   construction -- never formed.  Classes are grouped into tiers of similar
+   register need, one launch per tier (`electrolites/_j3ck.py`).  Shell-pair
+   groups that meet a class past ``FASTDFJ3C_KMAX_ORDER`` stay on
+   GPU4PySCF's kernels, launched with those groups' offsets alone.
+
+8. *A single-density call can be built from the difference to the previous
+   one, screened on it* (W20) -- **off**, because measured against item 7 it
+   is a loss on every whole run (0.89x-0.97x, `docs/README_fastdfj3cinc.md`):
+   once the kernels are this cheap the pairs a Schwarz screen drops are worth
+   less than the screen's host work and the extra SCF cycle it can cost.
+
+Items 1-6 are a copy, not an approximation: the same kernels are launched
+with the same arguments in the same order.  Item 7 evaluates the same
+integrals in a different order and with ``rsqrt`` for two divisions, so it
+agrees to round-off rather than bit for bit; ``tests/test_dfj3c.py`` checks
+the Coulomb matrix element-wise against an unpatched binding in the same
+process either way.
 
 Switches, which are what every ablation column of
 ``docs/README_fastdfj3c.md`` is measured with:
@@ -116,6 +137,16 @@ Switches, which are what every ablation column of
                                block per A100 SM, and cutting it is
                                monotonically *slower* -- these kernels want
                                shell pairs in flight, not blocks per SM
+    FASTDFJ3C_KERNELS=upstream keep GPU4PySCF's two integral kernels
+                               (item 7)
+    FASTDFJ3C_KMAX_ORDER=<n>   the highest lij + lk item 7's kernels serve;
+                               a shell-pair group that meets a higher class
+                               is left to GPU4PySCF's kernels whole
+    FASTDFJ3C_INCREMENTAL=1    item 8, the build from the difference;
+                               FASTDFJ3C_INC_TOL (1e-11), _INC_REBUILD (8)
+                               and _INC_MAXFRAC (0.1) are its threshold, the
+                               builds between full ones and the difference
+                               past which a call is built whole
     FASTDFJ3C_PER_CLASS=1      the other rejected idea: one launch of the
                                auxiliary-vector kernel per (shell-pair class,
                                auxiliary class), each asking only for the
@@ -139,6 +170,8 @@ from gpu4pyscf.gto.mole import SortedGTO, libvhf_rys
 from gpu4pyscf.lib.cupy_helper import ndarray, transpose_sum
 
 from . import _j3c
+from . import _j3ck
+from . import _j3cinc
 
 _OFF = bool(os.environ.get('FASTDFJ3C_OFF'))
 _NO_CTR = bool(os.environ.get('FASTDFJ3C_NO_CTR'))
@@ -186,11 +219,27 @@ SHM_FRAC = float(os.environ.get('FASTDFJ3C_SHM_FRAC', 1.0))
 #: which is GPU4PySCF's -- and with it the widest angular-momentum class's
 #: shared-memory request for every block in the grid.
 PER_CLASS = int(os.environ.get('FASTDFJ3C_PER_CLASS', 0))
+#: 'ours' launches `electrolites/_j3ck.py`'s kernels for every class they
+#: serve (item 7); 'upstream' keeps GPU4PySCF's for all of them.
+KERNELS = os.environ.get('FASTDFJ3C_KERNELS', 'ours')
+#: item 8, `docs/DF_WORK_LIST.md` W20: build a single-density Coulomb matrix
+#: from the difference to the previous one, screened on it.  Off: a measured
+#: loss once item 7's kernels are in (`docs/README_fastdfj3cinc.md`).  The threshold on
+#: the Schwarz bound of what a dropped pair contributes, the full builds
+#: between which the error may accumulate, and the size of a difference past
+#: which the call is not an SCF step (a response density, a new geometry) and
+#: is built whole.
+INCREMENTAL = os.environ.get('FASTDFJ3C_INCREMENTAL', '0') != '0'
+INC_TOL = float(os.environ.get('FASTDFJ3C_INC_TOL', 1e-11))
+INC_REBUILD = int(os.environ.get('FASTDFJ3C_INC_REBUILD', 8))
+INC_MAXFRAC = float(os.environ.get('FASTDFJ3C_INC_MAXFRAC', 0.1))
 
 _libmd = J3C.libvhf_md
 
 #: counters, so a coverage claim is read off a run rather than assumed
-STATS = {'contract_dm': 0, 'contract_auxvec': 0, 'ctr': 0, 'passthrough': 0,
+STATS = {'inc_full': 0, 'inc_step': 0, 'inc_pairs_dm': 0, 'inc_pairs_aux': 0,
+         'inc_pairs_all': 0,
+         'contract_dm': 0, 'contract_auxvec': 0, 'ctr': 0, 'passthrough': 0,
          'get_j': 0, 'get_j_md': 0, 'get_j_rys': 0}
 
 
@@ -304,6 +353,19 @@ def _auxvec_shm(lij, lk, nsp_lookup_host):
     return int((nsp * (order + 1 + nf3ijkl) + nf3k) * 8)
 
 
+def _kernel_plan(opt, c):
+    """Item 7's launch plan for this option object, or None to keep
+    GPU4PySCF's kernels for every class."""
+    if KERNELS != 'ours' or opt.mol.omega != 0:
+        return None
+    try:
+        return _j3ck.plan(opt, c)
+    except RuntimeError:
+        # a basis the kernels were not written for (they assert a
+        # decontracted one, which `Int3c2eOpt.build` always makes)
+        return None
+
+
 def contract_dm(self, dm, hermi=0):
     """``rho_P = sum_ij (ij|P) D_ij``, with the pair tables already resident."""
     if _OFF or _NO_OPT:
@@ -324,25 +386,30 @@ def contract_dm(self, dm, hermi=0):
         dm = transpose_sum(dm)
 
     nsp_lookup, shm_size = _scheme('dm', SHM_FRAC)
-    pair_ij_offsets, sp_blocks = c.pair_offsets(SP_CHUNK_DM)
+    kp = _kernel_plan(self, c)
+    runs = (kp.upstream_runs(SP_CHUNK_DM) if kp is not None
+            else [c.pair_offsets(SP_CHUNK_DM)])
     dm_xyz = c.scratch('dm_xyz', c.dm_xyz_size)
     vj_aux = cp.zeros((n_dm, c.naux_cart))
     for i_dm in range(n_dm):
         _dm_to_Rt(c, dm[i_dm], dm_xyz)
-        err = _libmd.contract_int3c2e_dm(
-            ctypes.cast(vj_aux[i_dm].data.ptr, ctypes.c_void_p),
-            ctypes.cast(dm_xyz.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(1), ctypes.c_int(c.naux_cart),
-            ctypes.byref(c.envs), ctypes.c_int(shm_size),
-            ctypes.c_int(sp_blocks),
-            ctypes.c_int(c.auxnbas),
-            ctypes.cast(pair_ij_offsets.data.ptr, ctypes.c_void_p),
-            ctypes.cast(c.shl_pair_idx.data.ptr, ctypes.c_void_p),
-            ctypes.cast(c.pair_loc.data.ptr, ctypes.c_void_p),
-            ctypes.cast(nsp_lookup.data.ptr, ctypes.c_void_p),
-            ctypes.c_double(self.mol.omega))
-        if err != 0:
-            raise RuntimeError('contract_int3c2e_dm kernel failed')
+        if kp is not None:
+            kp.contract_dm(dm_xyz, vj_aux[i_dm])
+        for pair_ij_offsets, sp_blocks in runs:
+            err = _libmd.contract_int3c2e_dm(
+                ctypes.cast(vj_aux[i_dm].data.ptr, ctypes.c_void_p),
+                ctypes.cast(dm_xyz.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(1), ctypes.c_int(c.naux_cart),
+                ctypes.byref(c.envs), ctypes.c_int(shm_size),
+                ctypes.c_int(sp_blocks),
+                ctypes.c_int(c.auxnbas),
+                ctypes.cast(pair_ij_offsets.data.ptr, ctypes.c_void_p),
+                ctypes.cast(c.shl_pair_idx.data.ptr, ctypes.c_void_p),
+                ctypes.cast(c.pair_loc.data.ptr, ctypes.c_void_p),
+                ctypes.cast(nsp_lookup.data.ptr, ctypes.c_void_p),
+                ctypes.c_double(self.mol.omega))
+            if err != 0:
+                raise RuntimeError('contract_int3c2e_dm kernel failed')
     if hermi == 1:
         vj_aux *= 2
     if dm_ndim == 2:
@@ -387,6 +454,10 @@ def contract_auxvec(self, auxvec):
     else:
         launches = [(pair_ij_offsets, sp_blocks, ksh_offsets, ksh_blocks,
                      shm_size)]
+    kp = _kernel_plan(self, c)
+    if kp is not None:
+        launches = [(off, n, ksh_offsets, ksh_blocks, shm_size)
+                    for off, n in kp.upstream_runs(chunk)]
 
     for i_dm in range(n_dm):
         _libmd.aux_to_Rt(
@@ -396,6 +467,8 @@ def contract_auxvec(self, auxvec):
             ctypes.cast(c.aux_loc.data.ptr, ctypes.c_void_p),
             ctypes.cast(c.aux_xyz_loc.data.ptr, ctypes.c_void_p),
             ctypes.c_int(c.auxnbas))
+        if kp is not None:
+            kp.contract_auxvec(aux_xyz, vj_xyz[i_dm])
         for sp_off, nsp_blk, k_off, n_k_blk, shm in launches:
             err = _libmd.contract_int3c2e_auxvec(
                 ctypes.cast(vj_xyz[i_dm].data.ptr, ctypes.c_void_p),
@@ -667,6 +740,10 @@ def get_j(dfobj, dm, hermi=1):
 
     dm_shape = dm.shape
     intopt = dfobj.j_engine
+    if INCREMENTAL and dm.ndim == 2 and hermi == 1 and not _OFF:
+        vj = _get_j_incremental(dfobj, intopt, dm)
+        if vj is not None:
+            return vj.reshape(dm_shape)
     mol = intopt.mol
     auxmol = intopt.auxmol
     dm = mol.apply_C_mat_CT(dm)
@@ -686,6 +763,134 @@ def get_j(dfobj, dm, hermi=1):
     vj = intopt.contract_auxvec(rhoj)
     vj = mol.apply_CT_mat_C(vj)
     return vj.reshape(dm_shape)
+
+
+def _solve_metric(dfobj, rhoj):
+    j2c, tag = dfobj._cd_j2c
+    if tag == 'cd':
+        rhoj = DFJK.solve_triangular(j2c, rhoj.T, lower=True)
+        return DFJK.solve_triangular(j2c.T, rhoj, lower=False).T
+    return cp.linalg.solve(j2c, rhoj.T).T
+
+
+# --------------------------------------------------------------------------
+# 8.  The Coulomb matrix from the difference, screened on it (W20).
+# --------------------------------------------------------------------------
+_INC_ATTR = '_electrolites_jinc'
+
+
+def _get_j_incremental(dfobj, intopt, dm):
+    """``J(D) = J(D_last) + J(D - D_last)`` with the pairs the difference
+    cannot reach dropped from both contractions.
+
+    The state is the previous call's sorted-basis density, its fitted
+    auxiliary density before the metric (``rho``), its coefficients after it
+    (``cs``) and its sorted-basis Coulomb matrix, all on the ``DF`` object.
+    ``rho`` and the Coulomb matrix are accumulated; the metric solve, which
+    is a small share of the call and couples every auxiliary function to
+    every other, is done on the whole ``rho`` every time.  Returns None when
+    the kernels are not this repository's, so that the caller builds whole.
+    """
+    c = _j3c.constants(intopt)
+    kp = _kernel_plan(intopt, c)
+    if kp is None:
+        return None
+    mol, auxmol = intopt.mol, intopt.auxmol
+    dms = mol.apply_C_mat_CT(dm)
+    st = getattr(dfobj, _INC_ATTR, None)
+    full = (st is None or st['envs'] is not intopt.int3c2e_envs
+            or st['n'] >= INC_REBUILD or st['dms'].shape != dms.shape)
+    if not full:
+        ddm = dms - st['dms']
+        full = (float(abs(ddm).max())
+                > INC_MAXFRAC * float(abs(dms).max()))
+    if full:
+        STATS['inc_full'] += 1
+        rho = intopt.contract_dm(dms, 1)
+    else:
+        STATS['inc_step'] += 1
+        scr = _j3cinc.screen(intopt, c)
+        keep = scr.keep_dm(ddm, INC_TOL)
+        rho = st['rho'] + _contract_dm_subset(c, kp, ddm, keep)
+    cs = auxmol.apply_C_dot(
+        _solve_metric(dfobj, auxmol.apply_CT_dot(rho, axis=-1)), axis=-1)
+    if full:
+        vjs = intopt.contract_auxvec(cs)
+    else:
+        dcs = cs - st['cs']
+        keep2 = scr.keep_aux(dcs, INC_TOL)
+        vjs = st['vjs'] + _contract_auxvec_subset(c, kp, dcs, keep2)
+        STATS['inc_pairs_dm'] += int(keep.sum())
+        STATS['inc_pairs_aux'] += int(keep2.sum())
+        STATS['inc_pairs_all'] += c.npair
+    setattr(dfobj, _INC_ATTR, {'envs': intopt.int3c2e_envs, 'dms': dms,
+                               'rho': rho, 'cs': cs, 'vjs': vjs,
+                               'n': 0 if full else st['n'] + 1})
+    return mol.apply_CT_mat_C(vjs)
+
+
+def _contract_dm_subset(c, kp, ddm, keep):
+    """``contract_dm(ddm, hermi=1)`` over the pairs ``keep`` selects."""
+    dm_xyz = c.scratch('dm_xyz', c.dm_xyz_size)
+    _dm_to_Rt(c, ddm, dm_xyz)
+    sub, spi = kp.subset(keep, c.shl_pair_idx)
+    out = cp.zeros(c.naux_cart)
+    sub.contract_dm(dm_xyz, out)
+    nsp_lookup, shm_size = _scheme('dm', SHM_FRAC)
+    for off, nblk in sub.upstream_runs(0):
+        err = _libmd.contract_int3c2e_dm(
+            ctypes.cast(out.data.ptr, ctypes.c_void_p),
+            ctypes.cast(dm_xyz.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(1), ctypes.c_int(c.naux_cart),
+            ctypes.byref(c.envs), ctypes.c_int(shm_size),
+            ctypes.c_int(nblk), ctypes.c_int(c.auxnbas),
+            ctypes.cast(off.data.ptr, ctypes.c_void_p),
+            ctypes.cast(spi.data.ptr, ctypes.c_void_p),
+            ctypes.cast(sub.pair_loc.data.ptr, ctypes.c_void_p),
+            ctypes.cast(nsp_lookup.data.ptr, ctypes.c_void_p),
+            ctypes.c_double(0.))
+        if err != 0:
+            raise RuntimeError('contract_int3c2e_dm kernel failed')
+    out *= 2
+    return out
+
+
+def _contract_auxvec_subset(c, kp, dcs, keep):
+    """``contract_auxvec(dcs)`` over the pairs ``keep`` selects."""
+    aux_xyz = c.scratch('aux_xyz', c.aux_xyz_size)
+    _libmd.aux_to_Rt(
+        ctypes.cast(aux_xyz.data.ptr, ctypes.c_void_p),
+        ctypes.cast(dcs.data.ptr, ctypes.c_void_p),
+        ctypes.byref(c.envs),
+        ctypes.cast(c.aux_loc.data.ptr, ctypes.c_void_p),
+        ctypes.cast(c.aux_xyz_loc.data.ptr, ctypes.c_void_p),
+        ctypes.c_int(c.auxnbas))
+    vj_xyz = c.scratch('vj_xyz', c.dm_xyz_size, zero=True)
+    sub, spi = kp.subset(keep, c.shl_pair_idx)
+    sub.contract_auxvec(aux_xyz, vj_xyz)
+    runs = sub.upstream_runs(1024)
+    if runs:
+        nsp_lookup, shm_size = _scheme('auxvec', SHM_FRAC)
+        ksh_offsets, ksh_blocks = c.ksh_batches(KSH_CHUNK)
+        for off, nblk in runs:
+            err = _libmd.contract_int3c2e_auxvec(
+                ctypes.cast(vj_xyz.data.ptr, ctypes.c_void_p),
+                ctypes.cast(aux_xyz.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(1), ctypes.c_int(c.naux_sph),
+                ctypes.byref(c.envs), ctypes.c_int(shm_size),
+                ctypes.c_int(nblk), ctypes.c_int(ksh_blocks),
+                ctypes.cast(off.data.ptr, ctypes.c_void_p),
+                ctypes.cast(ksh_offsets.data.ptr, ctypes.c_void_p),
+                ctypes.cast(spi.data.ptr, ctypes.c_void_p),
+                ctypes.cast(sub.pair_loc.data.ptr, ctypes.c_void_p),
+                ctypes.cast(c.aux_xyz_loc.data.ptr, ctypes.c_void_p),
+                ctypes.cast(nsp_lookup.data.ptr, ctypes.c_void_p),
+                ctypes.c_double(0.))
+            if err != 0:
+                raise RuntimeError('contract_int3c2e_auxvec kernel failed')
+    out = cp.empty((1, c.nao, c.nao))
+    _Rt_to_dm(c, vj_xyz, out)
+    return out[0]
 
 
 DFJK.get_j = get_j

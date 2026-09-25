@@ -14,7 +14,12 @@ whole pure-functional SCF.
                 (item 6) and nothing else.  Identical to ``stock`` at one
                 density, which is the row that says how much of a
                 multi-density margin is the engine and how much is the rest;
-* ``fast``   -- all of them.
+* ``w9``     -- all of those, which is what W9 shipped;
+* ``fast``   -- ``w9`` plus W19's kernels (`electrolites/_j3ck.py`), which
+                is what ships now;
+* ``inc``    -- ``fast`` plus W20's build from the difference
+                (``FASTDFJ3C_INCREMENTAL``).  At a fixed density it is
+                ``fast``; it is a column of the ``--scf`` table.
 
 The variants are installed by swapping the bound methods rather than by
 re-importing, so all six run **in one process, against one density, on one
@@ -25,7 +30,7 @@ process (§5.3) and a second tensor silently landing on the host (§5.10).
 ``--scf`` adds whole DF-PBE runs, which is the thing W9 is actually about: a
 pure functional never builds a cderi, so `fastdf` reads zero calls on it and
 this build is its entire two-electron cost.  Each variant is run twice and the
-second is quoted.
+second is quoted; ``--scf-variants`` picks them.
 
     python benchmarks/df_j3c_bench.py --cases glycine,penicillinV,taxol
     python benchmarks/df_j3c_bench.py --cases PfPMT:-1 --reps 3
@@ -52,7 +57,8 @@ ap.add_argument('--ndm', default='1')
 ap.add_argument('--reps', type=int, default=8)
 ap.add_argument('--cycles', type=int, default=1,
                 help='SCF cycles to run before the fixed-density timing')
-ap.add_argument('--variants', default='stock,ctr,opt,blk,mdm,fast')
+ap.add_argument('--variants', default='stock,ctr,opt,blk,mdm,w9,fast')
+ap.add_argument('--scf-variants', default='stock,w9,fast')
 ap.add_argument('--scf', action='store_true',
                 help='also run whole SCFs, stock and fast, twice each')
 ap.add_argument('--scf-max-cycle', type=int, default=50)
@@ -91,20 +97,24 @@ _CHUNK = fastdfj3c.SP_CHUNK_AUX
 
 #: variant -> (recontraction tables cached, contraction constants hoisted,
 #:             auxiliary-vector shell pairs per block, MD engine for every
-#:             density count)
+#:             density count, W19's kernels, W20's incremental build)
 VARIANTS = {
-    'stock': (False, False, 0, False),
-    'ctr': (True, False, 0, False),
-    'opt': (False, True, 0, False),
-    'blk': (False, True, _CHUNK, False),
-    'mdm': (False, False, 0, True),
-    'fast': (True, True, _CHUNK, True),
+    'stock': (False, False, 0, False, False, False),
+    'ctr': (True, False, 0, False, False, False),
+    'opt': (False, True, 0, False, False, False),
+    'blk': (False, True, _CHUNK, False, False, False),
+    'mdm': (False, False, 0, True, False, False),
+    'w9': (True, True, _CHUNK, True, False, False),
+    'fast': (True, True, _CHUNK, True, True, False),
+    'inc': (True, True, _CHUNK, True, True, True),
 }
 
 
 def install(variant):
     """Bind one variant's methods.  Nothing else in the process changes."""
-    ctr, opt, chunk, mdm = VARIANTS[variant]
+    ctr, opt, chunk, mdm, kern, inc = VARIANTS[variant]
+    fastdfj3c.KERNELS = 'ours' if kern else 'upstream'
+    fastdfj3c.INCREMENTAL = inc
     for n in _CTR_NAMES:
         setattr(SortedGTO, n, (_FAST_CTR if ctr else _STOCK_CTR)[n])
     for n, f in (_FAST_OPT if opt else _STOCK_OPT).items():
@@ -197,9 +207,12 @@ def whole_scf(spec):
     name, mol = load(spec)
     print(f'\n## {name}  whole {a.xc} SCF, density-fitted', flush=True)
     out = {}
+    scfv = [v for v in a.scf_variants.split(',') if v in VARIANTS]
     for rep in range(2):
-        for v in ('stock', 'fast'):
+        for v in scfv:
             install(v)
+            for k in fastdfj3c.STATS:
+                fastdfj3c.STATS[k] = 0
             mf = mk(mol)
             mf.max_cycle = a.scf_max_cycle
             _sync()
@@ -208,14 +221,22 @@ def whole_scf(spec):
             _sync()
             dt = time.perf_counter() - t0
             out[v] = (dt, e, mf.cycles if hasattr(mf, 'cycles') else -1)
-            print(f'  rep {rep}  {v:6s} {dt:8.3f} s   E = {e:.10f}',
-                  flush=True)
+            st = fastdfj3c.stats()
+            extra = ''
+            if st['inc_step']:
+                extra = (f'  (built whole {st["inc_full"]}, from the '
+                         f'difference {st["inc_step"]}; pairs kept '
+                         f'{st["inc_pairs_dm"] / st["inc_pairs_all"]:.3f} / '
+                         f'{st["inc_pairs_aux"] / st["inc_pairs_all"]:.3f})')
+            print(f'  rep {rep}  {v:6s} {dt:8.3f} s   E = {e:.10f}  '
+                  f'cycles {out[v][2]}{extra}', flush=True)
             mf = None
             cp.get_default_memory_pool().free_all_blocks()
-    print(f'  {name}: stock {out["stock"][0]:.3f} s, '
-          f'fast {out["fast"][0]:.3f} s, '
-          f'{out["stock"][0]/out["fast"][0]:.3f}x, '
-          f'dE = {abs(out["stock"][1]-out["fast"][1]):.2e} Eh', flush=True)
+    b = scfv[0]
+    for v in scfv[1:]:
+        print(f'  {name}: {b} {out[b][0]:.3f} s, {v} {out[v][0]:.3f} s, '
+              f'{out[b][0]/out[v][0]:.3f}x, '
+              f'dE = {abs(out[b][1]-out[v][1]):.2e} Eh', flush=True)
     install('stock')
 
 

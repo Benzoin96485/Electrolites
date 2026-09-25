@@ -208,6 +208,10 @@ Ablations, for the tables in ``docs/README_fastdfgrad.md``:
                             an array this module no longer allocates
     FASTDFGRAD_FILLBUF=0    the other ablation: put back the per-block
                             cuTENSOR temporary in the cderi half-transform
+    FASTDFGRAD_PLANQ=0      choose the ip1 blocks with `lib.prange` and rely
+                            on the halve-and-retry alone, as W10 did, instead
+                            of asking cuTENSOR which extents plan
+                            (`docs/DF_WORK_LIST.md` W21)
 """
 import ctypes
 import os
@@ -229,6 +233,8 @@ from gpu4pyscf.df.int3c2e_bdiv import (
 from gpu4pyscf.gto.mole import SortedMole
 from gpu4pyscf.lib import logger, multi_gpu
 from gpu4pyscf.lib.cupy_helper import contract, get_avail_mem, ndarray
+
+from electrolites import _cuplan
 
 try:                                         # cuTENSOR is optional upstream
     from cupy_backends.cuda.libs.cutensor import CuTensorError
@@ -298,6 +304,11 @@ _OOPIN = os.environ.get('FASTDFGRAD_OOPIN', 'register').lower()
 #: and the memory the plan has to work in are functions of `get_avail_mem`.
 #: `docs/README_fastdfgradoo.md` 4.1.
 _BLK = int(os.environ.get('FASTDFGRAD_BLK', 0))
+#: choose the ip1 loop's blocks so that cuTENSOR plans every one of them,
+#: by asking it (`electrolites/_cuplan.py`, `docs/DF_WORK_LIST.md` W21)
+#: rather than by halving after a refusal.  0 restores W10's retry alone,
+#: which is still behind this as the backstop.
+_PLANQ = os.environ.get('FASTDFGRAD_PLANQ', '1') != '0'
 #: give the first half-transform of the cderi a buffer allocated once instead
 #: of the temporary cuTENSOR allocates per block.  An **ablation**, like
 #: `_OOSIZING`: this round is faster than W3's table at sizes that already
@@ -1027,6 +1038,40 @@ def _ejk(int3c2e_opt, dm_factor, store, naux_in,
         if err != 0:
             raise RuntimeError('int3c2e_ejk_ip1 failed')
 
+    def ip1_plans(dk):
+        """Whether both ip1 contractions plan at an auxiliary extent ``dk``.
+
+        `docs/DF_WORK_LIST.md` W21: cuTENSOR refuses an output of more than
+        2**29 elements unless it can cut the output's last mode by factors no
+        larger than 13, so an extent of 914 = 2 x 457 is refused where 1096 =
+        8 x 137 is not.  Asked of descriptors, not of arrays
+        (`electrolites/_cuplan.py`), so the loop's blocks are chosen before
+        any of them is allocated.
+        """
+        if not _PLANQ:
+            return True
+        if unrestricted:
+            return (_cuplan.planable('nrji,nqj->niqr', (nset, dk, nocc, nocc),
+                                     (nset, nao, nocc), (nset, nocc, nao, dk))
+                    and _cuplan.planable('niqr,npi->pqr',
+                                         (nset, nocc, nao, dk),
+                                         (nset, nao, nocc), (nao, nao, dk)))
+        return (_cuplan.planable('rji,qj->iqr', (dk, nocc, nocc), (nao, nocc),
+                                 (nocc, nao, dk))
+                and _cuplan.planable('iqr,pi->pqr', (nocc, nao, dk),
+                                     (nao, nocc), (nao, nao, dk)))
+
+    def _block_range(nb, blksize):
+        """``lib.prange(0, nb, blksize)`` with every extent one that plans.
+
+        The block that a fixed ``blksize`` gets wrong is the *remainder*:
+        W10's "refused block of 1096" on taxol was the 914 auxiliary
+        functions left at the end of the first batch.
+        """
+        if not _PLANQ:
+            return lib.prange(0, nb, blksize)
+        return _cuplan.prange(0, int(nb), int(blksize), ip1_plans)
+
     def ip1_loop(blksize):
         """The pseudo-density, the `cp.take` and the ip1 launches.
 
@@ -1039,15 +1084,15 @@ def _ejk(int3c2e_opt, dm_factor, store, naux_in,
         array to reserve for, `mem_avail` is larger and this expression picks
         a bigger block than GPU4PySCF would have.
 
-        A **retry rather than a cap**, and that is measured rather than
-        preferred.  Pinning the block with ``FASTDFGRAD_BLK`` and moving the
-        free memory independently (``docs/README_fastdfgradoo.md`` §4.1) says
-        the refusal does not depend on the memory at all -- 1096 is refused
-        at 70 GB free and at 46 -- and is **not monotonic in the block**:
-        1096 is refused where 1240, 1456, 2048 and 3072 are accepted, the
-        last of those with 4.3e9 elements in the output, twice 2**31.  So no
-        element cap describes this boundary; what clears a refusal is
-        changing the extent, which is what halving does.
+        The blocks come from `_block_range`, which asks cuTENSOR before it
+        commits to an extent, so the retry below is a backstop and does not
+        fire on any shape measured (`docs/DF_WORK_LIST.md` W21).  What W10
+        read as "1096 is refused at 70 GB free and at 46, 1240 is accepted,
+        so the boundary is not monotonic in the block" was the *remainder*:
+        taxol's first auxiliary batch leaves 914 = 2 x 457 functions after
+        its 1096-wide blocks, and an output of ``1185**2 x 914`` elements --
+        past 2**29 with no factor of 13 or less to cut it by -- is what was
+        refused.  Neither free memory nor the block was the variable.
 
         A rejected *plan* raises before any kernel is launched and before any
         operand is read, and nothing in this loop writes to the store, so
@@ -1060,7 +1105,7 @@ def _ejk(int3c2e_opt, dm_factor, store, naux_in,
         a1 = 0
         for kbatch in range(aux_batches):
             nb = aux_offsets[kbatch + 1] - aux_offsets[kbatch]
-            for k0, k1 in lib.prange(0, nb, blksize):
+            for k0, k1 in _block_range(nb, blksize):
                 a0, a1 = a1, a1 + (k1 - k0)
                 plan.append((kbatch, k0, k1, a0, a1))
         cur = -1

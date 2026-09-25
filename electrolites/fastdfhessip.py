@@ -84,6 +84,9 @@ The unrestricted twins live in ``df/hessian/uhf.py`` and are not covered.
                              the ``ip2`` kernel's ``gout_width`` (upstream's
                              ``None``; swept, +-3 %)
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call
+    FASTDFHESSIP_RCHUNK=<n>  W17's 1.2e8-element bound on the Gram form's
+                             auxiliary chunk; the default asks cuTENSOR
+                             (`docs/DF_WORK_LIST.md` W21)
     FASTDFHESSIP_MEM=<bytes>, FASTDFHESSIP_VCHUNK=<n>,
     FASTDFHESSIP_OCC_BATCH=<n>
                              test-only: reach the paths upstream takes when
@@ -114,10 +117,16 @@ from gpu4pyscf.hessian.rhf import _aggregate_to_atoms
 from gpu4pyscf.lib import multi_gpu
 
 from ._dfaux import _spmult
+from . import _cuplan
 
 
 def _env(name, default):
     return os.environ.get(name, default)
+
+
+#: W17's chunk bound on the Gram form's auxiliary index, in elements of one
+#: ``(3, r, nao, nao)`` slab; 0 (the default) asks cuTENSOR instead.
+_RCHUNK = float(_env('FASTDFHESSIP_RCHUNK', 0))
 
 
 _S = {'ip2': 0, 'h1': 0, 'declined': 0, 'fused': 0, 'vchunks': 0,
@@ -969,11 +978,22 @@ def _oo_gram(j3c_100, v0, dv, work, natm, nocc, atm_ind, _dm_factor_l,
     """
     nao = _dm_factor_l.shape[0]
     per_r = 3*nao*nocc + 6*nao*nao
-    # the chunk is bounded by the buffer upstream sized for X, and by a
-    # size at which the two cuTENSOR contractions below plan (W21: past a
-    # few 1e8 elements `createPlan` can refuse a contraction outright);
-    # `_accumulate_r` halves along r if one is refused anyway
-    kb = max(1, min(dv, work.size // per_r, int(1.2e8 // (3*nao*nao))))
+    # the chunk is bounded by the buffer upstream sized for X.  W17 also
+    # bounded it at 1.2e8 // (3 nao^2) because R's contraction was refused
+    # once at 42 atoms with the whole auxiliary set in one chunk; W21 found
+    # that cuTENSOR's refusal is a property of the *output* (past 2**29
+    # elements), R's output is (3, 3, nao, nao) whatever the chunk, and the
+    # whole-set chunk at 42 atoms plans.  So the bound is now a query
+    # (`electrolites/_cuplan.py`); `FASTDFHESSIP_RCHUNK=<elements>` puts
+    # W17's back, and `_accumulate_r` still halves along r if a plan is
+    # refused anyway
+    kb = max(1, min(dv, work.size // per_r))
+    if _RCHUNK:
+        kb = max(1, min(kb, int(_RCHUNK // (3*nao*nao))))
+    else:
+        kb = _cuplan.largest(kb, lambda m: _cuplan.planable(
+            'xrui,yrvi->xyuv', (3, m, nao, nocc), (3, m, nao, nocc),
+            (3, 3, nao, nao)))
     R = cp.zeros((3, 3, nao, nao))
     Q = cp.zeros((3, 3, nao, nao))
     for k0, k1 in lib.prange(0, dv, kb):

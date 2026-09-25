@@ -100,9 +100,10 @@ Ablations, for the tables in ``docs/README_fastdfhess.md``:
     FASTDFHESS_ARRANGE=upstream|fused|blasvk
                             item 2: GPU4PySCF's ordering (default, and the
                             measured best), or either of the two that lose
-    FASTDFHESS_MAX_PLAN=<n> item 1: the largest intermediate handed to one
-                            cuTENSOR contraction, in elements; 0 disables
-                            the cap and leaves only the retry
+    FASTDFHESS_MAX_PLAN=<n> item 1: W8's cap on the largest intermediate
+                            handed to one cuTENSOR contraction, in elements.
+                            The default, 0, asks cuTENSOR instead
+                            (`docs/DF_WORK_LIST.md` W21)
     FASTDFHESS_JPASS=blas|tensor
                             item 4, or GPU4PySCF's two `contract` calls
     FASTDFHESS_BALANCE=0    item 5 off: uneven batches, as upstream does
@@ -133,6 +134,7 @@ from gpu4pyscf.lib.cupy_helper import (
 from gpu4pyscf.lib import multi_gpu
 
 from electrolites import _dffp32 as FP32
+from electrolites import _cuplan
 
 _OFF = bool(os.environ.get('FASTDFHESS_OFF'))
 #: 'upstream' (GPU4PySCF's ordering, which is the **measured** best of the
@@ -158,18 +160,19 @@ HOST = os.environ.get('FASTDFHESS_HOST', 'auto')
 KRYLOV_CYCLES = int(os.environ.get('FASTDFHESS_KRYLOV_CYCLES', 8))
 
 #: The largest ``nspin * dm_batch * nao * nocc * blksize`` this module will
-#: hand to one cuTENSOR contraction.  **Not a memory limit** -- past about
-#: this size ``cutensor.createPlan`` returns ``CUTENSOR_STATUS_NOT_SUPPORTED``
-#: for ``Lpq,snqi->snpiL`` and the call fails with tens of GB free, which is
-#: what stops GPU4PySCF running a 42-atom def2-TZVPP or a 113-atom def2-SVP
-#: DF Hessian at all.  `benchmarks/df_hess_cutensor_limit.py` is what placed
-#: it, and the boundary is **not** a clean function of the shape: bisected,
-#: the largest planable ``dm_batch`` is 530 at (nao 430, nocc 92), 224 at
-#: (478, 39), 22 at (1007, 92) and 8 at (1123, 226), which is 5.4e9, 1.1e9,
-#: 5.2e8 and 5.2e8 output elements.  5e8 is under all four, and it costs
-#: nothing: at 42 atoms the batch sweep reads 1083 ms at 48 densities against
-#: 1094 at 126.  The halve-and-retry in `_jk` is the real safety net.
-MAX_PLAN_ELEMENTS = float(os.environ.get('FASTDFHESS_MAX_PLAN', 5.0e8))
+#: hand to one cuTENSOR contraction, **if set**.  W8 placed it at 5e8 by
+#: bisection, and `docs/DF_WORK_LIST.md` W21 says what it was guarding: past
+#: 2**29 = 5.37e8 output elements `cutensor.createPlan` refuses
+#: ``Lpq,snqi->snpiL`` unless it can cut the ``p`` mode by factors no larger
+#: than 13 -- which is why the bisected ceilings were 5.4e9 at nao 430 (= 10
+#: x 43, so ten pieces) and 1.1e9 at 478 (= 2 x 239, two) and exactly 2**29
+#: at 1007 and 1123, which have no such factor.  5e8 was therefore a real
+#: boundary with a margin, not a coincidence -- but it is one cuTENSOR's
+#: boundary on one card, and it is now **asked** instead
+#: (`electrolites/_cuplan.py`, `_plan_batch`).  0, the default, asks;
+#: a number restores W8's cap.  The halve-and-retry in `_jk` stays as the
+#: backstop.
+MAX_PLAN_ELEMENTS = float(os.environ.get('FASTDFHESS_MAX_PLAN', 0))
 
 try:                                         # cutensor is optional upstream
     from cupy_backends.cuda.libs.cutensor import CuTensorError
@@ -383,9 +386,43 @@ def _dm_batch(nspin, n_dm, nao, nocc, blksize):
     if MAX_PLAN_ELEMENTS:
         nb = max(1, min(nb, int(MAX_PLAN_ELEMENTS
                                 // (nspin * nao * nocc * blksize))))
+    else:
+        nb = _cuplan.largest(nb, _batch_plans(nspin, nao, nocc, blksize))
     if BALANCE:
         nb = max(1, DFHESS._balance_batch_size(nb, n_dm))
     return nb
+
+
+def _batch_plans(nspin, nao, nocc, blksize):
+    """Whether every batch-sized contraction of ``_jk_once`` plans at ``nb``.
+
+    Asked of descriptors (`electrolites/_cuplan.py`), with the ``(L, p, q)``
+    view ``DF.loop(unpack=True)`` yields, for the widest auxiliary block --
+    the output of each is widest there and cuTENSOR's refusal is a property
+    of the output (`docs/DF_WORK_LIST.md` W21).
+    """
+    nL = blksize
+    cderi = ((nL, nao, nao), (8, nao * nL * 8, nL * 8))
+    fused = ARRANGE == 'fused'
+
+    def plans(nb):
+        if fused:
+            return (_cuplan.planable('sqjL,snqi->snijL', (nspin, nao, nocc, nL),
+                                     (nspin, nb, nao, nocc),
+                                     (nspin, nb, nocc, nocc, nL))
+                    and _cuplan.planable('snpa,sajL->snpjL',
+                                         (nspin, nb, nao, nocc),
+                                         (nspin, nocc, nocc, nL),
+                                         (nspin, nb, nao, nocc, nL)))
+        ok = _cuplan.planable('Lpq,snqi->snpiL', cderi, (nspin, nb, nao, nocc),
+                              (nspin, nb, nao, nocc, nL))
+        if ok and ARRANGE != 'blasvk':
+            ok = _cuplan.planable('snpiL,spj->snjiL',
+                                  (nspin, nb, nao, nocc, nL),
+                                  (nspin, nao, nocc),
+                                  (nspin, nb, nocc, nocc, nL))
+        return ok
+    return plans
 
 
 # --------------------------------------------------------------------------
@@ -525,7 +562,13 @@ def _jk_once(dfobj, mo1, occ_coeff, nspin, n_dm, nao, nocc,
         rhok_oo = ndarray((nspin, nocc, nocc, nL), buffer=buf1)
         contract('Lpq,sqj->spjL', cderi, _occ, out=rhok)
         contract('spjL,spi->sijL', rhok, _occ, out=rhok_oo)
-        for i0, i1 in lib.prange(0, n_dm, nb_max):
+        # every batch, the remainder included, at an extent that plans
+        # (`docs/DF_WORK_LIST.md` W21: which extents do is not monotonic in
+        # general, so a cap on the largest does not cover the last)
+        batches = (_cuplan.prange(0, n_dm, nb_max,
+                                  _batch_plans(nspin, nao, nocc, nL))
+                   if not MAX_PLAN_ELEMENTS else lib.prange(0, n_dm, nb_max))
+        for i0, i1 in batches:
             nb = i1 - i0
             x = _mo1[:, i0:i1]
             if with_j:

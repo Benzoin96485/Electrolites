@@ -70,7 +70,9 @@ Another capacity result: `df/grad/rhf.py` holds the occupied-occupied
 transform of the three-centre integrals **twice**, as dense
 `(naux, nocc, nocc)` device arrays — 37.7 GB each at 284 atoms, so a 40 GB
 card is asked for 75.5 GB.  Neither copy is necessary.
-`docs/README_fastdfgrad.md`, `docs/README_fastdfgradoo.md`.
+`docs/README_fastdfgrad.md`, `docs/README_fastdfgradoo.md`, and
+`docs/README_fastdfplan.md` for the cuTENSOR plan wall three of these modules
+met and now ask about instead of retrying.
 
 ### Density-fitted SCF
 
@@ -81,9 +83,12 @@ card is asked for 75.5 GB.  Neither copy is necessary.
 | taxol, DF-B3LYP, cderi on the host | 25.75 s | **22.39 s** | **1.15x** |
 | the cderi build alone, taxol, on the host | 12.76 s | **3.99 s** | **3.20x** |
 | the cderi build alone, PfPMT, on the host | 87.1 s | **29.5 s** | **2.95x** |
-| `df_jk.get_j` (pure functional), penicillin V | 26.2 ms | **14.7 ms** | **1.78x** |
-| ↳ two densities | 130.9 ms | **29.4 ms** | **4.45x** |
-| ↳ Ni dithiolene, open shell, two densities | 317.8 ms | **24.0 ms** | **13.2x** |
+| `df_jk.get_j` (pure functional), penicillin V | 26.2 ms | **4.27 ms** | **6.14x** |
+| ↳ taxol, 113 atoms | 157.3 ms | **29.1 ms** | **5.40x** |
+| ↳ PfPMT, 284 atoms | 732.1 ms | **143.7 ms** | **5.10x** |
+| ↳ penicillin V, two densities | 130.8 ms | **8.5 ms** | **15.3x** |
+| ↳ Ni dithiolene, open shell, two densities | 317.7 ms | **11.7 ms** | **27.2x** |
+| whole DF-PBE SCF, PfPMT, 50 cycles, against W9 (which is 1.01x at this size) | 85.1 s | **56.0 s** | **1.52x** |
 
 **RIJONX** — `density_fit(only_dfj=True)`, density-fitted J with exact
 exchange — cannot run on GPU4PySCF 1.8.1 at all (`'Mole' object has no
@@ -96,6 +101,7 @@ large hybrid, because a Coulomb-only DF build never constructs a cderi:
 | before the first Fock matrix | 88.7 s / 86.4 GB | **1.08 s / nothing** | — |
 
 `docs/README_fastdf.md`, `docs/README_fastdfj.md`, `docs/README_fastdfj3c.md`,
+`docs/README_fastdfj3ck.md`, `docs/README_fastdfj3cinc.md`,
 `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md`,
 `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md`,
 `docs/README_fastdffp32.md`, and `docs/DF_WORK_LIST.md` for what is left.
@@ -220,7 +226,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |
-| `fastdfj3c` | `df.df_jk.get_j` and the three-centre Coulomb engine | `docs/README_fastdfj3c.md` |
+| `fastdfj3c` | `df.df_jk.get_j` and the three-centre Coulomb engine, its two integral kernels included | `docs/README_fastdfj3c.md`, `docs/README_fastdfj3ck.md` |
 | `fastdfcderi` | `df.df._cholesky_eri` — the one-time cderi build — and `df.int3c2e_bdiv.int2c2e`, the two-centre metric integrals under it | `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md` |
 | `fastdfgrad` | `df.grad.{rhf,rks,uhf,uks}.Gradients.jk_energy_per_atom` | `docs/README_fastdfgrad.md`, `docs/README_fastdfgradoo.md` |
 | `fastdfhess` | `df.hessian.rhf._get_jk` — the DF Hessian's CPHF build | `docs/README_fastdfhess.md` |

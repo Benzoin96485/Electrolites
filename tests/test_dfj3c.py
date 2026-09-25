@@ -44,6 +44,7 @@ What is checked:
 Needs one GPU.
 """
 import argparse
+import os
 import sys
 
 import numpy as np
@@ -315,14 +316,125 @@ def energies():
     return fails
 
 
+NI_DITHIOLENE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             '..', 'benchmarks', 'molecules',
+                             'tmc_ni_dithiolene.xyz')
+
+
+def kernels():
+    """W19's kernels class by class, and the split with GPU4PySCF's.
+
+    `electrolites/_j3ck.py` serves every class up to ``KMAX_ORDER`` and
+    leaves the shell-pair groups that meet a higher one to GPU4PySCF's
+    kernels.  Three cases: an open-shell 3d complex, whose auxiliary set
+    reaches ``i`` (lk 6) on the metal, with every class this module's; the
+    same with the ceiling at 8, so that the groups past ``lij = 2`` go back to
+    GPU4PySCF and the two sets of kernels write into one output; and ethanol
+    with the ceiling at 6, the same split in a basis whose auxiliary set
+    stops at ``g``.
+    """
+    from electrolites import _j3ck
+    fails = 0
+    cases = [('Ni dithiolene', NI_DITHIOLENE, -1, 1, 99),
+             ('Ni dithiolene', NI_DITHIOLENE, -1, 1, 8),
+             ('ethanol', ETHANOL, 0, 0, 6)]
+    for name, geom, charge, spin, kmax in cases:
+        mol = gto.M(atom=geom, basis=a.basis, charge=charge, spin=spin,
+                    verbose=0)
+        mf = (scf.UHF if spin else scf.RHF)(mol).density_fit(
+            auxbasis=a.auxbasis)
+        mf.verbose = 0
+        dfobj = mf.with_df
+        dfobj.build(build_cderi=False)
+        dm = cp.asarray(_dm(mol, spin, 1))
+        dm = dm.reshape(-1, mol.nao, mol.nao).sum(0)
+        install(False)
+        ref = df_jk.get_j(dfobj, dm, 1)
+        install(True)
+        old = _j3ck.MAX_ORDER
+        _j3ck.MAX_ORDER = kmax
+        if dfobj.j_engine is not None:
+            setattr(dfobj.j_engine, _j3ck._ATTR, {})
+        try:
+            got = df_jk.get_j(dfobj, dm, 1)
+            plan = _j3ck.plan(dfobj.j_engine, _j3c.constants(dfobj.j_engine))
+        finally:
+            _j3ck.MAX_ORDER = old
+            setattr(dfobj.j_engine, _j3ck._ATTR, {})
+        e = _err(got, ref)
+        ok = e < a.tol
+        fails += not ok
+        print(f'{"ok  " if ok else "FAIL"} W19 kernels, {name}/{a.basis}, '
+              f'ceiling {kmax}: {len(plan.classes)} classes ours, '
+              f'{len(plan.theirs)} groups GPU4PySCF\'s: {e:.1e}')
+    return fails
+
+
+def incremental():
+    """W20's build from the difference: the same SCF, the same answer.
+
+    The screen drops what a Schwarz bound says is below ``INC_TOL``, so the
+    Fock matrix differs by that much and a DIIS trajectory can take one cycle
+    more or fewer; the energy has to agree to ``--etol``.  Then the guard: a
+    call whose density is nothing like the previous one (a response density)
+    must be built whole, and must equal a build that never had a state.
+    """
+    fails = 0
+    for name, geom, spin, xc in (('ethanol', ETHANOL, 0, 'pbe'),
+                                 ('CH3', CH3, 1, 'pbe'),
+                                 ('ethanol', ETHANOL, 0, 'b3lyp')):
+        mol = gto.M(atom=geom, basis=a.basis, spin=spin, verbose=0)
+        out = {}
+        for inc in (False, True):
+            install(True)
+            fastdfj3c.INCREMENTAL = inc
+            fastdfj3c.STATS['inc_step'] = 0
+            mf = (dft.UKS if spin else dft.RKS)(mol, xc=xc).density_fit(
+                auxbasis=a.auxbasis)
+            mf.grids.level = 3
+            mf.verbose = 0
+            mf.conv_tol = 1e-11
+            e = mf.kernel()
+            out[inc] = (e, mf.cycles, fastdfj3c.STATS['inc_step'], mf)
+        fastdfj3c.INCREMENTAL = False
+        de = abs(out[True][0] - out[False][0])
+        dc = abs(out[True][1] - out[False][1])
+        ok = de < a.etol and dc <= 1 and (out[True][2] > 0 or xc == 'b3lyp')
+        fails += not ok
+        print(f'{"ok  " if ok else "FAIL"} W20 {name}/{xc} spin={spin}: dE = '
+              f'{de:.1e} Eh, cycles {out[False][1]} vs {out[True][1]}, '
+              f'{out[True][2]} builds from the difference')
+
+    # the guard, on the state the last SCF left behind
+    mf = out[True][3]
+    dfobj = mf.with_df
+    rng = np.random.default_rng(3)
+    d = cp.asarray(rng.normal(scale=1e-2, size=(mol.nao, mol.nao)))
+    d = d + d.T
+    fastdfj3c.INCREMENTAL = True
+    full0 = fastdfj3c.STATS['inc_full']
+    got = df_jk.get_j(dfobj, d, 1)
+    whole = fastdfj3c.STATS['inc_full'] - full0
+    fastdfj3c.INCREMENTAL = False
+    ref = df_jk.get_j(dfobj, d, 1)
+    e = _err(got, ref)
+    ok = e < a.tol and whole == 1
+    fails += not ok
+    print(f'{"ok  " if ok else "FAIL"} W20 a response-like density after an '
+          f'SCF is built whole ({whole}): {e:.1e}')
+    return fails
+
+
 def main():
     print(f'# gpu4pyscf {electrolites.gpu4pyscf_version()}  '
           f'patched: {electrolites.patched()}  basis {a.basis}')
     fails = matrices()
+    fails += kernels()
     fails += rebuild()
     fails += devices()
     if not a.no_scf:
         fails += energies()
+        fails += incremental()
     install(True)
     print(f'\nfastdfj3c {fastdfj3c.stats()}')
     print('FAILURES' if fails else 'all ok')

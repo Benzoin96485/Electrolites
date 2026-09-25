@@ -14,6 +14,9 @@ is; `docs/README_fastdfgrad.md` closed **W3**, `docs/README_fastdfcderi.md`
 **W7**, `docs/README_fastdfhess.md` **W8** (whose result is that its own
 target cannot be made faster, and whose *finding* is W16, W17 and W18),
 `docs/README_fastdfj3c.md` **W9** (whose findings are W19 and W20),
+`docs/README_fastdfj3ck.md` closed **W19** and `docs/README_fastdfj3cinc.md`
+**W20** (whose finding is W26), `docs/README_fastdfplan.md` closed **W21**
+(whose finding is W27),
 `docs/README_fastdfstore.md` closed **W11**, **W12** and **W13** together
 (they are three items on one function, and its finding is W22),
 `docs/README_fastdfunpack.md` closed **W14** and **W15** together (the two
@@ -277,6 +280,19 @@ found rather than closed is that after it the build is **85 % two integral
 kernels at 42 atoms and 97 % at 284** (`docs/README_fastdfj3c.md`), and the
 three things still inside them are **W19**; the fourth, which is not inside
 them, is **W20**.
+
+**W19, W20 and W21 are done, and W26 and W27 are what they found.**  The
+three-centre Coulomb build is **1.3x–5.0x** faster again on top of W9 (4.8x at
+113 atoms, 5.0x at 284; 2.8x–27x against GPU4PySCF) from kernels written
+from the angular-momentum class alone, one thread per shell pair with
+everything in registers (`docs/README_fastdfj3ck.md`).  That made W20's
+density screen, measured and built, a loss on every whole run — 0.89x–0.97x
+— so it ships off (`docs/README_fastdfj3cinc.md`).  And W21's plan wall is a
+rule, not a mystery: an output past 2²⁹ elements is refused unless one mode
+can be cut by factors of at most 13, W10's "non-monotonic" block was the
+remainder of an auxiliary batch, W8's cap was a real boundary, and all three
+modules now ask cuTENSOR on a descriptor before they commit to an extent
+(`docs/README_fastdfplan.md`).
 
 **W3 is done, and W10 is what it found.**  The DF gradient's two-electron
 derivative is 1.75x–2.59x faster and the gradient around it 1.24x–2.27x
@@ -1547,7 +1563,53 @@ shape — both build a density-fitted quantity per atom out of
 `Int3c2eOpt` — so the two are one project rather than two, and W17 is the
 half worth measuring first.
 
-### W19 — The three-centre Coulomb kernels themselves
+### W19 — The three-centre Coulomb kernels themselves — **done, 1.3x–5.0x on top of W9, and the margin grows with the molecule**
+
+`electrolites/codegen/gen_j3c.py` (the generator), `electrolites/_j3ck.py`
+(the tables, the tiers and the launches), `fastdfj3c` item 7,
+`tests/test_dfj3c.py`, `benchmarks/df_j3c_class_probe.py` and
+`benchmarks/df_j3c_kernel_sweep.py`; write-up in `docs/README_fastdfj3ck.md`.
+
+**The falsification does not fire.**  Profiled class by class first, the time
+is spread over every class and the low ones run at 70–100 ps per quartet
+where the useful work is one Boys function: instruction-bound, not
+bandwidth-bound on the Hermite density (which is served from L2).  So the
+generator was written — and it takes nothing from `contract_int3c2e.cu`:
+one thread carries one shell pair through a batch of auxiliary shells with
+everything in registers, the pair's product centre and `1/aij` read from a
+table instead of recomputed per auxiliary shell (all three divisions and the
+square root gone, one `rsqrt` in their place), every Hermite index a literal,
+`omega == 0` compiled in — the entry's three items — and one it did not name:
+**the auxiliary Hermite components of the wrong parity are zero by
+construction and upstream's density contraction forms them anyway** (a
+quarter of it at `L = 1`, three tenths at `L = 2`).
+
+`df_jk.get_j`, milliseconds, W9 → W19: glycine 1.533 → 1.165 (1.32x),
+alanine dipeptide 3.318 → 1.611 (2.06x), penicillin V 14.706 → **4.271
+(3.44x)**, taxol 139.677 → **29.114 (4.80x)**, PfPMT 712.174 → **143.670
+(4.96x)**, def2-TZVPP 3.90x, the Ni and Cu complexes 2.06x and 3.21x, two
+and four densities 3.44x and 3.72x — **2.8x–27x against GPU4PySCF**.  The
+kernels alone are 4.9x–6.5x (density) and 4.4x–4.9x (auxiliary vector).  A
+whole DF-PBE SCF is 1.11x at 42 atoms, **1.34x** at 113 and **1.52x** at
+284 on top of W9, same energies and same cycles.
+
+Two things the entry did not expect.  **One thread per quartet beats
+upstream's shared-memory cooperation even where it spills**: the classes up to
+`lij + lk = 10` are this module's and still win at order 7–8; the ceiling
+(`FASTDFJ3C_KMAX_ORDER`) is set by compile time — 8–10 s for a def2-SVP
+organic basis, ~22 s for TZVPP or a 3d metal, once per machine — not by
+speed.  And **a class is not a launch**: one kernel per class was 2x slower
+than GPU4PySCF at ten atoms, because most classes' grids are a handful of
+blocks, so classes of similar order share a tier kernel that reads each
+block's class from a table.  A per-class launch configuration chosen by
+sweeping was measured and **not kept**: optima found alone do not compose
+(0.92x–1.03x of the defaults on the whole build).
+
+What it found rather than closed is that the Coulomb build is now a small
+part of a pure-functional SCF — 0.5 s of a 5.6 s taxol run — which is W20's
+answer too.
+
+The original entry, for the record:
 
 *(Found by W9, which measured them rather than changed them.)*
 
@@ -1589,7 +1651,35 @@ thing left on this path, and that its two halves are known to cost the same.
   from the host and it is monotone the way GPU4PySCF has it
   (`docs/README_fastdfj3c.md` §8).
 
-### W20 — The three-centre Coulomb build does not screen on the density
+### W20 — The three-centre Coulomb build does not screen on the density — **done, and off: W19 got there first**
+
+`electrolites/_j3cinc.py` (the bounds), `fastdfj3c` item 8
+(`FASTDFJ3C_INCREMENTAL=1`), `_j3ck.Plan.subset`,
+`benchmarks/df_j3c_screen_probe.py`; write-up in
+`docs/README_fastdfj3cinc.md`.
+
+**The pair count was measured first, as the entry asked.**  At a threshold of
+1e-11 on the Schwarz bound of what a dropped pair contributes, the density
+contraction keeps 80 → 38 % of its work from the first cycle to the last at
+113 atoms and 88 → 55 % at 42; the auxiliary-vector contraction keeps every
+auxiliary shell and 73–100 % of its pairs, because the coefficients'
+difference is small everywhere and local nowhere once the metric has coupled
+them.  At 284 atoms, on a DF-PBE SCF that does not converge in 50 cycles, it
+keeps 57–78 %.
+
+**Then it was built and the falsification fired**, though not quite as the
+entry framed it.  The filtered list is cheap to make (gathered on the card,
+one small host synchronisation); what it saves is the problem.  After W19 the
+two kernels are 24.8 ms a cycle at 113 atoms, so dropping 46 % of one and 13 %
+of the other saves at most 7.4 ms, 0.10 s over an SCF — and the screened Fock
+matrix differs by the threshold, which cost one extra cycle there (0.33 s)
+and three on the Cu macrocycle.  Whole runs against W19 alone: **0.95x, 0.96x,
+0.89x, 0.97x, 1.00x**, energies within 6e-10–7e-9 Eh.  So it ships off, correct and
+tested (`tests/test_dfj3c.py`, including the guard that builds a response
+density handed to the same object whole).  What would change the answer is
+**W26**.
+
+The original entry, for the record:
 
 *(Also from W9.)*
 
@@ -1613,7 +1703,52 @@ auxiliary shell on every cycle, 330 612 × 5 817 of them at 284 atoms.
   need a two-tier cache.  Measure the pair count first: a probe over an SCF
   trajectory is an afternoon and this item is not.
 
-### W21 — Two modules have now hit the same cuTENSOR plan wall
+### W21 — Two modules have now hit the same cuTENSOR plan wall — **done, and the refusal is predictable: all three modules now ask**
+
+`electrolites/_cuplan.py` (the query), `fastdfgrad._block_range`,
+`fastdfhess._batch_plans`, `fastdfhessip._oo_gram`, `tests/test_cuplan.py`,
+`benchmarks/cutensor_plan_probe.py`; write-up in
+`docs/README_fastdfplan.md`.
+
+**A plan depends on shapes and strides and not on data**, so it can be asked
+for on descriptors that point into a one-kilobyte buffer: ~0.3 ms a query,
+nothing allocated, and exact on whatever cuTENSOR and card the process has.
+Walked over thousands of extents that way, the one statement is: **cuTENSOR
+2.6.0 refuses an output of more than 2²⁹ elements unless it can cut one mode
+of the output — for every pattern measured, the last output mode of the
+first operand — by factors of at most 13 into pieces of at most 2²⁹.**  In
+elements, not bytes (the same for float32, float64 and complex128); on the
+output only (a 4.3e9-element input plans); unchanged by every algorithm,
+workspace preference and JIT mode (0 of 30 plan a refused extent).  The rule
+is exact on 5999 consecutive extents of the ip1 contraction and on 3994 of
+4000 random shapes over ten patterns; the six it misses are outputs 30–50x
+past the limit, where a second mode is cut.
+
+**W10's "not monotonic in the block" was the remainder.**  Logged at the
+moment of refusal, the contraction refused at a pinned block of 1096 on
+taxol has `r = 914` — the 914 functions left at the end of a 2010-wide
+auxiliary batch, 2 × 457, with no factor of 13 or less — while 1096 = 8 ×
+137 plans.  **And W8's cap was a real boundary**: 5e8 sits under 2²⁹, and the
+four bisected ceilings it could not explain (5.4e9, 1.1e9, 5.2e8, 5.2e8) are
+10, 2, 1 and 1 times 2²⁹ — the 13-smooth part of `nao`, because in
+`Lpq,snqi->snpiL` the cut mode is `p`.  The query reproduces W8's bisections
+from the shape alone.  **W17's refusal does not reproduce**: that
+contraction's output is `(3, 3, nao, nao)` whatever the chunk, and the
+whole-set chunk plans.
+
+So the falsification criterion fires as written — "a cheap test beats a
+retry and both modules should carry it" — and all three do, with each retry
+kept behind the query as a backstop: `fastdfgrad` makes every ip1 block an
+extent that plans (a refused remainder is cut near the middle, 914 → 458 +
+456), `fastdfhess` takes the largest batch that plans instead of W8's
+constant (`MAX_PLAN_ELEMENTS` now defaults to "ask"), `fastdfhessip` bounds
+its chunk by the query instead of W17's 1.2e8.  Where a refusal came late in
+the loop the restart was expensive — with the block pinned at 1096 on taxol
+asking first is **1.34x** on the term and 1.24x on the whole gradient — and
+on the default blocks, which a retry fixed early or never needed to, the
+query is 1.00x: it costs nothing, and nothing now depends on the retry.
+
+The original entry, for the record:
 
 *(Found by W8 on the DF Hessian's CPHF build and by W10 on the DF gradient's
 ip1 loop, from opposite directions.)*
@@ -1745,6 +1880,43 @@ already covered — there is no `nr_uks_fxc_mo`, it comes through
 `fastxcfxc`'s `nr_uks_fxc` `mo1` branch — so this is two functions, of the
 same shape as W17 and W18, and `electrolites/fastdfhessip.py`'s items 1–5
 should transplant.
+
+### W26 — A density screen inside the three-centre kernels
+
+*(Found by W20.)*
+
+W20's screen is host-side: a pair is kept or dropped for *every* auxiliary
+shell at once, so its bound carries `max_P q_P` (18–19 on def2-SVP jkfit)
+and the auxiliary-vector side, whose input difference is spread over every
+auxiliary function by the metric, keeps 87–92 % of its work.  W19's kernels
+walk a block of pairs against a batch of auxiliary shells, so a per-block
+bound — `max q_ij max|dD_ij|` over the block's pairs against `max q_P` over
+the batch's shells, and the same with `|dc_P|` on the other side — can skip a
+*block* with the tight factor on both sides and no list to rebuild.
+
+* **Do**: one `max` per block of each side, computed on the card per call,
+  and a test at the top of each tier kernel's block.
+* **Success**: the incremental build pays against W19 on a whole run.
+* **Falsified if**: the extra SCF cycles a screened Fock matrix costs (one at
+  113 atoms, three on the Cu macrocycle at W20's threshold) outweigh what any
+  bound tight enough to matter can drop — measure the cycle count at a
+  threshold of 1e-13 first; it is free to measure with W20's code.
+
+### W27 — Every other contraction whose output can pass 2²⁹ elements
+
+*(Found by W21.)*
+
+W21's rule says which contractions can be refused — any whose *output* can
+pass 2²⁹ elements — and three modules now ask before they run one.  Nobody
+has audited the rest of the repository against the rule: a `contract` whose
+output is `(naux, nao, nocc)`-shaped at 284 atoms is past it, and whether it
+is refused depends on the factors of an extent that moves with the molecule.
+
+* **Do**: grep every `contract(` on the density-fitting path, bound its
+  output at the 545-atom HcgC case, and put the query in front of the ones
+  that can pass the limit; `benchmarks/cutensor_plan_probe.py --run` finds
+  any that do on a real run.
+* **Success**: a list with every entry either bounded under 2²⁹ or guarded.
 
 ### Not on this list
 
@@ -1994,6 +2166,19 @@ python benchmarks/coverage_probe.py --xyz ... --xc pbe --density-fit
 ```
 
 ```bash
+python tests/test_dfj3c.py                                       # W19, W20 too
+python benchmarks/df_j3c_class_probe.py --cases penicillinV --ours  # per class
+python benchmarks/df_j3c_kernel_sweep.py --cases penicillinV,taxol  # W19 tuning
+python benchmarks/df_j3c_bench.py --cases ... --variants stock,w9,fast \
+    [--scf --scf-variants w9,fast,inc]                   # W19 and W20 end to end
+python benchmarks/df_j3c_screen_probe.py --xyz ... --xc pbe      # W20's count
+python tests/test_cuplan.py                                      # W21's bar
+python benchmarks/cutensor_plan_probe.py --threshold --rule --options  # W21
+python benchmarks/cutensor_plan_probe.py --run benchmarks/<script>.py ...
+    # a real run, with every refused contraction printed as @@REFUSED
+```
+
+```bash
 python tests/test_dfhessip.py [--basis def2-tzvpp] [--no-hessian]   # W16-W18
 python benchmarks/df_hess_terms_probe.py --xyz ... --xc b3lyp --patch all \
     --terms fxc,ip2,h1 --variants stock,ours [--env 'x:FASTDFHESSIP_...=...']
@@ -2030,7 +2215,10 @@ GPU4PySCF's own build would read the narrow tensor as a wide one.
 `FASTDFJ3C_NO_OPT`, `FASTDFJ3C_NO_MDM`, `FASTDFJ3C_SP_CHUNK_AUX`,
 `FASTDFJ3C_SP_CHUNK_DM`, `FASTDFJ3C_KSH_CHUNK`, `FASTDFJ3C_MDM_MAX_NDM`,
 `FASTDFJ3C_TARGET_BLOCKS`, `FASTDFJ3C_CHUNK_MIN`, `FASTDFJ3C_CHUNK_MAX`,
-`FASTDFJ3C_SHM_FRAC`, `FASTDFJ3C_PER_CLASS`) are listed with their meanings at
+`FASTDFJ3C_SHM_FRAC`, `FASTDFJ3C_PER_CLASS`, and W19's `FASTDFJ3C_KERNELS`,
+`FASTDFJ3C_KMAX_ORDER`, `FASTDFJ3C_KSTREAMS`, `FASTDFJ3C_KDM_PPB` and W20's
+`FASTDFJ3C_INCREMENTAL`, `FASTDFJ3C_INC_TOL`, `FASTDFJ3C_INC_REBUILD`,
+`FASTDFJ3C_INC_MAXFRAC`) are listed with their meanings at
 the top of `electrolites/fastdfj3c.py`.  The last two are the two ideas
 `docs/README_fastdfj3c.md` §8 measured and rejected, kept runnable rather than
 described.
@@ -2040,7 +2228,7 @@ described.
 `FASTDFGRAD_INTOPT`, and W10's `FASTDFGRAD_OOSTORE`, `FASTDFGRAD_OOFRAC`,
 `FASTDFGRAD_OOSLICE`, `FASTDFGRAD_OOPREFETCH`, `FASTDFGRAD_OOPIN`,
 `FASTDFGRAD_J3CBATCH`, `FASTDFGRAD_OOSIZING`, `FASTDFGRAD_FILLBUF`,
-`FASTDFGRAD_BLK`) are
+`FASTDFGRAD_BLK`, and W21's `FASTDFGRAD_PLANQ`) are
 listed with their meanings at the top of `electrolites/fastdfgrad.py`.  The
 last two are ablations rather than settings: they put back what W3's code did
 and are how `docs/README_fastdfgradoo.md` §5 accounts for the difference
