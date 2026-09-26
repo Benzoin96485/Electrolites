@@ -183,6 +183,7 @@ Ablations, for the tables in ``docs/README_fastdf.md``:
                       `docs/README_fastdffp32.md`; off unless asked for
 """
 import os
+import weakref
 
 import numpy as np
 import cupy as cp
@@ -267,7 +268,7 @@ _orig_get_jk = DFJK.get_jk
 DFJK._get_jk_orig = _orig_get_jk
 
 #: counters, so an ablation or a coverage claim can be read off a run.
-STATS = {'calls': 0, 'declined': 0, 'syrk': 0, 'gemm': 0,
+STATS = {'resident_dropped': 0, 'tiles_dropped': 0, 'calls': 0, 'declined': 0, 'syrk': 0, 'gemm': 0,
          'bgemm': 0, 'tensor': 0, 'tiled': 0, 'blocks': 0,
          'resident_rows': 0, 'streamed_rows': 0, 'tile_fill': 0.0,
          'blksize': 0}
@@ -484,6 +485,12 @@ def _blksize(nao, nocc, nbuf, on_gpu, naux_slice, fill=1.0, extra=0,
     return blk
 
 
+#: every DF object holding a resident prefix or a tile buffer -- the two
+#: device allocations this module keeps between calls -- so that a call that
+#: runs out of device memory can give them back (`get_jk`, W22)
+_CACHE_OWNERS = weakref.WeakSet()
+
+
 def _resident_prefix(dfobj, cderi_sparse, reserve_words):
     """As many auxiliary rows of a host-resident cderi as the device can hold.
 
@@ -521,6 +528,8 @@ def _resident_prefix(dfobj, cderi_sparse, reserve_words):
                 except Exception:                           # noqa: BLE001
                     buf = None
             dfobj._fastdf_resident = (cderi_sparse, buf)
+            if buf is not None:
+                _CACHE_OWNERS.add(dfobj)
     STATS['resident_rows'] = 0 if buf is None else int(buf.shape[0])
     STATS['streamed_rows'] = naux_slice - STATS['resident_rows']
     return buf
@@ -591,6 +600,7 @@ def _tiles(dfobj, nao, blksize):
         rc = RowCompressed.for_dfobj(dfobj, nao, TILE, blksize,
                                      order=TILE_ORDER).to_device()
         dfobj._fastdf_tiles = (key, rc)
+        _CACHE_OWNERS.add(dfobj)
     else:
         rc = cached[1]
     STATS['tile_fill'] = rc.fill
@@ -735,8 +745,64 @@ def _get_j(dfobj, dms, hermi, omega):
     return vj, None
 
 
+def _is_oom(exc):
+    if isinstance(exc, cp.cuda.memory.OutOfMemoryError):
+        return True
+    return 'cudaErrorMemoryAllocation' in str(exc)
+
+
 def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
-    """``df/df_jk.py:get_jk`` with its three stages rearranged."""
+    """``df/df_jk.py:get_jk`` with its three stages rearranged.
+
+    One thing GPU4PySCF cannot do and this can: run out of device memory
+    because of what this module keeps between calls.  The resident prefix of
+    a host tensor (item 4) and the tiled path's buffer (W5, 10.8 GB at 284
+    atoms) are both sized from the free memory at the *first* call and kept,
+    and a range-separated SCF builds its second tensor after that call -- on
+    the device, if it fits in what is left.  At 284 atoms on an 80 GB card
+    that is a 26 GB long-range tensor, and the next full-range call had
+    nowhere to put its prefetch buffers: `docs/DF_WORK_LIST.md` W22 found
+    every patched wB97X-D3 run there dying in its second cycle, where
+    GPU4PySCF's own runs.  So a call that runs out of memory gives back what
+    every DF object holds -- the prefix for good, the tile buffer to be
+    re-sized from the memory there is now -- and runs once more; nothing else
+    is retried.
+    """
+    try:
+        return _get_jk(dfobj, dms, hermi, with_j, with_k, omega)
+    except Exception as exc:                                 # noqa: BLE001
+        if not _is_oom(exc) or not _release_caches():
+            raise
+    return _get_jk(dfobj, dms, hermi, with_j, with_k, omega)
+
+
+def _release_caches():
+    """Drop every kept device allocation; ``False`` if there was none."""
+    import gc
+    owners = list(_CACHE_OWNERS)
+    released = 0
+    for o in owners:
+        cached = getattr(o, '_fastdf_resident', None)
+        if cached is not None and cached[1] is not None:
+            # `(tensor, None)` is the cache's own "no prefix" entry, so the
+            # prefix is not rebuilt on the next call
+            o._fastdf_resident = (cached[0], None)
+            STATS['resident_dropped'] += 1
+            released += 1
+        if getattr(o, '_fastdf_tiles', None) is not None:
+            o._fastdf_tiles = None
+            STATS['tiles_dropped'] += 1
+            released += 1
+        _CACHE_OWNERS.discard(o)
+    if not released:
+        return False
+    # the frames of the call that failed hold views of both until collected
+    gc.collect()
+    cp.get_default_memory_pool().free_all_blocks()
+    return True
+
+
+def _get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
     if _OFF:
         return _fall_through(dfobj, dms, hermi, with_j, with_k, omega,
                              'FASTDF_OFF')
@@ -789,6 +855,12 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
     naux_slice = cderi_sparse.shape[0]
     STATS['calls'] += 1
     on_gpu = isinstance(cderi_sparse, cp.ndarray)
+    if on_gpu and getattr(dfobj, '_fastdf_resident', None) is not None:
+        # `DF.range_coulomb` makes its long-range object with `self.copy()`,
+        # which hands it *this* object's resident prefix; a device-resident
+        # tensor never looks at the entry, so it would hold the other
+        # tensor's prefix alive for the rest of the SCF (W22)
+        dfobj._fastdf_resident = None
     pair_addresses, diags = dfobj._cderi_idx
     pair_idx = cp.asarray(pair_addresses, dtype=np.int32)
 

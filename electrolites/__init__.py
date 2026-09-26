@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip',
+    'fastdfhessip', 'fastdfrsh',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -166,6 +166,12 @@ _TARGETS = {
                      ('gpu4pyscf.df.hessian.rhf', 'int3c2e_scheme_ip2'),
                      ('gpu4pyscf.df.int3c2e_bdiv', '_int3c2e_ip1_evaluator'),
                      ('gpu4pyscf.df.int3c2e_bdiv', 'libvhf_rys')),
+    # a range-separated DF SCF's exchange from one tensor instead of two
+    # (docs/DF_WORK_LIST.md W22).  It wraps whatever `_DFHF.get_veff` is --
+    # `fastxcnlc`'s under `patch_all()` -- and reaches `DF._rsh_df`, where it
+    # keeps the fused tensor so that `DF.reset` drops it
+    'fastdfrsh': (('gpu4pyscf.df.df_jk', '_DFHF.get_veff'),
+                  ('gpu4pyscf.df.df', 'DF.range_coulomb')),
 }
 
 _patched = []

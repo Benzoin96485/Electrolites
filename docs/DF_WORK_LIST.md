@@ -19,6 +19,7 @@ target cannot be made faster, and whose *finding* is W16, W17 and W18),
 (whose finding is W27),
 `docs/README_fastdfstore.md` closed **W11**, **W12** and **W13** together
 (they are three items on one function, and its finding is W22),
+`docs/README_fastdfrsh.md` closed **W22**,
 `docs/README_fastdfunpack.md` closed **W14** and **W15** together (the two
 W5 left behind: one is a kernel that pays and one is a measurement that says
 not to write the code),
@@ -1243,7 +1244,9 @@ alive at the same time, so there is nothing for a pool to hand over and it
 correctly does nothing there.  That is worth recording for its own sake: at
 284 atoms a range-separated density-fitted SCF holds **two** 86.41 GB host
 tensors, 173 of the node's 251 GB, and nothing warns.  That is a capacity
-item, not a speed one, and it is **W22**.
+item, not a speed one, and it is **W22**.  *(Measured since, and it is not: the
+long-range tensor is 30.6 % of the rows and fits on the card, and the host
+holds 86.41 GB.  W22.)*
 
 ### W13 — `_decompose_j2c`'s latency at the small end — **done, and it is none of the three**
 
@@ -1793,33 +1796,59 @@ block pinned with `FASTDFGRAD_BLK`, `docs/README_fastdfgradoo.md` §4.1):
   extent is the obvious thing to test next), in which case a cheap test
   beats a retry and both modules should carry it.
 
-### W22 — A range-separated DF run holds two host cderi tensors at once
+### W22 — A range-separated DF run holds two host cderi tensors at once — **done, and it does not: the second is a third of the first, and for one class of functional it is the only one needed**
 
 *(Found by W12, which went looking for a pool and found there is nothing to
 pool.)*
 
-`DF.range_coulomb` builds a second `DF` object for the long-range operator
-and **keeps** it: `df/df.py:245` stores it in `self._rsh_df[key]` and both
-objects live until the SCF ends.  So a range-separated density-fitted run
-holds two cderi tensors of the same size at the same time — at 284 atoms
-that is **two 86.41 GB host tensors, 173 of the node's 251 GB**, and nothing
-warns.  §3.2 sizes the tensor; this entry is about there being two of them.
+`electrolites/fastdfrsh.py`, the fused build and the host note in
+`electrolites/fastdfcderi.py`, the live count and the eviction in
+`electrolites/_dfpin.py`, the out-of-memory retry in `electrolites/fastdf.py`,
+`tests/test_dfrsh.py`, `benchmarks/df_rsh_rank_probe.py`,
+`benchmarks/df_rsh_bench.py`; write-up in `docs/README_fastdfrsh.md`.
 
-It is a capacity item rather than a speed one, and it is the reason W12's
-pool does nothing for a range-separated functional: there is no released
-buffer to hand over.
+**The entry's price was never measured, and it is wrong twice.**  The
+long-range metric `(P|erf|Q)` is numerically singular in an auxiliary basis
+built for `1/r` — its smallest eigenvalue is negative at rounding level on all
+eleven systems measured — so GPU4PySCF's Cholesky fails on it every time and
+the eigen route keeps only the modes above `LINEAR_DEP_THR`: **30.6 %** of the
+rows at 284 atoms for ω = 0.25, and 26–64 % over the whole table, set by ω far
+more than by size or chemistry.  And that 26.05 GB tensor fits on an 80 GB
+card after the full-range one has gone to the host, so a 284-atom wB97X-D3 DF
+SCF holds **86.41 GB** of host memory (peak RSS 88 GB), not 173.  The entry's
+worry is real only for a larger ω: ωB97 (ω = 0.4) keeps 61.9 %, 53 GB, which
+does not fit on the card, and the pair is **139.4 GB** on the host.
 
-* **Do**: find out whether the second tensor has to be a second *tensor*.
-  The long-range build differs from the full-range one only in `omega`, and
-  `electrolites/_dfj2c.py` already shows that the two share an
-  `Int2c2eOpt` exactly; whether they can share storage is a different
-  question and needs the three-centre integrals looked at, not assumed.
-  Failing that, the honest minimum is that `DF.build` should *say* how much
-  host memory the pair will take before it takes it.
-* **Success**: a wB97X-D3 DF SCF at 284 atoms that does not need 173 GB of
-  host memory, or that says it does.
-* **Falsified if**: the two tensors genuinely share no structure, in which
-  case the item is a warning message and nothing more.
+* **Long-range-only functionals need one tensor, exactly.**  ωB97, LC-ωPBE,
+  LRC-ωPBE and LC-VV10 have `hyb = 0`, and `_DFHF.get_veff` builds the
+  full-range tensor, runs a whole exchange pass against it every cycle and
+  multiplies the result by zero; J is all it is used for, and the three-centre
+  engine computes J without it.  `fastdfrsh` builds only the long-range tensor
+  and takes J from the engine: the same energy to 1e-11 Eh (RKS and UKS, three
+  functionals, two bases), on by default, **139.4 → 53.0 GB** of host memory,
+  **2.62x** per cycle and **2.30x** on a whole SCF at 284 atoms (269.3 →
+  117.0 s); a whole taxol ωB97 SCF 1.63x.
+* **The other range-separated hybrids can share one tensor at a measured
+  cost.**  `hyb/r + (α − hyb) erf(ωr)/r` is positive definite for `hyb, α ≥
+  0` and has a robust fit of its own — one full-rank tensor, one exchange
+  pass.  It differs from the two-tensor fit by **3.2e-7–1.5e-6 Eh** (42–284
+  atoms, a UKS Cu(II) quartet among them) against a fitting error of
+  1.7e-4–4.3e-4 that both share, so it is opt-in (`FASTDFRSH=fuse`): 1.29x
+  per cycle at 113 atoms, and a whole 284-atom wB97X-D3 SCF **218.5 → 166.3
+  s** against the patched two-tensor run.
+* **A patched 284-atom wB97X-D3 run could die in its second cycle** — found
+  measuring the baseline.  `fastdf`'s resident prefix and tile buffer are
+  sized at the first call and kept; the long-range tensor is built after it,
+  on the device; the next call had no room for its prefetch buffers.
+  GPU4PySCF's own run does not keep either.  `fastdf.get_jk` now gives both
+  back and retries once on an out-of-memory error (§5.16).
+* **And `DF.build` says it**: every host-resident tensor prints its size, the
+  tensors already alive and the node's `MemAvailable` before it is allocated,
+  refuses with `MemoryError` and those numbers when it cannot fit, and the
+  pinned pool evicts for a build that needs the room.
+
+The success criterion is met both ways: the 284-atom wB97X-D3 SCF needs 88
+GB, and says so.
 
 ### W23 — A restricted meta-GGA Hessian is not reproducible
 
@@ -2050,6 +2079,16 @@ four are cheap to avoid and none is detectable from the number itself.
    This is §5.13 in a third costume and the symptom is the same: a stock
    column that agrees with the patched one.
 
+16. **A buffer sized at the first call can be starved by a tensor built
+   after it.**  §5.9 fixed `fastdf`'s block at the first call so a cached
+   buffer is not reallocated when free memory moves by a few per cent.  A
+   range-separated SCF moves it by 26 GB: its long-range tensor is built
+   *after* the first full-range call, on the device, in what `fastdf`'s
+   prefix and tile buffer left, and the second call ran out of memory where
+   GPU4PySCF's own run did not (W22).  A test that makes one call, or one
+   tensor, cannot see it; `benchmarks/df_rsh_bench.py --veff-reps` is three
+   calls after both builds.
+
 And one that is not about timing: **a patch target is not a code path.**
 Three rounds in this repository have now shipped a module that was loaded,
 correct, and never called — `dft/uks.py`, `hessian/uks.py`, and now
@@ -2177,6 +2216,19 @@ python benchmarks/cutensor_plan_probe.py --threshold --rule --options  # W21
 python benchmarks/cutensor_plan_probe.py --run benchmarks/<script>.py ...
     # a real run, with every refused contraction printed as @@REFUSED
 ```
+
+```bash
+python tests/test_dfrsh.py [--basis def2-tzvp]                      # W22's bar
+python benchmarks/df_rsh_rank_probe.py --xyz ... --xc hyb_gga_xc_wb97x_d3
+    # the long-range metric's spectrum, and the exchange each mode carries
+python benchmarks/df_rsh_rank_probe.py --xyz ... --spectrum-only     # no SCF
+FASTDFRSH=off|auto|fuse python benchmarks/df_rsh_bench.py --xyz ... \
+    --xc hyb_gga_xc_wb97 --patch all --veff-reps 3 [--cpu-cderi] [--scf] [--no-df]
+```
+
+`fastdfrsh`'s switch is `FASTDFRSH` (`auto`, the default: only the exact
+long-range-only path; `fuse`: the one-tensor fit of every positive-definite
+range-separated hybrid, which changes the answer by 1e-7–1e-6 Eh; `off`).
 
 ```bash
 python tests/test_dfhessip.py [--basis def2-tzvpp] [--no-hessian]   # W16-W18

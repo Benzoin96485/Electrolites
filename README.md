@@ -104,7 +104,8 @@ large hybrid, because a Coulomb-only DF build never constructs a cderi:
 `docs/README_fastdfj3ck.md`, `docs/README_fastdfj3cinc.md`,
 `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md`,
 `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md`,
-`docs/README_fastdffp32.md`, and `docs/DF_WORK_LIST.md` for what is left.
+`docs/README_fastdffp32.md`, `docs/README_fastdfrsh.md`, and
+`docs/DF_WORK_LIST.md` for what is left.
 
 ### Response properties — penicillin V/def2-SVP, whole runs
 
@@ -232,6 +233,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastdfhess` | `df.hessian.rhf._get_jk` — the DF Hessian's CPHF build | `docs/README_fastdfhess.md` |
 | `fastdfhessip` | `df.hessian.rhf._jk_energy_per_atom` and `_get_veff` — the DF Hessian's `ip2` and `h1` two-electron terms | `docs/README_fastdfhessip.md` |
 | `fastdffp32` | `DF.loop` and the DF Hessian's cderi transfer — carries `FASTDF_FP32=1`, which is inert unless set and **changes the answer** when it is | `docs/README_fastdffp32.md` |
+| `fastdfrsh` | `df.df_jk._DFHF.get_veff` for a range-separated hybrid — one cderi tensor where upstream keeps two: exactly, for the long-range-only functionals (ωB97, LC-ωPBE, LC-VV10), and under `FASTDFRSH=fuse`, which **changes the answer** by 1e-7–1e-6 Eh, for the rest | `docs/README_fastdfrsh.md` |
 
 `docs/CATALOGUE_06_STATUS.md` maps these onto the kernel-target catalogue,
 including the entries that turned out to be closed upstream or reversed.

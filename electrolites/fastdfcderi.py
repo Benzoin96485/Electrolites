@@ -159,6 +159,7 @@ def stats():
     out['pin'] = PIN.stats()
     out['store'] = STORE.stats()
     out['j2c'] = J2C.stats()
+    out['host_builds'] = list(HOST_BUILDS)
     return out
 
 
@@ -169,7 +170,8 @@ def _decline(reason):
 # --------------------------------------------------------------------------
 # the metric
 # --------------------------------------------------------------------------
-def _decompose_j2c(auxmol, aux_sorting=None, omega=None, keep_factor=False):
+def _decompose_j2c(auxmol, aux_sorting=None, omega=None, keep_factor=False,
+                   fuse=None):
     """``_decompose_j2c``, optionally keeping the factor it throws away.
 
     Byte for byte upstream's function in the ``aux_coef`` it returns; the
@@ -178,7 +180,17 @@ def _decompose_j2c(auxmol, aux_sorting=None, omega=None, keep_factor=False):
     it, and rebuilding it would cost a second ``int2c2e`` and a second
     ``potrf``.
     """
-    j2c = J2C.int2c2e(auxmol, omega=omega)
+    if fuse is None:
+        j2c = J2C.int2c2e(auxmol, omega=omega)
+    else:
+        # W22: the metric of the functional's own exchange operator,
+        # `a_full/r + a_lr erf(omega r)/r`.  Positive definite whenever
+        # `a_full >= 0` and `a_full + a_lr >= 0`, which the caller checks
+        a_full, a_lr, om_lr = fuse
+        j2c = J2C.int2c2e(auxmol, omega=om_lr)
+        j2c *= a_lr
+        if a_full:
+            j2c += a_full * J2C.int2c2e(auxmol, omega=None)
     cd_low = None
     try:
         cd_low = cholesky(j2c)
@@ -250,6 +262,72 @@ def _trmm_right_lowerT(x, cd_inv, out=None):
 
 
 # --------------------------------------------------------------------------
+# the host budget (W22)
+# --------------------------------------------------------------------------
+#: every host-resident tensor this module has built, in order: operator,
+#: shape, bytes, and what the node had left when it was asked for.
+HOST_BUILDS = []
+
+
+def _host_preflight(log, naux, npairs, itemsize, omega):
+    """Report a host-resident cderi's size against the node, before it exists.
+
+    ``docs/DF_WORK_LIST.md`` W22.  A range-separated run builds a second
+    tensor for the long-range operator and keeps both.  The second is not the
+    size of the first -- its metric is numerically rank-deficient, and
+    GPU4PySCF's eigen route stores only the modes above ``LINEAR_DEP_THR``,
+    26-46 % of the rows (``docs/README_fastdfrsh.md`` §2) -- but it is not
+    small either, and before this nothing said how much of the node the pair
+    took.  This says it at ``NOTE`` level, warns when the pair leaves less
+    than the pool's reserve, and raises ``MemoryError`` with the numbers when
+    the tensor cannot be had at all, where the alternative is a ``SIGKILL``
+    in the middle of the store.
+    """
+    nbytes = int(naux) * int(npairs) * int(itemsize)
+    live = PIN.live_bytes()
+    pooled = PIN._pool_bytes()
+    avail = PIN.host_avail()
+    total = PIN._meminfo('MemTotal:')
+    _, reserve = PIN._limits()
+    fused = isinstance(omega, tuple)
+    rec = {'omega': omega[1] if fused else float(omega or 0.),
+           'shape': (int(naux), int(npairs)),
+           'gb': nbytes * 1e-9, 'live_gb': live * 1e-9,
+           'avail_gb': None if avail is None else avail * 1e-9,
+           'total_gb': None if total is None else total * 1e-9}
+    HOST_BUILDS.append(rec)
+    if fused:
+        a_full, a_lr, om = omega[1]
+        label = f'fused {a_full:g}/r + {a_lr:g} erf({om:g} r)/r'
+    else:
+        label = 'full-range' if not omega else f'omega={omega:g}'
+    msg = (f'cderi ({label}) {naux} x {npairs} '
+           f'{"fp32" if itemsize == 4 else "fp64"} = {nbytes * 1e-9:.2f} GB on '
+           f'the host')
+    if live:
+        msg += (f'; with the {live * 1e-9:.2f} GB already alive in this '
+                f'process, {(live + nbytes) * 1e-9:.2f} GB')
+    if total:
+        msg += f' of the node\'s {total * 1e-9:.1f} GB'
+    if avail is not None:
+        msg += f' (MemAvailable {avail * 1e-9:.1f} GB)'
+    log.note(msg)
+    if avail is None:
+        return
+    # the pool's buffers are resident and so outside MemAvailable, but the
+    # build is allowed to evict them (`_dfpin._make_room`)
+    if nbytes > avail + pooled:
+        raise MemoryError(msg + ': it does not fit.  A range-separated '
+                          'functional keeps one tensor per operator; '
+                          'FASTDF_FP32=1 halves both')
+    if avail + pooled - nbytes < reserve:
+        import warnings
+        warnings.warn(msg + f': it leaves less than {reserve * 1e-9:.0f} GB '
+                      'of the node free', RuntimeWarning, stacklevel=2)
+        log.warn(msg + ': it leaves less than the reserve free')
+
+
+# --------------------------------------------------------------------------
 # the build
 # --------------------------------------------------------------------------
 _orig_cholesky_eri = DFMOD._cholesky_eri
@@ -266,15 +344,31 @@ bdiv.int2c2e_orig = J2C._orig_int2c2e
 bdiv.int2c2e = J2C.int2c2e
 
 
-def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
+#: ``x <- a x + b y`` in place, for the fused operator's integrals (W22)
+_axpby = cp.ElementwiseKernel('float64 a, float64 b, float64 y', 'float64 x',
+                              'x = a * x + b * y', 'electrolites_axpby')
+
+
+def _cholesky_eri(intopt, omega=None, use_gpu_memory=None, fuse=None):
     """``df/df.py:_cholesky_eri``, with the three changes this module is.
 
     Structure, batching, memory accounting, the host branch and the
     recontraction branch are upstream's; what differs is the shell-pair
     aggregation the evaluator is built with, how each block's metric
     contraction is done, and how the host buffer is page-locked.
+
+    ``fuse=(a_full, a_lr, omega_lr)`` builds the tensor of one operator,
+    ``a_full/r + a_lr erf(omega_lr r)/r``, instead of either of the two
+    ``DF.range_coulomb`` keeps: the three-centre integrals of both are
+    evaluated over the *full-range* evaluator's pair list (a superset of the
+    long-range one's -- ``erf(wr)/r <= 1/r`` bounds every integral) and
+    combined block by block, and the metric is the same combination.  That is
+    ``electrolites/fastdfrsh.py``'s fused mode, `docs/DF_WORK_LIST.md` W22.
+    GPU4PySCF has no such build, so there is nothing to hand it back to.
     """
-    if _OFF:
+    if fuse is not None:
+        assert omega is None and multi_gpu.num_devices == 1
+    elif _OFF:
         return _orig_cholesky_eri(intopt, omega, use_gpu_memory)
     if _METRIC not in ('trmm', 'trsm', 'gemm'):
         raise ValueError(f'FASTDFCDERI_METRIC={_METRIC!r}: expected one of '
@@ -302,7 +396,9 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
 
     mem_avail = get_avail_mem(exclude_memory_pool=True)
     word_avail = mem_avail // 8
-    batch_size = int(word_avail * .2) // naux_sorted
+    # the fused build holds the two operators' integrals at once, so each is
+    # given half of the fifth of the card upstream gives one
+    batch_size = int(word_avail * (.1 if fuse else .2)) // naux_sorted
 
     current_device = cp.cuda.device.get_device_id()
     with _spmult(_SPMULT, short_range=(omega or 0) < 0):
@@ -314,6 +410,26 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
     cderi_batch_size = int(max(ao_pair_offsets[1:] - ao_pair_offsets[:-1]))
     batch_size = cderi_batch_size
     num_batches = len(ao_pair_offsets) - 1
+    if fuse is not None:
+        a_full, a_lr, om_lr = fuse
+        with _spmult(_SPMULT, short_range=False):
+            # the clone context is what makes the long-range evaluator walk
+            # the same batches over the same pairs in the same order
+            eval_lr = intopt.int3c2e_evaluator(
+                reorder_aux=True, clone_context=clone_context,
+                omega=om_lr)[0]
+        eval_full = eval_j3c
+        lr_work = cp.empty(naux_sorted * batch_size)
+        word_avail -= naux_sorted * batch_size
+        a_full = np.float64(a_full)
+        a_lr = np.float64(a_lr)
+
+        def eval_j3c(shl_pair_batch_id, out=None):
+            j3c = eval_full(shl_pair_batch_id, out=out)
+            lr = eval_lr(shl_pair_batch_id, out=lr_work)
+            assert lr.shape == j3c.shape
+            _axpby(a_full, a_lr, lr, j3c)
+            return j3c
 
     if needs_recontraction:
         recontract, ao_pair_counts, contracted_ao_pair_counts, pair_addresses = \
@@ -344,7 +460,7 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
         _decline('metric contraction too small')
         sparse = False
     aux_coef, tag, cd_low = _decompose_j2c(
-        auxmol, None, omega, keep_factor=sparse)
+        auxmol, None, omega, keep_factor=sparse, fuse=fuse)
     if sparse and tag != 'cd':
         # the filtered-eigen branch has no triangular factor to solve against
         _decline('linear-dependent auxiliary basis')
@@ -448,6 +564,11 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None):
         return out
 
     if not on_gpu:
+        # W22: say what this tensor takes of the host, and what the tensors
+        # already alive take, before taking it -- and refuse with a reason
+        # rather than let the kernel's OOM killer do it without one.
+        _host_preflight(log, naux, cderi_npairs, itemsize,
+                        omega if fuse is None else ('fused', fuse))
         # W12: page-locked the cheap way, and kept for the next build.  A
         # geometry optimisation builds this buffer once per step and a
         # range-separated functional twice per SCF, and page-locking 86 GB is

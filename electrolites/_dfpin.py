@@ -76,7 +76,8 @@ _libc = ctypes.CDLL('libc.so.6')
 #: than assumed.  `registered_gb` is what was page-locked and `reused_gb`
 #: what the pool handed back without page-locking anything.
 STATS = {'allocated': 0, 'reused': 0, 'registered_gb': 0., 'reused_gb': 0.,
-         'retained': 0, 'released': 0, 'evicted': 0, 'refused_by_memory': 0}
+         'retained': 0, 'released': 0, 'evicted': 0, 'refused_by_memory': 0,
+         'evicted_for_room': 0}
 DECLINED = {}
 
 
@@ -186,6 +187,15 @@ class _MappedArray(np.ndarray):
 # --------------------------------------------------------------------------
 #: retained buffers, least recently released first
 _pool = []
+#: buffers currently handed out, by ``id`` -- the host-resident cderi tensors
+#: that are alive in this process.  `docs/DF_WORK_LIST.md` W22: a
+#: range-separated run holds two of them at once and nothing said so.
+_live = {}
+
+
+def live_bytes():
+    """Bytes of page-locked cderi currently in use in this process."""
+    return sum(p.capacity for p in _live.values())
 
 
 def _pool_bytes():
@@ -214,6 +224,7 @@ def _acquire(nbytes):
 
 def _release(pinned):
     """Offer a buffer back to the pool, or unregister it."""
+    _live.pop(id(pinned), None)
     STATS['released'] += 1
     if not _POOL:
         pinned.close()
@@ -242,6 +253,24 @@ def free_pool():
     return n
 
 
+def _make_room(nbytes):
+    """Evict retained buffers, oldest first, until ``nbytes`` would fit.
+
+    A retained buffer is resident and locked, so ``MemAvailable`` does not
+    count it; a build that needs the memory more than a later build needs the
+    10 s must get it.  Before W22 nothing did this: a pool holding one
+    calculation's two tensors would sit on memory a *different* calculation's
+    build then failed for want of.
+    """
+    _, reserve = _limits()
+    while _pool:
+        avail = host_avail()
+        if avail is None or avail - nbytes >= reserve:
+            return
+        STATS['evicted_for_room'] += 1
+        _pool.pop(0).close()
+
+
 # --------------------------------------------------------------------------
 # what the build calls
 # --------------------------------------------------------------------------
@@ -266,6 +295,7 @@ def empty_mapped_pooled(shape, dtype=float, hugepage=None, pool=None):
         STATS['reused'] += 1
         STATS['reused_gb'] += nbytes * 1e-9
     else:
+        _make_room(nbytes)
         try:
             pinned = _Pinned(nbytes, hugepage)
         except Exception as exc:                             # noqa: BLE001
@@ -276,6 +306,7 @@ def empty_mapped_pooled(shape, dtype=float, hugepage=None, pool=None):
     out = np.ndarray(shape, dtype=dtype, buffer=pinned.raw.data,
                      offset=pinned.offset).view(_MappedArray)
     out._pin = _Lease(pinned) if pool is not False else _NoPool(pinned)
+    _live[id(pinned)] = pinned
     return out
 
 
@@ -291,6 +322,7 @@ class _NoPool:
         pinned, self.pinned = self.pinned, None
         if pinned is not None:
             try:
+                _live.pop(id(pinned), None)
                 pinned.close()
             except Exception:                                # noqa: BLE001
                 pass
@@ -301,5 +333,7 @@ def stats():
     out = dict(STATS)
     out['pooled'] = len(_pool)
     out['pooled_gb'] = _pool_bytes() * 1e-9
+    out['live'] = len(_live)
+    out['live_gb'] = live_bytes() * 1e-9
     out['declined_reasons'] = dict(DECLINED)
     return out
