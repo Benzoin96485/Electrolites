@@ -160,8 +160,12 @@ _TARGETS = {
     # `df/hessian/{rhf,rks}.py` look both up on this module at call time, so
     # the module globals are the targets; the rest are what the copies
     # import rather than replace
+    # `df/hessian/{uhf,uks}.py` look the unrestricted twins up on
+    # `df/hessian/uhf.py` the same way (W25)
     'fastdfhessip': (('gpu4pyscf.df.hessian.rhf', '_jk_energy_per_atom'),
                      ('gpu4pyscf.df.hessian.rhf', '_get_veff'),
+                     ('gpu4pyscf.df.hessian.uhf', '_jk_energy_per_atom'),
+                     ('gpu4pyscf.df.hessian.uhf', '_get_veff'),
                      ('gpu4pyscf.df.hessian.rhf', '_int2c2e_ip2_per_atom'),
                      ('gpu4pyscf.df.hessian.rhf', 'int3c2e_scheme_ip2'),
                      ('gpu4pyscf.df.int3c2e_bdiv', '_int3c2e_ip1_evaluator'),

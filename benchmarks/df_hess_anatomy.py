@@ -13,6 +13,9 @@ Hessian, with the same wraps plus the ones W16-W18 need, and runs it
 
 Nested rows (``..``) are sub-intervals of their parent.  The trace of the
 Hessian is printed so two runs can be compared without a file.
+
+An open-shell molecule (``--spin`` not 0) runs a UKS SCF and Hessian, and
+the rows are the unrestricted entry points (W25).
 """
 import importlib
 import json
@@ -38,7 +41,9 @@ _sync = cp.cuda.Stream.null.synchronize
 
 mol = build_mol(a)
 natm = mol.natm
-mf = dft.RKS(mol, xc=a.xc).density_fit(auxbasis=a.auxbasis)
+uks = mol.spin != 0
+mf = (dft.UKS if uks else dft.RKS)(mol, xc=a.xc).density_fit(
+    auxbasis=a.auxbasis)
 mf.grids.level = a.grids
 mf.conv_tol = a.conv_tol
 mf.conv_tol_cpscf = a.conv_tol_cpscf
@@ -80,18 +85,30 @@ def wrap(mod_path, attr, label):
 
 
 # class attributes, bound at class creation (tests/test_patch_aliases.py)
-wrap('gpu4pyscf.df.hessian.rks', 'Hessian.partial_hess_elec',
-     'partial_hess_elec')
-wrap('gpu4pyscf.df.hessian.rks', 'Hessian.make_h1', 'make_h1')
-wrap('gpu4pyscf.hessian.rhf', 'solve_mo1', 'solve_mo1 (CPHF)')
-# module globals, looked up at call time -- after every patch has run, so
-# these wrap whatever is installed
-wrap('gpu4pyscf.df.hessian.rhf', '_jk_energy_per_atom', '.. ip2 (W17)')
-wrap('gpu4pyscf.hessian.rks', '_get_exc_deriv2', '.. _get_exc_deriv2')
-wrap('gpu4pyscf.df.hessian.rhf', '_get_veff', '.. h1 _get_veff (W18)')
-wrap('gpu4pyscf.hessian.rks', '_get_vxc_deriv1', '.. _get_vxc_deriv1')
-wrap('gpu4pyscf.grad.rhf', 'get_grad_hcore', '.. get_grad_hcore')
-wrap('gpu4pyscf.hessian.rks', 'nr_rks_fxc_mo', '.. nr_rks_fxc_mo (W16)')
+if uks:
+    wrap('gpu4pyscf.df.hessian.uks', 'Hessian.partial_hess_elec',
+         'partial_hess_elec')
+    wrap('gpu4pyscf.df.hessian.uks', 'Hessian.make_h1', 'make_h1')
+    wrap('gpu4pyscf.hessian.uhf', 'solve_mo1', 'solve_mo1 (CPHF)')
+    wrap('gpu4pyscf.df.hessian.uhf', '_jk_energy_per_atom', '.. ip2 (W25)')
+    wrap('gpu4pyscf.hessian.uks', '_get_exc_deriv2', '.. _get_exc_deriv2')
+    wrap('gpu4pyscf.df.hessian.uhf', '_get_veff', '.. h1 _get_veff (W25)')
+    wrap('gpu4pyscf.hessian.uks', '_get_vxc_deriv1', '.. _get_vxc_deriv1')
+    wrap('gpu4pyscf.grad.rhf', 'get_grad_hcore', '.. get_grad_hcore')
+    wrap('gpu4pyscf.dft.numint', 'NumInt.nr_uks_fxc', '.. nr_uks_fxc')
+else:
+    wrap('gpu4pyscf.df.hessian.rks', 'Hessian.partial_hess_elec',
+         'partial_hess_elec')
+    wrap('gpu4pyscf.df.hessian.rks', 'Hessian.make_h1', 'make_h1')
+    wrap('gpu4pyscf.hessian.rhf', 'solve_mo1', 'solve_mo1 (CPHF)')
+    # module globals, looked up at call time -- after every patch has run,
+    # so these wrap whatever is installed
+    wrap('gpu4pyscf.df.hessian.rhf', '_jk_energy_per_atom', '.. ip2 (W17)')
+    wrap('gpu4pyscf.hessian.rks', '_get_exc_deriv2', '.. _get_exc_deriv2')
+    wrap('gpu4pyscf.df.hessian.rhf', '_get_veff', '.. h1 _get_veff (W18)')
+    wrap('gpu4pyscf.hessian.rks', '_get_vxc_deriv1', '.. _get_vxc_deriv1')
+    wrap('gpu4pyscf.grad.rhf', 'get_grad_hcore', '.. get_grad_hcore')
+    wrap('gpu4pyscf.hessian.rks', 'nr_rks_fxc_mo', '.. nr_rks_fxc_mo (W16)')
 wrap('gpu4pyscf.df.hessian.rhf', '_get_jk', '.. _get_jk (W8)')
 wrap('gpu4pyscf.dft.numint', 'NumInt.cache_xc_kernel', '.. cache_xc_kernel')
 wrap('gpu4pyscf.df.df', '_cholesky_eri', 'cderi build')

@@ -94,7 +94,9 @@ more to ``_jk_energy_per_atom``:
     ``24``.  ``FASTDFHESSIP_CARVE=0``.
 
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
-The unrestricted twins live in ``df/hessian/uhf.py`` and are not covered.
+The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
+(``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
+the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
 
     FASTDFHESSIP_OFF=1       hand every call back to GPU4PySCF
     FASTDFHESSIP_SPMULT=<n>  item 1: shell pairs per thread block, as a
@@ -1198,8 +1200,20 @@ def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
     j2c_10v = contract('xrs,st->xrt', j2c_10, _metric_v)
     tmp = None
 
-    j3c_oo1p = contract('xuv,vij->xuij', j2c_10, dm_oo, alpha=-1, beta=1,
-                        out=j3c_oo1)
+    if _cuplan.planable('xuv,vij->xuij', j2c_10, dm_oo, j3c_oo1):
+        j3c_oo1p = contract('xuv,vij->xuij', j2c_10, dm_oo, alpha=-1, beta=1,
+                            out=j3c_oo1)
+    else:
+        # an output past cuTENSOR's 2**29 elements (W21), which the
+        # unrestricted twin's 2 nocc reaches at 113 atoms: the same GEMM
+        # through cuBLAS, one direction at a time
+        _S['plan_gemm'] = _S.get('plan_gemm', 0) + 1
+        d2 = dm_oo.reshape(dm_oo.shape[0], -1)
+        for x in range(3):
+            cp.cublas.gemm('N', 'N', j2c_10[x], d2,
+                           out=j3c_oo1[x].reshape(j3c_oo1.shape[1], -1),
+                           alpha=-1., beta=1.)
+        j3c_oo1p = j3c_oo1
     h_aux = _gram(j3c_oo1p, -.5*k_factor,
                   out=ndarray((3*n, 3*n), buffer=h_buf) if carve else None
                   ).reshape(3, n, 3, n)
@@ -2181,6 +2195,9 @@ def apply_patch():
     DFHESS._get_veff_orig = _orig_get_veff
     DFHESS._jk_energy_per_atom = _jk_energy_per_atom
     DFHESS._get_veff = _get_veff
+    # W25: the unrestricted twins, df/hessian/uhf.py
+    from . import _dfhessip_u
+    _dfhessip_u.apply_patch()
     _PATCHED = True
 
 

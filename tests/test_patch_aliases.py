@@ -133,6 +133,12 @@ ORIGINALS = [
     # point for one line of it, so what this module saves is that wrapper and
     # not upstream's function -- the two save slots are deliberately distinct
     ('fastdfhess', 'gpu4pyscf.df.hessian.rhf', '_hess_get_jk_orig'),
+    # W17/W18 and their unrestricted twins (W25): `df/hessian/{rhf,rks}.py`
+    # and `df/hessian/{uhf,uks}.py` look them up on their own module
+    ('fastdfhessip', 'gpu4pyscf.df.hessian.rhf', '_jk_energy_per_atom_orig'),
+    ('fastdfhessip', 'gpu4pyscf.df.hessian.rhf', '_get_veff_orig'),
+    ('fastdfhessip', 'gpu4pyscf.df.hessian.uhf', '_jk_energy_per_atom_orig'),
+    ('fastdfhessip', 'gpu4pyscf.df.hessian.uhf', '_get_veff_orig'),
 ]
 
 #: aliases that are known and deliberate: (holder, attribute) -> why

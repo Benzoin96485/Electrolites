@@ -162,6 +162,12 @@ if 'fastdfhessip' in active:
                      _dfhess, '_jk_energy_per_atom_orig'))
     _ENTRIES.append(('fastdfhessip h1', _dfhess, '_get_veff',
                      _dfhess, '_get_veff_orig'))
+    # W25: their unrestricted twins, on `df/hessian/uhf.py`
+    from gpu4pyscf.df.hessian import uhf as _dfuhess         # noqa: E402
+    _ENTRIES.append(('fastdfhessip uhf ip2', _dfuhess, '_jk_energy_per_atom',
+                     _dfuhess, '_jk_energy_per_atom_orig'))
+    _ENTRIES.append(('fastdfhessip uhf h1', _dfuhess, '_get_veff',
+                     _dfuhess, '_get_veff_orig'))
 if 'fastdfj' in active:
     from gpu4pyscf.df import df_jk as _dfjk1                 # noqa: E402
     # the `only_dfj` branch.  It reads `(-)` on any run that does not pass

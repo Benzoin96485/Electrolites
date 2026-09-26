@@ -26,6 +26,10 @@ region with ``cudaProfilerStart/Stop``, so
     nsys profile -t cuda,nvtx -c cudaProfilerApi -o $SCRATCH/p python ...
 
 captures only the calls and not the SCF in front of them.
+
+An open-shell molecule (``--spin`` not 0, or ``--uks``) runs a UKS SCF and
+times the unrestricted twins in ``df/hessian/uhf.py`` instead (W25); the
+``fxc`` term is restricted-only here.
 """
 import json
 import time
@@ -45,6 +49,8 @@ ap.add_argument('--natm-block', type=int, default=0,
                      '0 = all of them')
 ap.add_argument('--nvtx', action='store_true')
 ap.add_argument('--no-check', action='store_true')
+ap.add_argument('--uks', action='store_true',
+                help='UKS even for a closed shell (implied by --spin)')
 ap.add_argument('--env', default='',
                 help="extra variants as 'label:VAR=val;VAR2=val2,...' -- each "
                      "runs 'ours' with those module switches set")
@@ -55,11 +61,16 @@ from gpu4pyscf import dft                                    # noqa: E402
 from gpu4pyscf.lib.cupy_helper import (                      # noqa: E402
     contract, tag_array, transpose_sum)
 from gpu4pyscf.df.hessian import rhf as dfhess_rhf           # noqa: E402
+from gpu4pyscf.df.hessian import uhf as dfhess_uhf           # noqa: E402
 from gpu4pyscf.hessian import rks as rks_hess                # noqa: E402
 
 _sync = cp.cuda.Stream.null.synchronize
 terms = [t for t in a.terms.split(',') if t]
 variants = [v for v in a.variants.split(',') if v]
+
+uks = a.uks or a.spin != 0
+if uks and 'fxc' in terms:
+    raise SystemExit('the fxc term is restricted-only; drop it from --terms')
 
 # upstream's function objects, before anything below can patch them
 STOCK = {
@@ -68,24 +79,35 @@ STOCK = {
                    dfhess_rhf._jk_energy_per_atom),
     'h1': getattr(dfhess_rhf, '_get_veff_orig', dfhess_rhf._get_veff),
 }
+if uks:
+    STOCK = {
+        'ip2': getattr(dfhess_uhf, '_jk_energy_per_atom_orig',
+                       dfhess_uhf._jk_energy_per_atom),
+        'h1': getattr(dfhess_uhf, '_get_veff_orig', dfhess_uhf._get_veff),
+    }
 
 mol = build_mol(a)
 natm = mol.natm
-mf = dft.RKS(mol, xc=a.xc).density_fit(auxbasis=a.auxbasis)
+mf = (dft.UKS if uks else dft.RKS)(mol, xc=a.xc).density_fit(
+    auxbasis=a.auxbasis)
 mf.grids.level = a.grids
 mf.conv_tol = a.conv_tol
 mf.verbose = 0
 t0 = time.perf_counter()
 e = mf.kernel()
-print(f'# {natm} atoms  nao {mol.nao}  basis {a.basis}  xc {a.xc}')
+print(f'# {natm} atoms  nao {mol.nao}  basis {a.basis}  xc {a.xc}  '
+      f'{"UKS spin " + str(mol.spin) if uks else "RKS"}')
 print(f'# DF-SCF {time.perf_counter() - t0:.2f} s   E = {e:.10f}', flush=True)
 
 mo_coeff = cp.asarray(mf.mo_coeff)
 mo_occ = cp.asarray(mf.mo_occ)
 mo_energy = cp.asarray(mf.mo_energy)
-nao, nmo = mo_coeff.shape
-orbo = mo_coeff[:, mo_occ > 0]
-nocc = orbo.shape[1]
+nao, nmo = mo_coeff.shape[-2:]
+if uks:
+    nocc = int((mo_occ[0] > 0).sum())
+else:
+    orbo = mo_coeff[:, mo_occ > 0]
+    nocc = orbo.shape[1]
 hess = mf.Hessian()
 ni = mf._numint
 omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
@@ -101,6 +123,10 @@ def _ours(term):
         from electrolites import fastxcfxc
         return fastxcfxc._nr_rks_fxc_mo
     from electrolites import fastdfhessip
+    if uks:
+        from electrolites import _dfhessip_u
+        return {'ip2': _dfhessip_u._jk_energy_per_atom,
+                'h1': _dfhessip_u._get_veff}[term]
     return {'ip2': fastdfhessip._jk_energy_per_atom,
             'h1': fastdfhessip._get_veff}[term]
 
@@ -210,7 +236,11 @@ def setup_h1():
     def call(fn):
         out = fn(intopt, mo_coeff, mo_occ, 1., hyb)
         if abs(omega) > 1e-10 and abs(alpha - hyb) > 1e-10:
-            out = out + fn(intopt, mo_coeff, mo_occ, 0., alpha - hyb, omega)
+            lr = fn(intopt, mo_coeff, mo_occ, 0., alpha - hyb, omega)
+            out = ([x + y for x, y in zip(out, lr)] if uks else out + lr)
+        if uks:
+            # [vhfa, vhfb] have different shapes: compare them as one vector
+            out = cp.concatenate([x.ravel() for x in out])
         return out
     return call
 

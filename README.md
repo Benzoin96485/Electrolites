@@ -135,6 +135,8 @@ digit printed.  `docs/RESPONSE_1.8.1.md`, `docs/README_fastjk.md`,
 | ↳ its gradient | 7.84 s | **3.05 s** | **2.57x** |
 | 60-atom Cu macrocycle (quartet), SCF | 72.6 s | **25.6 s** | **2.84x** |
 | ↳ its gradient | 9.60 s | **4.94 s** | **1.94x** |
+| ↳ its DF Hessian's `ip2` / `h1` terms | 10.96 / 4.89 s | **5.93 / 2.90 s** | **1.85x / 1.69x** |
+| 113-atom Co(II) sextet, DF Hessian `ip2` term | **cannot be run** | **48.2 s** | — |
 
 83 % of a 28 242-entry CSD-derived set is open-shell, and def2-SVP already
 reaches an f shell on a 3d metal.  Several entry points an open-shell run
@@ -142,7 +144,7 @@ takes bind their own copies of a function, so patching the restricted one
 never reached them; `benchmarks/coverage_probe.py` is what finds that, and it
 is worth running before believing any coverage claim here.
 `docs/OPENSHELL_TMC.md`, `docs/OPENSHELL_HESSIAN.md`, `docs/OPENSHELL_FXC.md`,
-`docs/VV10_OPENSHELL.md`.
+`docs/VV10_OPENSHELL.md`, `docs/README_fastdfuhessip.md`.
 
 ### Not a drop-in replacement
 
@@ -236,7 +238,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastdfcderi` | `df.df._cholesky_eri` — the one-time cderi build — and `df.int3c2e_bdiv.int2c2e`, the two-centre metric integrals under it | `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md` |
 | `fastdfgrad` | `df.grad.{rhf,rks,uhf,uks}.Gradients.jk_energy_per_atom` | `docs/README_fastdfgrad.md`, `docs/README_fastdfgradoo.md` |
 | `fastdfhess` | `df.hessian.rhf._get_jk` — the DF Hessian's CPHF build | `docs/README_fastdfhess.md` |
-| `fastdfhessip` | `df.hessian.rhf._jk_energy_per_atom` and `_get_veff` — the DF Hessian's `ip2` and `h1` two-electron terms | `docs/README_fastdfhessip.md`, `docs/README_fastdfhessip2.md` |
+| `fastdfhessip` | `df.hessian.{rhf,uhf}._jk_energy_per_atom` and `_get_veff` — the DF Hessian's `ip2` and `h1` two-electron terms, restricted and unrestricted | `docs/README_fastdfhessip.md`, `docs/README_fastdfhessip2.md`, `docs/README_fastdfuhessip.md` |
 | `fastdffp32` | `DF.loop` and the DF Hessian's cderi transfer — carries `FASTDF_FP32=1`, which is inert unless set and **changes the answer** when it is | `docs/README_fastdffp32.md` |
 | `fastdfrsh` | `df.df_jk._DFHF.get_veff` for a range-separated hybrid — one cderi tensor where upstream keeps two: exactly, for the long-range-only functionals (ωB97, LC-ωPBE, LC-VV10), and under `FASTDFRSH=fuse`, which **changes the answer** by 1e-7–1e-6 Eh, for the rest | `docs/README_fastdfrsh.md` |
 

@@ -25,8 +25,9 @@ W5 left behind: one is a kernel that pays and one is a measurement that says
 not to write the code),
 `docs/README_fastdfhessip.md` closed **W16**, **W17** and **W18** together
 (W8's three findings, whose own findings are W23, W24 and W25),
-`docs/README_mgga_repro.md` closed **W23** (whose finding is W28) and
-`docs/README_fastdfhessip2.md` **W24** (whose finding is W29),
+`docs/README_mgga_repro.md` closed **W23** (whose finding is W28),
+`docs/README_fastdfhessip2.md` **W24** (whose finding is W29) and
+`docs/README_fastdfuhessip.md` **W25** (whose finding is W30),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -256,6 +257,21 @@ some terms against an eigen `J⁻¹` in others left 2e-9 of an ill-conditioned
 metric's round-off in the answer.  What is left at small sizes is the
 `ejk_int3c2e_ip2` kernel (W29, 46–52 % of the call at 21–42 atoms), and in a
 meta-GGA Hessian the XC derivatives `fastxchess` does not cover (W28, 73 %).
+
+**W25 is done: the unrestricted twins transplant, and at 113 atoms
+GPU4PySCF's own one does not run.**  `df/hessian/uhf.py`'s `ip2` and `h1`
+terms are the restricted ones with a spin index, so `fastdfhessip`'s items
+1–5, 7 and 9–11 carry over (`electrolites/_dfhessip_u.py`): `ip2` is
+**1.14x–1.85x** and `h1` **1.16x–1.91x** on nine open-shell cases from 5 to
+60 atoms, organic radicals and Fe, Ni, Cu and Pt complexes, def2-SVP and
+def2-TZVPP.  On the taxol radical cation and a 113-atom Co(II) sextet
+upstream's `ip2` raises `CUTENSOR_STATUS_NOT_SUPPORTED` (W21's wall, in its
+pseudo-density); this module asks first and sends a refused contraction to
+cuBLAS, and both run (63 s, 48 s).  One new item, h1's per-atom exchange
+term projected on the occupied side before the atom's contraction, is 1.37x
+of the function in def2-TZVPP and loses at every def2-SVP size to 60 atoms,
+so a shape score chooses it.  A whole UKS DF Hessian is **1.05x–1.12x**:
+the CPHF is 35–75 % of it.  The restricted `h1` has the same choice, W30.
 
 **W16, W17 and W18 are done, and W23, W24 and W25 are what they found.**
 The three functions W8's anatomy said the density-fitted Hessian's time was
@@ -2006,7 +2022,51 @@ the auxiliary set.
 * **Falsified if**: the block only fits where the chunked form is already
   one chunk.
 
-### W25 — The unrestricted twins of W16–W18
+### W25 — The unrestricted twins of W16–W18 — **done: they transplant, 1.14x–1.91x, and at 113 atoms upstream's does not run**
+
+`electrolites/_dfhessip_u.py` (loaded and patched by `fastdfhessip`),
+`tests/test_dfuhessip.py`, the open-shell modes of
+`benchmarks/df_hess_terms_probe.py` and `df_hess_anatomy.py`; write-up in
+`docs/README_fastdfuhessip.md`.
+
+**It transplants.**  Both functions are the restricted ones with a spin
+index on every occupied quantity (`nocc = max(nocca, noccb)`, the padded
+beta columns zero, `-k` per spin density), and no occupied batching; items
+1–5, 7 (the `k = 0` term, which upstream hands to the restricted
+`_j_energy_per_atom` on the total density) and 9–11 carry over, the Gram
+form once per spin.  Item 8 does not: it needs the second pass in one
+chunk, and the unrestricted block takes three at 113 atoms.  Function
+level, before → after: penicillin V⁺ `ip2` 5546 → 3440 ms (**1.61x**), `h1`
+1.47x; Cu(II) macrocycle (60 atoms, quartet) **1.85x** / 1.69x; def2-TZVPP
+1.74x / **1.91x**; Ni, Pt, Fe complexes and the small organics 1.14x–1.67x.
+**Success met** (the rows move by what W17 and W18 were worth).
+
+**Two things the entry did not say.**  GPU4PySCF's unrestricted `ip2` does
+not run at 113 atoms: the pseudo-density's `(nao, nao, blk)` output passes
+2²⁹ elements with a cut mode that does not factor, and it raises.  Four
+contractions in the function can pass the limit on a large open shell; each
+is one GEMM, and **item 13** asks `_cuplan` and sends a refused one to cuBLAS
+— taxol⁺ 63.4 s, the Co sextet 48.2 s, where upstream has no number.  And
+**item 12**: h1's per-atom exchange term with the AO pair projected on the
+occupied orbitals before the atom's contraction (`8 nao² nocc` flops per
+auxiliary function and direction against `4 nao³`, and one more launch per
+atom).  It is 1.37x of the function in def2-TZVPP and 1.09x–1.11x at 113
+atoms, and it loses at every def2-SVP case up to 60 atoms (to 0.71x), so the
+module takes it where `(nao/natm) nao (nao − 2 nocc)` passes 4e6; that picks
+the better form on all eleven systems measured.
+
+**Whole UKS Hessians 1.05x–1.12x** (penicillin V⁺ 35.30 → 31.93 s, def2-TZVPP
+104.2 → 93.1 s, Cu macrocycle 82.5 → 75.5 s): the two terms were 19–31 % of
+an unpatched one, and the CPHF (`_get_jk`, `nr_uks_fxc`) is 35–75 % after.
+Traces agree to 1e-9, 1.1e-8 on the Cu complex — item 2's Gram form, which is
+1.1e-10 relative from upstream there (4e-9 Eh/bohr²) where upstream against
+itself is 3e-12.  Stage A has to sum the spins in upstream's order: in one
+contraction the long-range operator's term moved by 1.1e-10 on a triplet.
+And a 42-atom UKS DF-PBE Hessian spreads by 4e-5 between runs in GPU4PySCF
+itself, because its SCF does (energies 2e-8 apart at `conv_tol = 1e-9`) —
+not this round's.  What it found is **W30**.
+
+The original entry, for the record:
 
 *(Left by W16–W18.)*
 
@@ -2105,6 +2165,30 @@ call on penicillin V, **51–52 %** on the Pt(II) and Ni(II) complexes and
 * **Falsified if**: the high-`l` classes are already at the card's rate for
   the arithmetic a Rys second derivative needs — then the answer is
   screening on the pseudo-density, which this kernel does not do.
+
+### W30 — The restricted `h1`'s per-atom exchange term on the occupied side
+
+*(Found by W25.)*
+
+W25's item 12 — `(X + X^T) C` for each atom's AO-pair exchange matrix
+formed as upstream's memory-short branch with both intermediates hoisted,
+instead of W18's item 4 accumulating `X` in the AO basis and projecting at
+the end — is `8 nao² nocc` against `4 nao³` flops per auxiliary function
+and direction.  On the unrestricted function it took the stage 2.66 →
+0.84 s in def2-TZVPP at 42 atoms and 9.0 → 5.1 s at 113, and lost at every
+def2-SVP case up to 60 atoms.  `fastdfhessip._get_veff` has the same term
+(stage D2: 4.7 s of 21.3 at 113 atoms) and does not have the choice.
+
+* **Do**: the same two contractions per atom in the restricted function,
+  with `s = C_o dm_oo` and D1's `j3c . C_o` as the hoisted halves, and the
+  same score.
+* **Success**: D2 moves by what item 12 was worth on the twin (1.8x at 113
+  atoms, 3.2x in def2-TZVPP), and the score picks the better form on the
+  restricted rows of `docs/README_fastdfhessip.md`.
+* **Falsified if**: the occupied form loses at every restricted size — each
+  restricted per-atom contraction is one spin's work where the twin's is two
+  spins' in the same launch, so the launches are a larger share of it and
+  the crossover can sit higher than 4e6, or past every size that fits.
 
 ### Not on this list
 
@@ -2391,6 +2475,9 @@ range-separated hybrid, which changes the answer by 1e-7–1e-6 Eh; `off`).
 
 ```bash
 python tests/test_dfhessip.py [--basis def2-tzvpp] [--no-hessian]   # W16-W18
+python tests/test_dfuhessip.py [--no-hessian]                       # W25
+python benchmarks/df_hess_terms_probe.py --xyz ... --charge 1 --spin 1 \
+    --terms ip2,h1 --variants stock,ours     # an open shell: the uhf.py twins
 python benchmarks/df_hess_terms_probe.py --xyz ... --xc b3lyp --patch all \
     --terms fxc,ip2,h1 --variants stock,ours [--env 'x:FASTDFHESSIP_...=...']
 python benchmarks/df_hess_terms_probe.py --xyz ... --terms ip2,h1 \
