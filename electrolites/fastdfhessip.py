@@ -66,6 +66,33 @@ Coulomb-only ``ip2`` term a pure functional reaches -- a third:
    two GEMMs against the stored pair list (``_j_energy_per_atom``).
    ``FASTDFHESSIP_JPAIR``.
 
+``docs/DF_WORK_LIST.md`` **W24** (``docs/README_fastdfhessip2.md``) added four
+more to ``_jk_energy_per_atom``:
+
+8. **The metric as its Cholesky factor on the spherical auxiliary index.**
+   Upstream's ``metric_v`` is ``C v`` with ``C`` block diagonal by shell, so
+   the eigenbasis carries a Cartesian index it does not need.  With
+   ``J_sph = L L^T`` the ``(10|0)`` block is held spherical and whole (the
+   memory the one-chunk eigen pass already holds), D3 is ``C^T`` applied per
+   integral batch, the eigenbasis in and out of D5 is two ``dtrmm`` against
+   ``L^-1``, and D5's contraction is spherical in both auxiliary indices:
+   upstream's three ``naux_cart x naux_sph`` contractions become two
+   ``naux_sph^2`` ones (``_SphAux``, ``_chol_d4_d5``).  The factor is used in
+   *every* line of the call, as ``V = C L^-T`` with ``W = 1`` wherever
+   upstream's arithmetic takes ``V W^-1 V^T``: this function's terms cancel,
+   and a Cholesky ``J^-1`` in some of them against an eigen ``J^-1`` in the
+   others leaves the metric's round-off in the answer (2e-9 on a metric of
+   condition 1.6e9).  ``FASTDFHESSIP_METRIC=eigen`` is upstream's basis;
+   ``=mixed`` is that mistake, kept so that it can be measured.
+9. **The ``h_aux`` block's two Gram matrices as ``dsyrk``** (``_gram``).
+   ``FASTDFHESSIP_SYRK=0``.
+10. **D4's ``R`` as ``dsyrk``, and ``Q`` from one GEMM** and a shared-memory
+    transpose (``_oo_gram_rq_syrk``, ``_HADAMARD_T``).  ``FASTDFHESSIP_D4=gemm``
+    is W17's.
+11. **The ``h_aux`` block's temporaries in the integral buffers** the fused
+    pass has finished with, so item 3's margin is ``10 naux^2`` instead of
+    ``24``.  ``FASTDFHESSIP_CARVE=0``.
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins live in ``df/hessian/uhf.py`` and are not covered.
 
@@ -83,7 +110,11 @@ The unrestricted twins live in ``df/hessian/uhf.py`` and are not covered.
     FASTDFHESSIP_IP2_GOUT=<n>
                              the ``ip2`` kernel's ``gout_width`` (upstream's
                              ``None``; swept, +-3 %)
-    FASTDFHESSIP_TIME=1      print a synchronised stage table per call
+    FASTDFHESSIP_METRIC=chol|eigen|mixed, FASTDFHESSIP_TRI=mult|solve,
+    FASTDFHESSIP_SYRK=0, FASTDFHESSIP_D4=gemm, FASTDFHESSIP_T2SPH=0,
+    FASTDFHESSIP_CARVE=0     items 8-11 off, or measured variants of them
+    FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
+                             also times the ip2 kernel per auxiliary l
     FASTDFHESSIP_RCHUNK=<n>  W17's 1.2e8-element bound on the Gram form's
                              auxiliary chunk; the default asks cuTENSOR
                              (`docs/DF_WORK_LIST.md` W21)
@@ -106,7 +137,7 @@ from gpu4pyscf.lib.cupy_helper import (
     fill_symmetric)
 from gpu4pyscf.df.int3c2e_bdiv import (
     _split_l_ctr_pattern, argsort_aux, get_ao_pair_loc, libvhf_rys,
-    int2c2e_ip1, _check_rsh_factors, int3c2e_scheme_ip1,
+    int2c2e, int2c2e_ip1, _check_rsh_factors, int3c2e_scheme_ip1,
     int3c2e_scheme_ipaux)
 from gpu4pyscf.df.hessian import rhf as DFHESS
 from gpu4pyscf.df.hessian.rhf import (
@@ -116,7 +147,7 @@ from gpu4pyscf.df.hessian.rhf import (
 from gpu4pyscf.hessian.rhf import _aggregate_to_atoms
 from gpu4pyscf.lib import multi_gpu
 
-from ._dfaux import _spmult
+from ._dfaux import _spmult, trmm_left_lower
 from . import _cuplan
 
 
@@ -145,7 +176,7 @@ class _Stages:
     """Synchronised stage timers, printed when FASTDFHESSIP_TIME is set."""
 
     def __init__(self, tag):
-        self.on = bool(int(_env('FASTDFHESSIP_TIME', '0')))
+        self.on = int(_env('FASTDFHESSIP_TIME', '0')) > 0
         self.tag = tag
         self.t = {}
         self.order = []
@@ -165,9 +196,17 @@ class _Stages:
         self.t[label] += now - self.last
         self.last = now
 
+    def note(self, **kw):
+        """Sizes to print with the table, e.g. the second pass's plan."""
+        if self.on:
+            self.notes = {**getattr(self, 'notes', {}), **kw}
+
     def report(self):
         if not self.on:
             return
+        if getattr(self, 'notes', None):
+            print(f'[fastdfhessip {self.tag}] ' + '  '.join(
+                f'{k}={v}' for k, v in self.notes.items()), flush=True)
         cp.cuda.Stream.null.synchronize()
         tot = _time.perf_counter() - self.t0
         print(f'[fastdfhessip {self.tag}] total {tot * 1e3:9.1f} ms  ' +
@@ -298,6 +337,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     spmult = int(_env('FASTDFHESSIP_SPMULT', '1'))
     oosum = _env('FASTDFHESSIP_OOSUM', 'gram')
     fuse = _env('FASTDFHESSIP_FUSE', '1') != '0'
+    metric = _env('FASTDFHESSIP_METRIC', 'chol')
     st = _Stages('ip2')
 
     mol = int3c2e_opt.mol
@@ -364,7 +404,31 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     j3c_full = buf = buf1 = eval_j3c = j3c = tmp = compressed = None
     st('A j3c_oo')
 
-    metric_w, metric_v = _factorize_j2c(auxmol, aux_sorting, omega)
+    # item 8: the metric as its Cholesky factor, everywhere in this call.
+    # Upstream only ever uses `V W^-1 V^T`, so `V = C L^-T` with `W = 1`
+    # serves every line of it unchanged -- and it has to serve *every* line:
+    # the terms of this function cancel to a part in 1e9 on an ill-conditioned
+    # metric, and a Cholesky J^-1 in one term against an eigen J^-1 in
+    # another leaves 2e-9 of the metric's round-off in the answer (W24).
+    # (`FASTDFHESSIP_METRIC=mixed` is that mistake, kept so it can be
+    # measured: the factor in D3-D5 and upstream's eigenbasis everywhere
+    # else -- `benchmarks/df_hess_metric_sens.py`.)
+    sa = None
+    if (metric in ('chol', 'mixed') and omega == 0 and num_occ_batches == 1
+            and oosum == 'gram' and not auxmol.mol.cart):
+        try:
+            sa = _SphAux(auxmol, aux_sorting, omega,
+                         _bas_atom_labels(auxmol, aux_sorting))
+        except RuntimeError:
+            sa = None
+    if sa is not None and metric == 'chol':
+        metric_v = sa.factor()
+        metric_w = cp.ones(sa.nsph)
+        _S['chol'] = _S.get('chol', 0) + 1
+    else:
+        metric_w, metric_v = _factorize_j2c(auxmol, aux_sorting, omega)
+        if sa is not None and metric_v.shape[1] != sa.nsph:
+            sa = None
     metric_size = metric_v.shape[1]
     dm_oo = contract('uv,uij->vij', metric_v, j3c_oo)
     dm_oo /= metric_w[:, None, None]
@@ -416,6 +480,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
 
     h_ao_aux = cp.zeros((natm, naux, 3, 3))
     ejk_ao = cp.zeros((natm, natm, 3, 3))
+    h_sph = None
 
     for batch_id in range(num_occ_batches):
         nocc0 = batch_id * nocc_per_batch
@@ -440,6 +505,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         plan = _plan_v(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair,
                        batch_size, nao_on_atom, natm, metric_size, batch_id)
         do_fuse = False
+        plan_f = (None,)
         if fuse:
             # Fused, the first pass rides on the second pass's *first*
             # chunk and the h_aux block runs after that chunk's integrals,
@@ -449,8 +515,18 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             # taken only if that does not cost the second pass a chunk: a
             # chunk is a whole walk over the integrals, and the fusion saves
             # exactly one.
+            # Item 11: the block's naux^2 temporaries can live in the
+            # second pass's integral buffers, which the walk is done with by
+            # then and which are at least 6 batch_size nao_pair words however
+            # the pass is planned -- so where that covers them, the margin is
+            # what the block still allocates (j2c_10, its sorted copy and
+            # j2c_10v), not the 24 naux^2 of all of it.
+            carve = (_env('FASTDFHESSIP_CARVE', '1') != '0' and
+                     6 * batch_size * nao_pair >=
+                     _h_aux_words(naux, metric_size))
+            margin = (10 if carve else 24) * naux**2
             try:
-                plan_f = _plan_v(word_avail - 24 * naux**2, naux, nao, nocc,
+                plan_f = _plan_v(word_avail - margin, naux, nao, nocc,
                                  nocc_in_batch, nao_pair, batch_size,
                                  nao_on_atom, natm, metric_size, batch_id)
             except AssertionError:
@@ -459,6 +535,19 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                                   -(-metric_size // plan[0])):
                 plan, do_fuse = plan_f, True
         aux_batch_size, aux_blksize, blksize2 = plan
+        # item 8's structured second pass needs the whole auxiliary index in
+        # its one chunk; otherwise the factor goes through upstream's chunked
+        # arithmetic like an eigenbasis would
+        chol = sa if (sa is not None and aux_batch_size >= metric_size) \
+            else None
+        if sa is not None and chol is None:
+            _S['chol_chunked'] = _S.get('chol_chunked', 0) + 1
+        st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
+                plan_fused=plan_f[0])
+        st.note(chol=chol is not None, nao=nao, nocc=nocc, naux=naux, metric_size=metric_size,
+                nao_pair=nao_pair, batch_size=batch_size,
+                num_aux_batches=num_aux_batches, vchunk=aux_batch_size,
+                blksize2=blksize2, fused=do_fuse, occ_batches=num_occ_batches)
         _S['vchunks'] = (metric_size + aux_batch_size - 1) // aux_batch_size
         if do_fuse:
             _S['fused'] += 1
@@ -477,10 +566,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 _auxvec if j_factor != 0 else None, natm, aux_atm_labels)
             ejk_ao += h_aux_parts[0]
             j2c_10v = h_aux_parts[1]
+            j2c_10c = _j2c_10c(chol, h_aux_parts[2])
+            h_aux_parts = None
+            if chol is not None:
+                j2c_10v = None
             st('D2 h_aux')
         else:
             j3c_oo1p = j3c_oo1
-            j2c_10v = None
+            j2c_10v = j2c_10c = None
 
         # the second pass: (10|0), and with item 3 the (1|00) of the first
         if batch_id == 0:
@@ -540,23 +633,45 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                         else:
                             contract('pqr,qi->pir', j3c,
                                      _dm_factor_l[:, nocc0:nocc1], out=tmp)
-                        contract('rs,pir->spi', _metric_v[aux0:aux1, v0:v1],
-                                 tmp, beta=1, out=j3c_100[x])
+                        if chol is None:
+                            contract('rs,pir->spi',
+                                     _metric_v[aux0:aux1, v0:v1], tmp,
+                                     beta=1, out=j3c_100[x])
+                        else:
+                            # item 8: the spherical (10|0), one shell block
+                            # at a time -- a pass over memory, not a GEMM
+                            c0, c1 = chol.cols(aux0, aux1)
+                            contract('rs,pir->spi', chol.ms[aux0:aux1, c0:c1],
+                                     tmp, beta=1, out=j3c_100[x, c0:c1])
                 st('D3 j3c_100')
             j3c_full = buf0 = buf1 = None
             compressed_di = compressed_dj = compressed_dk = None
 
             if do_fuse and v0 == 0:
-                # the h_aux block that upstream runs between the passes
+                # the h_aux block that upstream runs between the passes, in
+                # the integral buffers the walk has finished with
                 j3c_oo1p, h_aux_parts = _h_aux_block(
                     auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
                     j3c_oo1, naux, metric_size, k_factor, j_factor, batch_id,
                     auxvec_ipauxp if j_factor != 0 else None,
-                    _auxvec if j_factor != 0 else None, natm, aux_atm_labels)
+                    _auxvec if j_factor != 0 else None, natm, aux_atm_labels,
+                    work=work if carve else None)
                 ejk_ao += h_aux_parts[0]
                 j2c_10v = h_aux_parts[1]
+                j2c_10c = _j2c_10c(chol, h_aux_parts[2])
+                h_aux_parts = None
+                if chol is not None:
+                    j2c_10v = None
                 st('D2 h_aux')
 
+            if chol is not None:
+                h_sph = _chol_d4_d5(
+                    chol, j3c_100, work, natm, nocc, atm_ind, aoslices,
+                    _dm_factor_l, dm_oo, j3c_oo1p, j2c_10c, k_factor,
+                    j_factor, ejk_ao, h_ao_aux,
+                    _auxvec if j_factor != 0 else None,
+                    auxvec_ipauxp if j_factor != 0 else None, st)
+                continue
             if batch_id == 0 and oosum == 'gram':
                 _oo_gram(j3c_100, v0, dv, work, natm, nocc, atm_ind,
                          _dm_factor_l, _metric_w, _metric_v, k_factor,
@@ -597,9 +712,11 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             st('D5 per-atom')
         j3c_buf = work = work1 = tmp0 = tmp1 = None
         j3c = j3c_100 = None
-        j2c_10v = j3c_oo1p = j3c_oo1 = None
+        j2c_10v = j2c_10c = j3c_oo1p = j3c_oo1 = None
 
     ejk_ao_aux = _aggregate_to_atoms(h_ao_aux, natm, aux_atm_labels, axis=1)
+    if h_sph is not None:
+        ejk_ao_aux += h_sph
     ejk += ejk_ao_aux
     ejk += ejk_ao_aux.transpose(1, 0, 3, 2)
     ejk += ejk_ao
@@ -826,6 +943,106 @@ def _j_energy_per_atom(int3c2e_opt, dm, verbose=None):
     return ej
 
 
+class _SphAux:
+    """The auxiliary index in spherical functions, for item 8 (W24).
+
+    The derivative integrals are Cartesian in the auxiliary index and so is
+    everything upstream builds from them; the metric is spherical, and
+    ``metric_v`` is ``C v`` with ``C`` the Cartesian-to-spherical
+    coefficients (``_factorize_j2c``: ``auxmol.apply_C_dot``).  ``C`` has a
+    block per shell, so applying it is a pass over memory, not a GEMM.
+
+    ``ms`` is ``C`` with its rows in the integrals' order (``aux_sorting``)
+    and its columns permuted so that the rows of consecutive shells map to
+    consecutive columns; ``lo``/``hi`` are each row's column range, and
+    ``blocks`` a partition of the rows into runs whose column ranges do not
+    overlap, for the block-diagonal apply.  ``linv`` is the inverse of the
+    Cholesky factor of the spherical metric in the same column order, or
+    the constructor raises ``RuntimeError`` if the metric is not positive
+    definite.
+    """
+
+    def __init__(self, auxmol, aux_sorting, omega, aux_atm_labels,
+                 block=256):
+        nsph = auxmol.mol.nao
+        mc0 = auxmol.apply_C_dot(cp.eye(nsph))
+        ncart = mc0.shape[0]
+        mc = cp.empty_like(mc0)
+        mc[cp.asarray(aux_sorting)] = mc0
+        mc0 = None
+        nz = cp.asnumpy(mc != 0)
+        # columns in the order of the first row that reaches them
+        perm = np.lexsort((np.arange(nsph), nz.argmax(axis=0)))
+        self.ms = cp.ascontiguousarray(mc[:, cp.asarray(perm)])
+        mc = None
+        nzp = nz[:, perm]
+        self.lo = nzp.argmax(axis=1)
+        self.hi = nsph - nzp[:, ::-1].argmax(axis=1)
+        # a row may start a block when every earlier row maps below every
+        # later one
+        pre = np.maximum.accumulate(self.hi)
+        suf = np.minimum.accumulate(self.lo[::-1])[::-1]
+        cuts = [0] + [r for r in range(1, ncart) if pre[r-1] <= suf[r]]
+        cuts.append(ncart)
+        self.blocks = []
+        a0 = 0
+        for i, r in enumerate(cuts[1:], 1):
+            if r - a0 >= block or r == ncart:
+                self.blocks.append((a0, r, int(self.lo[a0:r].min()),
+                                    int(self.hi[a0:r].max())))
+                a0 = r
+        self.nsph, self.ncart = nsph, ncart
+        j2c = int2c2e(auxmol, omega=omega)
+        pj = cp.asarray(perm)
+        j2c = j2c[pj[:, None], pj]
+        low = cp.linalg.cholesky(j2c)
+        if not bool(cp.isfinite(low).all()):
+            raise RuntimeError('metric not positive definite')
+        from cupyx.scipy.linalg import solve_triangular
+        self.linv = cp.ascontiguousarray(solve_triangular(
+            low, cp.eye(nsph), lower=True))
+        self.atm = np.asarray(aux_atm_labels)[nzp.argmax(axis=0)]
+
+    def cols(self, a0, a1):
+        return int(self.lo[a0:a1].min()), int(self.hi[a0:a1].max())
+
+    def to_sph(self, x, out):
+        """``out[:nsph] = ms^T x`` along axis 0; ``out`` may be ``x``."""
+        n = x.shape[0]
+        assert n == self.ncart
+        x2 = x.reshape(n, -1)
+        o2 = out.reshape(out.shape[0], -1)
+        for a0, a1, c0, c1 in self.blocks:
+            # c1 <= a1 and the blocks run in order, so a block writes only
+            # rows the earlier blocks have already read
+            o2[c0:c1] = self.ms[a0:a1, c0:c1].T.dot(x2[a0:a1])
+        return out[:self.nsph]
+
+    def to_sph_pinv(self, x, out):
+        """``out[:nsph] = mp^T x``, ``mp = C (C^T C)^-1`` shell by shell:
+        the spherical ``y`` of a Cartesian ``x = C y``, exactly."""
+        if not hasattr(self, 'mp'):
+            self.mp = cp.zeros_like(self.ms)
+            for a0, a1, c0, c1 in self.blocks:
+                b = self.ms[a0:a1, c0:c1]
+                self.mp[a0:a1, c0:c1] = b.dot(cp.linalg.inv(b.T.dot(b)))
+        n = x.shape[0]
+        x2 = x.reshape(n, -1)
+        o2 = out.reshape(out.shape[0], -1)
+        for a0, a1, c0, c1 in self.blocks:
+            o2[c0:c1] = self.mp[a0:a1, c0:c1].T.dot(x2[a0:a1])
+        return out[:self.nsph]
+
+    def factor(self):
+        """``C L^-T``, Cartesian rows in the integrals' order: with unit
+        weights, what ``_factorize_j2c``'s ``V`` is to its ``w``."""
+        out = cp.empty((self.ncart, self.nsph))
+        lt = self.linv.T
+        for a0, a1, c0, c1 in self.blocks:
+            cp.dot(self.ms[a0:a1, c0:c1], lt[c0:c1], out=out[a0:a1])
+        return out
+
+
 def _plan_v(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair, batch_size,
             nao_on_atom, natm, metric_size, batch_id):
     """Upstream's sizing of the second pass, unchanged."""
@@ -900,10 +1117,80 @@ def _ipaux_batch(compressed, aux0, naux_in_batch, blksize, j3c_full, work,
     j3c_full[:] = 0.
 
 
+_MIRROR = cp.RawKernel(r'''
+extern "C" __global__
+void mirror_upper(double* __restrict__ c, const long long n)
+{
+    // c[i][j] = c[j][i] below the diagonal, from the upper triangle
+    long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long i = (long long)blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < n && j < i) c[i*n + j] = c[j*n + i];
+}
+''', 'mirror_upper')
+_ONE_H = np.ones(1)
+
+
+def _gram(a, alpha, out=None):
+    """``alpha a a^T`` over the leading index, the rest flattened: item 9.
+
+    Upstream writes these as ``contract('xrij,ysij->xrys', a, a)``, a general
+    contraction that computes both triangles of a symmetric result.  cuBLAS
+    ``dsyrk`` computes one -- half the arithmetic -- and the other is a copy.
+    ``docs/README_fastdf.md`` 3.2 found ``dsyrk`` slower than the GEMM below
+    about 800 rows; these are ``naux`` and ``3 naux`` rows, thousands.
+    ``FASTDFHESSIP_SYRK=0`` keeps the contraction.
+    """
+    lead = a.shape[0] if a.ndim == 3 else a.shape[0] * a.shape[1]
+    if _env('FASTDFHESSIP_SYRK', '1') == '0' or not a.flags.c_contiguous:
+        a2 = a.reshape(lead, -1)
+        return contract('rk,sk->rs', a2, a2, alpha, out=out)
+    from cupy.cuda import cublas
+    a2 = a.reshape(lead, -1)
+    n, k = a2.shape
+    if out is None:
+        out = cp.empty((n, n))
+    al = np.array([alpha], dtype=np.float64)
+    ze = np.zeros(1)
+    # C-ordered (n, k) is the column-major (k, n) a^T: op = T gives a a^T,
+    # and the column-major lower triangle is the C-ordered upper one
+    cublas.dsyrk(cp.cuda.device.get_cublas_handle(),
+                 cublas.CUBLAS_FILL_MODE_LOWER, cublas.CUBLAS_OP_T,
+                 n, k, al.ctypes.data, a2.data.ptr, k, ze.ctypes.data,
+                 out.data.ptr, n)
+    bs = 32
+    _MIRROR(((n + bs - 1) // bs, (n + bs - 1) // bs), (bs, bs),
+            (out, np.int64(n)))
+    return out
+
+
+def _h_aux_words(naux, metric_size):
+    """What ``_h_aux_block``'s temporaries take from ``work``, in words."""
+    return 15 * naux**2 + naux * metric_size
+
+
 def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
                  j3c_oo1, naux, metric_size, k_factor, j_factor, batch_id,
-                 auxvec_ipauxp, _auxvec, natm, aux_atm_labels):
-    """Upstream's code between the two passes, unchanged."""
+                 auxvec_ipauxp, _auxvec, natm, aux_atm_labels, work=None):
+    """Upstream's code between the two passes, in upstream's order.
+
+    With ``work`` -- the second pass's integral buffers, which the fused
+    path has finished with when it gets here -- the ``naux^2``-sized
+    temporaries are carved from it instead of allocated (item 11, W24):
+    that is 15-16 of the 24 ``naux^2`` words item 3 had to hold back, and
+    what decided that a 113-atom call could not be fused.
+    """
+    n = naux
+    carve = work is not None and work.size >= _h_aux_words(n, metric_size)
+    if carve:
+        h_buf = work[:9*n*n]
+        rest = work[9*n*n:]
+
+    def take(shape, off):
+        if not carve:
+            return cp.empty(shape)
+        size = int(np.prod(shape))
+        return ndarray(shape, buffer=rest[off:off+size])
+
     j2c_10 = int2c2e_ip1(auxmol, sort_output=False, omega=omega)
     j2c_10 *= -1
     j2c_10, tmp = cp.empty_like(j2c_10), j2c_10
@@ -913,69 +1200,170 @@ def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
 
     j3c_oo1p = contract('xuv,vij->xuij', j2c_10, dm_oo, alpha=-1, beta=1,
                         out=j3c_oo1)
-    h_aux = contract('xrij,ysij->xrys', j3c_oo1p, j3c_oo1p, -.5*k_factor)
+    h_aux = _gram(j3c_oo1p, -.5*k_factor,
+                  out=ndarray((3*n, 3*n), buffer=h_buf) if carve else None
+                  ).reshape(3, n, 3, n)
     if j_factor != 0 and batch_id == 0:
         contract('xuv,v->xu', j2c_10, _auxvec, -1, 1, out=auxvec_ipauxp)
         contract('xr,ys->xrys', auxvec_ipauxp, auxvec_ipauxp, j_factor, 1,
                  h_aux)
-    j2c_inv = (_metric_v / _metric_w).dot(_metric_v.T)
+    vw = take((n, metric_size), n*n)
+    cp.divide(_metric_v, _metric_w, out=vw)
+    j2c_inv = cp.dot(vw, _metric_v.T, out=take((n, n), 0))
     h_aux *= j2c_inv[None, :, None, :]
+    j2c_inv = vw = None
 
-    dm_aux = contract('rij,sij->rs', dm_oo, dm_oo, alpha=-.5*k_factor)
+    dm_aux = _gram(dm_oo, -.5*k_factor, out=take((n, n), 0))
     if j_factor != 0 and batch_id == 0:
         contract('r,s->rs', _auxvec, _auxvec, j_factor, 1, dm_aux)
     ejk_aux = _int2c2e_ip2_per_atom(
         auxmol, dm_aux[_aux_sorting[:, None], _aux_sorting], omega)
     ejk = -ejk_aux
 
-    j2c_ip2 = None
+    j2c_10v_w = take((n, metric_size), n*n)
+    j2c_ip2 = take((n, n), n*n + n*metric_size)
     for x in range(3):
-        j2c_10v_w = j2c_10v[x] / _metric_w
+        cp.divide(j2c_10v[x], _metric_w, out=j2c_10v_w)
         for y in range(3):
             j2c_ip2 = contract('rs,ts->rt', j2c_10v_w, j2c_10v[y], out=j2c_ip2)
             j2c_ip2 *= dm_aux
             h_aux[x, :, y] += j2c_ip2
     dm_aux = j2c_ip2 = j2c_10v_w = None
 
-    dm_aux1 = contract('xrij,sij->xrs', j3c_oo1p, dm_oo, -.5*k_factor)
+    dm_aux1 = contract('xrij,sij->xrs', j3c_oo1p, dm_oo, -.5*k_factor,
+                       out=take((3, n, n), 0))
     if j_factor != 0 and batch_id == 0:
         contract('xr,t->xrt', auxvec_ipauxp, _auxvec, j_factor, 1, out=dm_aux1)
-    tmp = contract('xrt,st->xrs', j2c_10v, _metric_v/_metric_w)
+    vw = take((n, metric_size), 3*n*n)
+    cp.divide(_metric_v, _metric_w, out=vw)
+    tmp = contract('xrt,st->xrs', j2c_10v, vw,
+                   out=take((3, n, n), 3*n*n + n*metric_size))
     h_aux = contract('xrt,ytr->xryt', tmp, dm_aux1, alpha=-2, beta=1,
                      out=h_aux)
-    dm_aux1 = j2c_10 = tmp = None
+    dm_aux1 = tmp = vw = None
 
-    h_aux = transpose_sum(h_aux.reshape(3*naux, 3*naux), inplace=True)
-    h_aux = h_aux.reshape(3, naux, 3, naux).transpose(1, 3, 0, 2)
+    h_aux = transpose_sum(h_aux.reshape(3*n, 3*n), inplace=True)
+    h_aux = h_aux.reshape(3, n, 3, n).transpose(1, 3, 0, 2)
     ejk_aux = _aggregate_to_atoms(h_aux, natm, aux_atm_labels, axis=(0, 1))
     ejk += ejk_aux * .5
-    return j3c_oo1p, (ejk, j2c_10v)
+    return j3c_oo1p, (ejk, j2c_10v, j2c_10)
 
 
-def _oo_gram(j3c_100, v0, dv, work, natm, nocc, atm_ind, _dm_factor_l,
-             _metric_w, _metric_v, k_factor, j_factor, ejk, h_ao_aux,
-             j2c_10v, _auxvec, auxvec_ipauxp, naux):
-    """Item 2 as a Gram matrix: the (10|0)(0|0)(0|01) block without ``X``.
+def _j2c_10c(sa, j2c_10):
+    """``j2c_10 C``: the metric derivative with its second index spherical.
 
-    Upstream builds ``X[A,x,r,i,j] = sum_{u in A} J[x,r,u,i] C[u,j]`` for
-    every atom, symmetrises it, and contracts
-    ``sum_{r,i,j} S[A,x,r,i,j] S[B,y,r,i,j] / w_r``: ``3 natm nocc^2``
-    doubles per auxiliary function (138 MB at 113 atoms) and
-    ``9 natm^2 naux nocc^2`` flops.  With ``S = X + X^T`` the sum is
-    ``2 (T1 + T2)``, and both halves fold the atom sums out of the
-    contraction:
-
-        T1[A,B] = sum_{u in A, v in B} P[u,v] R[u,v],
-                  R[u,v] = sum_{r,i} J[r,u,i] J[r,v,i] / w_r,   P = C C^T
-        T2[A,B] = sum_{u in A, v in B} Q[u,v],
-                  Q[u,v] = sum_r M[r,u,v] M[r,v,u] / w_r,    M_r = J_r C^T
-
-    which is ``9 nao^2 naux nocc`` flops for ``R`` and ``3 nao^2 naux nocc``
-    for ``M``, against upstream's ``9 natm^2 naux nocc^2`` -- fewer by
-    ``natm^2 nocc / (4/3 nao^2)``, a ratio that grows linearly with the
-    system -- and no array whose size has ``natm`` in it.  The ``1/w_r``
-    is split as ``1/sqrt(w_r)`` on each factor.
+    Only item 8 needs it; the eigen form drops ``j2c_10`` here, as upstream
+    does.
     """
+    if sa is None:
+        return None
+    out = cp.empty((3, sa.ncart, sa.nsph))
+    for x in range(3):
+        cp.dot(j2c_10[x], sa.ms, out=out[x])
+    return out
+
+
+def _chol_d4_d5(sa, ksph, work, natm, nocc, atm_ind, aoslices, dm_factor_l,
+                dm_oo, j3c_oo1p, j2c_10c, k_factor, j_factor, ejk, h_ao_aux,
+                auxvec, auxvec_ipauxp, st):
+    """Item 8: D4 and D5 with the metric as its Cholesky factor.
+
+    Upstream carries ``(10|0)`` into the metric's eigenbasis
+    (``j3c_100 = V^T K``, D3), back out of it for the cross terms
+    (``(V/w) j3c_100``, the first half of D5) and against ``dm_oo`` there
+    (the second half): three ``2 3 naux^2 nao nocc`` contractions, each with
+    one Cartesian and one spherical auxiliary index.  With ``J = L L^T`` on
+    the spherical index and ``K`` the spherical ``(10|0) C``, which D3 has
+    left in ``ksph`` instead:
+
+    * every sum ``sum_r' X_r' Y_r' / w_r'`` D4 forms is the same sum over
+      ``Y = L^{-1} K`` -- a rotation of the whitened eigenbasis ``js`` --
+      so D4 runs unchanged on it;
+    * ``(V/w) j3c_100 = C J^{-1} K = C Z`` with ``Z = L^{-T} Y``, and ``C``
+      is block diagonal by shell, so the first half of D5 contracts ``Z``
+      with ``C^T`` applied to its partner, per auxiliary shell, rather than
+      forming ``C Z``;
+    * the second half is ``sum_t j2c_10C[y,s,t] sum_{u in A,j} P[s,u,j]
+      Z[x,t,u,j]``, one contraction as before.
+
+    The two triangular multiplies against ``L^{-1}`` are one
+    ``naux_sph^2``-sized contraction between them, so the three become two,
+    and both are spherical in the auxiliary index that was Cartesian.
+    Returns the spherical-indexed cross terms, summed over auxiliary atoms.
+    """
+    nsph = sa.nsph
+    nao = dm_factor_l.shape[0]
+    solve = _env('FASTDFHESSIP_TRI', 'mult') == 'solve'
+    if solve:
+        from cupyx.scipy.linalg import solve_triangular
+        low = cp.linalg.inv(sa.linv)
+    for x in range(3):
+        if solve:
+            ksph[x] = solve_triangular(low, ksph[x].reshape(nsph, -1),
+                                       lower=True).reshape(ksph[x].shape)
+        else:
+            trmm_left_lower(sa.linv, ksph[x].reshape(nsph, -1))
+    st('D8 L^-1 K')
+    _oo_gram(ksph, 0, nsph, work, natm, nocc, atm_ind, dm_factor_l,
+             cp.ones(nsph), None, k_factor, j_factor, ejk, None, None,
+             auxvec, None, None, h_j=False)
+    st('D4 oo_atm')
+    for x in range(3):
+        if solve:
+            ksph[x] = solve_triangular(low, ksph[x].reshape(nsph, -1),
+                                       lower=True, trans='T'
+                                       ).reshape(ksph[x].shape)
+        else:
+            trmm_left_lower(sa.linv, ksph[x].reshape(nsph, -1), trans=True)
+    z = ksph
+    st('D8 L^-T Y')
+    if j_factor != 0:
+        # upstream's (10|0)(0|1)(0|00) term of the Gram block, which needs
+        # J^{-1} K and not L^{-1} K: sum_r' a[r']/w V[s,r'] = (C J^-1 a)[s]
+        d = contract('xtui,ui->xtu', z, dm_factor_l)
+        at = contract('au,xtu->axt', atm_ind, d, alpha=2.)
+        tmp, _ = _allocate((3, sa.ncart, nsph), work)
+        # upstream's `contract(..., beta=-1)`: ipaux' V - j2c_10v auxvec
+        cp.multiply(j2c_10c, -auxvec[None, :, None], out=tmp)
+        tmp += auxvec_ipauxp[:, :, None] * sa.ms
+        contract('pxt,yst->psxy', at, tmp, j_factor, 1, h_ao_aux)
+        d = at = tmp = None
+    # C^T on the partner of the first half, in place
+    for x in range(3):
+        sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
+    t1s = j3c_oo1p[:, :nsph]
+    # and on the output index of the second half: its s is summed over an
+    # auxiliary atom, and C does not mix atoms, so sum_{s in B} of a product
+    # linear in P_cart = C P_sph is sum_{s' in B} of C^T on the other factor
+    t2sph = _env('FASTDFHESSIP_T2SPH', '1') != '0'
+    if t2sph:
+        for y in range(3):
+            sa.to_sph(j2c_10c[y], j2c_10c[y])
+        j10s = j2c_10c[:, :nsph]
+    h_sph = cp.zeros((natm, nsph, 3, 3))
+    for i, (p0, p1) in enumerate(zip(aoslices[:-1], aoslices[1:])):
+        t1, work1 = _allocate((3, nsph, p1-p0, nocc), work)
+        contract('ysji,ui->ysuj', t1s, dm_factor_l[p0:p1], out=t1)
+        contract('xsuj,ysuj->sxy', z[:, :, p0:p1], t1, -k_factor, 1,
+                 h_sph[i])
+        pa, work1 = _allocate((sa.ncart, p1-p0, nocc), work)
+        contract('sji,ui->suj', dm_oo, dm_factor_l[p0:p1], out=pa)
+        if t2sph:
+            ps = sa.to_sph_pinv(pa, pa)
+            m, work1 = _allocate((3, nsph, nsph), work1)
+            contract('suj,xtuj->xst', ps, z[:, :, p0:p1], out=m)
+            contract('xst,yst->sxy', m, j10s, k_factor, 1, h_sph[i])
+        else:
+            m, work1 = _allocate((3, sa.ncart, nsph), work1)
+            contract('suj,xtuj->xst', pa, z[:, :, p0:p1], out=m)
+            contract('xst,yst->sxy', m, j2c_10c, k_factor, 1, h_ao_aux[i])
+    st('D5 per-atom')
+    return _aggregate_to_atoms(h_sph, natm, sa.atm, axis=1)
+
+
+def _oo_gram_rq(j3c_100, v0, dv, work, nocc, _dm_factor_l, _metric_w):
+    """W17's ``R`` and ``Q``: ``R`` as one contraction, ``Q`` from ``M`` and
+    its transpose as two GEMMs.  ``FASTDFHESSIP_D4=gemm``."""
     nao = _dm_factor_l.shape[0]
     per_r = 3*nao*nocc + 6*nao*nao
     # the chunk is bounded by the buffer upstream sized for X.  W17 also
@@ -1014,7 +1402,134 @@ def _oo_gram(j3c_100, v0, dv, work, natm, nocc, atm_ind, _dm_factor_l,
         cp.matmul(_dm_factor_l, js.reshape(3*dk, nao, nocc).transpose(0, 2, 1),
                   out=n.reshape(3*dk, nao, nao))
         _hadamard_r(m, n, Q)
-        if j_factor != 0:
+    return R, Q
+
+
+def _oo_gram_rq_syrk(j3c_100, v0, dv, work, nocc, _dm_factor_l, _metric_w):
+    """Item 10: ``R`` as a ``dsyrk`` and ``Q`` from one GEMM.
+
+    ``R[(x,u),(y,v)] = sum_{r,i} js[x,r,u,i] js[y,r,v,i]`` is ``A A^T`` for
+    ``A[(x,u),(r,i)]``, symmetric, and ``3 nao`` rows is thousands -- so
+    the chunk is copied into that layout once and half of the contraction
+    is not computed.  In the same layout ``M'[x,u,r,v] = sum_i A C[v,i]`` is
+    one GEMM, and ``Q = sum_r M'[x,u,r,v] M'[y,v,r,u]`` reads its transpose
+    through shared memory (``_HADAMARD_T``) instead of forming it with a
+    second GEMM.
+    """
+    from cupy.cuda import cublas
+    nao = _dm_factor_l.shape[0]
+    per_r = 3*nao*nocc + 3*nao*nao
+    kb = max(1, min(dv, work.size // per_r))
+    n3 = 3 * nao
+    R2 = cp.zeros((n3, n3))
+    Q = cp.zeros((3, 3, nao, nao))
+    one = np.ones(1)
+    handle = cp.cuda.device.get_cublas_handle()
+    for k0, k1 in lib.prange(0, dv, kb):
+        dk = k1 - k0
+        jt, work1 = _allocate((3, nao, dk, nocc), work)
+        m, work1 = _allocate((3, nao, dk, nao), work1)
+        sw = 1. / cp.sqrt(_metric_w[v0+k0:v0+k1])
+        cp.multiply(j3c_100[:, k0:k1].transpose(0, 2, 1, 3),
+                    sw[None, None, :, None], out=jt)
+        kk = dk * nocc
+        cublas.dsyrk(handle, cublas.CUBLAS_FILL_MODE_LOWER,
+                     cublas.CUBLAS_OP_T, n3, kk, one.ctypes.data,
+                     jt.data.ptr, kk, one.ctypes.data, R2.data.ptr, n3)
+        cp.dot(jt.reshape(-1, nocc), _dm_factor_l.T, out=m.reshape(-1, nao))
+        _hadamard_t(m, Q)
+    jt = m = None
+    bs = 32
+    _MIRROR(((n3 + bs - 1) // bs, (n3 + bs - 1) // bs), (bs, bs),
+            (R2, np.int64(n3)))
+    R = cp.ascontiguousarray(R2.reshape(3, nao, 3, nao).transpose(0, 2, 1, 3))
+    return R, Q
+
+
+_HADAMARD_T = cp.RawKernel(r'''
+#define T 16
+extern "C" __global__
+void hadamard_t(const double* __restrict__ m, double* __restrict__ q,
+                const int nao, const int nr)
+{
+    // q[x][y][u][v] += sum_r m[x][u][r][v] * m[y][v][r][u]
+    __shared__ double sa[3][T][T+1];
+    __shared__ double sb[3][T][T+1];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int u0 = blockIdx.y * T, v0 = blockIdx.x * T;
+    const long long sx = (long long)nao * nr * nao;
+    const long long su = (long long)nr * nao;
+    double acc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const int ua = u0 + ty, va = v0 + tx;   // sa: m[x][ua][r][va]
+    const int vb = v0 + ty, ub = u0 + tx;   // sb: m[y][vb][r][ub]
+    for (int r = 0; r < nr; r++) {
+        for (int x = 0; x < 3; x++) {
+            sa[x][ty][tx] = (ua < nao && va < nao) ?
+                m[x*sx + ua*su + (long long)r*nao + va] : 0.;
+            sb[x][ty][tx] = (vb < nao && ub < nao) ?
+                m[x*sx + vb*su + (long long)r*nao + ub] : 0.;
+        }
+        __syncthreads();
+        // this thread's (u, v) = (u0+ty, v0+tx); sb holds [v-v0][u-u0]
+        for (int x = 0; x < 3; x++) {
+            const double a = sa[x][ty][tx];
+            for (int y = 0; y < 3; y++) acc[x*3+y] += a * sb[y][tx][ty];
+        }
+        __syncthreads();
+    }
+    const int u = u0 + ty, v = v0 + tx;
+    if (u < nao && v < nao) {
+        const long long np = (long long)nao * nao;
+        for (int k = 0; k < 9; k++) q[k*np + (long long)u*nao + v] += acc[k];
+    }
+}
+''', 'hadamard_t')
+
+
+def _hadamard_t(m, q):
+    """``q[x,y,u,v] += sum_r m[x,u,r,v] m[y,v,r,u]``."""
+    nao = m.shape[1]
+    nr = m.shape[2]
+    t = 16
+    g = (nao + t - 1) // t
+    _HADAMARD_T((g, g), (t, t), (m, q, np.int32(nao), np.int32(nr)))
+
+
+def _oo_gram(j3c_100, v0, dv, work, natm, nocc, atm_ind, _dm_factor_l,
+             _metric_w, _metric_v, k_factor, j_factor, ejk, h_ao_aux,
+             j2c_10v, _auxvec, auxvec_ipauxp, naux, h_j=True):
+    """Item 2 as a Gram matrix: the (10|0)(0|0)(0|01) block without ``X``.
+
+    Upstream builds ``X[A,x,r,i,j] = sum_{u in A} J[x,r,u,i] C[u,j]`` for
+    every atom, symmetrises it, and contracts
+    ``sum_{r,i,j} S[A,x,r,i,j] S[B,y,r,i,j] / w_r``: ``3 natm nocc^2``
+    doubles per auxiliary function (138 MB at 113 atoms) and
+    ``9 natm^2 naux nocc^2`` flops.  With ``S = X + X^T`` the sum is
+    ``2 (T1 + T2)``, and both halves fold the atom sums out of the
+    contraction:
+
+        T1[A,B] = sum_{u in A, v in B} P[u,v] R[u,v],
+                  R[u,v] = sum_{r,i} J[r,u,i] J[r,v,i] / w_r,   P = C C^T
+        T2[A,B] = sum_{u in A, v in B} Q[u,v],
+                  Q[u,v] = sum_r M[r,u,v] M[r,v,u] / w_r,    M_r = J_r C^T
+
+    which is ``9 nao^2 naux nocc`` flops for ``R`` and ``3 nao^2 naux nocc``
+    for ``M``, against upstream's ``9 natm^2 naux nocc^2`` -- fewer by
+    ``natm^2 nocc / (4/3 nao^2)``, a ratio that grows linearly with the
+    system -- and no array whose size has ``natm`` in it.  The ``1/w_r``
+    is split as ``1/sqrt(w_r)`` on each factor.
+    """
+    nao = _dm_factor_l.shape[0]
+    if _env('FASTDFHESSIP_D4', 'syrk') == 'syrk':
+        R, Q = _oo_gram_rq_syrk(j3c_100, v0, dv, work, nocc, _dm_factor_l,
+                                _metric_w)
+    else:
+        R, Q = _oo_gram_rq(j3c_100, v0, dv, work, nocc, _dm_factor_l,
+                           _metric_w)
+    if j_factor != 0:
+        kb = max(1, min(dv, int(2e8) // (3*(naux or nao))))
+        for k0, k1 in lib.prange(0, dv, kb):
+            dk = k1 - k0
             # the trace of S: 2 sum_{u in A, i} J[x,r,u,i] C[u,i]
             d = contract('xrui,ui->xru', j3c_100[:, k0:k1], _dm_factor_l)
             auxvec_100_atm = contract('au,xru->axr', atm_ind, d, alpha=2.)
@@ -1022,6 +1537,8 @@ def _oo_gram(j3c_100, v0, dv, work, natm, nocc, atm_ind, _dm_factor_l,
             auxvec_100_atm_w = auxvec_100_atm / w_part
             contract('pxr,qyr->pqxy', auxvec_100_atm_w, auxvec_100_atm,
                      j_factor, beta=1, out=ejk)
+            if not h_j:
+                continue
             tmp = cp.empty((3, naux, dk))
             cp.multiply(j2c_10v[:, :, v0+k0:v0+k1], _auxvec[:, None], out=tmp)
             contract('ys,sr->ysr', auxvec_ipauxp, _metric_v[:, v0+k0:v0+k1],
@@ -1029,7 +1546,6 @@ def _oo_gram(j3c_100, v0, dv, work, natm, nocc, atm_ind, _dm_factor_l,
             contract('pxr,ysr->psxy', auxvec_100_atm_w, tmp, j_factor, 1,
                      h_ao_aux)
             d = tmp = auxvec_100_atm = auxvec_100_atm_w = None
-    js = m = None
     P = _dm_factor_l.dot(_dm_factor_l.T)
     R *= P
     R += Q
@@ -1167,6 +1683,12 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
     buf = cp.empty((nao_pair*batch_size))
     buf2 = cp.empty((blksize, nao, nao))
     buf1 = cp.empty((blksize, nao, nocc))
+    per_class = _env('FASTDFHESSIP_TIME', '0') == '2'
+    if per_class:
+        # `FASTDFHESSIP_TIME=2`: the ip2 kernel timed per auxiliary batch,
+        # which is one angular momentum and contraction pattern (W24)
+        lk = np.repeat(uniq_l_ctr_aux[:, 0], np.diff(l_ctr_aux_offsets))
+        ev = []
     for kbatch in range(num_aux_batches):
         naux_in_batch = aux_offsets[kbatch+1] - aux_offsets[kbatch]
         aux0 = aux1 = aux_ao_offset = aux_loc[ksh_offsets_cpu[kbatch]]
@@ -1187,6 +1709,9 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
             cp.take(dm_tensor.reshape(-1, dk), pair_addresses, axis=0,
                     out=compressed[:, k0:k1])
         st('C pseudo-dm')
+        if per_class:
+            e0 = cp.cuda.Event()
+            e0.record()
         err = kern_ip2(
             ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
             ctypes.cast(compressed.data.ptr, ctypes.c_void_p),
@@ -1205,7 +1730,28 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
             ctypes.c_int(naux_in_batch))
         if err != 0:
             raise RuntimeError('ejk_int3c2e_ip2 failed')
+        if per_class:
+            e1 = cp.cuda.Event()
+            e1.record()
+            ev.append((kbatch, e0, e1))
         st('C ip2 kernel')
+    if per_class:
+        cp.cuda.Stream.null.synchronize()
+        by_l = {}
+        for kbatch, e0, e1 in ev:
+            ks0, ks1 = ksh_offsets_cpu[kbatch], ksh_offsets_cpu[kbatch+1]
+            l = int(lk[ks0])
+            t = cp.cuda.get_elapsed_time(e0, e1)
+            n = int(aux_offsets[kbatch+1] - aux_offsets[kbatch])
+            a = by_l.setdefault(l, [0., 0, 0])
+            a[0] += t
+            a[1] += ks1 - ks0
+            a[2] += n
+        tot = sum(v[0] for v in by_l.values())
+        print('[fastdfhessip ip2 kernel] by auxiliary l: ' + '  '.join(
+            f'l={l}: {v[0]:.1f} ms ({100 * v[0] / tot:.0f} %, {v[1]} shells,'
+            f' {v[2]} functions)' for l, v in sorted(by_l.items())),
+            flush=True)
     return ejk
 
 

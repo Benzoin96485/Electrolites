@@ -117,3 +117,52 @@ def _sparse_ctr_coeff(auxmol, aux_sorting=None):
     idx[cols, pos] = rows.astype(np.int32)
     coef[cols, pos] = c[rows, cols]
     return idx, coef, counts, maxnnz
+
+
+# --------------------------------------------------------------------------
+# the triangular multiply, from the left, on a C-ordered right-hand side
+# --------------------------------------------------------------------------
+#: cuBLAS's ``dtrmm``, which cupy does not wrap.  `fastdfcderi` binds the same
+#: symbol for the cderi build, where it reaches GEMM throughput and the
+#: triangular solve does not (39 % of ``dgemm``, `docs/README_fastdfcderi.md`);
+#: `fastdfhessip`'s Cholesky form of the ip2 term (`docs/DF_WORK_LIST.md` W24)
+#: needs it from the other side.
+import ctypes                                                 # noqa: E402
+from cupy.cuda import cublas as _cublas                       # noqa: E402
+
+_ONE = np.ones(1)
+_libcublas = ctypes.CDLL('libcublas.so.12')
+_dtrmm = _libcublas.cublasDtrmm_v2
+_dtrmm.restype = ctypes.c_int
+_dtrmm.argtypes = ([ctypes.c_void_p] + [ctypes.c_int] * 6 +
+                   [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                    ctypes.c_int])
+
+
+def trmm_left_lower(tri, x, trans=False):
+    """``x <- T x`` (or ``T^T x``) in place, ``T`` lower triangular.
+
+    Both arrays are C-ordered: ``tri`` is ``(n, n)`` and ``x`` is ``(n, m)``.
+    cuBLAS reads a C-ordered array as its transpose, so ``x`` is the
+    column-major ``(m, n)`` matrix ``x^T`` and the product wanted is
+    ``x^T T^T`` (or ``x^T T``) -- a right-side multiply -- while ``tri``,
+    C-ordered and lower, is read as the upper-triangular ``T^T``.
+    """
+    n, m = x.shape
+    if m == 0 or n == 0:
+        return x
+    assert x.flags.c_contiguous and tri.flags.c_contiguous
+    assert tri.shape == (n, n)
+    err = _dtrmm(
+        ctypes.c_void_p(cp.cuda.device.get_cublas_handle()),
+        _cublas.CUBLAS_SIDE_RIGHT, _cublas.CUBLAS_FILL_MODE_UPPER,
+        _cublas.CUBLAS_OP_T if trans else _cublas.CUBLAS_OP_N,
+        _cublas.CUBLAS_DIAG_NON_UNIT, m, n,
+        ctypes.c_void_p(_ONE.ctypes.data),
+        ctypes.c_void_p(tri.data.ptr), n,
+        ctypes.c_void_p(x.data.ptr), m,
+        ctypes.c_void_p(x.data.ptr), m)
+    if err != 0:
+        raise RuntimeError(f'cublasDtrmm failed ({err})')
+    return x

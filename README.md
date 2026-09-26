@@ -52,9 +52,14 @@ cuTENSOR contraction in the CPHF build from free memory alone and
 `createPlan` then refuses it with tens of GB free.  The DF rows' remaining time is mostly that
 same CPHF build, which is at 78 % of the card's fp64 peak; the three terms
 around it that nothing covered before (the CPHF's grid half, and the `ip2`
-and `h1` two-electron terms) are 2.6x, 1.4x and 1.4x inside a 42-atom run,
-and upstream's grid half is wrong for meta-GGAs.
+and `h1` two-electron terms) are 2.6x, 1.4x and 1.4x inside a 42-atom run.
+Upstream's restricted **meta-GGA** Hessian is wrong and irreproducible — two
+of its functions contract `fxc` into one of their own operands, which
+cuTENSOR gets wrong at five density components — and `fastxchess` repairs
+both.  The `ip2` term has since gone to 2.3x–2.5x GPU4PySCF's at 113 atoms
+with the fitting metric as a Cholesky factor.
 `docs/README_fastdfhess.md`, `docs/README_fastdfhessip.md`,
+`docs/README_fastdfhessip2.md`, `docs/README_mgga_repro.md`,
 `docs/HESSIAN_1.8.1.md`, `docs/README_fastxchess.md`.
 
 ### Density-fitted gradient — B3LYP/def2-SVP
@@ -221,7 +226,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastgrad` | `grad.rks.Gradients.energy_ee` | — |
 | `fastxcgrad` | `grad.{rks,uks}.get_exc`, `get_nlc_exc` | `docs/README_fastxcgrad.md` |
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | — |
-| `fastxchess` | `hessian.{rks,uks}._get_vxc_deriv{1,2}` | `docs/README_fastxchess.md` |
+| `fastxchess` | `hessian.{rks,uks}._get_vxc_deriv{1,2}`, and `hessian.rks`'s in-place `contract` calls (meta-GGA) | `docs/README_fastxchess.md`, `docs/README_mgga_repro.md` |
 | `fastxcfxc` | `dft.numint.nr_{rks,uks}_fxc` — the grid half of every response property — and `hessian.rks.nr_rks_fxc_mo`, a restricted Hessian's | `docs/README_fastxcfxc.md`, `docs/README_fastdfhessip.md` |
 | `fastfnlc` | `hessian.{rks,uks}.nr_rks_fnlc_mo` — the VV10 response term | `docs/README_fastfnlc.md` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
@@ -231,7 +236,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastdfcderi` | `df.df._cholesky_eri` — the one-time cderi build — and `df.int3c2e_bdiv.int2c2e`, the two-centre metric integrals under it | `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md` |
 | `fastdfgrad` | `df.grad.{rhf,rks,uhf,uks}.Gradients.jk_energy_per_atom` | `docs/README_fastdfgrad.md`, `docs/README_fastdfgradoo.md` |
 | `fastdfhess` | `df.hessian.rhf._get_jk` — the DF Hessian's CPHF build | `docs/README_fastdfhess.md` |
-| `fastdfhessip` | `df.hessian.rhf._jk_energy_per_atom` and `_get_veff` — the DF Hessian's `ip2` and `h1` two-electron terms | `docs/README_fastdfhessip.md` |
+| `fastdfhessip` | `df.hessian.rhf._jk_energy_per_atom` and `_get_veff` — the DF Hessian's `ip2` and `h1` two-electron terms | `docs/README_fastdfhessip.md`, `docs/README_fastdfhessip2.md` |
 | `fastdffp32` | `DF.loop` and the DF Hessian's cderi transfer — carries `FASTDF_FP32=1`, which is inert unless set and **changes the answer** when it is | `docs/README_fastdffp32.md` |
 | `fastdfrsh` | `df.df_jk._DFHF.get_veff` for a range-separated hybrid — one cderi tensor where upstream keeps two: exactly, for the long-range-only functionals (ωB97, LC-ωPBE, LC-VV10), and under `FASTDFRSH=fuse`, which **changes the answer** by 1e-7–1e-6 Eh, for the rest | `docs/README_fastdfrsh.md` |
 

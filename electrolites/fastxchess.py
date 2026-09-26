@@ -95,8 +95,25 @@ which at 0.5 % of a Hessian is not where the next hour goes.
 ``tests/test_xchess_fd.py`` carries an LDA row so that the claim they agree is
 checked rather than asserted.
 
+**The meta-GGA fall-through is repaired, not only handed back.**
+``hessian/rks.py`` contracts ``fxc`` in place in three places --
+``wv2 = contract('xyg,sxg->syg', wf, dR_rho1, out=dR_rho1)`` in both the GGA
+and the meta-GGA branch of ``_get_vxc_deriv1_task``, and ``contract('axg,
+xyg->ayg', rho1, fxc_w, out=rho1)`` in ``_nr_rks_fxc_mo_task`` -- and cuTENSOR
+does not promise an in-place contraction is correct.  At four density
+components it is; at five, on a block of more than a few hundred grid points,
+it is off by a third of the largest element, and which elements depends on the
+run.  That is why a restricted meta-GGA Hessian was not reproducible
+(``docs/DF_WORK_LIST.md`` W23, ``docs/README_mgga_repro.md``).  The module
+replaces the ``contract`` that ``hessian/rks.py`` looked up at import with
+``_alias_safe_contract``, which is the same call unless ``out`` overlaps an
+operand, and then contracts into a temporary and copies it into ``out``.  It
+is on whenever the module is loaded, including under ``FASTXCHESS_OFF=1``;
+``FASTXCHESS_INPLACE=1`` puts the unsafe call back.
+
 Environment switches (for the ablations):
 ``FASTXCHESS_OFF=1``         hand both functions back to GPU4PySCF
+``FASTXCHESS_INPLACE=1``     keep ``hessian/rks.py``'s in-place contractions
 ``FASTXCHESS_ATOMSCREEN=0``  keep every atom on every block, i.e. mechanism 2
                              alone, so the two screens can be separated
 ``FASTXCHESS_MEM``           fraction of free memory one atom block may take
@@ -119,6 +136,7 @@ from gpu4pyscf.lib import logger
 from gpu4pyscf.__config__ import num_devices
 
 _OFF = bool(os.environ.get('FASTXCHESS_OFF'))
+_INPLACE = bool(os.environ.get('FASTXCHESS_INPLACE'))
 _ATOMSCREEN = os.environ.get('FASTXCHESS_ATOMSCREEN', '1') != '0'
 MEM_FRACTION = float(os.environ.get('FASTXCHESS_MEM', '0.2'))
 GB = 1024 ** 3
@@ -861,3 +879,39 @@ if not _PATCHED:
     hess_uks._get_vxc_deriv1 = get_vxc_deriv1_u
     hess_uks._get_vxc_deriv2 = get_vxc_deriv2_u
     _PATCHED = True
+
+
+# ------------------------------------------- the in-place contraction (W23) ----
+
+_contract_orig = hess_rks.contract
+_ALIASED = [0]
+
+
+def _alias_safe_contract(pattern, a, b, alpha=1.0, beta=0.0, out=None):
+    """``cupy_helper.contract``, correct when ``out`` overlaps an operand.
+
+    ``may_share_memory`` compares address ranges, so it costs nothing and can
+    only err towards the copy.  With ``beta`` the old ``out`` is read after
+    the temporary is complete, which is what the in-place call meant.
+    """
+    if out is None or not (cupy.may_share_memory(out, a)
+                           or cupy.may_share_memory(out, b)):
+        return _contract_orig(pattern, a, b, alpha, beta, out=out)
+    _ALIASED[0] += 1
+    tmp = _contract_orig(pattern, a, b, alpha, 0.0)
+    if beta == 0:
+        out[...] = tmp
+    else:
+        out *= beta
+        out += tmp
+    return out
+
+
+if not _INPLACE and getattr(hess_rks, '_contract_orig', None) is None:
+    hess_rks._contract_orig = _contract_orig
+    hess_rks.contract = _alias_safe_contract
+
+
+def stats():
+    return {'aliased_contractions': _ALIASED[0],
+            'inplace_repaired': hess_rks.contract is _alias_safe_contract}

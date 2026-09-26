@@ -25,6 +25,8 @@ W5 left behind: one is a kernel that pays and one is a measurement that says
 not to write the code),
 `docs/README_fastdfhessip.md` closed **W16**, **W17** and **W18** together
 (W8's three findings, whose own findings are W23, W24 and W25),
+`docs/README_mgga_repro.md` closed **W23** (whose finding is W28) and
+`docs/README_fastdfhessip2.md` **W24** (whose finding is W29),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -236,6 +238,24 @@ arithmetic: `cudaHostAlloc`, which page-locks the host buffer at 2.09 GB/s
 and is 41.5 s of a 72.5 s 284-atom build.  Made 4.1x faster here; the
 remaining 10 s, the host store and `_decompose_j2c`'s latency are **W12**,
 **W11** and **W13**.
+
+**W23 and W24 are done, and W28 and W29 are what they found.**  W23's
+second noise source is W16's bug in a second function — `_get_vxc_deriv1`
+contracts `fxc` into one of its own operands, and cuTENSOR gets that wrong
+at five density components — and it made every restricted meta-GGA Hessian
+GPU4PySCF computes *wrong* as well as irreproducible (1.6e-5–4.2e-5 against
+PySCF's CPU function, 2.3e-12 repaired); one indirection in `fastxchess`
+repairs all three such lines, and a 42-atom DF-TPSS Hessian now gives the
+same trace to 1e-10 in two processes.  W24 is the ip2 term's metric as a
+Cholesky factor on the spherical auxiliary index: D3 + D5 at two
+contractions' cost as the entry asked, D4 and the `h_aux` block as `dsyrk`,
+and the fusion no longer declined at 113 atoms — the function is 1.24x–1.34x
+W17's there and 2.3x–2.5x GPU4PySCF's.  Its lesson is about round-off: the
+factor has to be the only factor in the call, because a Cholesky `J⁻¹` in
+some terms against an eigen `J⁻¹` in others left 2e-9 of an ill-conditioned
+metric's round-off in the answer.  What is left at small sizes is the
+`ejk_int3c2e_ip2` kernel (W29, 46–52 % of the call at 21–42 atoms), and in a
+meta-GGA Hessian the XC derivatives `fastxchess` does not cover (W28, 73 %).
 
 **W16, W17 and W18 are done, and W23, W24 and W25 are what they found.**
 The three functions W8's anatomy said the density-fitted Hessian's time was
@@ -1850,7 +1870,44 @@ does not fit on the card, and the pair is **139.4 GB** on the host.
 The success criterion is met both ways: the 284-atom wB97X-D3 SCF needs 88
 GB, and says so.
 
-### W23 — A restricted meta-GGA Hessian is not reproducible
+### W23 — A restricted meta-GGA Hessian is not reproducible — **done: the same in-place contraction in a second function, and it was a wrong answer as well as a noisy one**
+
+`electrolites/fastxchess.py` (`_alias_safe_contract`, and
+`FASTXCHESS_INPLACE=1` to put the in-place calls back),
+`tests/test_mgga_inplace.py`, `benchmarks/mgga_hess_repro.py`, write-up in
+`docs/README_mgga_repro.md`.
+
+Bisected, not grepped: every stage of a DF-TPSS Hessian called three times on
+one SCF in one process, and exactly two differ between calls —
+`nr_rks_fxc_mo` (W16's line) and **`_get_vxc_deriv1`**, whose
+`_get_vxc_deriv1_task` writes `wv2 = contract('xyg,sxg->syg', wf, dR_rho1,
+out=dR_rho1)` in both its GGA and its meta-GGA branch.  At five components
+the in-place call is off by 0.14–0.29 of the largest element in some calls
+and exact in others — a race.  The patched Hessian spread as far as the
+unpatched one because `fastxchess` declines meta-GGAs and hands them to
+exactly that line; its GGA branch is right only because `ncomp = 4`.  A grep
+afterwards finds these three lines in GPU4PySCF 1.8.1 and no others, all in
+`hessian/rks.py`; `hessian/uks.py` has none, and an unrestricted meta-GGA
+Hessian is reproducible unpatched.
+
+**It is not noise around the right answer.**  Against PySCF's CPU
+`_get_vxc_deriv1` on the same orbitals and grid, GPU4PySCF's is off by
+1.6e-5 and 4.2e-5 in two runs, and repaired it agrees to **2.3e-12**; a
+direct TPSS Hessian's trace moves from 2.6e-4 off PySCF's to 1.5e-5, which
+is where a PBE one sits (GPU4PySCF solves the CPHF on its coarser
+`cphf_grids`).  The fix is one indirection: `fastxchess` replaces the
+`contract` that `hessian/rks.py` imported with one that contracts into a
+temporary when `out` overlaps an operand.  That repairs all three lines —
+upstream's `nr_rks_fxc_mo` is right again when `fastxcfxc` is off — and costs
+nothing measurable.  **Success met**: a 42-atom DF-TPSS Hessian gives
+40.9142598198 and 40.9142598199 in two processes (unpatched: 40.9141875571 and
+40.9143467896), glycine the same trace to 1e-10 in eight.  **Not
+falsified**: the SCF energy is the same to the printed digit in every run.
+What it found is **W28**: with the Hessian now right, the meta-GGA XC
+derivatives — still upstream's, because `fastxchess` covers GGAs — are 73 %
+of a patched 42-atom DF-TPSS Hessian.
+
+The original entry, for the record:
 
 *(Found by W16.)*
 
@@ -1879,7 +1936,57 @@ reproducible to 5e-10 in the same harness.
   1e-9 leaves a density whose Hessian moves by this much), in which case it
   is a convergence setting and not a bug.
 
-### W24 — What is left in the density-fitted Hessian's ip2 term
+### W24 — What is left in the density-fitted Hessian's ip2 term — **done: D3 + D5 at two contractions' cost, and the factor has to be the only factor**
+
+`electrolites/fastdfhessip.py` items 8–11 (`_SphAux`, `_chol_d4_d5`,
+`_gram`, `_oo_gram_rq_syrk`, `_h_aux_block(work=...)`),
+`electrolites/_dfaux.py:trmm_left_lower`, `tests/test_dfhessip.py`,
+`benchmarks/df_hess_metric_sens.py`, write-up in
+`docs/README_fastdfhessip2.md`.
+
+**Item 8, the metric as `J = L Lᵀ` on the spherical auxiliary index.**
+Upstream's `metric_v` is `C v`, `C` the block-diagonal Cartesian-to-spherical
+coefficients, so D3's eigenbasis contraction carries a Cartesian index it does
+not need.  With the spherical `(10|0)` held whole — **the same
+`3·naux·nao·nocc` words the one-chunk eigen pass already holds** — D3 is `Cᵀ`
+applied per integral batch (a pass over memory), the eigenbasis in and out of
+D5 is two `dtrmm` against `L⁻¹` (one contraction between them, at GEMM rate),
+and D5's contraction is spherical in both auxiliary indices because `C` does
+not mix atoms and D5's output index is only ever summed over an auxiliary
+atom.  Three `naux_cart × naux_sph` contractions become two `naux_sph²` ones
+— the success line — and at 113 atoms D3 + D4 + D5 go 17.7 → 11.7 s.
+
+**The factor has to be the only factor.**  The first version used `L` in
+D3–D5 and upstream's eigenbasis in stage B and the `h_aux` block.  On the
+Ni(II) dithiolene dianion (metric condition 1.6e9) it was 1.7e-9 from
+upstream, and a one-ulp perturbation of the metric moved it by 2e-9 while
+it moved upstream's by 1e-11: this function's terms cancel, and two
+roundings of `J⁻¹` do not cancel each other.  Upstream only ever uses
+`V W⁻¹ Vᵀ`, so `V = C L⁻ᵀ, W = 1` serves every other line unchanged, and
+the difference is **3.2e-11** (organic cases 2–5e-12).  A triangular solve
+in place of the explicit `L⁻¹` gives the same numbers to the digit.
+
+**Items 9–11**: the `h_aux` block's Gram matrices and D4's `R` as `dsyrk`,
+`Q` from one GEMM and a shared-memory transpose, and the `h_aux` block's
+temporaries carved from the integral buffers the fused pass has finished
+with — which makes a 113-atom call fuse again (the margin was 8.4 GB).
+
+**What it is worth**: at 113 atoms, one process, GPU4PySCF 63.1 s / W17
+33.3 s / items 8–10 26.9 s (**2.34x**, 1.24x W17), and item 11 takes 25.8 →
+**24.8 s** in another; def2-TZVPP 1.11x W17 (1.89x GPU4PySCF); the organic
+and transition-metal cases at 21–42 atoms 1.05x–1.06x, because there the
+integral kernels are 70 % of what is left.  Whole Hessians 1.00x–1.02x.
+
+**The falsification criterion fires in its letter and not in its intent**:
+the resident block fits exactly where the chunked form is one chunk, because
+they are the same size — but a 113-atom call on an 80 GB card is one chunk,
+and past that the factor still serves upstream's chunked arithmetic as its
+`V` at the eigenbasis's cost.  **The kernel is profiled, not moved**: by
+auxiliary angular momentum its cost per function rises from 0.30 ms at
+`l = 0` to 4.9 ms at `l = 6`, and on the Ni complex one `l = 6` shell (1 % of
+the set) is 11 % of it.  That is **W29**.
+
+The original entry, for the record:
 
 *(Found by W17.)*
 
@@ -1946,6 +2053,58 @@ is refused depends on the factors of an extent that moves with the molecule.
   that can pass the limit; `benchmarks/cutensor_plan_probe.py --run` finds
   any that do on a real run.
 * **Success**: a list with every entry either bounded under 2²⁹ or guarded.
+
+### W28 — The meta-GGA XC derivatives of a Hessian
+
+*(Found by W23.)*
+
+`fastxchess` (catalogue B5) replaces `hessian/rks.py:_get_vxc_deriv1` and
+`_get_vxc_deriv2` for GGAs and declines everything else, so a meta-GGA
+Hessian runs GPU4PySCF's own code for both — which is also why W23's
+in-place contraction was reached at all.  With W23 fixed, on a patched
+42-atom DF-TPSS/def2-SVP Hessian (40.7 s), `_get_vxc_deriv1` is **15.0 s**
+and `_get_exc_deriv2` (which is `_get_vxc_deriv2` plus `_get_vxc_diag`)
+**14.8 s**: 73 % of the run.
+
+* **Do**: read the meta-GGA branches of both tasks against the GGA ones
+  `fastxchess` already replaces.  The meta-GGA terms are the `tau`
+  contributions — `for j in range(1, 4)` over the AO gradient components in
+  `_get_vxc_deriv1_task`, and the matching blocks in `_get_vxc_deriv2_task`
+  — on top of the same atom loop inside the block loop, so B5's two
+  mechanisms (skip the atoms with no AO in the block's mask; do the GEMMs
+  in the masked AO space) should carry over unchanged.
+* **Success**: the two rows move by what B5 was worth on GGAs
+  (`docs/README_fastxchess.md`).
+* **Falsified if**: the time is in the per-block `eval_xc_eff` rather than
+  the atom loop — a meta-GGA's third functional derivative is more
+  expensive than a GGA's — in which case it is catalogue G1's grouping and
+  not B5's screen.
+* `tests/test_mgga_inplace.py` is the CPU reference to check against:
+  PySCF's `_get_vxc_deriv1` agrees with the repaired upstream one to 2e-12.
+
+### W29 — The `ejk_int3c2e_ip2` kernel
+
+*(Found by W24.)*
+
+After W24 the ip2 term's contractions are small wherever the molecule is:
+at 42 atoms the call is 2.9 s, of which **1.33 s** is this kernel and
+another 0.6 s the `ip1`/`ipaux` derivative fills.  It is **46 %** of the
+call on penicillin V, **51–52 %** on the Pt(II) and Ni(II) complexes and
+16 % at 113 atoms.  `FASTDFHESSIP_TIME=2` times it per auxiliary batch
+(`docs/README_fastdfhessip2.md` §6): the cost per auxiliary function is
+0.30 ms at `l = 0` and 4.9 ms at `l = 6`, and on the Ni complex **one
+`l = 6` shell — 28 functions, 1 % of the set — is 11 % of the kernel**.
+
+* **Do**: what W19 did to `contract_int3c2e.cu`, on a kernel that computes
+  second derivatives: profile it per `(li, lj, lk)` class rather than per
+  auxiliary `l` (restrict `shl_pair_offsets` to one pair class), establish
+  whether the high classes are Boys-function-, register- or shared-memory
+  bound, and start with whatever W19's generator can be taught to emit.
+* **Success**: the kernel moves by what W19's scaffolding was worth on the
+  first-derivative-free kernels (4.4x–6.5x alone).
+* **Falsified if**: the high-`l` classes are already at the card's rate for
+  the arithmetic a Rys second derivative needs — then the answer is
+  screening on the pseudo-density, which this kernel does not do.
 
 ### Not on this list
 

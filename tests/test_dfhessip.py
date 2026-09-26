@@ -131,7 +131,13 @@ SWITCHES = [('default', {}),
             ('FUSE=0', {'FUSE': 0}),
             ('H1J=upstream', {'H1J': 'upstream'}),
             ('H1ATOM=upstream', {'H1ATOM': 'upstream'}),
-            ('JPAIR=0', {'JPAIR': 0})]
+            ('JPAIR=0', {'JPAIR': 0}),
+            ('METRIC=eigen', {'METRIC': 'eigen'}),
+            ('TRI=solve', {'TRI': 'solve'}),
+            ('SYRK=0', {'SYRK': 0}),
+            ('D4=gemm', {'D4': 'gemm'}),
+            ('T2SPH=0', {'T2SPH': 0}),
+            ('CARVE=0', {'CARVE': 0})]
 
 
 def run_terms(mf, tag, factors, switches=SWITCHES, mem=None):

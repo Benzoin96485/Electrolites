@@ -210,6 +210,8 @@ glycine gives traces of 9.18679802, 9.18682691, 9.18680002 and 9.18679915 in
 four runs, and the patched one moves by the same 3e-5 Eh/bohr² — so there is
 a second source of run-to-run noise on the meta-GGA Hessian path, not in any
 of this round's functions and not found.  It is `DF_WORK_LIST.md` **W23**.
+*(Found since: the same in-place contraction in `_get_vxc_deriv1`, which
+`fastxchess` hands meta-GGAs back to; `docs/README_mgga_repro.md`.)*
 
 ---
 
@@ -342,6 +344,9 @@ needs the whole `(10|0)` block resident, 34 GB at 113 atoms, instead of one
 metric chunk of it.  And the `ip2` kernel itself is 1.34 s of 3.04 at 42
 atoms and 50 % of the call on the two transition-metal complexes, where it
 is why W17 is only 1.15x–1.20x (§5).  Both are `DF_WORK_LIST.md` **W24**.
+*(The first is done since — two contractions' cost, with the metric as a
+Cholesky factor on the spherical auxiliary index; the kernel is profiled and
+is W29.  `docs/README_fastdfhessip2.md`.)*
 
 ---
 
