@@ -128,12 +128,23 @@ how two of the Rys kernels are launched, and nothing inside them:
     pass and first, h1's, the Coulomb-only term's -- gets it.
     ``FASTDFHESSIP_FILL_TILE=0`` is item 1's; the default is 2 passes.
 
+``docs/DF_WORK_LIST.md`` **W31** (``docs/README_fastdfhessip4.md``) replaced
+the kernel item 15 launches:
+
+17. **``ejk_int3c2e_ip2`` rewritten** (``electrolites/kernels/cuda/myip2``,
+    built by ``_nvcc.ip2_library``, chosen in ``_ip2launch.kernel``): the
+    same entry point and arguments; the light classes' triples in registers
+    with every index a literal, the contraction down to the 21 sums that are
+    not linear combinations of the others, the rest on twice upstream's
+    threads, and the atomics summed per block first.  Only under item 15's
+    launch.  ``FASTDFHESSIP_IP2_KERNEL=upstream``.
+
 ``docs/DF_WORK_LIST.md`` **W32** (``docs/README_fastdfh1c.md``) changed stage C
 of ``_get_veff``, in both spin cases (``_h1_stage_c``):
 
-17. **The per-auxiliary-atom ``j2c_10`` term grouped.**  One cuBLAS GEMM
-    per group of consecutive auxiliary atoms (up to 3072 rows, in stage D's
-    buffer before D uses it) instead of one ``3 naux_A``-row contraction
+18. **The per-auxiliary-atom ``j2c_10`` term grouped.**  One cuBLAS GEMM
+    per group of consecutive auxiliary atoms (up to 3072 rows, sized from the
+    free memory at the stage's start) instead of one ``3 naux_A``-row contraction
     per atom, each atom's exchange contraction as ``3 ns`` cuBLAS calls,
     and the Coulomb term formed without ``j3c_1`` at all: one
     ``(natm 3, naux)`` matrix and one GEMM, which with ``k_factor = 0`` is
@@ -159,7 +170,7 @@ the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
                              (default auto, 4e6)
     FASTDFHESSIP_K0=compute  item 14 off
     FASTDFHESSIP_H1C=atom, FASTDFHESSIP_H1C_ROWS=<n>
-                             item 17 off, or its group size in GEMM rows
+                             item 18 off, or its group size in GEMM rows
                              (3072)
     FASTDFHESSIP_H1METRIC=inverse
                              item 6 on
@@ -174,6 +185,8 @@ the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
     FASTDFHESSIP_IP2_KCHUNK=<n>, FASTDFHESSIP_IP2_PCHUNK=tile|upstream|<n>,
     FASTDFHESSIP_FILL_TILE=<passes>
                              their tile shapes (16, tile, 2)
+    FASTDFHESSIP_IP2_KERNEL=upstream
+                             item 17 off: GPU4PySCF's kernel under item 15
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
                              also times the ip2 kernel per auxiliary l
     FASTDFHESSIP_RCHUNK=<n>  W17's 1.2e8-element bound on the Gram form's
@@ -1926,7 +1939,7 @@ def _h1c_groups(aux_slices, cap):
 
 def _h1_stage_c(j2c_10, dm_3c, dm_oo, aux_idx, aux_slices, auxvec,
                 auxvec_by_atm, vhf_j, vhf_ao, vhf_occ, kf, j_factor, st):
-    """Stage C of both spin cases' h1 term, the auxiliary atoms grouped: item 17.
+    """Stage C of both spin cases' h1 term, the auxiliary atoms grouped: item 18.
 
     Upstream (and W18's copy) runs, for every auxiliary atom ``A``,
 
@@ -2248,7 +2261,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         j2c_10 = j2c_10[:, inv_aux_sorting[aux_idx, None], inv_aux_sorting]
         st('C int2c2e_ip1')
         if _env('FASTDFHESSIP_H1C', 'grouped') != 'atom':
-            # item 17 (W32): the auxiliary atoms grouped into GEMMs of a few
+            # item 18 (W32): the auxiliary atoms grouped into GEMMs of a few
             # thousand rows, the exchange contractions as cuBLAS calls, and
             # the Coulomb term without j3c_1
             v5 = vhf_atm.reshape(natm, 3, 1, nocc, nao)

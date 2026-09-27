@@ -41,6 +41,14 @@ Every triple is computed by the same code with the same arguments; only the
 assignment of triples to blocks and the order of the atomic additions into
 ``ejk`` change, so the result agrees with upstream to the kernel's own
 run-to-run spread (its atomics are unordered either way).
+
+``docs/DF_WORK_LIST.md`` W31 then replaced the kernel itself: by default the
+entry point is ``libmyip2``'s (``electrolites/kernels/cuda/myip2``, built by
+``_nvcc.ip2_library``) -- the same arguments and launch, with the light
+classes' triples in registers, the contraction down to 21 sums and the
+atomics reduced per block (``docs/README_fastdfhessip4.md``).
+``FASTDFHESSIP_IP2_KERNEL=upstream`` puts GPU4PySCF's back; so does a
+machine without ``nvcc``.
 """
 import ctypes
 
@@ -56,6 +64,27 @@ import os
 
 def _env(name, default):
     return os.environ.get(name, default)
+
+
+_KERNEL = {}
+
+
+def kernel():
+    """The ``ejk_int3c2e_ip2`` entry point to launch: W31's, unless
+    ``FASTDFHESSIP_IP2_KERNEL=upstream`` or it cannot be built."""
+    mode = _env('FASTDFHESSIP_IP2_KERNEL', 'w31')
+    if mode not in _KERNEL:
+        fn = None
+        if mode != 'upstream':
+            from ._nvcc import ip2_library
+            path = ip2_library()
+            if path is not None:
+                fn = ctypes.CDLL(path).ejk_int3c2e_ip2
+                fn.restype = ctypes.c_int
+        if fn is None:
+            fn = libvhf_rys.ejk_int3c2e_ip2
+        _KERNEL[mode] = fn
+    return _KERNEL[mode]
 
 
 #: auxiliary shells per block, the kernel's BLOCK_SIZE
@@ -210,7 +239,7 @@ class Tiles:
              ksh, lk, aux_offset, naux):
         spo = self.pair_offsets(lk)
         self.launches += 1
-        err = libvhf_rys.ejk_int3c2e_ip2(
+        err = kernel()(
             ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
             ctypes.cast(dm.data.ptr, ctypes.c_void_p),
             (lib.c_null_ptr() if density_auxvec is None else

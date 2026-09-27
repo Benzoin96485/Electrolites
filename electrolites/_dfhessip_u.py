@@ -783,7 +783,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     j2c_10 = j2c_10[:, inv_aux_sorting[aux_idx, None], inv_aux_sorting]
     st('C int2c2e_ip1')
     if _env('FASTDFHESSIP_H1C', 'grouped') != 'atom':
-        # item 17 (W32): fastdfhessip's grouped stage C, on the spin index
+        # item 18 (W32): fastdfhessip's grouped stage C, on the spin index
         H._h1_stage_c(
             j2c_10, dm_3c, dm_oo if do_k else None, aux_idx, aux_slices,
             auxvec if j_factor != 0 else None,

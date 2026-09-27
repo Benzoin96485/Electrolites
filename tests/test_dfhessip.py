@@ -154,7 +154,12 @@ SWITCHES = [('default', {}),
             ('IP2_KCHUNK=0', {'IP2_KCHUNK': 0}),
             ('IP2_PCHUNK=5', {'IP2_PCHUNK': 5}),
             ('FILL_TILE=0', {'FILL_TILE': 0}),
-            ('FILL_TILE=0.05', {'FILL_TILE': 0.05})]
+            ('FILL_TILE=0.05', {'FILL_TILE': 0.05}),
+            # W31's kernel: GPU4PySCF's instead, and W31's under the other
+            # launches (every triple in a few-shell range; the long-range
+            # operator's classes all take its shared-memory path)
+            ('IP2_KERNEL=upstream', {'IP2_KERNEL': 'upstream'}),
+            ('IP2_KCHUNK=3 IP2_PCHUNK=5', {'IP2_KCHUNK': 3, 'IP2_PCHUNK': 5})]
 
 
 def run_terms(mf, tag, factors, switches=SWITCHES, mem=None):

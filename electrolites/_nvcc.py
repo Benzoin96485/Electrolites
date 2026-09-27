@@ -2,7 +2,7 @@
 
 Almost every kernel here is compiled at run time by NVRTC through
 ``cupy.RawModule``, so nothing has to be built at install time and no wheel
-carries device code.  Two are exceptions, both because they are split over
+carries device code.  Three are exceptions, all because they are split over
 several translation units and need relocatable device code, which NVRTC cannot
 do:
 
@@ -12,6 +12,9 @@ do:
   GPU4PySCF's ``rys_contract_jk_ip2.cu`` and ``unrolled_ejk_ip2_type{12,3}.cu``
   with the divisions folded and a register cap added (codegen/gen_ejk_ip2.py),
   which `fastejk2` binds over GPU4PySCF's own entry points.
+* ``libmyip2``, the density-fitted Hessian's ``ejk_int3c2e_ip2`` with its
+  contraction and atomics rewritten (``docs/DF_WORK_LIST.md`` W31), which
+  ``_ip2launch`` launches in place of GPU4PySCF's.
 
 Each is compiled with ``nvcc`` the first time it is wanted and cached per
 compute capability.  If ``nvcc`` is not on the machine, the accessor returns
@@ -20,6 +23,7 @@ None and the module that wanted it stands down -- slower, still correct.
 Overrides:
   ELECTROLITES_LIBMYKG   path to a prebuilt libmykg; used as-is
   ELECTROLITES_LIBMYEJK2 path to a prebuilt libmyejk2; used as-is
+  ELECTROLITES_LIBMYIP2  path to a prebuilt libmyip2; used as-is
   ELECTROLITES_CACHE     where to put the build (default ~/.cache/electrolites)
   ELECTROLITES_NVCC      the compiler to use (default: nvcc on PATH)
   ELECTROLITES_ARCH      compute capability digits, e.g. 80 (default: this GPU)
@@ -48,6 +52,17 @@ _EJK2_SOURCES = (
     'myejk2/rys_contract_jk_ip2.cu',
     'myejk2/unrolled_ejk_ip2_type12.cu',
     'myejk2/unrolled_ejk_ip2_type3.cu',
+)
+#: the density-fitted Hessian's ip2 kernel (W31): GPU4PySCF's
+#: ejk_int3c2e_ip2 with its contraction and atomics rewritten
+_IP2_SOURCES = (
+    'gvhf-rys181/gvhf-rys/rys_roots_dat.cu',
+    'gvhf-rys181/gvhf-rys/rys_constant.cu',
+    'myip2/ejk_int3c2e_ip2.cu',
+)
+_IP2_DEPS = (
+    'myip2/build_rys_gxyz.cuh',
+    'myip2/ip2_cases.inc',
 )
 _warned = False
 
@@ -90,7 +105,7 @@ def nvcc_path():
         return None
 
 
-def _build(name, sources, includes, what, override_env):
+def _build(name, sources, includes, what, override_env, deps=()):
     """Path to one nvcc-built library for this GPU, or None.
 
     ``what`` names the thing that stands down if the build cannot happen, so
@@ -110,7 +125,7 @@ def _build(name, sources, includes, what, override_env):
     out = os.path.join(out_dir, name)
     if all(os.path.exists(s) for s in srcs):
         h = hashlib.sha256()
-        for s_ in srcs:
+        for s_ in srcs + [os.path.join(CUDA_DIR, d) for d in deps]:
             with open(s_, 'rb') as f:
                 h.update(f.read())
         h.update(repr((arch, includes)).encode())
@@ -166,5 +181,14 @@ def ejk_ip2_library():
                   'ELECTROLITES_LIBMYEJK2')
 
 
-__all__ = ['general_k_library', 'ejk_ip2_library', 'cache_dir',
+@functools.lru_cache(maxsize=1)
+def ip2_library():
+    """Path to ``libmyip2`` (W31's ``ejk_int3c2e_ip2``) for this GPU, or None."""
+    return _build('libmyip2.so', _IP2_SOURCES,
+                  ('gvhf-rys181', 'gvhf-rys181/gvhf-rys'),
+                  "the DF Hessian's ip2 kernel", 'ELECTROLITES_LIBMYIP2',
+                  deps=_IP2_DEPS)
+
+
+__all__ = ['general_k_library', 'ejk_ip2_library', 'ip2_library', 'cache_dir',
            'compute_capability', 'nvcc_path']

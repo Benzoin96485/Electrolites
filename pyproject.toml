@@ -49,4 +49,5 @@ electrolites = [
   "kernels/cuda/**/*.cu",
   "kernels/cuda/**/*.cuh",
   "kernels/cuda/**/*.json",
+  "kernels/cuda/**/*.inc",
 ]
