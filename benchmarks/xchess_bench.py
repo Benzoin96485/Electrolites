@@ -26,6 +26,9 @@ import cupy as cp
 from _common import build_mol, parser
 
 ap = parser(__doc__.splitlines()[0])
+ap.add_argument('--skip-orig', action='store_true',
+                help="don't time GPU4PySCF (minutes at 113 atoms); the "
+                     'speedup columns are then against nothing and read nan')
 a = ap.parse_args()
 
 import electrolites                                          # noqa: E402
@@ -71,8 +74,12 @@ for name, fast, orig in (
          hess._get_vxc_deriv1_orig),
         ('_get_vxc_deriv2', hess._get_vxc_deriv2,
          hess._get_vxc_deriv2_orig)):
-    t_o, ref = timeit(lambda: orig(*args), a.reps)
-    t_f, out = timeit(lambda: fast(*args), a.reps)
+    if a.skip_orig:
+        t_f, out = timeit(lambda: fast(*args), a.reps)
+        t_o, ref = float('nan'), out
+    else:
+        t_o, ref = timeit(lambda: orig(*args), a.reps)
+        t_f, out = timeit(lambda: fast(*args), a.reps)
     # the unrestricted functions return a (spin-up, spin-down) tuple whose
     # two members can have different shapes, so they are compared separately
     pairs = list(zip(out, ref)) if mol.spin else [(out, ref)]
@@ -82,18 +89,25 @@ for name, fast, orig in (
     fastxchess._ATOMSCREEN = False
     t_n, _ = timeit(lambda: fast(*args), a.reps)
     fastxchess._ATOMSCREEN = True
+    # W28's bandwidth kernel for aow/mow off, i.e. the cuTENSOR contraction
+    # this module used before (only _get_vxc_deriv1 forms either)
+    fastxchess._SCALESUM = False
+    t_k = (timeit(lambda: fast(*args), a.reps)[0]
+           if name == '_get_vxc_deriv1' else t_f)
+    fastxchess._SCALESUM = True
     ref = out = None
     cp.get_default_memory_pool().free_all_blocks()
-    rows.append((name, t_o, t_f, t_n, err, scale))
+    rows.append((name, t_o, t_f, t_n, err, scale, t_k))
     print(f'# {name}: {t_o:.3f} -> {t_f:.3f} s  ({t_o/t_f:.2f}x), '
           f'no atom screen {t_n:.3f} s ({t_o/t_n:.2f}x), '
+          f'cuTENSOR aow/mow {t_k:.3f} s ({t_k/t_f:.2f}x slower), '
           f'max err {err:.2e} of {scale:.2e}', flush=True)
 
 print(f'\n{"term":18s} {"GPU4PySCF":>10s} {"fastxchess":>11s} {"speedup":>8s} '
       f'{"no screen":>10s} {"":>8s} {"max err":>9s}')
 print('-' * 82)
 tot_o = tot_f = tot_n = 0.
-for name, t_o, t_f, t_n, err, scale in rows:
+for name, t_o, t_f, t_n, err, scale, _ in rows:
     tot_o += t_o
     tot_f += t_f
     tot_n += t_n
@@ -106,4 +120,5 @@ print('\n' + json.dumps({'tag': tag, 'gpu': gpu, 'natm': mol.natm,
                          'nao': int(mol.nao), 'spin': int(mol.spin),
                          'rows': [{'term': r[0], 'orig': r[1], 'fast': r[2],
                                    'no_atom_screen': r[3], 'err': r[4],
-                                   'scale': r[5]} for r in rows]}))
+                                   'scale': r[5], 'cutensor_aow': r[6]}
+                                  for r in rows]}))

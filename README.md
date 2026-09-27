@@ -56,7 +56,9 @@ and `h1` two-electron terms) are 2.6x, 1.4x and 1.4x inside a 42-atom run.
 Upstream's restricted **meta-GGA** Hessian is wrong and irreproducible — two
 of its functions contract `fxc` into one of their own operands, which
 cuTENSOR gets wrong at five density components — and `fastxchess` repairs
-both.  The `ip2` term has since gone to 2.3x–2.5x GPU4PySCF's at 113 atoms
+both, and since W28 replaces both meta-GGA XC terms as it does the GGA ones:
+a 42-atom DF-TPSS Hessian is **41.5 s → 13.4 s**, and 3.2x on open-shell Ni
+and Pt complexes (`docs/README_fastxchessmgga.md`).  The `ip2` term has since gone to 2.3x–2.5x GPU4PySCF's at 113 atoms
 with the fitting metric as a Cholesky factor.
 `docs/README_fastdfhess.md`, `docs/README_fastdfhessip.md`,
 `docs/README_fastdfhessip2.md`, `docs/README_mgga_repro.md`,
@@ -228,7 +230,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastgrad` | `grad.rks.Gradients.energy_ee` | — |
 | `fastxcgrad` | `grad.{rks,uks}.get_exc`, `get_nlc_exc` | `docs/README_fastxcgrad.md` |
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | — |
-| `fastxchess` | `hessian.{rks,uks}._get_vxc_deriv{1,2}`, and `hessian.rks`'s in-place `contract` calls (meta-GGA) | `docs/README_fastxchess.md`, `docs/README_mgga_repro.md` |
+| `fastxchess` | `hessian.{rks,uks}._get_vxc_deriv{1,2}` (GGA and meta-GGA), and `hessian.rks`'s in-place `contract` calls | `docs/README_fastxchess.md`, `docs/README_mgga_repro.md`, `docs/README_fastxchessmgga.md` |
 | `fastxcfxc` | `dft.numint.nr_{rks,uks}_fxc` — the grid half of every response property — and `hessian.rks.nr_rks_fxc_mo`, a restricted Hessian's | `docs/README_fastxcfxc.md`, `docs/README_fastdfhessip.md` |
 | `fastfnlc` | `hessian.{rks,uks}.nr_rks_fnlc_mo` — the VV10 response term | `docs/README_fastfnlc.md` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |

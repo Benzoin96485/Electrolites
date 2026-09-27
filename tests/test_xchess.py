@@ -38,18 +38,26 @@ CASES = [
     (GLYCINE, 'def2-svp', 'wb97x-d3bj', 3),
     (ALA2, 'def2-svp', 'b3lyp', 3),
     (ALA2, '6-31g**', 'pbe', 2),
-    # declined paths: they must fall through and still agree exactly
+    # meta-GGAs (W28): pure, hybrid, range-separated, and one with VV10
+    (H2O, 'def2-svp', 'tpss', 3),
+    (H2O, 'def2-tzvpp', 'r2scan', 3),
+    (CH3OH, 'def2-svp', 'm06-l', 3),
+    (GLYCINE, 'def2-svp', 'tpss', 3),
+    (GLYCINE, '6-31g*', 'scan', 3),
+    (ALA2, 'def2-svp', 'm06-2x', 3),
+    (CH3OH, 'def2-svp', 'wb97m-v', 3),
+    # a declined path: it must fall through and still agree exactly
     (H2O, 'def2-svp', 'svwn', 3),
     (H2O, 'def2-svp', 'm06-2x', 3),
 ]
 
 #: the functionals this module hands back to GPU4PySCF
-DECLINED = ('svwn', 'm06-2x')
+DECLINED = ('svwn',)
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--quick', action='store_true')
 a = ap.parse_args()
-cases = CASES[:4] + CASES[-2:] if a.quick else CASES
+cases = CASES[:4] + CASES[9:11] + CASES[-2:] if a.quick else CASES
 
 FAST1, FAST2 = hess_rks._get_vxc_deriv1, hess_rks._get_vxc_deriv2
 ORIG1, ORIG2 = hess_rks._get_vxc_deriv1_orig, hess_rks._get_vxc_deriv2_orig

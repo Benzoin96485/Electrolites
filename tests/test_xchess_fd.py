@@ -23,6 +23,10 @@ written the wrong way round still produces a symmetric, plausible-looking
 Hessian that is not the second derivative of anything.  Finite differences of
 the analytic UKS gradient do not care.
 
+The meta-GGA rows (W28) are the same check on the branches that turn on the
+kinetic-energy density: before W23 GPU4PySCF's own meta-GGA Hessian was
+wrong, so agreeing with it proves less there than agreeing with the energy.
+
     python tests/test_xchess_fd.py [--eps 1e-3] [--level 6]
 """
 import argparse
@@ -50,6 +54,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--eps', type=float, default=1e-3, help='bohr')
 ap.add_argument('--level', type=int, default=6)
 ap.add_argument('--tol', type=float, default=1e-3)
+ap.add_argument('--only', default='', help='run only the rows with this xc')
 a = ap.parse_args()
 
 BOHR = 0.52917721092
@@ -93,28 +98,50 @@ def fd_hessian(atom, basis, xc, spin=0):
 CASES = [(H2O, 'def2-svp', 'b3lyp', 0), (H2O, '6-31g*', 'pbe', 0),
          (NH3, 'def2-svp', 'b3lyp', 0), (H2O, 'def2-svp', 'svwn', 0),
          (O2, 'def2-svp', 'b3lyp', 2), (CH3, '6-31g*', 'pbe', 1),
-         (O2, 'def2-svp', 'svwn', 2)]
+         (O2, 'def2-svp', 'svwn', 2),
+         # W28: the meta-GGA branches (the finite difference is the only
+         # reference here that owes nothing to upstream's meta-GGA code)
+         (H2O, 'def2-svp', 'tpss', 0), (NH3, 'def2-svp', 'r2scan', 0),
+         (CH3, '6-31g*', 'tpss', 1)]
 
+if a.only:
+    CASES = [c for c in CASES if c[2] == a.only]
 print(f'# eps = {a.eps} bohr, grids.level = {a.level}, tol = {a.tol}')
 print(f'{"molecule/basis/xc":30s} {"ref":>4s} {"max |H_an - H_fd|":>18s} '
-      f'{"max |H|":>10s} {"xctype":>7s}')
-print('-' * 78)
+      f'{"max |H|":>10s} {"xctype":>7s} {"upstream":>10s}')
+print('-' * 89)
 fails = 0
 for atom, basis, xc, spin in CASES:
     mf = _mf(atom, basis, xc, spin=spin)
     xctype = mf._numint._xc_type(xc)
     han = cp.asnumpy(cp.asarray(mf.Hessian().kernel()))
+    up = ''
+    if xctype == 'MGGA':
+        # the same row on GPU4PySCF's meta-GGA branches: whether a
+        # disagreement with the finite difference is this module's or not
+        from gpu4pyscf.hessian import rks as hr, uks as hu
+        H = hu if spin else hr
+        F = H._get_vxc_deriv1, H._get_vxc_deriv2
+        H._get_vxc_deriv1, H._get_vxc_deriv2 = (H._get_vxc_deriv1_orig,
+                                                H._get_vxc_deriv2_orig)
+        hup = cp.asnumpy(cp.asarray(mf.Hessian().kernel()))
+        H._get_vxc_deriv1, H._get_vxc_deriv2 = F
     mf = None
     cp.get_default_memory_pool().free_all_blocks()
     hfd = fd_hessian(atom, basis, xc, spin=spin)
     err = np.abs(han - hfd).max()
+    if xctype == 'MGGA':
+        up = f' {np.abs(hup - hfd).max():10.2e}'
     ok = err < a.tol
     fails += not ok
     name = NAMES[id(atom)] + f'/{basis}/{xc}'
     print(f'{name:30s} {"UKS" if spin else "RKS":>4s} {err:18.2e} '
-          f'{np.abs(han).max():10.2e} {xctype:>7s}'
+          f'{np.abs(han).max():10.2e} {xctype:>7s}{up or " " * 11}'
           f'{"" if ok else "   FAIL"}', flush=True)
-print('-' * 78)
+print('-' * 89)
 print(f'{len(CASES) - fails}/{len(CASES)} within {a.tol}')
-# the LDA row is upstream's, not this module's: it is reported, not asserted
+# the LDA row is upstream's, not this module's: it is reported, not asserted.
+# NH3/r2SCAN is 1.1e-2 off at level 6 and 6.6e-3 at level 8 with GPU4PySCF's
+# own meta-GGA branches as well (the `upstream` column): r2SCAN's Hessian is
+# grid-sensitive, not wrong here.
 sys.exit(0)
