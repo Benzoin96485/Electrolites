@@ -2435,7 +2435,40 @@ exponent table to shared memory alone was measured at 1.00x
 * **Falsified if**: a literal-index contraction is not faster than the
   ablation's 53–83 % share allows.
 
-### W32 — The restricted `h1`'s stage C
+### W32 — The restricted `h1`'s stage C — **done: it was already at the GEMM rate (the price had the wrong `naux`), grouping takes it to the card's; for a pure functional C did not need its GEMM**
+
+`fastdfhessip._h1_stage_c` (item 17, both spin cases; `FASTDFHESSIP_H1C=atom`
+is W30's loop, `FASTDFHESSIP_H1C_ROWS` the group), `benchmarks/df_h1c_probe.py`,
+`tests/test_dfhessip.py`, `tests/test_dfuhessip.py`; write-up in
+`docs/README_fastdfh1c.md`.
+
+**For a hybrid the falsification fires.**  The auxiliary index here is
+Cartesian — 6598 functions on taxol, not 5598 — so C is 8.3e13 flops, and
+one launch per auxiliary atom already ran its GEMM at **15.7 TF/s** and the
+exchange contraction at 12.7 (`df_h1c_probe.py`, taxol's shapes).  Grouping
+consecutive atoms into GEMMs of up to 3072 rows (sized from free memory,
+released before stage D) takes the GEMM to **18.9 TF/s** of the A100's 19.5
+and the exchange, as cuBLAS calls, to 17.3: C **5.6–5.8 → 4.56 s
+(1.23x–1.28x)** at 113 atoms, the restricted B3LYP call **1.075x** (18.71 →
+17.40 s), 1.05x on the 113-atom Co complex, ties within ±3 % at 10–60 atoms
+and in def2-TZVPP, where C is a few per cent of the call.  The success bar's
+"≈4 s" was the same miscount; 4.56 s is the card's rate.  **The finding that
+paid is the Coulomb term**: `sum_{r in A} auxvec[r] j3c_1[x,r]` is
+`(sum_{r in A} auxvec[r] j2c_10[x,r]) · dm_3c`, one `(3 natm) x naux` matrix
+and one GEMM for every atom, `naux/natm` ≈ 58x less arithmetic — and with
+`k_factor = 0` (W30's item 14) that is all of stage C.  DF-PBE: C 4.60 →
+0.15 s, the h1 call **1.53x** on taxol, 1.48x on the Co complex, up to 1.23x
+at 21–60 atoms, **2.1x–3.4x** GPU4PySCF's; the unrestricted twin 1.10x–1.32x
+at 21–60 atoms and **1.75x** on taxol⁺ (C 9.04 → 0.18 s).  Whole DF-PBE
+Hessian on taxol 145.3 → 140.4 s; at 42 atoms inside the spread.  Correct to
+1.1e-15 against GPU4PySCF on every path, including the memory-short exchange
+branch, which no test had reached (`FASTDFHESSIP_H1KAO=0` forces it).  On a
+40 GB card (a 40 GB ballast) C keeps 1.18x, but the call is 28.7 s against
+17.4 because W30's D2 grows from 2.5 to 13.1 s at the smaller block — the
+next thing there.
+
+The original entry, for the record:
+
 
 *(Found by W30.)*
 
