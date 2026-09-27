@@ -29,7 +29,8 @@ not to write the code),
 `docs/README_fastdfhessip2.md` **W24** (whose finding is W29) and
 `docs/README_fastdfuhessip.md` **W25** (whose finding is W30),
 `docs/README_fastdfj3cscr.md` closed **W26**,
-`docs/README_fastdfaudit.md` **W27**, `docs/README_fastdfhessip3.md` **W29**
+`docs/README_fastdfaudit.md` **W27**, `docs/README_fastxchessmgga.md` **W28**
+(whose finding is W33), `docs/README_fastdfhessip3.md` **W29**
 (whose finding is W31), `docs/README_fastdfh1occ.md` **W30** (whose finding
 is W32),
 and **W6** took two rounds --
@@ -231,6 +232,17 @@ this page and it is what re-ranked §4.
 Ranked by (value × confidence) / cost, **after** §3.3.  Each item gives what
 to change, the evidence it rests on, what would count as success, and what
 would falsify it.
+
+**W28 is done, and W33 is what it found.**  `fastxchess` now covers
+meta-GGAs on both references: the atom loop was 92–95 % of both upstream
+functions and `eval_xc_eff` 1.2 %, and every tau term folds into a
+contraction B5 already had.  The two XC terms are 10.7x and 16.3x on a
+42-atom TPSS Hessian and 8.7x and 26.5x at 113 atoms; a whole DF-TPSS
+Hessian goes 41.5 → 13.4 s, 3.2x on UKS Ni and Pt complexes.  The profile
+also found B5's own GEMM operands written by cuTENSOR at a tenth of the
+card's bandwidth; a small kernel fixes that for GGAs too (1.9x–2.0x on
+B3LYP's `_get_vxc_deriv1`).  What is left is the CPHF — `nr_rks_fxc_mo`, 3.9x
+the B3LYP one on the same molecule: W33 (`docs/README_fastxchessmgga.md`).
 
 **W27 is done: 101 contractions can pass the plan wall by 545 atoms, and one
 guard covers all of them.**  `benchmarks/cutensor_audit.py` records every
@@ -2231,7 +2243,39 @@ is refused depends on the factors of an extent that moves with the molecule.
   any that do on a real run.
 * **Success**: a list with every entry either bounded under 2²⁹ or guarded.
 
-### W28 — The meta-GGA XC derivatives of a Hessian
+### W28 — The meta-GGA XC derivatives of a Hessian — **done: B5's screen carries over, every tau term folds into a contraction B5 already had, and the operands of B5's GEMMs were the other half**
+
+`electrolites/fastxchess.py` (`nc = 5` through every helper;
+`FASTXCHESS_MGGA=0` hands meta-GGAs back, `FASTXCHESS_SCALESUM=0` restores
+the cuTENSOR operands), `tests/test_xchess_mgga.py`,
+`benchmarks/mgga_xchess_probe.py`, `benchmarks/xchess_gemm_probe.py`;
+write-up in `docs/README_fastxchessmgga.md`.
+
+**The falsification does not fire.**  Upstream's meta-GGA branches, staged
+on penicillin V/TPSS: the atom loop is 92–95 % of both functions and the
+per-block `eval_xc_eff` at `deriv=2` 1.2 %, so B5's two mechanisms apply
+unchanged, and every tau term becomes part of a contraction B5 already had:
+`d tau / d R` comes from the same second-derivative gather as the gradient
+rows; in `_get_vxc_deriv1` upstream's `for j in range(1, 4)` block adds a
+matrix and its own transpose, which are the same matrix, and is one slab of
+a GEMM of inner dimension `4 ngrids` shared with the GGA term; in
+`_get_vxc_deriv2` the nine per-atom tau contractions are a fifth row of the
+atom-independent `W[x]`.  **The profile then found something that is not
+about meta-GGAs**: the GEMMs run at 16 TF/s, but cuTENSOR wrote their
+`aow`/`mow` operands at 139 GB/s (`'ypg,ayg->apg'` has a batch index it does
+not handle as one); a register-tiled kernel writes them at 766 GB/s, which
+is 1.4x–2.0x on `_get_vxc_deriv1` for GGAs as well (B3LYP taxol 19.8 →
+9.75 s).  **Success is met**: B5 was 5.07x/12.94x on GGAs at 42 atoms; on
+meta-GGAs the two functions are 10.7x and 16.3x on penicillin V (TPSS,
+r2SCAN, M06-L, M06-2X alike), 8.7x and 26.5x at 113 atoms, 5.8x and 9.1x in
+def2-TZVPP, 10.0x–13.5x and 12.7x–24x on open-shell Ni, Pt and Cu complexes.
+Whole DF-TPSS Hessians: penicillin V 41.5 → 13.4 s (3.10x), def2-TZVPP 67.4
+→ 41.7 s (1.62x), UKS Ni and Pt complexes 3.2x; traces to 1e-9.  Checked
+against PySCF's CPU functions: `deriv1` to 1e-12, `deriv2` to 1e-14 on eight
+restricted and unrestricted cases.  What is left is the CPHF's meta-GGA
+response kernel, **W33**.
+
+The original entry, for the record:
 
 *(Found by W23.)*
 
@@ -2413,6 +2457,23 @@ one launch per auxiliary atom, `naux_A` ≈ 50 rows each.
 * **Falsified if**: the per-atom launches are already at 15 TF/s — then C
   is arithmetic, and the next thing to try is `j2c_10`'s sparsity (the
   derivative of `(r|s)` on `r`'s atom decays with the distance to `s`).
+
+### W33 — The CPHF's meta-GGA response kernel
+
+*(Found by W28.)*
+
+After W28 a DF-TPSS Hessian at 42 atoms is 57 % CPHF in def2-SVP and 72 % in
+def2-TZVPP, and almost all of that is `nr_rks_fxc_mo`, which already runs
+`fastxcfxc`'s blocked code (W16): six calls take 28.5 s for TPSS against
+7.2 s for B3LYP on the same molecule in def2-TZVPP (3.9x), 6.6 s against
+2.0 s in def2-SVP (3.2x).  A meta-GGA response needs four density products
+per block where a GGA needs one, so part of that gap is arithmetic.
+
+* **Do**: profile `fastxcfxc`'s meta-GGA `_mo` path per stage — its GEMM
+  rate and its operand-formation rate, the latter being W28's finding.
+* **Success**: the def2-TZVPP call moves toward the arithmetic ratio over
+  B3LYP.
+* **Falsified if**: it is already at the GEMM rate for four products.
 
 ### Not on this list
 

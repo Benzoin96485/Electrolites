@@ -298,7 +298,10 @@ block of the size seen where there is a `blk`; `first past` is the smallest
 of taxol, PfPMT and HcgC at which it passes; `plan` is cuTENSOR's answer at
 the largest shape seen.  Line numbers are this commit's for `electrolites/` and GPU4PySCF 1.8.1's for the rest.  The runs are from before
 W29 (`docs/README_fastdfhessip3.md`); the penicillin V Hessian re-audited
-after it reaches the same call sites and patterns.  Every row is
+after it reaches the same call sites and patterns.  The four
+`fastxchess` rows have no line: W28 (`docs/README_fastxchessmgga.md`)
+writes those operands with a kernel of its own instead of `contract`
+(W28 did not re-run this audit).  Every row is
 guarded by `planguard`; the rows marked in §2 are also behind their own
 query.
 
@@ -352,13 +355,13 @@ query.
   fastdfhessip._h_aux_block:1334               xrt,ytr->xryt          7  8.24e+07 ok    (3,naux_c,3,naux_c)             7.63e+09 PfPMT
   fastdfhessip._j_energy_per_atom:981          xrs,yts->rtxy          1  6.04e+07 ok    (naux_c,naux_c,3,3)             7.63e+09 PfPMT
   fastdfhessip._j_energy_per_atom:991          xrt,ytr->rtxy          1  6.04e+07 ok    (naux_c,naux_c,3,3)             7.63e+09 PfPMT
-  fastxchess._deriv1_block_u:618               yqg,ayg->aqg           592  7.37e+07 ok    (3*natm,nocc,blk=4096)          6.77e+09 PfPMT
-  fastxchess._deriv1_block:352                 yqg,ayg->aqg           844  4.75e+07 ok    (3*natm,nocc,blk=4096)          6.77e+09 PfPMT
+  fastxchess._deriv1_block_u                   yqg,ayg->aqg           592  7.37e+07 ok    (3*natm,nocc,blk=4096)          6.77e+09 PfPMT
+  fastxchess._deriv1_block                     yqg,ayg->aqg           844  4.75e+07 ok    (3*natm,nocc,blk=4096)          6.77e+09 PfPMT
   df.df_jk.proc:558                            Lij,njk->nikL          144  5.06e+07 ok    (5,nao,nocc,blk=256)            6.52e+09 PfPMT
   _dfhessip_u._jk_energy_per_atom:341          xrnuj,sr->xsnuj        102  6.54e+07 ok    (3,naux_c,2,blk=36,nocc)        6.36e+09 PfPMT
   _dfhessip_u._jk_energy_per_atom:343          ysnij,nui->ysnuj       102  6.54e+07 ok    (3,naux_c,2,blk=36,nocc)        6.36e+09 PfPMT
   _dfhessip_u._get_veff:946                    rniq,ar->aniq          87  6.49e+06 ok    (natm,2,nocc,nao_c)             5.83e+09 PfPMT
-  fastxchess._deriv1_block:348                 ypg,ayg->apg           844  4.11e+08 ok    (3*natm,blk=797,blk=4096)       5.34e+09 taxol
+  fastxchess._deriv1_block                     ypg,ayg->apg           844  4.11e+08 ok    (3*natm,blk=797,blk=4096)       5.34e+09 taxol
   fastdfhessip._jk_energy_per_atom:711         rs,pir->spi            39  4.14e+07 ok    (blk=992,nao_c,nocc)            5.31e+09 PfPMT
   _dfhessip_u._jk_energy_per_atom:156          pqr,pi->iqr            58  5.36e+07 ok    (nocc,nao_c,blk=990)            5.30e+09 PfPMT
   fastdfgrad.ip1_loop:1135                     rji,qj->iqr            310  2.57e+08 ok    (nocc,nao_c,blk=960)            5.14e+09 PfPMT
@@ -372,7 +375,7 @@ query.
   fastdfhessip._jk_energy_per_atom:706         pqr,qi->pir            219  3.23e+07 ok    (nao_c,nocc,blk=774)            4.14e+09 PfPMT
   fastdfhessip._chol_d4_d5:1439                ysji,ui->ysuj          239  2.90e+07 ok    (3,naux,blk=48,nocc)            3.60e+09 PfPMT
   fastdfhessip._jk_energy_per_atom:718         rs,pir->spi            180  2.69e+07 ok    (blk=645,nao_c,nocc)            3.45e+09 PfPMT
-  fastxchess._deriv1_block_u:614               ypg,ayg->apg           592  3.38e+08 ok    (3*natm,blk=458,blk=4096)       3.07e+09 taxol
+  fastxchess._deriv1_block_u                   ypg,ayg->apg           592  3.38e+08 ok    (3*natm,blk=458,blk=4096)       3.07e+09 taxol
   fastdfhessip._get_veff:2252                  riq,ar->aiq            201  1.75e+06 ok    (natm,nocc,nao_c)               2.92e+09 HcgC
   fastdfhess._jk_once:563                      Lpq,sqj->spjL          441  2.64e+07 ok    (2,nao,nocc,blk=256)            2.61e+09 PfPMT
   fastdfhessip._h_aux_block:1326               xrij,sij->xrs          7  2.75e+07 ok    (3,naux_c,naux_c)               2.54e+09 PfPMT
