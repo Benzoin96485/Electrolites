@@ -131,6 +131,9 @@ SWITCHES = [('default', {}),
             ('FUSE=0', {'FUSE': 0}),
             ('H1J=upstream', {'H1J': 'upstream'}),
             ('H1ATOM=upstream', {'H1ATOM': 'upstream'}),
+            ('H1ATOM=batched', {'H1ATOM': 'batched'}),
+            ('H1ATOM=occ', {'H1ATOM': 'occ'}),
+            ('K0=compute', {'K0': 'compute'}),
             ('JPAIR=0', {'JPAIR': 0}),
             ('METRIC=eigen', {'METRIC': 'eigen'}),
             ('TRI=solve', {'TRI': 'solve'}),
@@ -227,17 +230,18 @@ for vchunk in (160, 64):
 # and the occupied batching, forced: ethanol's 13 occupied orbitals never
 # need it at any cap its sizing survives
 for nb in (8, 5):
-    for term in ('ip2', 'h1'):
-        with env(OCC_BATCH=nb):
+    for term in ('ip2', 'h1', 'h1 occ'):
+        with env(OCC_BATCH=nb, H1ATOM='occ' if term == 'h1 occ' else 'auto'):
             if term == 'ip2':
                 got = fastdfhessip._jk_energy_per_atom(intopt, dm0, 1., 0.2)
             else:
                 got = fastdfhessip._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
+                assert fastdfhessip.stats()['h1_occ'] == (term == 'h1 occ')
         st = fastdfhessip.stats()
         check(f'ethanol {term} {nb} occupied per batch '
-              f'(occ_batches={st["occ_batches"]})', got, ref[term])
+              f'(occ_batches={st["occ_batches"]})', got, ref[term[:3].strip()])
         if st['occ_batches'] > 1:
-            reached[term].add('occ')
+            reached[term[:3].strip()].add('occ')
 ok = reached['ip2'] == {'occ', 'v', 'v fused'} and 'occ' in reached['h1']
 if not ok:
     fails.append(f'memory cap did not reach the batched paths: {reached}')

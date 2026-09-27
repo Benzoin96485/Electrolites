@@ -130,6 +130,7 @@ SWITCHES = [('default', {}),
             ('H1ATOM=upstream', {'H1ATOM': 'upstream'}),
             ('H1ATOM=batched', {'H1ATOM': 'batched'}),
             ('H1ATOM=occ', {'H1ATOM': 'occ'}),
+            ('K0=compute', {'K0': 'compute'}),
             ('JPAIR=0', {'JPAIR': 0})]
 
 

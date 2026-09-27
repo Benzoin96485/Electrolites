@@ -112,6 +112,37 @@ def main():
     check(nb == 530, f'fastdfhess batch at nao 430, nocc 92: {nb} (W8 '
                      'bisected 530)')
 
+    # W27: `_cuplan.contract` cuts a refused contraction and gets the same
+    # numbers, with and without `out`, with beta, and on a strided operand
+    cp.get_default_memory_pool().free_all_blocks()
+    rng = cp.random.default_rng(1)
+    nocc, nao, dk = 226, 1185, 914
+    tmp = rng.standard_normal((nocc, nao, dk))
+    c = rng.standard_normal((nao, nocc))
+    check(not planable('iqr,pi->pqr', tmp, c, (nao, nao, dk)),
+          'W21 refused shape is refused')
+    ref = (c @ tmp.reshape(nocc, -1)).reshape(nao, nao, dk)
+    cut0 = _cuplan.stats().get('cut', 0)
+    got = _cuplan.contract('iqr,pi->pqr', tmp, c)
+    err = float(abs(got - ref).max() / abs(ref).max())
+    check(err < 1e-14 and _cuplan.stats().get('cut', 0) == cut0 + 1,
+          f'contract cuts the refused call, out=None: {err:.1e}')
+    got[:] = 1.
+    _cuplan.contract('iqr,pi->pqr', tmp, c, 2., 0.5, out=got)
+    err = float(abs(got - (2 * ref + .5)).max() / abs(ref).max())
+    check(err < 1e-14, f'with out, alpha and beta: {err:.1e}')
+    got = None
+    ct = cp.asfortranarray(c)
+    got = _cuplan.contract('iqr,pi->pqr', tmp, ct)
+    err = float(abs(got - ref).max() / abs(ref).max())
+    check(err < 1e-14, f'with a strided operand: {err:.1e}')
+    got = ref = tmp = None
+    small = rng.standard_normal((8, 9))
+    got = _cuplan.contract('ij,jk->ik', small, small.T.copy())
+    check(float(abs(got - small @ small.T).max()) < 1e-13,
+          'a small call is the plain call')
+    cp.get_default_memory_pool().free_all_blocks()
+
     print(f'\n_cuplan {_cuplan.stats()}')
     print('FAILURES' if fails else 'all ok')
     return 1 if fails else 0

@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh',
+    'fastdfhessip', 'fastdfrsh', 'planguard',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -176,6 +176,10 @@ _TARGETS = {
     # keeps the fused tensor so that `DF.reset` drops it
     'fastdfrsh': (('gpu4pyscf.df.df_jk', '_DFHF.get_veff'),
                   ('gpu4pyscf.df.df', 'DF.range_coulomb')),
+    # not a kernel: the one function every `contract` in GPU4PySCF and here
+    # goes through, looked up at call time, wrapped so that a contraction
+    # cuTENSOR refuses is cut into pieces it plans (docs/DF_WORK_LIST.md W27)
+    'planguard': ('gpu4pyscf.lib.cutensor', 'contraction'),
 }
 
 _patched = []

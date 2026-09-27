@@ -29,6 +29,10 @@ are the same ``FASTDFHESSIP_*`` ones and mean the same thing:
   hoisted, one per spin) and **item 5** (the Coulomb half's per-atom loop as
   one GEMM against the atom indicator).  The Coulomb ``vhf1`` term, which
   upstream forms once per spin from the same ``auxvec``, is formed once.
+  **Item 12** (the per-atom exchange term on the occupied side, chosen by a
+  shape score) started here and was carried back to the restricted function
+  by W30, which also added **item 14** to both (no exchange contraction at
+  all when ``k_factor = 0``).
 
 Item 8 (the metric as its Cholesky factor, W24) is not carried over: it
 lives in ``_chol_d4_d5``, whose five contractions would all need the spin
@@ -612,6 +616,8 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     _S['h1_u'] = _S.get('h1_u', 0) + 1
     spmult = int(_env('FASTDFHESSIP_SPMULT', '1'))
     jbatch = _env('FASTDFHESSIP_H1J', 'batched') != 'upstream'
+    # item 14 (W30): no exchange contraction at all when k_factor = 0
+    do_k = k_factor != 0 or _env('FASTDFHESSIP_K0', 'skip') != 'skip'
     st = _Stages('h1 U')
 
     mol = int3c2e_opt.mol
@@ -654,7 +660,9 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     assert word_avail > 0, 'Insufficient GPU memory'
 
     mem_sufficient = natm*3*2*nao**2 < word_avail * .6
-    if mem_sufficient:
+    # the per-atom AO-pair matrices hold exchange terms only
+    k_ao = mem_sufficient and do_k
+    if k_ao:
         vhf_atm_ao = cp.zeros((natm, 3, 2, nao, nao))
         word_avail -= vhf_atm_ao.size
 
@@ -683,7 +691,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     # occupied-contracted density of both spins, so the block is sized with
     # it in the denominator
     h1atom = _env('FASTDFHESSIP_H1ATOM', 'auto')
-    hoist = mem_sufficient and h1atom != 'upstream'
+    hoist = k_ao and h1atom != 'upstream'
     # item 12: the same per-atom exchange term with the AO pair projected
     # on the occupied orbitals before the atom's contraction, not after.
     # Per atom and block it saves 4 nao_A dk nao (nao - 2 nocc) flops and
@@ -754,7 +762,12 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     buf = cp.empty((3, naux_in_atm, 2, nocc, nao))
     buf1 = cp.empty((naux_in_atm, 2, nocc, nao))
     for i, (p0, p1) in enumerate(aux_slices):
-        if mem_sufficient:
+        if not do_k:
+            dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
+                                out=buf1[:p1-p0])
+            j3c_1 = ndarray((3, p1-p0, 2, nocc, nao), buffer=buf)
+            contract('xrs,sniq->xrniq', j2c_10[:, p0:p1], dm_3c, out=j3c_1)
+        elif mem_sufficient:
             dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
                                 out=buf1[:p1-p0])
             j3c_1 = ndarray((3, p1-p0, 2, nocc, nao), buffer=buf)
@@ -839,12 +852,15 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
             for x in range(3):
                 j3c[j_addr, i_addr] = compressed_dj[x, :, k0:k1]
                 j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
-                tmp = ndarray((2, nao, dk, nocc), buffer=work1)
-                j3c_pri = contract('pqr,nqi->npri', j3c, orbo, out=tmp)
-                contract('npri,rniq->npq', j3c_pri, dm_3c[_aux0:_aux1],
-                         -k_factor, beta=1, out=vhf1[x])
+                if do_k:
+                    tmp = ndarray((2, nao, dk, nocc), buffer=work1)
+                    j3c_pri = contract('pqr,nqi->npri', j3c, orbo, out=tmp)
+                    contract('npri,rniq->npq', j3c_pri, dm_3c[_aux0:_aux1],
+                             -k_factor, beta=1, out=vhf1[x])
                 st('D1 vhf1')
-                if occ_k:
+                if not do_k:
+                    pass
+                elif occ_k:
                     # sum_{u in A, r} of the two halves of X + X^T, each
                     # already on the occupied side: upstream's
                     # memory-short branch with both of its intermediates
@@ -865,7 +881,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
                         contract('upr,nurq->npq', j3c[p0:p1],
                                  t_all[:, p0:p1], -k_factor, beta=1,
                                  out=vhf_atm_ao[i, x])
-                elif mem_sufficient:
+                elif k_ao:
                     for i, (p0, p1) in enumerate(zip(aoslices[:-1],
                                                      aoslices[1:])):
                         if p1 - p0 < nocc:
@@ -958,7 +974,10 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
             if count == 0:
                 continue
             p0, p1 = p1, p1 + count
-            if mem_sufficient:
+            if not do_k:
+                auxvec_ipaux = contract('xrnip,npi->xr', j3c_aux[:, p0:p1],
+                                        orbo)
+            elif mem_sufficient:
                 auxvec_ipaux = contract('xrnip,npi->xr', j3c_aux[:, p0:p1],
                                         orbo)
                 contract('xrnip,rniq->xnpq', j3c_aux[:, p0:p1],
@@ -986,7 +1005,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     compressed_di = compressed_dj = compressed_dk = t_all = s_all = None
     dm_oo = dm_3c = None
 
-    if mem_sufficient:
+    if k_ao:
         transpose_sum(vhf_atm_ao.reshape(-1, nao, nao), inplace=True)
         contract('nxspq,sqj->nxsjp', vhf_atm_ao, orbo, beta=1, out=vhf_atm)
         vhf_atm_ao = None

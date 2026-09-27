@@ -248,6 +248,15 @@ def int2c2e(mol, sort_output=True, omega=None):
     # `_check_rsh_factors` falls back to `cell.omega` when the call does not
     # name one, and a kept optimiser holds the `cell` of whichever build made
     # it -- `DF.range_coulomb` sets `omega` on the *caller's* auxmol, so the
-    # two have to be put back in step before the kernel reads it.
+    # two have to be put back in step before the kernel reads it -- and put
+    # back afterwards: `from_cell` returns a `SortedGTO` it is given, so the
+    # kept `cell` can be the very object a full-range `Int3c2eOpt` holds as
+    # its `auxmol`, and leaving the long-range omega on it made the next
+    # user of that optimiser -- the DF gradient's reuse of the SCF's -- build
+    # the long-range metric for the full-range call (`DF_WORK_LIST.md` W27)
+    saved = opt.cell.omega
     opt.cell.omega = mol.omega
-    return opt.int2c2e(None, sort_output=sort_output, omega=omega)
+    try:
+        return opt.int2c2e(None, sort_output=sort_output, omega=omega)
+    finally:
+        opt.cell.omega = saved

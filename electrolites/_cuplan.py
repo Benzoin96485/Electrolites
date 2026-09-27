@@ -208,9 +208,104 @@ def prange(start, stop, step, accepts):
         k0 = k1
 
 
+def _free_modes(sa, sb, sc):
+    """Output modes that appear in exactly one operand, with that operand.
+
+    Cutting one of them cuts the contraction into independent pieces: each
+    piece reads a slice of one operand, all of the other, and writes a slice
+    of the output.
+    """
+    out = []
+    for m in sc:
+        if (m in sa) != (m in sb):
+            out.append((m, 0 if m in sa else 1))
+    return out
+
+
+def _cut(x, axis, k0, k1):
+    return x[(slice(None),) * axis + (slice(k0, k1),)]
+
+
+@functools.lru_cache(maxsize=4096)
+def _parse(pattern):
+    p = pattern.replace(' ', '')
+    sa, rest = p.split(',')
+    sb, sc = rest.split('->')
+    return p, sa, sb, sc
+
+
+def contract_with(call, pattern, a, b, alpha=1.0, beta=0.0, out=None,
+                  **kw):
+    """``call(pattern, a, b, alpha, beta, out=out)``, cut if cuTENSOR refuses.
+
+    `docs/DF_WORK_LIST.md` **W27**.  ``call`` is
+    ``gpu4pyscf.lib.cutensor.contraction`` or anything with its signature.
+    An output of at most 2**29 elements is never refused, so below that this
+    is the plain call and costs one product of the output's extents.  Above
+    it cuTENSOR is asked first (`planable`, cached); a refused contraction is
+    cut along an output mode that belongs to one operand only -- the largest
+    such mode, into the largest pieces that plan (`prange`) -- and each piece
+    is the same call on views.  The arithmetic of every element is unchanged:
+    a piece is the same contraction over the same summed indices, so the
+    result is the same to the last bit whenever cuTENSOR picks the same
+    kernel for the pieces.  If no mode can be cut into pieces that plan, the
+    call goes to ``cupy.einsum``, which has no such limit.
+    """
+    p, sa, sb, sc = _parse(pattern)
+    if out is not None:
+        n = out.size
+    else:
+        ext = dict(zip(sa + sb, a.shape + b.shape))
+        n = 1
+        for m in sc:
+            n *= ext[m]
+    if n <= OUTPUT_ELEMENT_LIMIT or a.size == 0 or b.size == 0:
+        return call(pattern, a, b, alpha, beta, out=out, **kw)
+    ext = dict(zip(sa + sb, a.shape + b.shape))
+    shape = tuple(out.shape) if out is not None else tuple(ext[m] for m in sc)
+    if out is None:
+        out = cp.empty(shape, dtype=np.result_type(a.dtype, b.dtype))
+        beta = 0.0
+    if planable(p, a, b, out):
+        return call(pattern, a, b, alpha, beta, out=out, **kw)
+    STATS['cut'] = STATS.get('cut', 0) + 1
+    for m, side in sorted(_free_modes(sa, sb, sc), key=lambda t: -ext[t[0]]):
+        ax_in = (sa if side == 0 else sb).index(m)
+        ax_out = sc.index(m)
+        src = a if side == 0 else b
+
+        def pieces_plan(k, ax_in=ax_in, ax_out=ax_out, src=src, side=side):
+            x = _cut(src, ax_in, 0, k)
+            ops = (x, b) if side == 0 else (a, x)
+            return planable(p, *ops, _cut(out, ax_out, 0, k))
+        if not pieces_plan(1):
+            continue
+        for k0, k1 in prange(0, ext[m], ext[m], pieces_plan):
+            x = _cut(src, ax_in, k0, k1)
+            ops = (x, b) if side == 0 else (a, x)
+            call(pattern, *ops, alpha, beta, out=_cut(out, ax_out, k0, k1),
+                 **kw)
+        return out
+    STATS['einsum'] = STATS.get('einsum', 0) + 1
+    from gpu4pyscf.lib import cutensor as _g
+    return _g._contract_einsum(p, a, b, alpha, beta, out)
+
+
+def contract(pattern, a, b, alpha=1.0, beta=0.0, out=None):
+    """``cupy_helper.contract`` through `contract_with`."""
+    if not HAVE_CUTENSOR:
+        from gpu4pyscf.lib.cupy_helper import contract as _c
+        return _c(pattern, a, b, alpha, beta, out=out)
+    from gpu4pyscf.lib import cutensor as _g
+    # the unguarded call when `planguard` has installed itself over it
+    call = getattr(_g, '_contraction_unguarded', _g.contraction)
+    return contract_with(call, pattern, a, b, alpha, beta, out=out)
+
+
 def stats():
     return dict(STATS)
 
 
-__all__ = ['planable', 'largest', 'prange', 'stats', 'CuTensorError',
-           'OUTPUT_ELEMENT_LIMIT', 'HAVE_CUTENSOR']
+__all__ = ['planable', 'largest', 'prange', 'contract', 'contract_with',
+           'stats',
+           'CuTensorError', 'OUTPUT_ELEMENT_LIMIT', 'HAVE_CUTENSOR']

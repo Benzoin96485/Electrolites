@@ -321,6 +321,26 @@ def main():
                   f'built, cached and cached again: {worst_j2c:.2e}',
                   flush=True)
         saux.omega = 0.
+        # W27: a cached optimiser keeps the `cell` it was built from, which
+        # can be another caller's auxmol; a long-range call through a second
+        # object must not leave its omega on the first one.  It did, and a
+        # range-separated DF gradient reusing the SCF's `Int3c2eOpt` then
+        # built the long-range metric for its full-range call
+        J2C._J2C = 'cache'
+        first = _intopt(mol, a.auxbasis).auxmol
+        second = _intopt(mol, a.auxbasis).auxmol
+        want = _bdiv.int2c2e_orig(first)
+        J2C._CACHE.clear()
+        J2C.int2c2e(first)
+        second.omega = 0.3
+        J2C.int2c2e(second, omega=0.3)
+        left = first.omega
+        err = _cmp(J2C.int2c2e(first), want)
+        ok = left == 0. and err <= a.tol
+        fails += not ok
+        print(f'{"ok  " if ok else "FAIL"} ethanol  {basis:11s} a long-range '
+              f'call through a second auxmol leaves the first at omega='
+              f'{left}: {err:.2e}', flush=True)
     J2C._J2C = 'cache'
     if J2C.stats()['reused'] == 0:
         print('FAIL the optimiser cache never hit', flush=True)
