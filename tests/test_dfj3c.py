@@ -370,6 +370,83 @@ def kernels():
     return fails
 
 
+def screened():
+    """W26's test inside W19's kernels, on both contractions.
+
+    At a threshold of zero nothing may be skipped, so the screened launch
+    must equal the unscreened one to round-off; at a finite threshold what is
+    skipped is bounded by the Schwarz inequality -- a skipped (warp, batch)
+    of the density kernel moves an auxiliary component by at most ``tau``
+    per element of its 32 pairs' blocks, and a skipped (warp, shell) of the
+    auxiliary-vector kernel a pair's element by ``tau`` per function of the
+    shell -- and the error must sit under the sum of those bounds and above
+    zero.  The Ni complex with the ceiling at 8 puts
+    GPU4PySCF's kernels and this module's into one output, which is the path
+    that builds the groups past the ceiling whole.
+    """
+    from electrolites import _j3ck, _j3cinc
+    fails = 0
+    for name, geom, charge, spin, kmax in (
+            ('ethanol', ETHANOL, 0, 0, 99),
+            ('Ni dithiolene', NI_DITHIOLENE, -1, 1, 99),
+            ('Ni dithiolene', NI_DITHIOLENE, -1, 1, 8)):
+        mol = gto.M(atom=geom, basis=a.basis, charge=charge, spin=spin,
+                    verbose=0)
+        mf = (scf.UHF if spin else scf.RHF)(mol).density_fit(
+            auxbasis=a.auxbasis)
+        mf.verbose = 0
+        dfobj = mf.with_df
+        install(True)
+        dm = cp.asarray(_dm(mol, spin, 1)).reshape(-1, mol.nao, mol.nao)
+        df_jk.get_j(dfobj, dm.sum(0), 1)
+        opt = dfobj.j_engine
+        old = _j3ck.MAX_ORDER
+        _j3ck.MAX_ORDER = kmax
+        setattr(opt, _j3ck._ATTR, {})
+        try:
+            c = _j3c.constants(opt)
+            kp = _j3ck.plan(opt, c)
+            scr = _j3cinc.screen(opt, c)
+            rng = np.random.default_rng(7)
+            d = cp.asarray(rng.normal(scale=1e-6, size=(mol.nao, mol.nao)))
+            dds = opt.mol.apply_C_mat_CT(d + d.T)
+            dc = cp.asarray(rng.normal(scale=1e-6, size=c.naux_sph))
+            w = scr.pair_weights(dds)
+            e_aux = scr.aux_weights(dc)
+            ref_dm = fastdfj3c._contract_dm_screened(c, kp, dds, None)
+            ref_aux = fastdfj3c._contract_auxvec_screened(c, kp, dc, None)
+            for tau in (0., 1e-10):
+                got_dm = fastdfj3c._contract_dm_screened(
+                    c, kp, dds, (w, scr.q_aux, tau))
+                got_aux = fastdfj3c._contract_auxvec_screened(
+                    c, kp, dc, (scr.q_pair, e_aux, tau))
+                e_dm = float(abs(got_dm - ref_dm).max())
+                e_ax = float(abs(got_aux - ref_aux).max())
+                if tau == 0.:
+                    ok = (_err(got_dm, ref_dm) < a.tol
+                          and _err(got_aux, ref_aux) < a.tol)
+                    what = f'{_err(got_dm, ref_dm):.1e} / ' \
+                           f'{_err(got_aux, ref_aux):.1e} relative'
+                else:
+                    nwarp = sum((hi - lo + 31) // 32 for _, lo, hi in kp.ours)
+                    nf = int(np.diff(opt.mol.ao_loc).max())
+                    nfa = int(np.diff(opt.auxmol.ao_loc).max())
+                    # a pair's bound covers each of its nf^2 elements and a
+                    # shell's each of its nfa functions; x2 is hermi=1
+                    b_dm = 2 * 32 * nf * nf * tau * nwarp
+                    b_ax = nfa * tau * opt.auxmol.nbas
+                    ok = 0 < e_dm <= b_dm and e_ax <= b_ax
+                    what = (f'{e_dm:.1e} (bound {b_dm:.1e}) / {e_ax:.1e} '
+                            f'(bound {b_ax:.1e}) absolute')
+                fails += not ok
+                print(f'{"ok  " if ok else "FAIL"} W26 screened kernels, '
+                      f'{name}, ceiling {kmax}, tau {tau:g}: {what}')
+        finally:
+            _j3ck.MAX_ORDER = old
+            setattr(opt, _j3ck._ATTR, {})
+    return fails
+
+
 def incremental():
     """W20's build from the difference: the same SCF, the same answer.
 
@@ -380,9 +457,13 @@ def incremental():
     must be built whole, and must equal a build that never had a state.
     """
     fails = 0
-    for name, geom, spin, xc in (('ethanol', ETHANOL, 0, 'pbe'),
-                                 ('CH3', CH3, 1, 'pbe'),
-                                 ('ethanol', ETHANOL, 0, 'b3lyp')):
+    for mode, name, geom, spin, xc in (
+            (m, *case) for m in ('list', 'kernel')
+            for case in (('ethanol', ETHANOL, 0, 'pbe'),
+                         ('CH3', CH3, 1, 'pbe'),
+                         ('ethanol', ETHANOL, 0, 'b3lyp'))):
+        fastdfj3c.INC_SCREEN = mode
+        fastdfj3c.INC_TOL = 1e-13 if mode == 'kernel' else 1e-11
         mol = gto.M(atom=geom, basis=a.basis, spin=spin, verbose=0)
         out = {}
         for inc in (False, True):
@@ -401,7 +482,7 @@ def incremental():
         dc = abs(out[True][1] - out[False][1])
         ok = de < a.etol and dc <= 1 and (out[True][2] > 0 or xc == 'b3lyp')
         fails += not ok
-        print(f'{"ok  " if ok else "FAIL"} W20 {name}/{xc} spin={spin}: dE = '
+        print(f'{"ok  " if ok else "FAIL"} W20/{mode} {name}/{xc} spin={spin}: dE = '
               f'{de:.1e} Eh, cycles {out[False][1]} vs {out[True][1]}, '
               f'{out[True][2]} builds from the difference')
 
@@ -430,6 +511,7 @@ def main():
           f'patched: {electrolites.patched()}  basis {a.basis}')
     fails = matrices()
     fails += kernels()
+    fails += screened()
     fails += rebuild()
     fails += devices()
     if not a.no_scf:

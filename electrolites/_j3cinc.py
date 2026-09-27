@@ -26,6 +26,8 @@ through an SCF.
 
 This module patches nothing.
 """
+import functools
+
 import numpy as np
 import cupy as cp
 
@@ -66,6 +68,12 @@ class Screen:
         self.q_aux = cp.asarray(qP)
         self.q_aux_max = float(qP.max())
         self.q_pair_max = float(cp.asnumpy(self.q_pair.max()))
+        # W26's per-call inputs are one launch each
+        self._ish32 = self.ish.astype(np.int32)
+        self._jsh32 = self.jsh.astype(np.int32)
+        self._ao_loc = cp.asarray(ao_loc, dtype=np.int32)
+        self._aux_loc = cp.asarray(aux.ao_loc, dtype=np.int32)
+        self.nao = int(ao_loc[-1])
 
     def pair_absmax(self, m):
         """``max |m|`` over each stored pair's shell block of a sorted-basis
@@ -91,6 +99,29 @@ class Screen:
             out[s0:s1] = v[a0:a0 + (s1 - s0) * nf].reshape(s1 - s0, nf).max(1)
         return out
 
+    def pair_weights(self, ddm, out=None):
+        """``q_ij max|ddm|`` over each stored pair's shell block, in
+        ``shl_pair_idx`` order: `pair_absmax` times ``q_pair`` in one launch,
+        which is what W26's kernels read."""
+        n = len(self.q_pair)
+        out = cp.empty(n) if out is None else out
+        ddm = cp.ascontiguousarray(ddm)
+        _kernels().get_function('j3cinc_pair_w')(
+            ((n + 255) // 256,), (256,),
+            (ddm, np.int32(self.nao), self._ish32, self._jsh32, self._ao_loc,
+             self.q_pair, out, np.int32(n)))
+        return out
+
+    def aux_weights(self, dc, out=None):
+        """``q_P max|dc|`` over each sorted auxiliary shell, one launch."""
+        n = self.naux_sh
+        out = cp.empty(n) if out is None else out
+        dc = cp.ascontiguousarray(dc)
+        _kernels().get_function('j3cinc_aux_w')(
+            ((n + 255) // 256,), (256,),
+            (dc, self._aux_loc, self.q_aux, out, np.int32(n)))
+        return out
+
     def keep_dm(self, ddm, tol):
         """Pairs the density contraction of ``ddm`` cannot drop."""
         return self.q_pair * self.pair_absmax(ddm) * self.q_aux_max >= tol
@@ -99,6 +130,44 @@ class Screen:
         """Pairs the auxiliary-vector contraction of ``dc`` cannot drop."""
         s = float(cp.dot(self.q_aux, self.aux_absmax(dc)))
         return self.q_pair * s >= tol
+
+
+_SRC = r"""
+extern "C" __global__
+void j3cinc_pair_w(const double* __restrict__ m, const int nao,
+                   const int* __restrict__ ish, const int* __restrict__ jsh,
+                   const int* __restrict__ ao_loc,
+                   const double* __restrict__ q, double* __restrict__ w,
+                   const int n)
+{
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    const int i0 = ao_loc[ish[p]], i1 = ao_loc[ish[p] + 1];
+    const int j0 = ao_loc[jsh[p]], j1 = ao_loc[jsh[p] + 1];
+    double v = 0.;
+    for (int i = i0; i < i1; i++)
+        for (int j = j0; j < j1; j++)
+            v = fmax(v, fabs(m[(size_t)i * nao + j]));
+    w[p] = q[p] * v;
+}
+
+extern "C" __global__
+void j3cinc_aux_w(const double* __restrict__ c, const int* __restrict__ loc,
+                  const double* __restrict__ q, double* __restrict__ w,
+                  const int n)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    double v = 0.;
+    for (int i = loc[k]; i < loc[k + 1]; i++) v = fmax(v, fabs(c[i]));
+    w[k] = q[k] * v;
+}
+"""
+
+
+@functools.lru_cache(maxsize=None)
+def _kernels():
+    return cp.RawModule(code=_SRC, backend='nvrtc')
 
 
 def _dfact(n):

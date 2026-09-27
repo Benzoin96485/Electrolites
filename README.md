@@ -106,7 +106,7 @@ large hybrid, because a Coulomb-only DF build never constructs a cderi:
 | before the first Fock matrix | 88.7 s / 86.4 GB | **1.08 s / nothing** | — |
 
 `docs/README_fastdf.md`, `docs/README_fastdfj.md`, `docs/README_fastdfj3c.md`,
-`docs/README_fastdfj3ck.md`, `docs/README_fastdfj3cinc.md`,
+`docs/README_fastdfj3ck.md`, `docs/README_fastdfj3cinc.md`, `docs/README_fastdfj3cscr.md`,
 `docs/README_fastdfcderi.md`, `docs/README_fastdfstore.md`,
 `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md`,
 `docs/README_fastdffp32.md`, `docs/README_fastdfrsh.md`, and

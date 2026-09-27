@@ -101,10 +101,14 @@ and five host-to-device copies of tables that never change.
    GPU4PySCF's kernels, launched with those groups' offsets alone.
 
 8. *A single-density call can be built from the difference to the previous
-   one, screened on it* (W20) -- **off**, because measured against item 7 it
-   is a loss on every whole run (0.89x-0.97x, `docs/README_fastdfj3cinc.md`):
-   once the kernels are this cheap the pairs a Schwarz screen drops are worth
-   less than the screen's host work and the extra SCF cycle it can cost.
+   one, screened on it* (W20, W26) -- **off**.  W20 screened with a
+   host-side pair list and lost on every whole run (0.89x-0.97x,
+   `docs/README_fastdfj3cinc.md`); W26 moved the test inside item 7's kernels
+   (a screened twin of the module, per warp of pairs against an auxiliary
+   batch or shell), which costs no extra cycle and no host work, and is a
+   wash (`docs/README_fastdfj3cscr.md`): at the 1e-13 that keeps the cycle
+   count the Schwarz bound skips 6-17 % of the difference builds' kernel
+   time, 0.1-1.0 % of a run.
 
 Items 1-6 are a copy, not an approximation: the same kernels are launched
 with the same arguments in the same order.  Item 7 evaluates the same
@@ -143,10 +147,12 @@ Switches, which are what every ablation column of
                                a shell-pair group that meets a higher class
                                is left to GPU4PySCF's kernels whole
     FASTDFJ3C_INCREMENTAL=1    item 8, the build from the difference;
-                               FASTDFJ3C_INC_TOL (1e-11), _INC_REBUILD (8)
-                               and _INC_MAXFRAC (0.1) are its threshold, the
-                               builds between full ones and the difference
-                               past which a call is built whole
+                               FASTDFJ3C_INC_SCREEN (kernel: W26, list:
+                               W20), FASTDFJ3C_INC_TOL (1e-13 for kernel,
+                               1e-11 for list), _INC_REBUILD (8) and
+                               _INC_MAXFRAC (0.1) are its screen, threshold,
+                               the builds between full ones and the
+                               difference past which a call is built whole
     FASTDFJ3C_PER_CLASS=1      the other rejected idea: one launch of the
                                auxiliary-vector kernel per (shell-pair class,
                                auxiliary class), each asking only for the
@@ -222,15 +228,28 @@ PER_CLASS = int(os.environ.get('FASTDFJ3C_PER_CLASS', 0))
 #: 'ours' launches `electrolites/_j3ck.py`'s kernels for every class they
 #: serve (item 7); 'upstream' keeps GPU4PySCF's for all of them.
 KERNELS = os.environ.get('FASTDFJ3C_KERNELS', 'ours')
-#: item 8, `docs/DF_WORK_LIST.md` W20: build a single-density Coulomb matrix
-#: from the difference to the previous one, screened on it.  Off: a measured
-#: loss once item 7's kernels are in (`docs/README_fastdfj3cinc.md`).  The threshold on
+#: item 8, `docs/DF_WORK_LIST.md` W20 and W26: build a single-density Coulomb
+#: matrix from the difference to the previous one, screened on it.  Off: a
+#: loss with W20's list once item 7's kernels are in
+#: (`docs/README_fastdfj3cinc.md`), a wash with W26's in-kernel screen
+#: (`docs/README_fastdfj3cscr.md`).  The threshold on
 #: the Schwarz bound of what a dropped pair contributes, the full builds
 #: between which the error may accumulate, and the size of a difference past
 #: which the call is not an SCF step (a response density, a new geometry) and
 #: is built whole.
 INCREMENTAL = os.environ.get('FASTDFJ3C_INCREMENTAL', '0') != '0'
-INC_TOL = float(os.environ.get('FASTDFJ3C_INC_TOL', 1e-11))
+#: how item 8 screens: 'kernel' is W26's test inside a screened twin of item
+#: 7's kernels -- per (warp of pairs, auxiliary batch) on the density side
+#: and per (warp, auxiliary shell) on the other, nothing gathered; 'list' is
+#: W20's host-side pair list
+INC_SCREEN = os.environ.get('FASTDFJ3C_INC_SCREEN', 'kernel')
+#: the threshold is on what one skipped unit can contribute, and W26's units
+#: are finer than W20's -- a pair's Coulomb element sums one term per
+#: auxiliary shell rather than one per pair -- so the same number admits
+#: more error: at 1e-11 an ethanol DF-PBE SCF stops converging, and at 1e-12
+#: it takes four cycles more (`tests/test_dfj3c.py`)
+INC_TOL = float(os.environ.get('FASTDFJ3C_INC_TOL',
+                               1e-13 if INC_SCREEN == 'kernel' else 1e-11))
 INC_REBUILD = int(os.environ.get('FASTDFJ3C_INC_REBUILD', 8))
 INC_MAXFRAC = float(os.environ.get('FASTDFJ3C_INC_MAXFRAC', 0.1))
 
@@ -807,6 +826,11 @@ def _get_j_incremental(dfobj, intopt, dm):
     if full:
         STATS['inc_full'] += 1
         rho = intopt.contract_dm(dms, 1)
+    elif INC_SCREEN == 'kernel':
+        STATS['inc_step'] += 1
+        scr = _j3cinc.screen(intopt, c)
+        rho = st['rho'] + _contract_dm_screened(
+            c, kp, ddm, (scr.pair_weights(ddm), scr.q_aux, INC_TOL))
     else:
         STATS['inc_step'] += 1
         scr = _j3cinc.screen(intopt, c)
@@ -816,6 +840,10 @@ def _get_j_incremental(dfobj, intopt, dm):
         _solve_metric(dfobj, auxmol.apply_CT_dot(rho, axis=-1)), axis=-1)
     if full:
         vjs = intopt.contract_auxvec(cs)
+    elif INC_SCREEN == 'kernel':
+        dcs = cs - st['cs']
+        vjs = st['vjs'] + _contract_auxvec_screened(
+            c, kp, dcs, (scr.q_pair, scr.aux_weights(dcs), INC_TOL))
     else:
         dcs = cs - st['cs']
         keep2 = scr.keep_aux(dcs, INC_TOL)
@@ -827,6 +855,69 @@ def _get_j_incremental(dfobj, intopt, dm):
                                'rho': rho, 'cs': cs, 'vjs': vjs,
                                'n': 0 if full else st['n'] + 1})
     return mol.apply_CT_mat_C(vjs)
+
+
+def _contract_dm_screened(c, kp, ddm, screen):
+    """``contract_dm(ddm, hermi=1)`` with W26's test inside item 7's kernels;
+    the groups past their ceiling are GPU4PySCF's and are built whole."""
+    dm_xyz = c.scratch('dm_xyz', c.dm_xyz_size)
+    _dm_to_Rt(c, ddm, dm_xyz)
+    out = cp.zeros(c.naux_cart)
+    kp.contract_dm(dm_xyz, out, screen=screen)
+    nsp_lookup, shm_size = _scheme('dm', SHM_FRAC)
+    for off, nblk in kp.upstream_runs(SP_CHUNK_DM):
+        err = _libmd.contract_int3c2e_dm(
+            ctypes.cast(out.data.ptr, ctypes.c_void_p),
+            ctypes.cast(dm_xyz.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(1), ctypes.c_int(c.naux_cart),
+            ctypes.byref(c.envs), ctypes.c_int(shm_size),
+            ctypes.c_int(nblk), ctypes.c_int(c.auxnbas),
+            ctypes.cast(off.data.ptr, ctypes.c_void_p),
+            ctypes.cast(c.shl_pair_idx.data.ptr, ctypes.c_void_p),
+            ctypes.cast(c.pair_loc.data.ptr, ctypes.c_void_p),
+            ctypes.cast(nsp_lookup.data.ptr, ctypes.c_void_p),
+            ctypes.c_double(0.))
+        if err != 0:
+            raise RuntimeError('contract_int3c2e_dm kernel failed')
+    out *= 2
+    return out
+
+
+def _contract_auxvec_screened(c, kp, dcs, screen):
+    """``contract_auxvec(dcs)`` with W26's test inside item 7's kernels."""
+    aux_xyz = c.scratch('aux_xyz', c.aux_xyz_size)
+    _libmd.aux_to_Rt(
+        ctypes.cast(aux_xyz.data.ptr, ctypes.c_void_p),
+        ctypes.cast(dcs.data.ptr, ctypes.c_void_p),
+        ctypes.byref(c.envs),
+        ctypes.cast(c.aux_loc.data.ptr, ctypes.c_void_p),
+        ctypes.cast(c.aux_xyz_loc.data.ptr, ctypes.c_void_p),
+        ctypes.c_int(c.auxnbas))
+    vj_xyz = c.scratch('vj_xyz', c.dm_xyz_size, zero=True)
+    kp.contract_auxvec(aux_xyz, vj_xyz, screen=screen)
+    runs = kp.upstream_runs(1024)
+    if runs:
+        nsp_lookup, shm_size = _scheme('auxvec', SHM_FRAC)
+        ksh_offsets, ksh_blocks = c.ksh_batches(KSH_CHUNK)
+        for off, nblk in runs:
+            err = _libmd.contract_int3c2e_auxvec(
+                ctypes.cast(vj_xyz.data.ptr, ctypes.c_void_p),
+                ctypes.cast(aux_xyz.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(1), ctypes.c_int(c.naux_sph),
+                ctypes.byref(c.envs), ctypes.c_int(shm_size),
+                ctypes.c_int(nblk), ctypes.c_int(ksh_blocks),
+                ctypes.cast(off.data.ptr, ctypes.c_void_p),
+                ctypes.cast(ksh_offsets.data.ptr, ctypes.c_void_p),
+                ctypes.cast(c.shl_pair_idx.data.ptr, ctypes.c_void_p),
+                ctypes.cast(c.pair_loc.data.ptr, ctypes.c_void_p),
+                ctypes.cast(c.aux_xyz_loc.data.ptr, ctypes.c_void_p),
+                ctypes.cast(nsp_lookup.data.ptr, ctypes.c_void_p),
+                ctypes.c_double(0.))
+            if err != 0:
+                raise RuntimeError('contract_int3c2e_auxvec kernel failed')
+    out = cp.empty((1, c.nao, c.nao))
+    _Rt_to_dm(c, vj_xyz, out)
+    return out[0]
 
 
 def _contract_dm_subset(c, kp, ddm, keep):

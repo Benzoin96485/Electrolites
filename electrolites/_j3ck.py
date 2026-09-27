@@ -20,6 +20,13 @@ stream serialises thirty small grids, and W9 measured exactly that at 0.42x
 (`docs/README_fastdfj3c.md` §8); the tiers themselves go on a small pool of
 streams.
 
+Each plan also has a *screened* twin of the module (``module(scr=True)``),
+compiled only when a Coulomb build from a density difference asks for it:
+the same kernels with W26's Schwarz test on the difference compiled in
+(`contract_dm`/`contract_auxvec` with ``screen=``).  It is a second module
+rather than a flag because a flag cost the shipped kernels 0.8-1.0 % on
+every build (`docs/README_fastdfj3cscr.md`).
+
 This module patches nothing.
 """
 import functools
@@ -45,9 +52,10 @@ ANG_OF, NPRIM_OF, NCTR_OF, PTR_EXP, PTR_COEFF, PTR_BAS_COORD = 1, 2, 3, 5, 6, 7
 
 
 @functools.lru_cache(maxsize=16)
-def _module(classes, kb_items, tier_items):
+def _module(classes, kb_items, tier_items, scr=False):
     src = open(os.path.join(KERNEL_DIR, 'fastj_prologue.cu')).read()
-    src += gen_j3c.source(list(classes), dict(kb_items), dict(tier_items))
+    src += gen_j3c.source(list(classes), dict(kb_items), dict(tier_items),
+                          scr)
     return cp.RawModule(code=src, options=('-std=c++17',), backend='nvrtc')
 
 
@@ -128,8 +136,10 @@ class Plan:
         self._theirs_offsets = {}
         self._tables = {}
 
-    def module(self):
-        return _module(self.classes, self.kb, self.tiers)
+    def module(self, scr=False):
+        """The compiled kernels; ``scr`` is W26's screened twin, a separate
+        module compiled only when a build from a difference asks for it."""
+        return _module(self.classes, self.kb, self.tiers, scr)
 
     def subset(self, keep, shl_pair_idx):
         """A plan over the stored shell pairs ``keep`` selects (a device
@@ -252,22 +262,26 @@ class Plan:
         return got
 
     # ------------------------------------------------------------------
-    def _launches(self, kind, ppb, only):
+    def _launches(self, kind, ppb, only, scr=False):
         """``[(kernel, threads, block table, blocks)]``, cached: a Coulomb
         build of a 10-atom molecule is ~1 ms, so the host side of a launch
         is not free."""
-        key = ('launch', kind, ppb, only, self.kb, self.tiers)
+        key = ('launch', kind, ppb, only, self.kb, self.tiers, scr)
         got = self._tables.get(key)
         if got is None:
-            mod = self.module()
-            got = [(mod.get_function(gen_j3c.tier_name(kind, t)),
+            mod = self.module(scr)
+            got = [(mod.get_function(gen_j3c.tier_name(kind, t, scr)),
                     self.nt_of(kind, t), tab, nblk)
                    for t, tab, nblk in self.tables(kind, ppb, only)]
             self._tables[key] = got
         return got
 
-    def _launch(self, kind, args, ppb=None, only=None):
-        launches = self._launches(kind, ppb or DM_PPB, only)
+    def _launch(self, kind, args, ppb=None, only=None, screen=None):
+        launches = self._launches(kind, ppb or DM_PPB, only,
+                                  screen is not None)
+        if screen is not None:
+            w_pair, w_aux, tol = screen
+            args = args + (w_pair, w_aux, np.float64(tol))
         if len(launches) == 1 or NSTREAMS <= 1:
             for f, nt, tab, nblk in launches:
                 f((nblk,), (nt,), args + (tab,))
@@ -292,20 +306,31 @@ class Plan:
             ev.record(s)
             cur.wait_event(ev)
 
-    def contract_dm(self, dm_xyz, rho, ppb=None, only=None):
+    def contract_dm(self, dm_xyz, rho, ppb=None, only=None, screen=None):
         """``rho[P_cart] += sum_ij (ij|P) dm_xyz[ij]`` over this module's
-        groups.  ``rho`` is the Cartesian sorted auxiliary vector."""
+        groups.  ``rho`` is the Cartesian sorted auxiliary vector.
+
+        ``screen = (w_pair, q_aux, tol)`` skips every (warp, auxiliary batch)
+        whose pairs all have ``w_pair * max_batch q_aux < tol`` (W26):
+        ``w_pair`` is ``q_ij max|D_ij|`` in this plan's pair order and
+        ``q_aux`` the Schwarz factor of each sorted auxiliary shell."""
         self._launch('dm', (self.pair_data, self.pair_inv, self.pair_loc,
                             dm_xyz, self.aux_data, self.aux_inv,
-                            self.aux_cart_loc, rho), ppb, only)
+                            self.aux_cart_loc, rho), ppb, only, screen)
 
-    def contract_auxvec(self, aux_xyz, vj_xyz, only=None):
+    def contract_auxvec(self, aux_xyz, vj_xyz, only=None, screen=None):
         """``vj_xyz[ij] += sum_P (ij|P) aux_xyz[P]`` over this module's
         groups.  ``aux_xyz`` is the Hermite auxiliary vector ``aux_to_Rt``
-        makes."""
+        makes.
+
+        ``screen = (q_pair, e_aux, tol)`` skips every warp whose pairs all
+        have ``q_pair * sum_batch e_aux < tol`` (W26): ``q_pair`` is the
+        pairs' Schwarz factor in this plan's order and ``e_aux`` ``q_P
+        max|c_P|`` for each sorted auxiliary shell."""
         self._launch('aux', (self.pair_data, self.pair_inv, self.pair_loc,
                              vj_xyz, self.aux_data, self.aux_inv,
-                             self.aux_xyz_loc, aux_xyz), None, only)
+                             self.aux_xyz_loc, aux_xyz), None, only,
+                     screen)
 
 
 def plan(opt, c):

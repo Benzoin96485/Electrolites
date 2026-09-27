@@ -28,6 +28,7 @@ not to write the code),
 `docs/README_mgga_repro.md` closed **W23** (whose finding is W28),
 `docs/README_fastdfhessip2.md` **W24** (whose finding is W29) and
 `docs/README_fastdfuhessip.md` **W25** (whose finding is W30),
+`docs/README_fastdfj3cscr.md` closed **W26**,
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -317,6 +318,21 @@ found rather than closed is that after it the build is **85 % two integral
 kernels at 42 atoms and 97 % at 284** (`docs/README_fastdfj3c.md`), and the
 three things still inside them are **W19**; the fourth, which is not inside
 them, is **W20**.
+
+**W26 is done, and the incremental Coulomb build stays off.**  The screen
+now sits inside W19's kernels, in a screened twin of the module that is
+compiled only when asked for: per warp of pairs against an auxiliary batch
+on the density side, and per auxiliary shell on the other.  It gathers
+nothing and costs no host work.  At 1e-13 it costs no extra SCF cycle on
+any system measured, which answers the entry's falsification check.  It
+also skips only **6–17 %** of the difference builds' kernel time, and
+**0.1–1.0 %** of a whole DF-PBE run, from 42 to 284 atoms and on the Cu
+macrocycle, which is inside the noise (`docs/README_fastdfj3cscr.md`).
+The limit is the Schwarz bound, not the granularity: the difference stays
+above 1e-6, so only pairs just above the build's own cut can be dropped.
+Re-sorting pairs spatially makes it worse, because GPU4PySCF's
+Schwarz-sorted order is exactly what a per-warp bound needs.  The shipped
+kernels are byte-identical to W19's.
 
 **W19, W20 and W21 are done, and W26 and W27 are what they found.**  The
 three-centre Coulomb build is **1.3x–5.0x** faster again on top of W9 (4.8x at
@@ -2077,7 +2093,38 @@ already covered — there is no `nr_uks_fxc_mo`, it comes through
 same shape as W17 and W18, and `electrolites/fastdfhessip.py`'s items 1–5
 should transplant.
 
-### W26 — A density screen inside the three-centre kernels
+### W26 — A density screen inside the three-centre kernels — **done, and off: bounded, correct, a wash**
+
+`electrolites/codegen/gen_j3c.py` (`scr=True`: the screened twin),
+`_j3ck.Plan.contract_{dm,auxvec}(screen=...)`,
+`_j3cinc.Screen.{pair,aux}_weights`, `fastdfj3c` item 8 with
+`FASTDFJ3C_INC_SCREEN=kernel` (now the mode `FASTDFJ3C_INCREMENTAL=1` uses),
+`benchmarks/df_j3c_blockscreen_probe.py`; write-up in
+`docs/README_fastdfj3cscr.md`.
+
+**The cycle count at 1e-13 was measured first, as the entry asked, and it
+does not fire the falsification.**  With W20's code at 1e-13, penicillin V
+takes 15/15 cycles, taxol 17/17 and the Cu macrocycle 23/23.  **What fires
+instead is the drop.**  Measured on the kernels themselves over every
+difference of a converging SCF, the in-kernel screen at 1e-13 leaves
+**0.93, 0.92, 0.94, 0.83 and 0.89** of the unscreened time: penicillin V,
+the same in def2-TZVPP, the Cu macrocycle, taxol and PfPMT.  At 1e-11,
+which begins to cost cycles, it leaves 0.85, 0.86 and 0.69.  On the
+auxiliary side the tight factor does what the entry said: it keeps 0.52 of
+the last cycle's work against W20's 0.88.  But the difference is never
+smaller than ~4e-6 in the decontracted basis, so the Schwarz product of a
+skipped unit has to be below ~1e-8, and only the pairs just above
+`Int3c2eOpt.build`'s own cut are.  Whole runs against W19 alone: 0.91x–1.10x
+over four processes per case, with the kernel table predicting 0.1–1.0 %.
+At 113 atoms, even a screen that dropped everything would save 6 %.
+
+Two further results.  **The threshold is not W20's number.**  The in-kernel
+units are finer, and at 1e-11 an ethanol SCF stops converging, so the
+kernel mode defaults to 1e-13.  **The shipped kernels are unchanged.**  A
+run-time flag in them cost every build 0.8–1.0 %, so the screen is a
+separate module, and `gen_j3c` writes the previous commit's bytes.
+
+The original entry, for the record:
 
 *(Found by W20.)*
 
@@ -2454,6 +2501,7 @@ python benchmarks/df_j3c_kernel_sweep.py --cases penicillinV,taxol  # W19 tuning
 python benchmarks/df_j3c_bench.py --cases ... --variants stock,w9,fast \
     [--scf --scf-variants w9,fast,inc]                   # W19 and W20 end to end
 python benchmarks/df_j3c_screen_probe.py --xyz ... --xc pbe      # W20's count
+python benchmarks/df_j3c_blockscreen_probe.py --xyz ... --xc pbe [--time 3]   # W26's
 python tests/test_cuplan.py                                      # W21's bar
 python benchmarks/cutensor_plan_probe.py --threshold --rule --options  # W21
 python benchmarks/cutensor_plan_probe.py --run benchmarks/<script>.py ...
@@ -2514,9 +2562,9 @@ GPU4PySCF's own build would read the narrow tensor as a wide one.
 `FASTDFJ3C_SP_CHUNK_DM`, `FASTDFJ3C_KSH_CHUNK`, `FASTDFJ3C_MDM_MAX_NDM`,
 `FASTDFJ3C_TARGET_BLOCKS`, `FASTDFJ3C_CHUNK_MIN`, `FASTDFJ3C_CHUNK_MAX`,
 `FASTDFJ3C_SHM_FRAC`, `FASTDFJ3C_PER_CLASS`, and W19's `FASTDFJ3C_KERNELS`,
-`FASTDFJ3C_KMAX_ORDER`, `FASTDFJ3C_KSTREAMS`, `FASTDFJ3C_KDM_PPB` and W20's
+`FASTDFJ3C_KMAX_ORDER`, `FASTDFJ3C_KSTREAMS`, `FASTDFJ3C_KDM_PPB`, W20's
 `FASTDFJ3C_INCREMENTAL`, `FASTDFJ3C_INC_TOL`, `FASTDFJ3C_INC_REBUILD`,
-`FASTDFJ3C_INC_MAXFRAC`) are listed with their meanings at
+`FASTDFJ3C_INC_MAXFRAC` and W26's `FASTDFJ3C_INC_SCREEN`) are listed with their meanings at
 the top of `electrolites/fastdfj3c.py`.  The last two are the two ideas
 `docs/README_fastdfj3c.md` §8 measured and rejected, kept runnable rather than
 described.

@@ -139,8 +139,8 @@ def emit_boys_rt(L, ind):
     return o
 
 
-def kname(kind, lij, lk):
-    return f'j3c_{kind}_{lij}_{lk}'
+def kname(kind, lij, lk, scr=False):
+    return f'j3c_{kind}_{lij}_{lk}' + ('_scr' if scr else '')
 
 
 # --------------------------------------------------------------------------
@@ -155,7 +155,7 @@ def dm_smem(lk, nt, kb):
     return (nt // 32) * kb * len(parity(lk))
 
 
-def emit_dm(lij, lk, nt, kb):
+def emit_dm(lij, lk, nt, kb, scr=False):
     L = lij + lk
     nij = nf3(lij)
     par = parity(lk)
@@ -166,7 +166,7 @@ def emit_dm(lij, lk, nt, kb):
     nw = nt // 32
     o = []
     o.append('__device__ __forceinline__ static')
-    o.append(f'void {kname("dm", lij, lk)}(J3C_DM_ARGS, const int p0, '
+    o.append(f'void {kname("dm", lij, lk, scr)}(J3C_DM_ARGS, const int p0, '
              'const int p1, const int k0, const int k_hi, double* s_red)')
     o.append('{')
     o.append(f'    // ({lij}|{lk}): {nij} pair Hermite components, {nk} '
@@ -184,7 +184,24 @@ def emit_dm(lij, lk, nt, kb):
     o.append('    }')
     for b in range(kb):
         o.append(f'    double acc{b}[{nk}] = {{' + ', '.join(['0.'] * nk) + '};')
-    o.append(f'    for (int p = p0 + threadIdx.x; p < p1; p += {nt}) {{')
+    if scr:
+        # W26: the density screen.  A (warp, batch) is skipped when no pair
+        # of the warp has q_ij max|dD_ij| * max_batch q_P at the threshold;
+        # the loop is warp-uniform so that the vote sees every lane.
+        o.append('    double qb = 0.;')
+        o.append('#pragma unroll')
+        o.append(f'    for (int b = 0; b < {kb}; b++)')
+        o.append('        if (k0 + b < k_hi) qb = fmax(qb, scr_aux[k0 + b]);')
+        o.append('    const double wmin = qb > 0. ? scr_tol / qb : 1e300;')
+        o.append('    const int lane = threadIdx.x & 31;')
+        o.append(f'    for (int base = p0 + (threadIdx.x & ~31); base < p1; '
+                 f'base += {nt}) {{')
+        o.append('        const int p = base + lane;')
+        o.append('        if (!__any_sync(0xffffffff, '
+                 'p < p1 && scr_pair[p] >= wmin)) continue;')
+        o.append('        if (p >= p1) continue;')
+    else:
+        o.append(f'    for (int p = p0 + threadIdx.x; p < p1; p += {nt}) {{')
     o.append('        const double4 P = pair_data[p];')
     o.append('        const double iaij = pair_inv[p];')
     o.append('        const double* d = dm_xyz + pair_loc[p];')
@@ -211,7 +228,8 @@ def emit_dm(lij, lk, nt, kb):
         o.append('        }')
     o.append('    }')
     # block reduction: a warp shuffle, then the warps through shared memory
-    o.append('    const int lane = threadIdx.x & 31;')
+    if not scr:
+        o.append('    const int lane = threadIdx.x & 31;')
     o.append('    const int wid = threadIdx.x >> 5;')
     for b in range(kb):
         o.append('#pragma unroll')
@@ -267,11 +285,11 @@ def emit_dm(lij, lk, nt, kb):
 # [k0, k1), which are at most kb and all of one class.  One thread, one pair,
 # its Hermite J in registers; one atomicAdd per component at the end.
 # --------------------------------------------------------------------------
-def aux_smem(lk, kb):
-    return kb * (5 + len(parity(lk)))
+def aux_smem(lk, kb, scr=False):
+    return kb * (5 + scr + len(parity(lk)))
 
 
-def emit_aux(lij, lk, nt, kb):
+def emit_aux(lij, lk, nt, kb, scr=False):
     L = lij + lk
     nij = nf3(lij)
     par = parity(lk)
@@ -281,18 +299,22 @@ def emit_aux(lij, lk, nt, kb):
     sign = -1. if lk % 2 else 1.
     o = []
     o.append('__device__ __forceinline__ static')
-    o.append(f'void {kname("aux", lij, lk)}(J3C_AUX_ARGS, const int p0, '
+    o.append(f'void {kname("aux", lij, lk, scr)}(J3C_AUX_ARGS, const int p0, '
              'const int p1, const int k0, const int k1, double* smem)')
     o.append('{')
     o.append(f'    // ({lij}|{lk}): {nij} pair Hermite components, {nk} '
              f'auxiliary ones of the right parity, order {L}')
     o.append(f'    double* s_k = smem;                 // [{kb}][5]')
     o.append(f'    double* s_c = smem + {5 * kb};      // [{kb}][{nk}]')
+    if scr:
+        o.append(f'    double* s_e = smem + {(5 + nk) * kb};      // [{kb}]')
     o.append('    const int nkb = k1 - k0;')
     o.append(f'    for (int n = threadIdx.x; n < nkb; n += {nt}) {{')
     o.append('        const double4 a = aux_data[k0 + n];')
     o.append('        s_k[5*n] = a.x; s_k[5*n+1] = a.y; s_k[5*n+2] = a.z;')
     o.append('        s_k[5*n+3] = a.w; s_k[5*n+4] = aux_inv[2*(k0 + n)];')
+    if scr:
+        o.append('        s_e[n] = scr_aux[k0 + n];')
     o.append('    }')
     o.append(f'    for (int n = threadIdx.x; n < nkb * {nk}; n += {nt}) {{')
     o.append(f'        const int b = n / {nk};')
@@ -302,12 +324,28 @@ def emit_aux(lij, lk, nt, kb):
     o.append('    }')
     o.append('    __syncthreads();')
     o.append('    const int p = p0 + threadIdx.x;')
-    o.append('    if (p >= p1) return;')
-    o.append('    const double4 P = pair_data[p];')
-    o.append('    const double iaij = pair_inv[p] * PI_FAC;')
+    if scr:
+        # W26: the difference screen.  A warp leaves when none of its pairs
+        # has q_ij * sum_batch q_P max|dc_P| at the threshold, and skips an
+        # auxiliary shell when none has q_ij q_P max|dc_P| there.  Both votes
+        # need every lane, so a lane past the group's end stays, computes
+        # with the last pair and writes nothing.
+        o.append('    const double qv = p < p1 ? scr_pair[p] : 0.;')
+        o.append('    double S = 0.;')
+        o.append('    for (int n = 0; n < nkb; n++) S += s_e[n];')
+        o.append('    if (!__any_sync(0xffffffff, qv * S >= scr_tol)) return;')
+        o.append('    const int pp = min(p, p1 - 1);')
+    else:
+        o.append('    if (p >= p1) return;')
+    pp = 'pp' if scr else 'p'
+    o.append(f'    const double4 P = pair_data[{pp}];')
+    o.append(f'    const double iaij = pair_inv[{pp}] * PI_FAC;')
     o.append(f'    double acc[{nij}] = {{' + ', '.join(['0.'] * nij) + '};')
     o.append('    for (int b = 0; b < nkb; b++) {')
     ind = '        '
+    if scr:
+        o.append(f'{ind}if (!__any_sync(0xffffffff, qv * s_e[b] >= '
+                 'scr_tol)) continue;')
     o.append(f'{ind}const double* K = s_k + 5*b;')
     o.append(f'{ind}const double xpq = P.x - K[0];')
     o.append(f'{ind}const double ypq = P.y - K[1];')
@@ -325,6 +363,8 @@ def emit_aux(lij, lk, nt, kb):
             terms.append(f'R_{addr(L, t + e, u + f, v + g)} * c[{kk}]')
         o.append(f'{ind}acc[{i}] += ' + ' + '.join(terms) + ';')
     o.append('    }')
+    if scr:
+        o.append('    if (p >= p1) return;')
     o.append('    double* out = vj_xyz + pair_loc[p];')
     o.append('#pragma unroll')
     o.append(f'    for (int i = 0; i < {nij}; i++) atomicAdd(out + i, acc[i]);')
@@ -347,17 +387,35 @@ PROLOGUE = r"""
     const double4* __restrict__ pair_data, const double* __restrict__ pair_inv, \
     const int* __restrict__ pair_loc, const double* __restrict__ dm_xyz, \
     const double4* __restrict__ aux_data, const double* __restrict__ aux_inv, \
-    const int* __restrict__ aux_cart_loc, double* __restrict__ rho
+    const int* __restrict__ aux_cart_loc, double* __restrict__ rho%(scr)s
 #define J3C_DM_FWD pair_data, pair_inv, pair_loc, dm_xyz, aux_data, aux_inv, \
-    aux_cart_loc, rho
+    aux_cart_loc, rho%(fwd)s
 #define J3C_AUX_ARGS \
     const double4* __restrict__ pair_data, const double* __restrict__ pair_inv, \
     const int* __restrict__ pair_loc, double* __restrict__ vj_xyz, \
     const double4* __restrict__ aux_data, const double* __restrict__ aux_inv, \
-    const int* __restrict__ aux_xyz_loc, const double* __restrict__ aux_xyz
+    const int* __restrict__ aux_xyz_loc, const double* __restrict__ aux_xyz%(scr)s
 #define J3C_AUX_FWD pair_data, pair_inv, pair_loc, vj_xyz, aux_data, aux_inv, \
-    aux_xyz_loc, aux_xyz
+    aux_xyz_loc, aux_xyz%(fwd)s
 """
+
+#: W26's module: the same kernels with a screen compiled in, for a build from
+#: a difference.  The density kernel skips a (warp, auxiliary batch) whose
+#: pairs all have scr_pair[p] = q_ij max|dD_ij| below scr_tol / max_batch
+#: scr_aux[k] (scr_aux = q_P); the auxiliary-vector kernel a (warp, auxiliary
+#: shell) whose pairs all have scr_pair[p] = q_ij below scr_tol / scr_aux[k]
+#: (scr_aux = q_P max|dc_P|).  A separate module, not a run-time flag: a flag
+#: in the shipped kernels cost them 0.8-1.0 % on every build
+#: (`docs/README_fastdfj3cscr.md`).
+_SCR_ARGS = (', \\\n    const double* __restrict__ scr_pair, '
+             'const double* __restrict__ scr_aux, \\\n    const double scr_tol')
+_SCR_FWD = ', scr_pair, scr_aux, scr_tol'
+
+
+def prologue(scr=False):
+    return PROLOGUE % ({'scr': _SCR_ARGS, 'fwd': _SCR_FWD} if scr
+                       else {'scr': '', 'fwd': ''})
+
 
 #: order ranges of the tiers, and each tier's (threads, min blocks per SM)
 TIERS = ((0, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 14))
@@ -395,11 +453,11 @@ def classes(max_order=MAX_ORDER):
             for lk in range(LK_MAX + 1) if lij + lk <= max_order]
 
 
-def tier_name(kind, t):
-    return f'j3c_{kind}_tier{t}'
+def tier_name(kind, t, scr=False):
+    return f'j3c_{kind}_tier{t}' + ('_scr' if scr else '')
 
 
-def source(wanted=None, kb=None, tier_cfg=None):
+def source(wanted=None, kb=None, tier_cfg=None, scr=False):
     """CUDA source for the classes in ``wanted`` (default: all of them).
 
     ``kb`` maps ``(kind, lij, lk)`` to the auxiliary shells per block and
@@ -410,7 +468,7 @@ def source(wanted=None, kb=None, tier_cfg=None):
     wanted = list(wanted or classes())
     kb = kb or {}
     tier_cfg = tier_cfg or {}
-    out = [PROLOGUE]
+    out = [prologue(scr)]
     for kind, emit in (('dm', emit_dm), ('aux', emit_aux)):
         by_tier = {}
         for cid, (lij, lk) in enumerate(wanted):
@@ -420,23 +478,20 @@ def source(wanted=None, kb=None, tier_cfg=None):
             smem = 0
             for cid, lij, lk in members:
                 b = kb.get((kind, lij, lk), default_kb(kind, lij, lk))
-                if kind == 'dm':
-                    out.append(emit(lij, lk, nt, b))
-                    smem = max(smem, dm_smem(lk, nt, b))
-                else:
-                    out.append(emit(lij, lk, nt, b))
-                    smem = max(smem, aux_smem(lk, b))
+                out.append(emit(lij, lk, nt, b, scr))
+                smem = max(smem, dm_smem(lk, nt, b) if kind == 'dm'
+                           else aux_smem(lk, b, scr))
             args = 'J3C_DM_ARGS' if kind == 'dm' else 'J3C_AUX_ARGS'
             fwd = 'J3C_DM_FWD' if kind == 'dm' else 'J3C_AUX_FWD'
             o = [f'extern "C" __global__ __launch_bounds__({nt}, {mb})',
-                 f'void {tier_name(kind, t)}({args}, '
+                 f'void {tier_name(kind, t, scr)}({args}, '
                  'const int* __restrict__ blocks)',
                  '{',
                  f'    __shared__ double smem[{max(smem, 1)}];',
                  '    const int* b = blocks + 5 * blockIdx.x;',
                  '    switch (b[0]) {']
             for cid, lij, lk in members:
-                o.append(f'    case {cid}: {kname(kind, lij, lk)}({fwd}, '
+                o.append(f'    case {cid}: {kname(kind, lij, lk, scr)}({fwd}, '
                          'b[1], b[2], b[3], b[4], smem); break;')
             o += ['    }', '}', '']
             out.append('\n'.join(o))

@@ -18,8 +18,12 @@ whole pure-functional SCF.
 * ``fast``   -- ``w9`` plus W19's kernels (`electrolites/_j3ck.py`), which
                 is what ships now;
 * ``inc``    -- ``fast`` plus W20's build from the difference
-                (``FASTDFJ3C_INCREMENTAL``).  At a fixed density it is
-                ``fast``; it is a column of the ``--scf`` table.
+                (``FASTDFJ3C_INCREMENTAL``) with W20's host-side pair list.
+                At a fixed density it is ``fast``; it is a column of the
+                ``--scf`` table;
+* ``inck``   -- the same with W26's screen inside the kernels
+                (``FASTDFJ3C_INC_SCREEN=kernel``).  ``--inc-tol`` sets the
+                threshold of both; each mode's own default otherwise.
 
 The variants are installed by swapping the bound methods rather than by
 re-importing, so all six run **in one process, against one density, on one
@@ -62,6 +66,9 @@ ap.add_argument('--scf-variants', default='stock,w9,fast')
 ap.add_argument('--scf', action='store_true',
                 help='also run whole SCFs, stock and fast, twice each')
 ap.add_argument('--scf-max-cycle', type=int, default=50)
+ap.add_argument('--inc-tol', type=float, default=None,
+                help='threshold of the inc/inck variants (default: each '
+                     "mode's own)")
 ap.add_argument('--patch', default='',
                 help="other electrolites modules to patch underneath, so the "
                      "ratio is measured against a patched baseline")
@@ -97,24 +104,31 @@ _CHUNK = fastdfj3c.SP_CHUNK_AUX
 
 #: variant -> (recontraction tables cached, contraction constants hoisted,
 #:             auxiliary-vector shell pairs per block, MD engine for every
-#:             density count, W19's kernels, W20's incremental build)
+#:             density count, W19's kernels, the incremental build's screen:
+#:             None, W20's 'list' or W26's 'kernel')
 VARIANTS = {
-    'stock': (False, False, 0, False, False, False),
-    'ctr': (True, False, 0, False, False, False),
-    'opt': (False, True, 0, False, False, False),
-    'blk': (False, True, _CHUNK, False, False, False),
-    'mdm': (False, False, 0, True, False, False),
-    'w9': (True, True, _CHUNK, True, False, False),
-    'fast': (True, True, _CHUNK, True, True, False),
-    'inc': (True, True, _CHUNK, True, True, True),
+    'stock': (False, False, 0, False, False, None),
+    'ctr': (True, False, 0, False, False, None),
+    'opt': (False, True, 0, False, False, None),
+    'blk': (False, True, _CHUNK, False, False, None),
+    'mdm': (False, False, 0, True, False, None),
+    'w9': (True, True, _CHUNK, True, False, None),
+    'fast': (True, True, _CHUNK, True, True, None),
+    'inc': (True, True, _CHUNK, True, True, 'list'),
+    'inck': (True, True, _CHUNK, True, True, 'kernel'),
 }
+_INC_TOL = {'list': 1e-11, 'kernel': 1e-13}
 
 
 def install(variant):
     """Bind one variant's methods.  Nothing else in the process changes."""
     ctr, opt, chunk, mdm, kern, inc = VARIANTS[variant]
     fastdfj3c.KERNELS = 'ours' if kern else 'upstream'
-    fastdfj3c.INCREMENTAL = inc
+    fastdfj3c.INCREMENTAL = inc is not None
+    if inc is not None:
+        fastdfj3c.INC_SCREEN = inc
+        fastdfj3c.INC_TOL = a.inc_tol if a.inc_tol is not None \
+            else _INC_TOL[inc]
     for n in _CTR_NAMES:
         setattr(SortedGTO, n, (_FAST_CTR if ctr else _STOCK_CTR)[n])
     for n, f in (_FAST_OPT if opt else _STOCK_OPT).items():
@@ -225,9 +239,13 @@ def whole_scf(spec):
             extra = ''
             if st['inc_step']:
                 extra = (f'  (built whole {st["inc_full"]}, from the '
-                         f'difference {st["inc_step"]}; pairs kept '
-                         f'{st["inc_pairs_dm"] / st["inc_pairs_all"]:.3f} / '
-                         f'{st["inc_pairs_aux"] / st["inc_pairs_all"]:.3f})')
+                         f'difference {st["inc_step"]}')
+                if st['inc_pairs_all']:
+                    extra += (f'; pairs kept '
+                              f'{st["inc_pairs_dm"] / st["inc_pairs_all"]:.3f}'
+                              f' / {st["inc_pairs_aux"] / st["inc_pairs_all"]:.3f}')
+                extra += ')'
+
             print(f'  rep {rep}  {v:6s} {dt:8.3f} s   E = {e:.10f}  '
                   f'cycles {out[v][2]}{extra}', flush=True)
             mf = None
