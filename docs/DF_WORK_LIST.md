@@ -32,7 +32,9 @@ not to write the code),
 `docs/README_fastdfaudit.md` **W27**, `docs/README_fastxchessmgga.md` **W28**
 (whose finding is W33), `docs/README_fastdfhessip3.md` **W29**
 (whose finding is W31), `docs/README_fastdfh1occ.md` **W30** (whose finding
-is W32),
+is W32), `docs/README_fastdfhessip4.md` **W31** (whose finding is W34),
+`docs/README_fastdfh1c.md` **W32** (whose finding is W35),
+`docs/README_fastxcfxcmgga.md` **W33** (whose finding is W36),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -2580,6 +2582,74 @@ per block where a GGA needs one, so part of that gap is arithmetic.
 * **Success**: the def2-TZVPP call moves toward the arithmetic ratio over
   B3LYP.
 * **Falsified if**: it is already at the GEMM rate for four products.
+
+### W34 — The ip2 term's "D3 buffers"
+
+*(Found by W31.)*
+
+After W31 the `ejk_int3c2e_ip2` kernel is 124–134 ms of a 1.84 s ip2 call on
+penicillin V, and the largest stage is no longer arithmetic: "D3 buffers" —
+two `cp.empty` of several GB made right after the call's `free_all_blocks` —
+is **557–637 ms**, and moves by ±50 ms between calls
+(`FASTDFHESSIP_TIME=1`, `docs/README_fastdfhessip4.md` §3).  An allocation
+that takes half a second is not the allocation; it is what §5.8 and §5.11
+describe — the pool handing memory back and the driver mapping it again.
+
+* **Do**: time the two buffers with and without the preceding
+  `free_all_blocks`, and with them taken from a buffer held across the call
+  (W12's pool is the precedent); check whether the first write into them,
+  not the `cp.empty`, is what the row is charging.
+* **Success**: the row falls to the written volume's bandwidth cost (tens of
+  ms), and the ip2 call by what it loses, at 21–113 atoms.
+* **Falsified if**: the time is the first touch of freshly mapped pages at
+  any placement — then the buffers are the wrong size, and the next thing is
+  building D3 in auxiliary batches small enough to reuse one buffer.
+* After that, what is left inside the kernel is the heavy classes'
+  shared-memory contraction (58 % of it on penicillin V, 76 % on the Pt
+  complex, 50 % at 113 atoms), whose occupancy is capped by 155 KB of `g`
+  per block.
+
+### W35 — W30's occupied-side D2 at a smaller auxiliary block
+
+*(Found by W32.)*
+
+With a 40 GB ballast on an 80 GB card — the memory of the 40 GB nodes — the
+restricted B3LYP h1 call on taxol is **28.7 s against 17.4 s**, and 10.6 s
+of the 11.3 s difference is stage D2, W30's occupied form, which grows from
+2.5 to 13.1 s (`docs/README_fastdfh1c.md` §3).  D2 launches `2 natm`
+contractions per auxiliary block, so the launch count grows as the block
+shrinks while the arithmetic does not.
+
+* **Do**: count D2's launches and its rate at both block sizes; batch atoms
+  into one launch per block (the per-atom operands are slices of arrays the
+  stage already holds), or give D2 a minimum block of its own.
+* **Success**: the 40 GB call within about 1.2x of the 80 GB one at 113
+  atoms, restricted and unrestricted; unchanged on 80 GB.
+* **Falsified if**: D2's rate is the same at both block sizes and the extra
+  time is recomputation the smaller block forces elsewhere.
+
+### W36 — A local `nocc` for W33's occupied-side route
+
+*(Found by W33.)*
+
+W33's route replaces `8 nsub` by `8 nocc` per set and grid point, so its
+margin is `nsub/nocc`: 5.2x at a ratio of 5.4 (def2-TZVPP), 1.7x–1.9x at 1.8,
+and falling with the molecule in a fixed basis because `nocc` is global
+while `nsub` is local to the block.  At 113 atoms the `Y`/`W` round trip is
+also about 20 % of the call (the potential stage at 11.8 TF/s against the
+GEMMs' 16.5; `docs/README_fastxcfxcmgga.md` §7).
+
+* **Do**: rotate `C_o` to localised orbitals once per CPHF and keep, per grid
+  block, only those with support on it (W15's supports at 284 atoms,
+  `benchmarks/df_local_occ_probe.py`, are the measurement to start from);
+  then fuse the density kernel into the `Y` GEMM.
+* **Success**: the route's margin at 113 atoms in def2-SVP approaches its
+  def2-TZVPP margin at 42 atoms, restricted and unrestricted.
+* **Falsified if**: the number of localised orbitals with support on a grid
+  block's AOs at 113 atoms is not well below `nocc`.  W15's orbitals were
+  local (266 AOs of 2697 at 284 atoms) and its item failed anyway, because
+  the index it screened on — stored AO pairs — reached every orbital; count
+  on the block's AO subset before writing code.
 
 ### Not on this list
 

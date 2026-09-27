@@ -30,7 +30,7 @@ times less arithmetic: **4.60 s → 0.15 s**, and DF-PBE's h1 call on taxol is
 
 ## 0. Summary
 
-* **Item 17: stage C grouped** (`fastdfhessip._h1_stage_c`, §1), used by
+* **Item 18: stage C grouped** (`fastdfhessip._h1_stage_c`, §1), used by
   both spin cases.  Consecutive auxiliary atoms form a group of up to
   `FASTDFHESSIP_H1C_ROWS / 3` (1024) functions, bounded by 80 % of what is
   free when the stage starts; the group's `j3c_1` is one cuBLAS GEMM per
