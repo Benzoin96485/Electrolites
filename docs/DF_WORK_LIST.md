@@ -2491,7 +2491,43 @@ one launch per auxiliary atom, `naux_A` ≈ 50 rows each.
   is arithmetic, and the next thing to try is `j2c_10`'s sparsity (the
   derivative of `(r|s)` on `r`'s atom decays with the distance to `s`).
 
-### W33 — The CPHF's meta-GGA response kernel
+### W33 — The CPHF's meta-GGA response kernel — **done: already at the GEMM rate, so the arithmetic moved to the occupied side; 5.3x in def2-TZVPP, and the unrestricted Hessian with it**
+
+`electrolites/fastxcfxc.py` (`_occ_setup` and the occupied-side route in
+`_fxc_blocked`; `_get_veff_resp_mo_u` replaces `hessian/uks.py:
+get_veff_resp_mo`; `FASTXCFXC_OCC=0` restores W16's route,
+`FASTXCFXC_OCC_RATIO`, `_OCC_RATIO_GGA`, `_OCC_RHO_GGA`), two kernels in
+`kernels/fastxcfxc.cu`, `tests/test_fxc_occ.py`,
+`benchmarks/fxc_occ_probe.py`; write-up in `docs/README_fastxcfxcmgga.md`.
+
+**The falsification fires as written**: on W16's route both GEMM stages of
+a meta-GGA call run at 15.6–17.7 TF/s (penicillin V in both bases, taxol),
+92–94 % of the call, and operand formation — W28's finding — is 1.4 %; the
+3.9x over B3LYP was the four density products and four potential GEMMs,
+i.e. arithmetic.  So the arithmetic was changed.  Both CPHF callers want
+only `V C_o` (`_ao2mo` multiplies by it next) and hand `D = M (2C_o)^T +
+h.c.`, so on a block with `nsub > nocc` the density comes from
+`X[n] = C_o^T ao[n]` and `Y[n] = M^T ao[n]` and `V C_o` from four GEMMs
+`ao[n] · W[n]^T`: `8 nocc` per set and grid point against `8 nsub`, every
+GEMM long-sided.  Restricted meta-GGA function, against W16's route:
+**5.3x–7.5x in def2-TZVPP** (3.6x on Ni dithiolene²⁻), 1.6x–3.2x in
+def2-SVP from 10 to 60 atoms, 1.9x at 113; TPSS, r2SCAN, M06-L, M06-2X
+alike.  **Success is met**: TPSS/B3LYP on penicillin V/def2-TZVPP is 4.23x
+→ **1.15x** (the arithmetic ratio is now 1.58x), def2-SVP 3.48x → 1.49x.
+The unrestricted CPHF gets the route through `get_veff_resp_mo`, where its
+matrix route's density was upstream's `eval_rho4` at 4–9 TF/s: 1.7x–3.9x
+for meta-GGAs, 1.6x–2.1x for GGAs on Ni, Pt, Cu, Fe complexes; a
+restricted GGA takes the potential half, 1.2x–1.4x in def2-TZVPP.  Whole
+DF-TPSS Hessians: penicillin V/def2-TZVPP **40.6 → 17.5 s (2.31x)**, the
+six CPHF grid calls 28.5 → 5.6 s against B3LYP's 5.0; def2-SVP 1.44x;
+taxol 256.8 → 190.0 s (1.35x); UKS Ni and Pt complexes 1.14x–1.18x; traces
+to 1e-9.  The margin is `nsub/nocc`, which grows with the basis and falls
+with the molecule in a fixed basis (5.2x at 5.4, 1.7x–1.9x at 1.8), so the
+next step is a local `nocc`; and the matrix route's buffers, allocated
+eagerly for the largest block (41 GB at 113 atoms), are now lazy and share
+the route's — the first taxol Hessian ran out of memory without that.
+
+The original entry, for the record:
 
 *(Found by W28.)*
 

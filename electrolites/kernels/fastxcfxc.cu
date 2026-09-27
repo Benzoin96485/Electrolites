@@ -260,3 +260,127 @@ WRAP(fxc_scale_gga, scale_impl, 4,
       int nset, int nao, int ngrids, int nu_per_block,
       int wstride, int w0, int a0),
      (aow, wv, ao, nset, nao, ngrids, nu_per_block, wstride, w0, a0))
+
+// ---- W33: the occupied-side route of a Hessian's CPHF --------------------
+//
+// A CPHF right-hand side is a density matrix with factors,
+// D_i = M_i (2 C)^T + (2 C) M_i^T, and what the caller wants of the potential
+// is only V_i C (`hessian/rhf.py:_ao2mo` multiplies by C next).  So on a
+// block where the occupied count is well below the block's AO count both
+// halves can run on the occupied side, with
+//
+//   X[n][k][g]    = sum_u C[u][k] ao[n][u][g]              shared by every set
+//   Y[n][i][k][g] = sum_u M_i[u][k] ao[n][u][g]
+//
+// and sum_uv D_uv a_u b_v = 2 sum_k (Y^a X^b + X^a Y^b).  In the conventions
+// of fxc_rho1_mgga (gradient components doubled, tau halved):
+//
+//   rho1[i][0] = 4 sum_k Y0 X0
+//   rho1[i][x] = 4 sum_k (Yx X0 + Y0 Xx)                     x = 1,2,3
+//   rho1[i][4] = 2 sum_x sum_k Yx Xx
+//
+// A GGA is the same without the tau row (NC = 4).  Layouts: Y (4, nset,
+// nocc, ngrids), X (4, nocc, ngrids); set i's NC rows of rho1 start at row
+// i * rss, so the unrestricted caller can write one spin of its interleaved
+// (nset, 2, NC, ngrids) array (rss = 2 NC, pointer offset by the spin).  One
+// thread per (grid point, set), the k loop in the thread; the X loads are the
+// same for a block's TSY rows and come from L1.
+template <int NC> __device__ static void rho_occ_impl(
+    double *rho1, const double *Y, const double *X,
+    int nset, int nocc, int ngrids, int rss)
+{
+    const int g = blockIdx.x * WX + threadIdx.x;
+    const int i = blockIdx.y * TSY + threadIdx.y;
+    if (g >= ngrids || i >= nset) return;
+    const size_t sg = ngrids;
+    const size_t ys = (size_t)nset * nocc * sg;     // stride of Y's n index
+    const size_t xs = (size_t)nocc * sg;            // stride of X's n index
+    const double *yi = Y + (size_t)i * nocc * sg;
+    double r0 = 0., r1 = 0., r2 = 0., r3 = 0., t = 0.;
+    for (int k = 0; k < nocc; ++k) {
+        const size_t o = (size_t)k * sg + g;
+        const double y0 = yi[o], y1 = yi[ys + o], y2 = yi[2 * ys + o],
+                     y3 = yi[3 * ys + o];
+        const double x0 = X[o], x1 = X[xs + o], x2 = X[2 * xs + o],
+                     x3 = X[3 * xs + o];
+        r0 += y0 * x0;
+        r1 += y1 * x0 + y0 * x1;
+        r2 += y2 * x0 + y0 * x2;
+        r3 += y3 * x0 + y0 * x3;
+        if (NC == 5) t += y1 * x1 + y2 * x2 + y3 * x3;
+    }
+    double *ri = rho1 + (size_t)i * rss * sg + g;
+    ri[0] = 4. * r0;
+    ri[sg] = 4. * r1;
+    ri[2 * sg] = 4. * r2;
+    ri[3 * sg] = 4. * r3;
+    if (NC == 5) ri[4 * sg] = 2. * t;
+}
+
+// The potential on the occupied side.  With T = sum_g [sum_c wv_c ao_c ao_0^T
+// + sum_x wv_4 ao_x ao_x^T] (what fxc_scale and the GEMMs build, the tau term
+// only for meta-GGA) and V = T + T^T,
+//
+//   (V C)[u][k] = ao_0 [wv_0 X0 + sum_c wv_c Xc] + sum_x ao_x [wv_x X0
+//                 + 2 wv_4 Xx]                                (c = 0..3)
+//
+// Meta-GGA takes it as four GEMMs of inner dimension ngrids and output width
+// nset*nocc, (V C) = sum_n ao[n] . W[n]^T with
+//
+//   W[0] = 2 wv_0 X0 + sum_x wv_x Xx
+//   W[x] = wv_x X0 + 2 wv_4 Xx                              x = 1,2,3
+//
+// A GGA has no tau term, so its W[x] is a rank-one scaling of X0 and the
+// x terms fold with the wv_0 one into aow . X0^T, aow = sum_c wv_c ao_c being
+// what fxc_scale_gga already writes:
+//
+//   (V C) = ao_0 . Wc^T + aow . X0^T,     Wc = sum_c wv_c Xc
+//
+// -- two GEMMs where the meta-GGA needs four.  W has Y's layout and is
+// written into Y's memory; for a GGA only W[0] = Wc is written.  Set i's
+// rows of wv start at row i * wss (the unrestricted caller's interleaving,
+// as for rho_occ).
+template <int NC> __device__ static void w_occ_impl(
+    double *W, const double *wv, const double *X,
+    int nset, int nocc, int ngrids, int wss)
+{
+    const int g = blockIdx.x * WX + threadIdx.x;
+    const int i = blockIdx.y * TSY + threadIdx.y;
+    if (g >= ngrids || i >= nset) return;
+    const size_t sg = ngrids;
+    const size_t ws = (size_t)nset * nocc * sg;
+    const size_t xs = (size_t)nocc * sg;
+    const double *wi = wv + (size_t)i * wss * sg + g;
+    const double w0 = (NC == 5 ? 2. : 1.) * wi[0], w1 = wi[sg],
+                 w2 = wi[2 * sg], w3 = wi[3 * sg];
+    const double w4 = NC == 5 ? 2. * wi[4 * sg] : 0.;
+    double *Wi = W + (size_t)i * nocc * sg;
+    for (int k = 0; k < nocc; ++k) {
+        const size_t o = (size_t)k * sg + g;
+        const double x0 = X[o], x1 = X[xs + o], x2 = X[2 * xs + o],
+                     x3 = X[3 * xs + o];
+        Wi[o] = w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+        if (NC == 5) {
+            Wi[ws + o] = w1 * x0 + w4 * x1;
+            Wi[2 * ws + o] = w2 * x0 + w4 * x2;
+            Wi[3 * ws + o] = w3 * x0 + w4 * x3;
+        }
+    }
+}
+
+WRAP(fxc_rho_occ_gga, rho_occ_impl, 4,
+     (double *rho1, const double *Y, const double *X,
+      int nset, int nocc, int ngrids, int rss),
+     (rho1, Y, X, nset, nocc, ngrids, rss))
+WRAP(fxc_rho_occ_mgga, rho_occ_impl, 5,
+     (double *rho1, const double *Y, const double *X,
+      int nset, int nocc, int ngrids, int rss),
+     (rho1, Y, X, nset, nocc, ngrids, rss))
+WRAP(fxc_w_occ_gga, w_occ_impl, 4,
+     (double *W, const double *wv, const double *X,
+      int nset, int nocc, int ngrids, int wss),
+     (W, wv, X, nset, nocc, ngrids, wss))
+WRAP(fxc_w_occ_mgga, w_occ_impl, 5,
+     (double *W, const double *wv, const double *X,
+      int nset, int nocc, int ngrids, int wss),
+     (W, wv, X, nset, nocc, ngrids, wss))

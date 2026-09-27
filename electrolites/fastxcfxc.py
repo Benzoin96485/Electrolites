@@ -101,6 +101,23 @@ itself, and ``hessian/uhf.py:gen_vind`` tags the perturbed density with
 this function* and is declined here.  Everything that reaches it without that
 tag -- TDDFT, CPKS/polarizability, NMR, C6, all of which build a plain
 density matrix -- is covered.  ``docs/OPENSHELL_FXC.md`` measures both.
+
+**The occupied side of a Hessian's CPHF (W33).**  Both CPHF callers want
+only ``V C_o`` of the potential (``_ao2mo`` multiplies by it next), and hand
+a density with factors, ``D = M (2 C_o)^T + h.c.``.  So on a grid block whose
+AO count ``nsub`` is above ``nocc`` the block runs on the occupied side:
+``X[n] = C_o^T ao[n]`` once, ``Y[n] = M^T ao[n]`` for every set, the density
+from ``Y . X`` (``fxc_rho_occ_*``), and ``V C_o`` as four GEMMs
+``ao[n] . W[n]^T`` of inner dimension ``ngrids`` (``fxc_w_occ_*``) -- ``8
+nocc`` units of work per set and grid point for a meta-GGA where the
+AO-matrix route spends ``8 nsub``.  W16's matrix route ran its GEMMs at
+15-18 TF/s, the card's rate, so the gap to a GGA was arithmetic, and this
+is what changes it; ``docs/README_fastxcfxcmgga.md`` has the tables.  A
+restricted GGA takes only the potential half on that side (two GEMMs
+against one); an unrestricted Hessian takes both halves for every
+functional, through ``hessian/uks.py:get_veff_resp_mo`` -- the method that
+calls ``nr_uks_fxc`` and then ``_ao2mo`` -- which this module now replaces.
+``FASTXCFXC_OCC=0`` is the ablation.
 """
 import functools
 import os
@@ -293,7 +310,7 @@ def _prep(ni, mol, grids, dms, hermi, nspin=1):
 
 def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
                  rho0, vxc, fxc, max_memory, verbose, kernels=True, nspin=1,
-                 factors=None):
+                 factors=None, occ=None):
     """The shipped path, for one spin channel or two.
 
     The unrestricted case is the restricted one with the density matrices
@@ -304,6 +321,11 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
     the spin index, so the potential of spin ``t`` takes both spins' perturbed
     densities.  That contraction runs over the pair (spin, component) and has
     its own kernel (``fxc_wv_u_*``); everything on either side of it is shared.
+
+    With ``occ`` (the occupied orbitals ``C`` of a CPHF right-hand side
+    ``D = M (2C)^T + h.c.``, ``factors`` then being ``(M, 2C)``) it returns
+    ``V C`` of shape ``(nset, nao, nocc)`` instead of ``V``, and takes the
+    blocks where that is cheaper on the occupied side -- W33, `_occ_setup`.
     """
     log = logger.new_logger(mol, verbose)
     t0 = log.init_timer()
@@ -337,28 +359,42 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
     vmat = cupy.zeros((nsk, nao, nao))
 
     blk = NI.MIN_BLK_SIZE
-    nsub_max = max(len(x[1]) for x in grids.get_non0ao_idx(opt))
-    nsub_max = max(nsub_max, 1)
+    nsubs = [len(x[1]) for x in grids.get_non0ao_idx(opt)]
+    nsub_max = max(max(nsubs, default=1), 1)
     # every buffer here is linear in `nsk`, so an unrestricted call holds
     # twice what a restricted one of the same `nset` does.  There is
     # deliberately no threshold test: an allocation that cannot be met
     # raises, where a guard would add a way to decline silently on a case
     # that would have worked -- `docs/ROUND2_1.8.1.md` 5 is the round that
     # cost.
-    c0_buf = (None if mo1 is not None
-              else cupy.empty(nc0 * nsk * nsub_max * blk))
+    # The AO-matrix route's big buffers are allocated at the first block
+    # that takes that route (W33): when every block goes to the occupied
+    # side they are never needed, and at 113 atoms c0's alone is 31 GB.
+    # Each is sized, when first needed, for the largest block that will take
+    # its route (`_hint`, set below once the route is decided), and grown if
+    # a block ever asks for more.
+    _lazy = {}
+    _hint = {}
+
+    def _buf(name, n):
+        # on a block the occupied side does not take, its Y/W buffer is
+        # idle, and c0 (dead once the density kernel has run) and a
+        # meta-GGA's aow (written after that) can live in it in turn
+        if (oc is not None and (name == 'c0' or (name == 'aow' and mgga))
+                and oc['y_buf'].size >= n):
+            return oc['y_buf']
+        b = _lazy.get(name)
+        if b is None or b.size < n:
+            b = _lazy[name] = cupy.empty(max(n, _hint.get(name, 0)))
+        return b
     # the MO path evaluates the two channels into separate arrays and then
     # interleaves them, which is one copy of this size per block
     morho_buf = (cupy.empty(nsk * ncomp * blk) if mo1 is not None else None)
-    aow_buf = cupy.empty(nsk * nsub_max * blk)
     rho_buf = cupy.empty(nsk * ncomp * blk)
     wv_buf = cupy.empty(nsk * ncomp * blk)
-    v_buf = cupy.empty(nsk * nsub_max * nsub_max)
     # the masked densities go in a buffer too: `docs/README_fastxchess.md`
     # 3b measured per-block allocation of an array this shape at 48 % of that
     # function, and this one is the same shape times `nsk`
-    dm_buf = (None if mo1 is not None
-              else cupy.empty(nsk * nsub_max * nsub_max))
     # W16's second route to c0, for a density matrix that arrives with its
     # factors: D = M O^T + O M^T, so D . ao_0 = M (O^T ao_0) + O (M^T ao_0),
     # 3 nocc nsub flops per grid point per set against the matrix route's
@@ -381,6 +417,28 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
                    cupy.empty(nset * nocc_f * blk), cupy.empty(nocc_f * blk),
                    ratio)
         m_all = o_all = None
+    oc = None
+    if occ is not None and nspin == 1 and factors is not None:
+        # D = M (2C)^T + h.c.: the kernels' factor 4 is for exactly this
+        oc = _occ_setup(xctype, nset, nsub_max, blk, [
+            opt.sort_orbitals(cupy.asarray(factors[0]), axis=[1])],
+            [opt.sort_orbitals(cupy.asarray(occ), axis=[0])])
+    elif occ is not None and nspin == 2 and mo1 is not None:
+        # D_s = M_s C_s^T + h.c. (`hessian/uhf.py:gen_vind`), half of the
+        # restricted form's, which halving M puts back
+        oc = _occ_setup(xctype, nset, nsub_max, blk,
+                        [.5 * m for m in mo1], occ_coeff)
+    # the largest block each AO-matrix-route buffer serves
+    n_rho = n_pot = nsub_max
+    if oc is not None:
+        lim_rho = oc['ratio'] * oc['nocc'] if oc['yrho'] else np.inf
+        lim_pot = oc['ratio_pot'] * oc['nocc']
+        n_rho = max([n for n in nsubs if n <= lim_rho], default=1)
+        n_pot = max([n for n in nsubs if n <= lim_pot], default=1)
+    _hint['c0'] = nc0 * nsk * n_rho * blk
+    _hint['dm'] = nsk * n_rho * n_rho
+    _hint['v'] = nsk * n_pot * n_pot
+    _hint['aow'] = nsk * (n_pot if mgga else nsub_max) * blk
     if TIME:
         cupy.cuda.Stream.null.synchronize()
         _T['prep'] += _time.perf_counter() - _t
@@ -399,16 +457,29 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
             continue
         ao0 = ao if lda else ao[0]
 
+        # W33: this block on the occupied side?  Both halves, or for a
+        # restricted GGA by default the potential only (its density is W16's
+        # factor route, at nocc cost already)
+        ob_rho = ob = False
+        if oc is not None and ao.flags.c_contiguous:
+            ob_rho = oc['yrho'] and oc['ratio'] * oc['nocc'] < nsub
+            ob = oc['ratio_pot'] * oc['nocc'] < nsub
+        if ob or ob_rho:
+            _S['occ_blocks'] = _S.get('occ_blocks', 0) + 1
+            for sp in range(nspin):
+                _occ_x(oc, sp, idx, ao, nsub, ng)
         # ---- rho1 = (D . ao_0) . ao, one GEMM for every set --------------
-        if (fac is not None and fac[7] * fac[2] < nsub
+        if ob_rho:
+            pass                    # below, one spin at a time
+        elif (fac is not None and fac[7] * fac[2] < nsub
                 and ao0.flags.c_contiguous):
-            c0 = ndarray((nc0, nsk * nsub, ng), buffer=c0_buf)
+            c0 = ndarray((nc0, nsk * nsub, ng), buffer=_buf('c0', nc0 * nsk * nsub * ng))
             _c0_from_factors(fac, idx, ao0, c0[0], nset, nsub, ng)
             _S['factor_blocks'] = _S.get('factor_blocks', 0) + 1
         elif mo1 is None:
-            dm_mask = take_last2d(dms, idx, out=dm_buf)
+            dm_mask = take_last2d(dms, idx, out=_buf('dm', nsk * nsub * nsub))
             dm2 = dm_mask.reshape(nsk * nsub, nsub)
-            c0 = ndarray((nc0, nsk * nsub, ng), buffer=c0_buf)
+            c0 = ndarray((nc0, nsk * nsub, ng), buffer=_buf('c0', nc0 * nsk * nsub * ng))
             for n in range(nc0):
                 cupy.dot(dm2, ao0 if lda else ao[n], out=c0[n])
             dm_mask = dm2 = None
@@ -420,7 +491,20 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
         rho1 = ndarray((nsk, ncomp, ng), buffer=rho_buf)
         grid = ((ng + _WX - 1) // _WX, (nsk + _TSY - 1) // _TSY)
         grid_wv = ((ng + _WX - 1) // _WX, (nset + _TSY - 1) // _TSY)
-        if mo1 is not None:
+        if ob_rho:
+            for sp in range(nspin):
+                Y = _occ_y(oc, sp, idx, ao, nsub, ng)
+                if TIME:            # the Y GEMMs are the density's GEMMs
+                    cupy.cuda.Stream.null.synchronize()
+                    _T['gemm1'] += _time.perf_counter() - _t
+                    _t = _time.perf_counter()
+                _kernel(f'fxc_rho_occ_{suffix}')(
+                    grid_wv, (_WX, _TSY),
+                    (rho1.reshape(nset, nspin, ncomp, ng)[:, sp], Y,
+                     oc['x'][sp], np.int32(nset), np.int32(oc['nocc']),
+                     np.int32(ng), np.int32(nspin * ncomp)))
+            Y = None
+        elif mo1 is not None:
             # GPU4PySCF's own MO-basis density, one spin at a time, then one
             # copy into the interleaved layout the rest of this function
             # assumes.  Batching `eval_rho4` itself would be a third density
@@ -459,7 +543,9 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
             _t = _time.perf_counter()
 
         # ---- the fxc contraction ----------------------------------------
-        aow = ndarray((nsk * nsub, ng), buffer=aow_buf)
+        # a meta-GGA block on the occupied side never weights the AOs
+        aow = (None if ob and mgga else
+               ndarray((nsk * nsub, ng), buffer=_buf('aow', nsk * nsub * ng)))
         nz = (nsub + _UPB - 1) // _UPB
         if kernels:
             wv = ndarray((nsk, ncomp, ng), buffer=wv_buf)
@@ -494,7 +580,16 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
         # GGA and meta-GGA the final transpose_sum absorbs it; for LDA the
         # block matrix is symmetric, since aow = ao_0 * wv there, and the tau
         # term of meta-GGA is symmetric on its own.
-        vblk = ndarray((nsk * nsub, nsub), buffer=v_buf)
+        if ob:
+            for sp in range(nspin):
+                _occ_potential(oc, sp, nspin, idx, ao, wv, aow, mgga, nset,
+                               nsub, ng, grid_wv, nz)
+            if TIME:
+                cupy.cuda.Stream.null.synchronize()
+                _T['gemm2'] += _time.perf_counter() - _t
+                _t = _time.perf_counter()
+            continue
+        vblk = ndarray((nsk * nsub, nsub), buffer=_buf('v', nsk * nsub * nsub))
 
         def _weight(nw, w0, a0):
             # aow[i][v][g] = sum_n wv[i][w0+n][g] * ao[a0+n][v][g]
@@ -534,6 +629,24 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
 
     if not lda:
         transpose_sum(vmat)
+    if oc is not None:
+        # the blocks taken on the matrix route, projected once at the end
+        vmat = vmat.reshape(nset, nspin, nao, nao)
+        out = []
+        for sp in range(nspin):
+            u = oc['u'][sp].reshape(nao, nset, oc['nocc']).transpose(1, 0, 2)
+            u = contract('nij,jo->nio', vmat[:, sp], oc['c'][sp], beta=1.,
+                         out=u.copy())
+            out.append(opt.unsort_orbitals(u, axis=[1]))
+        vmat = out[0] if nspin == 1 else out
+        if TIME:
+            cupy.cuda.Stream.null.synchronize()
+            _T['n'] += 1
+            print('[fastxcfxc] call %2d  ' % _T['n']
+                  + '  '.join(f'{k} {_T[k]:6.3f}' for k in
+                              ('prep', 'gemm1', 'rho1', 'wv', 'scale',
+                               'gemm2', 'accum')), flush=True)
+        return vmat
     vmat = opt.unsort_orbitals(vmat, axis=[1, 2])
     if nspin == 2:
         # un-interleave; GPU4PySCF returns the two channels stacked
@@ -596,6 +709,134 @@ def _c0_from_factors(fac, idx, ao0, c0, nset, nsub, ng):
         handle, n_, n_, ng, nsub, nocc, _ONE.ctypes.data,
         y.data.ptr, ng, nocc * ng, o.data.ptr, nocc, 0,
         _ONE.ctypes.data, c0.data.ptr, ng, nsub * ng, nset)
+
+
+#: W33.  FASTXCFXC_OCC=0 keeps every block of a Hessian's CPHF call on the
+#: AO-matrix route (the ablation); otherwise a block goes to the occupied side
+#: where FASTXCFXC_OCC_RATIO * nocc < nsub (meta-GGA, and every functional on
+#: an unrestricted reference) or FASTXCFXC_OCC_RATIO_GGA * nocc < nsub (a
+#: restricted GGA).  FASTXCFXC_OCC_RHO_GGA=1 takes a restricted GGA's density
+#: on the occupied side too rather than by W16's factor route.  All read at
+#: call time.
+def _occ_setup(xctype, nset, nsub_max, blk, ms, cs):
+    """Everything the occupied-side route needs, per spin; ``ms`` and ``cs``
+    are the sorted factors, ``D_s = M_s (2 C_s)^T + h.c.``."""
+    if os.environ.get('FASTXCFXC_OCC', '1') == '0':
+        return None
+    nspin = len(cs)
+    if xctype not in ('GGA', 'MGGA'):
+        return None
+    # the density half: meta-GGA and the unrestricted case (whose matrix
+    # route evaluates it with upstream's `eval_rho4`) at `ratio`; the
+    # potential half at `ratio` for a meta-GGA, where it is four GEMMs a
+    # side, and at the GGA ratio for a GGA, where the occupied side's two
+    # nocc-wide GEMMs meet one nsub-wide one
+    ratio = float(os.environ.get('FASTXCFXC_OCC_RATIO', '1'))
+    ratio_pot = (ratio if xctype == 'MGGA' else
+                 float(os.environ.get('FASTXCFXC_OCC_RATIO_GGA', '3')))
+    yrho = (xctype == 'MGGA' or nspin == 2
+            or os.environ.get('FASTXCFXC_OCC_RHO_GGA', '0') == '1')
+    if xctype == 'GGA' and nspin == 1 and yrho:
+        ratio = ratio_pot
+    nao, nocc = cs[0].shape
+    if not min(ratio if yrho else ratio_pot, ratio_pot) * nocc < nsub_max:
+        return None
+    if any(m.shape != (nset, nao, nocc) for m in ms):
+        return None
+    ny = 4 if yrho else 1
+    return {
+        'ratio': ratio, 'ratio_pot': ratio_pot, 'nocc': nocc, 'nset': nset,
+        'yrho': yrho,
+        'c': [cupy.ascontiguousarray(c) for c in cs],
+        'ct': [cupy.ascontiguousarray(c.T) for c in cs],
+        # M^T, so that Y = M^T ao is one GEMM over (set, k) rows
+        'mt': ([cupy.ascontiguousarray(m.transpose(0, 2, 1)) for m in ms]
+               if yrho else None),
+        'mt_buf': cupy.empty(nset * nocc * nsub_max) if yrho else None,
+        'ct_buf': cupy.empty(nocc * nsub_max),
+        'x_buf': [cupy.empty(4 * nocc * blk) for _ in range(nspin)],
+        'x': [None] * nspin,
+        'y_buf': cupy.empty(ny * nset * nocc * blk),
+        'u_buf': cupy.empty(nsub_max * nset * nocc),
+        # V_s C_s accumulated as (nao, nset*nocc): the output of
+        # ao[n] . W[n]^T, rows scattered to the block's AOs
+        'u': [cupy.zeros((nao, nset * nocc)) for _ in range(nspin)]}
+
+
+def _occ_x(oc, sp, idx, ao, nsub, ng):
+    """X[n] = C^T ao[n] on one block, (4, nocc, ng), for spin ``sp``."""
+    nocc = oc['nocc']
+    ct = ndarray((nocc, nsub), buffer=oc['ct_buf'])
+    cupy.take(oc['ct'][sp], idx, axis=1, out=ct)
+    X = ndarray((4, nocc, ng), buffer=oc['x_buf'][sp])
+    for n in range(4):
+        cupy.dot(ct, ao[n], out=X[n])
+    oc['x'][sp] = X
+    return X
+
+
+def _occ_y(oc, sp, idx, ao, nsub, ng):
+    """Y[n] = M^T ao[n] for every set, (4, nset, nocc, ng)."""
+    nocc, nset = oc['nocc'], oc['nset']
+    mt = ndarray((nset, nocc, nsub), buffer=oc['mt_buf'])
+    cupy.take(oc['mt'][sp], idx, axis=2, out=mt)
+    mt2 = mt.reshape(nset * nocc, nsub)
+    Y = ndarray((4, nset * nocc, ng), buffer=oc['y_buf'])
+    for n in range(4):
+        cupy.dot(mt2, ao[n], out=Y[n])
+    return Y
+
+
+def _gemm_nt(m, n, k, a, lda, b, ldb, c, ldc, beta,
+             batch=1, sa=0, sb=0, sc=0):
+    """Row-major ``c[m, n] (+)= a[m, k] . b[n, k]^T``, optionally batched."""
+    from cupy_backends.cuda.libs import cublas
+    handle = cupy.cuda.device.get_cublas_handle()
+    bt = _ONE if beta else _ZERO
+    # column-major: c^T (n x m) = b^T-as-stored (op T) . a-as-stored (op N)
+    if batch == 1:
+        cublas.dgemm(handle, cublas.CUBLAS_OP_T, cublas.CUBLAS_OP_N,
+                     n, m, k, _ONE.ctypes.data, b, ldb, a, lda,
+                     bt.ctypes.data, c, ldc)
+    else:
+        cublas.dgemmStridedBatched(
+            handle, cublas.CUBLAS_OP_T, cublas.CUBLAS_OP_N,
+            n, m, k, _ONE.ctypes.data, b, ldb, sb, a, lda, sa,
+            bt.ctypes.data, c, ldc, sc, batch)
+
+
+def _occ_potential(oc, sp, nspin, idx, ao, wv, aow, mgga, nset, nsub, ng,
+                   grid, nz):
+    """(V_s C_s)[idx] += this block's contribution; see ``fxc_w_occ_*``.
+
+    ``wv`` is ``(nset, nspin, ncomp, ng)`` flattened; spin ``sp``'s rows
+    start ``sp * ncomp`` rows in and recur every ``nspin * ncomp``."""
+    nocc = oc['nocc']
+    nc = 5 if mgga else 4
+    X = oc['x'][sp]
+    W = ndarray((4 if mgga else 1, nset * nocc, ng), buffer=oc['y_buf'])
+    wv_s = wv.reshape(nset, nspin, nc, ng)[:, sp]
+    _kernel('fxc_w_occ_mgga' if mgga else 'fxc_w_occ_gga')(
+        grid, (_WX, _TSY),
+        (W, wv_s, X, np.int32(nset), np.int32(nocc), np.int32(ng),
+         np.int32(nspin * nc)))
+    ub = ndarray((nsub, nset * nocc), buffer=oc['u_buf'])
+    nw = nset * nocc
+    for n in range(4 if mgga else 1):
+        _gemm_nt(nsub, nw, ng, ao[n].data.ptr, ng, W[n].data.ptr, ng,
+                 ub.data.ptr, nw, n > 0)
+    if not mgga:
+        # + aow_i . X0^T, written into set i's nocc columns of ub
+        aow_s = aow[:nset * nsub]
+        _kernel('fxc_scale_gga')(
+            (grid[0], grid[1], nz), (_WX, _TSY),
+            (aow_s, wv, ao, np.int32(nset), np.int32(nsub), np.int32(ng),
+             np.int32(_UPB), np.int32(nspin * 4), np.int32(sp * 4),
+             np.int32(0)))
+        _gemm_nt(nsub, nocc, ng, aow_s.data.ptr, ng, X.data.ptr, ng,
+                 ub.data.ptr, nw, True, batch=nset, sa=nsub * ng, sb=0,
+                 sc=nocc)
+    oc['u'][sp][idx] += ub
 
 
 def _nr_rks_fxc_blocked(*a, **kw):
@@ -808,19 +1049,119 @@ def _nr_rks_fxc_mo(ni, mol, grids, xc_code, dm0=None, dms=None,
     if fn is _nr_rks_fxc_blocked and hasattr(dms, 'mo1'):
         # the factors of `dm1 = mo1 (2 C_o)^T + h.c.` (`gen_vind`)
         kw['factors'] = (dms.mo1, 2 * cupy.asarray(dms.occ_coeff))
+        # W33: and since `_ao2mo` wants only V C_o, ask for that
+        if os.environ.get('FASTXCFXC_OCC', '1') != '0':
+            kw['occ'] = dms.occ_coeff
     v = fn(ni, mol, grids, xc_code, None, plain.reshape(-1, nao, nao), 0, 1,
            rho0, vxc, fxc, max_memory, verbose, **kw)
-    v = _ao2mo(v, cupy.asarray(dms.occ_coeff), cupy.asarray(mo_coeff))
+    if v.shape[-1] == nao:
+        v = _ao2mo(v, cupy.asarray(dms.occ_coeff), cupy.asarray(mo_coeff))
+    else:
+        v = contract('nio,ip->npo', v, cupy.asarray(mo_coeff))
     if plain.ndim == 2:
         v = v[0]
     return v
 
 
 _nr_rks_fxc_mo_orig = None
+_get_veff_resp_mo_u_orig = None
+
+
+def _get_veff_resp_mo_u(hessobj, mol, dms, mo_coeff, mo_occ, hermi=1):
+    """``hessian/uks.py:get_veff_resp_mo`` -- an unrestricted Hessian's CPHF.
+
+    W33's unrestricted half.  Upstream calls ``nr_uks_fxc`` for the two AO
+    potentials and takes each to the MO basis with ``_ao2mo`` straight
+    after, which only ever wants ``V_s C_s``; so this asks ``_fxc_blocked``
+    for that product, and the blocks where it is cheaper run on the occupied
+    side (``_occ_setup``).  Everything else -- the NLC term, the Coulomb
+    and exchange response -- is upstream's lines unchanged.  Anything the
+    route does not cover is upstream's whole function.
+    """
+    from gpu4pyscf.hessian.rhf import _ao2mo
+    from gpu4pyscf.hessian.uks import nr_uks_fnlc_mo
+    mf = hessobj.base
+    ni = mf._numint
+    # by name, not by identity: a profiler that wraps `_nr_uks_fxc_blocked`
+    # (benchmarks/df_hess_anatomy.py does) must not turn the route off
+    if (MODE != 'blocked'
+            or os.environ.get('FASTXCFXC_OCC', '1') == '0'
+            or os.environ.get('FASTXCFXC_MO', '1') == '0'
+            or not hasattr(dms, 'mo1')
+            or ni._xc_type(mf.xc) not in ('GGA', 'MGGA')):
+        return _get_veff_resp_mo_u_orig(hessobj, mol, dms, mo_coeff, mo_occ,
+                                        hermi)
+    mol = hessobj.mol
+    grids = getattr(mf, 'cphf_grids', None)
+    if grids is not None:
+        logger.info(mf, 'Secondary grids defined for CPHF in Hessian')
+    else:
+        grids = getattr(mf, 'grids', None)
+        logger.info(mf, 'Primary grids is used for CPHF in Hessian')
+    if grids and grids.coords is None:
+        grids.build(mol=mol, with_non0tab=False, sort_grids=True)
+
+    nao, nmoa = mo_coeff[0].shape
+    nao, nmob = mo_coeff[1].shape
+    mocca = mo_coeff[0][:, mo_occ[0] > 0]
+    moccb = mo_coeff[1][:, mo_occ[1] > 0]
+    nocca = mocca.shape[1]
+    noccb = moccb.shape[1]
+    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, mol.spin)
+    hybrid = ni.libxc.is_hybrid_xc(mf.xc)
+    hermi = 1
+
+    rho0, vxc, fxc = ni.cache_xc_kernel(mol, grids, mf.xc,
+                                        mo_coeff, mo_occ, 1)
+    nset = dms.shape[1]
+    v1vo = cupy.empty([nset, nmoa * nocca + nmob * noccb])
+    if not _usable_u(ni, mf.xc, dms, hermi, fxc):
+        v1 = ni.nr_uks_fxc(mol, grids, mf.xc, None, dms, 0, hermi,
+                           rho0, vxc, fxc, max_memory=None)
+        vc = None
+    else:
+        _S['ours_u_mo'] += 1
+        v1 = _nr_uks_fxc_blocked(ni, mol, grids, mf.xc, None, dms, 0, hermi,
+                                 rho0, vxc, fxc, None, None, occ=True)
+        # `occ_coeff` is padded to nocca columns for both spins
+        vc = v1 if isinstance(v1, list) else None
+    if vc is not None:
+        _S['occ_u_calls'] = _S.get('occ_u_calls', 0) + 1
+        v1vo[:, :nmoa * nocca] = contract(
+            'nio,ip->npo', vc[0][:, :, :nocca], mo_coeff[0]
+        ).reshape(-1, nmoa * nocca)
+        v1vo[:, nmoa * nocca:] = contract(
+            'nio,ip->npo', cupy.ascontiguousarray(vc[1][:, :, :noccb]),
+            mo_coeff[1]).reshape(-1, nmob * noccb)
+    else:
+        v1vo[:, :nmoa * nocca] = _ao2mo(v1[0], mocca, mo_coeff[0]).reshape(
+            -1, nmoa * nocca)
+        v1vo[:, nmoa * nocca:] = _ao2mo(v1[1], moccb, mo_coeff[1]).reshape(
+            -1, nmob * noccb)
+    v1 = vc = None
+
+    if mf.do_nlc():
+        vnlca, vnlcb = nr_uks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dms)
+        v1vo[:, :nmoa * nocca] += vnlca.reshape(-1, nmoa * nocca)
+        v1vo[:, nmoa * nocca:] += vnlcb.reshape(-1, nmob * noccb)
+
+    if hybrid:
+        vj, vk = hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ, hermi=1)
+        vk *= hyb
+        if omega > 1e-10:
+            _, vk_lr = hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ,
+                                         hermi, with_j=False, omega=omega)
+            vk_lr *= (alpha - hyb)
+            vk += vk_lr
+        v1vo += vj - vk
+    else:
+        v1vo += hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ,
+                                  hermi=1, with_k=False)[0]
+    return v1vo
 
 
 def apply_patch():
-    global _PATCHED, _nr_rks_fxc_mo_orig
+    global _PATCHED, _nr_rks_fxc_mo_orig, _get_veff_resp_mo_u_orig
     if not _PATCHED:
         NI._nr_rks_fxc_orig = NI.nr_rks_fxc
         # the module attribute is the one `nr_rks_fxc_st` (TDA/TDDFT) calls;
@@ -844,6 +1185,13 @@ def apply_patch():
         _nr_rks_fxc_mo_orig = rks_hess.nr_rks_fxc_mo
         rks_hess._nr_rks_fxc_mo_orig = _nr_rks_fxc_mo_orig
         rks_hess.nr_rks_fxc_mo = _nr_rks_fxc_mo
+        # W33: an unrestricted Hessian's CPHF, which `hessobj` reaches as a
+        # method; the DF Hessian inherits it from this class
+        from gpu4pyscf.hessian import uks as uks_hess
+        _get_veff_resp_mo_u_orig = uks_hess.get_veff_resp_mo
+        uks_hess._get_veff_resp_mo_orig = _get_veff_resp_mo_u_orig
+        uks_hess.get_veff_resp_mo = _get_veff_resp_mo_u
+        uks_hess.Hessian.get_veff_resp_mo = _get_veff_resp_mo_u
         _PATCHED = True
 
 
