@@ -29,6 +29,9 @@ not to write the code),
 `docs/README_fastdfhessip2.md` **W24** (whose finding is W29) and
 `docs/README_fastdfuhessip.md` **W25** (whose finding is W30),
 `docs/README_fastdfj3cscr.md` closed **W26**,
+`docs/README_fastdfaudit.md` **W27**, `docs/README_fastdfhessip3.md` **W29**
+(whose finding is W31), `docs/README_fastdfh1occ.md` **W30** (whose finding
+is W32),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -228,6 +231,38 @@ this page and it is what re-ranked §4.
 Ranked by (value × confidence) / cost, **after** §3.3.  Each item gives what
 to change, the evidence it rests on, what would count as success, and what
 would falsify it.
+
+**W27 is done: 101 contractions can pass the plan wall by 545 atoms, and one
+guard covers all of them.**  `benchmarks/cutensor_audit.py` records every
+cuTENSOR contraction of ten DF runs (42–284 atoms, SCF to Hessian) by call
+site and bounds it at taxol, PfPMT and HcgC: 235 sites, 101 past 2²⁹ by 545
+atoms, 17 already at 113 — and of those 17, eight ran only because an extent
+happened to factor (W18's own item 4 plans at `nao_c = 1185` and is refused
+at 1187).  `electrolites/planguard.py`, in `patch_all()`, wraps the one
+function every `contract` reaches and cuts a refused contraction into pieces
+that plan, at 2–3 µs a call.  The audit's first ωB97X run found that **every
+range-separated DF gradient crashed under `patch_all()`**: W13's cached
+metric optimiser left the long-range ω on the full-range `auxmol`.  Fixed
+(`docs/README_fastdfaudit.md`).
+
+**W29 is done, and W31 is what it found.**  The DF Hessian's
+`ejk_int3c2e_ip2` kernel was slow first because of its launch — whole
+auxiliary batches per block, a grid one block high, one 254-register block
+per SM.  Launched as its own tile the unchanged kernel is **2.2x–6.4x**, and
+the two derivative fills launched the same way **3.8x–4.3x**; the ip2 term
+is 1.15x–2.03x W24's and a whole Hessian 1.04x–1.22x.  What bounds the kernel
+now is the contraction of the Rys `g` arrays in shared memory, 53–83 % of
+it, not the roots (1–4 %): W31 (`docs/README_fastdfhessip3.md`).
+
+**W30 is done, and W32 is what it found.**  W25's occupied-side form of the
+h1 term's per-atom exchange, in the restricted function: D2 **2.97x** in
+def2-TZVPP and **1.91x** at 113 atoms, and the twin's crossover score (4e6)
+picks the better form on all fourteen restricted systems measured, so the
+entry's worry that the restricted crossover sits higher does not hold.  On
+the way: a pure functional's h1 call has `k_factor = 0` and upstream formed
+every exchange contraction anyway; skipped, DF-PBE's h1 is another
+1.06x–1.16x (`docs/README_fastdfh1occ.md`).  What is left in h1 at 113 atoms
+is stage C, W32.
 
 **W4 is done, and W11, W12 and W13 are what it found.**  The cderi build is
 1.14x–1.83x faster with the tensor on the device and **2.72x–3.20x** with it
@@ -2145,7 +2180,42 @@ the batch's shells, and the same with `|dc_P|` on the other side — can skip a
   bound tight enough to matter can drop — measure the cycle count at a
   threshold of 1e-13 first; it is free to measure with W20's code.
 
-### W27 — Every other contraction whose output can pass 2²⁹ elements
+### W27 — Every other contraction whose output can pass 2²⁹ elements — **done: 101 can, one guard covers them all, and the audit's first run found a gradient that did not run**
+
+`benchmarks/cutensor_audit.py`, `electrolites/planguard.py`,
+`_cuplan.contract_with`, `tests/test_planguard.py`, the `_dfj2c` fix and its
+test in `tests/test_dfcderi.py`; write-up in `docs/README_fastdfaudit.md`.
+
+**The list is measured.**  The audit records every call into
+`gpu4pyscf/lib/cutensor.py:contraction` by call site over ten DF runs
+(penicillin V in B3LYP, PBE, ωB97X, def2-TZVPP, UKS, host cderi and TDA; the
+Cu macrocycle UKS; taxol with a Hessian and its cation; PfPMT's SCF and
+gradient), labels each extent of the largest output with the molecule's
+dimension it equals, and re-evaluates it at taxol, PfPMT and HcgC.  **235
+sites; 101 pass 2²⁹ by 545 atoms, 69 of them by 284 and 17 already at
+113** — 11 of the 101 in GPU4PySCF's own CPHF and `df_jk` code.  Of the 17,
+nine sit behind a W21/W25 query and eight ran because of their extents'
+factors: W18's own item 4, `(1185, 920, 1185)` on taxol, plans because
+`1185 = 3·5·79` and is refused at `nao_c = 1187`.  No real run was refused.
+
+**One guard, not a hundred.**  `planguard` (in `patch_all()`) wraps the one
+function every `contract` reaches: the plain call below 2²⁹, a cached query
+above, and a refused contraction cut along a free output mode into pieces
+that plan, element for element the same arithmetic — W21's refused gradient
+contraction and the CPHF's `gen_vind` product at 450 right-hand sides both
+come out at 0.0 against `cp.matmul`.  2–3 µs a call, about 1 % of a 42-atom
+DF Hessian.  The W21/W25 block queries stay: a block that plans whole is one
+launch.
+
+**What the first ωB97X row found**: every range-separated DF gradient under
+`patch_all()` raised `AssertionError` in `fastdfgrad._metric_pass`.  W13's
+cached two-centre optimiser set the long-range ω on the full-range
+`Int3c2eOpt`'s own `auxmol` and left it there, so W3's reuse of that
+optimiser built the long-range metric for the full-range call.  Fixed with a
+`try/finally`; gradients agree with GPU4PySCF to 4e-11–7e-9 on four
+molecule/functional/basis cases.  The SCF and the DF Hessian never saw it.
+
+The original entry, for the record:
 
 *(Found by W21.)*
 
@@ -2189,7 +2259,34 @@ and `_get_exc_deriv2` (which is `_get_vxc_deriv2` plus `_get_vxc_diag`)
 * `tests/test_mgga_inplace.py` is the CPU reference to check against:
   PySCF's `_get_vxc_deriv1` agrees with the repaired upstream one to 2e-12.
 
-### W29 — The `ejk_int3c2e_ip2` kernel
+### W29 — The `ejk_int3c2e_ip2` kernel — **done: a launch problem first, 2.2x–6.4x with the kernel unchanged; what is left inside it is W31**
+
+`electrolites/_ip2launch.py`, `fastdfhessip` items 15 and 16
+(`FASTDFHESSIP_IP2_TILE`, `_IP2_KCHUNK`, `_IP2_PCHUNK`, `_FILL_TILE`),
+`benchmarks/df_ip2_class_probe.py`; write-up in `docs/README_fastdfhessip3.md`.
+
+The class-by-class profile the entry asked for showed that the launch was
+the problem before any class was.  GPU4PySCF gives each block item 1's pair
+count and a whole auxiliary batch (up to 237 shells in series) on a grid one
+block high, and the card holds only one 254-register block per SM, so a
+launch was a few waves with a tail as long as its heaviest block.  Launched
+as its own tile — as many pairs per block as it runs side by side at the
+batch's `lk`, against 16 auxiliary shells, with the pseudo-density's columns
+permuted into the layout that split implies — the kernel is **2.2x–6.4x**
+faster on eleven systems (5–113 atoms, organic and Fe/Ni/Cu/Co/Pt, def2-SVP
+and def2-TZVPP) without a line of it changed.  The two derivative fills
+beside it had the same launch and are **3.8x–4.3x** from resizing the pair
+count alone.  The ip2 term is **1.15x–2.03x** W24's, h1 up to 1.43x, whole
+Hessians **1.04x–1.22x**.  The success bar (W19's 4.4x–6.5x) is met at 21–60
+atoms and missed at 113 atoms (2.2x) and on the small metal complexes
+(1.4x–2.3x).  The falsification does not fire: an ablation at equal launch
+geometry puts the Rys roots at 1–4 % of the kernel and the `gout`
+contraction over shared-memory `g` at 53–83 %, far from the card's
+arithmetic rate — that contraction is **W31**.  Half of the old "D3
+integrals" stage turned out to be buffer allocation, which now has its own
+row.
+
+The original entry, for the record:
 
 *(Found by W24.)*
 
@@ -2213,7 +2310,34 @@ call on penicillin V, **51–52 %** on the Pt(II) and Ni(II) complexes and
   the arithmetic a Rys second derivative needs — then the answer is
   screening on the pseudo-density, which this kernel does not do.
 
-### W30 — The restricted `h1`'s per-atom exchange term on the occupied side
+### W30 — The restricted `h1`'s per-atom exchange term on the occupied side — **done: the twin's crossover, and no exchange at all for a pure functional**
+
+`fastdfhessip._get_veff` item 12 (and item 14 in both spin cases),
+`tests/test_dfhessip.py`, `tests/test_dfuhessip.py`; write-up in
+`docs/README_fastdfh1occ.md`.
+
+**D2 moves by what it moved in the twin**: 1350 → 455 ms (**2.97x**) in
+def2-TZVPP at 42 atoms and 4.70 → 2.47 s (**1.91x**) at 113, against the
+entry's 3.2x and 1.8x; the function is 1.87x GPU4PySCF's in def2-TZVPP where
+the AO form was 1.48x, and 1.76x at 113 atoms where it was 1.53x.  **The
+falsification does not fire**: on fourteen restricted systems (10–113 atoms,
+organic and Ni, Pt, Cu, Co complexes, def2-SVP and def2-TZVPP) the AO form
+wins or ties at every score up to 1.7e6 and the occupied form wins at every
+score from 6.1e6 — the twin's interval — so the twin's 4e6 threshold is
+kept and picks the better form, or one within 2 %, on all fourteen.  With
+the occupied index batched, D1's `j3c·C_o` covers the batch only, so the
+form builds its own over every occupied orbital.
+
+**Item 14**, found on the way: `df/hessian/rks.py` calls `_get_veff` with
+`k_factor = hyb = 0` for a pure functional, and upstream (and W18's copy)
+formed every exchange contraction of stages C, D1, D2 and E and scaled it by
+zero.  Skipped, DF-PBE's h1 is 1.06x–1.16x on top of W18 from 22 to 113
+atoms (1.5x–2.1x GPU4PySCF's) and the unrestricted twin 1.07x–1.08x.  h1 is
+3–15 % of a whole Hessian after W18, so whole Hessians gain 1.02x–1.05x in
+def2-TZVPP B3LYP, 3 s of 700 at 113 atoms, and inside the spread elsewhere.
+What is left in h1 at 113 atoms is stage C, **W32**.
+
+The original entry, for the record:
 
 *(Found by W25.)*
 
@@ -2236,6 +2360,59 @@ def2-SVP case up to 60 atoms.  `fastdfhessip._get_veff` has the same term
   restricted per-atom contraction is one spin's work where the twin's is two
   spins' in the same launch, so the launches are a larger share of it and
   the crossover can sit higher than 4e6, or past every size that fits.
+
+### W31 — The ip2 kernel's contraction over shared-memory `g`, and its atomics
+
+*(Found by W29.)*
+
+After W29's tile launch, an ablation of `ejk_int3c2e_ip2` at equal geometry
+(occupancy held with dynamic shared memory) splits the kernel:
+
+| part | penicillin V | Pt(II) complex | taxol (113 atoms) |
+|---|---|---|---|
+| Rys roots | 1–3 % | 1 % | 4 % |
+| `g` recurrences | 12 % | 9 % | 11 % |
+| per-triple atomics | 9 % | 0 % | 18 % |
+| **`gout` contraction** | **62 %** | **83 %** | **53 %** |
+
+Per Cartesian component and root, the contraction does 18 shared `gx`
+loads, 9 constant `_c_cartesian_lexical_xyz` loads, a float-reciprocal index
+decode and up to 12 data-dependent branches, at 8 warps per SM; moving the
+exponent table to shared memory alone was measured at 1.00x
+(`docs/README_fastdfhessip3.md`).
+
+* **Do**: generate the contraction per `(li, lj, lk)` with the Cartesian
+  indices and the `i±1`/`j±1` offsets as literals, no decode, no branches.
+  W19's register-resident design does not carry over — `(dd|g)` needs 240
+  doubles of `g` per root.  Then replace the 24 per-triple `atomicAdd`s
+  with a block-level reduction.
+* **Success**: another 2x or more at 113 atoms and on the Pt/Fe complexes,
+  where W29's launch change gave least.
+* **Falsified if**: a literal-index contraction is not faster than the
+  ablation's 53–83 % share allows.
+
+### W32 — The restricted `h1`'s stage C
+
+*(Found by W30.)*
+
+With W30's occupied form, the largest stage left in the restricted `h1` term
+at 113 atoms is C — the per-*auxiliary*-atom `j2c_10` contractions,
+`contract('xrs,siq->xriq', j2c_10[:, A], dm_3c)` and its product with
+`dm_3c` into the AO matrices — at **5.6–6.8 s of a 19.6 s call** on taxol
+(`FASTDFHESSIP_TIME=1`, `docs/README_fastdfh1occ.md` §2).  The two carry
+`2·3·naux²·nocc·nao + 2·3·naux·nocc·nao²` = 6.1e13 flops there, so C runs at
+about 10 TF/s where W8 measured the DF Hessian's large GEMMs at 15 TF/s:
+one launch per auxiliary atom, `naux_A` ≈ 50 rows each.
+
+* **Do**: profile C per auxiliary atom (is it the `j2c_10` GEMM at `naux_A`
+  rows, or the `take` of `dm_3c` rows before it), then batch auxiliary
+  atoms into launches of a few thousand rows within the memory the stage
+  already holds.
+* **Success**: C at the GEMM rate (≈4 s at 113 atoms), the same on the
+  unrestricted twin.
+* **Falsified if**: the per-atom launches are already at 15 TF/s — then C
+  is arithmetic, and the next thing to try is `j2c_10`'s sparsity (the
+  derivative of `(r|s)` on `r`'s atom decays with the distance to `s`).
 
 ### Not on this list
 

@@ -296,7 +296,9 @@ largest first.  `bound` is the labelled shape at HcgC (`nao 5037`,
 `nao_c 5293`, `naux 24722`, `naux_c 29124`, `nocc 1011`, `natm 545`), per
 block of the size seen where there is a `blk`; `first past` is the smallest
 of taxol, PfPMT and HcgC at which it passes; `plan` is cuTENSOR's answer at
-the largest shape seen.  Line numbers are this commit's for `electrolites/` and GPU4PySCF 1.8.1's for the rest.  Every row is
+the largest shape seen.  Line numbers are this commit's for `electrolites/` and GPU4PySCF 1.8.1's for the rest.  The runs are from before
+W29 (`docs/README_fastdfhessip3.md`); the penicillin V Hessian re-audited
+after it reaches the same call sites and patterns.  Every row is
 guarded by `planguard`; the rows marked in §2 are also behind their own
 query.
 
@@ -305,102 +307,102 @@ query.
   fastdfhess._jk_once:590                      Lpq,snqi->snpiL        4852  2.55e+09 ok    (2,3*natm,nao,nocc,blk=256)     4.26e+12 taxol
   fastdfhess._jk_once:608                      snpiL,spj->snjiL       4852  5.46e+08 ok    (2,3*natm,nocc,nocc,blk=256)    8.56e+11 taxol
   _dfhessip_u._mm                              rs,npir->snpi          87  2.74e+08 ok    (naux,2,nao_c,nocc)             2.65e+11 taxol
-  fastdfhessip._h_aux_block:1221               xuv,vij->xuij          7  1.82e+08 ok    (3,naux_c,2*nocc,nocc)          1.79e+11 taxol
+  fastdfhessip._h_aux_block:1283               xuv,vij->xuij          7  1.82e+08 ok    (3,naux_c,2*nocc,nocc)          1.79e+11 taxol
   hessian.uhf.fx:358                           snpi,sqi->snpq         13  9.55e+07 ok    (2,3*natm,nao,nao)              8.30e+10 taxol
   _dfhessip_u._mm                              uv,vnij->unij          2  6.05e+07 ok    (naux_c,2,nocc,nocc)            5.95e+10 taxol
-  _dfhessip_u._get_veff:749                    rniq,nqj->rnij         2  6.05e+07 ok    (naux_c,2,nocc,nocc)            5.95e+10 taxol
-  _dfhessip_u._get_veff:846                    nui,rniq->nurq         29  5.80e+08 ok    (2,nao_c,blk=990,nao_c)         5.55e+10 taxol
+  _dfhessip_u._get_veff:768                    rniq,nqj->rnij         2  6.05e+07 ok    (naux_c,2,nocc,nocc)            5.95e+10 taxol
+  _dfhessip_u._get_veff:865                    nui,rniq->nurq         29  5.80e+08 ok    (2,nao_c,blk=990,nao_c)         5.55e+10 taxol
   _dfhessip_u._mm                              uv,unij->vnij          2  5.07e+07 ok    (naux,2,nocc,nocc)              5.05e+10 taxol
   hessian.rhf.fx:751                           npi,qi->npq            30  2.33e+07 ok    (3*natm,nao,nao)                4.15e+10 PfPMT
-  fastdfhessip._jk_energy_per_atom:454         uv,vij->uij            5  2.19e+07 ok    (naux_c,nocc,nocc)              2.98e+10 PfPMT
-  fastdfhessip._get_veff:1987                  riq,qj->rij            5  2.19e+07 ok    (naux_c,nocc,nocc)              2.98e+10 PfPMT
+  fastdfhessip._jk_energy_per_atom:506         uv,vij->uij            5  2.19e+07 ok    (naux_c,nocc,nocc)              2.98e+10 PfPMT
+  fastdfhessip._get_veff:2077                  riq,qj->rij            5  2.19e+07 ok    (naux_c,nocc,nocc)              2.98e+10 PfPMT
   fastdfgrad.ip1_loop:1132                     niqr,npi->pqr          44  2.90e+08 ok    (nao_c,nao_c,blk=990)           2.77e+10 taxol
-  _dfhessip_u._ejk_ip2:582                     niqr,npi->pqr          29  2.90e+08 ok    (nao_c,nao_c,blk=990)           2.77e+10 taxol
+  _dfhessip_u._ejk_ip2:590                     niqr,npi->pqr          29  2.90e+08 ok    (nao_c,nao_c,blk=990)           2.77e+10 taxol
   fastdfgrad.ip1_loop:1136                     iqr,pi->pqr            310  1.35e+09 ok    (nao_c,nao_c,blk=960)           2.69e+10 taxol
-  fastdfhessip._get_veff:2075                  ui,riq->urq            67  1.29e+09 ok    (nao_c,blk=920,nao_c)           2.58e+10 taxol
-  fastdfhessip._jk_energy_per_atom:452         uv,uij->vij            5  1.85e+07 ok    (naux,nocc,nocc)                2.53e+10 PfPMT
-  fastdfhessip._ejk_ip2:1738                   iqr,pi->pqr            73  1.60e+08 ok    (nao_c,nao_c,blk=774)           2.17e+10 taxol
-  _dfhessip_u._get_veff:1010                   nxspq,sqj->nxsjp       2  1.95e+07 ok    (natm,3,2,nocc,nao_c)           1.75e+10 PfPMT
-  _dfhessip_u._get_veff:1020                   nxsjp,spi->snxij       2  1.85e+07 ok    (2,natm,3,nao,nocc)             1.67e+10 PfPMT
+  fastdfhessip._get_veff:2165                  ui,riq->urq            67  1.29e+09 ok    (nao_c,blk=920,nao_c)           2.58e+10 taxol
+  fastdfhessip._jk_energy_per_atom:504         uv,uij->vij            5  1.85e+07 ok    (naux,nocc,nocc)                2.53e+10 PfPMT
+  fastdfhessip._ejk_ip2:1816                   iqr,pi->pqr            73  1.60e+08 ok    (nao_c,nao_c,blk=774)           2.17e+10 taxol
+  _dfhessip_u._get_veff:1029                   nxspq,sqj->nxsjp       2  1.95e+07 ok    (natm,3,2,nocc,nao_c)           1.75e+10 PfPMT
+  _dfhessip_u._get_veff:1039                   nxsjp,spi->snxij       2  1.85e+07 ok    (2,natm,3,nao,nocc)             1.67e+10 PfPMT
   hessian.uhf.fx:357                           snai,spa->snpi         13  1.85e+07 ok    (2,3*natm,nao,nocc)             1.67e+10 PfPMT
   fastdfhess._jk_once:576                      spiL,nL->nspi          4828  9.97e+06 ok    (3*natm,2,nao,nocc)             1.67e+10 PfPMT
   fastdfhess._jk_once:606                      snpiL,sjiL->nspj       4852  9.97e+06 ok    (3*natm,2,nao,nocc)             1.67e+10 PfPMT
   fastdfhess._jk_once:609                      spiL,snjiL->nspj       4852  9.97e+06 ok    (3*natm,2,nao,nocc)             1.67e+10 PfPMT
   fastdfhess._to_mo:649                        nspi,spq->nsqi         43  1.85e+07 ok    (3*natm,2,nao,nocc)             1.67e+10 PfPMT
   fastdfhess._to_mo:653                        nspi,spq->nsqi         37  1.85e+07 ok    (3*natm,2,nao,nocc)             1.67e+10 PfPMT
-  _dfhessip_u._get_veff:769                    xrs,sniq->xrniq        102  1.22e+08 ok    (3,blk=377,2,nocc,nao_c)        1.21e+10 taxol
+  _dfhessip_u._get_veff:788                    xrs,sniq->xrniq        102  1.22e+08 ok    (3,blk=377,2,nocc,nao_c)        1.21e+10 taxol
   fastdfgrad.ip1_loop:1131                     nrji,nqj->niqr         44  1.07e+08 ok    (2,nocc,nao_c,blk=990)          1.06e+10 PfPMT
-  _dfhessip_u._ejk_ip2:580                     rnji,nqj->niqr         29  1.07e+08 ok    (2,nocc,nao_c,blk=990)          1.06e+10 PfPMT
-  _dfhessip_u._ipaux_batch:438                 pqr,npi->niqr          87  1.07e+08 ok    (2,nocc,nao_c,blk=990)          1.06e+10 PfPMT
-  _dfhessip_u._jk_energy_per_atom:308          pqr,nqi->npir          87  1.07e+08 ok    (2,nao_c,nocc,blk=990)          1.06e+10 PfPMT
-  _dfhessip_u._get_veff:727                    pqr,npi->rniq          29  1.07e+08 ok    (blk=990,2,nocc,nao_c)          1.06e+10 PfPMT
-  _dfhessip_u._get_veff:857                    pqr,nqi->npri          87  1.07e+08 ok    (2,nao_c,blk=990,nocc)          1.06e+10 PfPMT
-  _dfhessip_u._get_veff:952                    pqr,npi->rniq          87  1.07e+08 ok    (blk=990,2,nocc,nao_c)          1.06e+10 PfPMT
-  fastdfhessip._get_veff:2253                  nxpq,qj->nxjp          5  5.26e+06 ok    (natm,3,nocc,nao_c)             8.75e+09 PfPMT
+  _dfhessip_u._ejk_ip2:588                     rnji,nqj->niqr         29  1.07e+08 ok    (2,nocc,nao_c,blk=990)          1.06e+10 PfPMT
+  _dfhessip_u._ipaux_batch:443                 pqr,npi->niqr          87  1.07e+08 ok    (2,nocc,nao_c,blk=990)          1.06e+10 PfPMT
+  _dfhessip_u._jk_energy_per_atom:313          pqr,nqi->npir          87  1.07e+08 ok    (2,nao_c,nocc,blk=990)          1.06e+10 PfPMT
+  _dfhessip_u._get_veff:746                    pqr,npi->rniq          29  1.07e+08 ok    (blk=990,2,nocc,nao_c)          1.06e+10 PfPMT
+  _dfhessip_u._get_veff:876                    pqr,nqi->npri          87  1.07e+08 ok    (2,nao_c,blk=990,nocc)          1.06e+10 PfPMT
+  _dfhessip_u._get_veff:971                    pqr,npi->rniq          87  1.07e+08 ok    (blk=990,2,nocc,nao_c)          1.06e+10 PfPMT
+  fastdfhessip._get_veff:2343                  nxpq,qj->nxjp          5  5.26e+06 ok    (natm,3,nocc,nao_c)             8.75e+09 PfPMT
   hessian.rhf._ao2mo:826                       nij,jo->nio            56  9.27e+06 ok    (3*natm,nao,nocc)               8.33e+09 PfPMT
   hessian.rhf._ao2mo:827                       nio,ip->npo            56  9.27e+06 ok    (3*natm,nao,nocc)               8.33e+09 PfPMT
   hessian.uhf.hess_elec:81                     kxai,pa->kxpi          2  9.27e+06 ok    (natm,3,nao,nocc)               8.33e+09 PfPMT
   hessian.uhf.hess_elec:82                     kxai,pa->kxpi          2  8.99e+06 ok    (natm,3,nao,noccb)              8.33e+09 PfPMT
-  fastdfhessip._get_veff:2261                  nxjp,pi->nxij          6  4.98e+06 ok    (natm,3,nao,nocc)               8.33e+09 PfPMT
+  fastdfhessip._get_veff:2351                  nxjp,pi->nxij          6  4.98e+06 ok    (natm,3,nao,nocc)               8.33e+09 PfPMT
   hessian.rhf.fx:750                           npo,ip->nio            30  4.98e+06 ok    (3*natm,nao,nocc)               8.33e+09 PfPMT
   hessian.rhf.hess_elec:91                     kxai,pa->kxpi          5  4.98e+06 ok    (natm,3,nao,nocc)               8.33e+09 PfPMT
   fastdfhess._to_mo:660                        pqn,sqi->nspi          6  4.98e+06 ok    (3*natm,1,nao,nocc)             8.33e+09 PfPMT
   fastdfhess._to_mo:661                        nspi,spq->nsqi         6  4.98e+06 ok    (3*natm,1,nao,nocc)             8.33e+09 PfPMT
-  fastdfhessip._h_aux_block:1239               xr,ys->xrys            6  8.24e+07 ok    (3,naux_c,3,naux_c)             7.63e+09 PfPMT
-  fastdfhessip._h_aux_block:1272               xrt,ytr->xryt          7  8.24e+07 ok    (3,naux_c,3,naux_c)             7.63e+09 PfPMT
-  fastdfhessip._j_energy_per_atom:919          xrs,yts->rtxy          1  6.04e+07 ok    (naux_c,naux_c,3,3)             7.63e+09 PfPMT
-  fastdfhessip._j_energy_per_atom:929          xrt,ytr->rtxy          1  6.04e+07 ok    (naux_c,naux_c,3,3)             7.63e+09 PfPMT
+  fastdfhessip._h_aux_block:1301               xr,ys->xrys            6  8.24e+07 ok    (3,naux_c,3,naux_c)             7.63e+09 PfPMT
+  fastdfhessip._h_aux_block:1334               xrt,ytr->xryt          7  8.24e+07 ok    (3,naux_c,3,naux_c)             7.63e+09 PfPMT
+  fastdfhessip._j_energy_per_atom:981          xrs,yts->rtxy          1  6.04e+07 ok    (naux_c,naux_c,3,3)             7.63e+09 PfPMT
+  fastdfhessip._j_energy_per_atom:991          xrt,ytr->rtxy          1  6.04e+07 ok    (naux_c,naux_c,3,3)             7.63e+09 PfPMT
   fastxchess._deriv1_block_u:618               yqg,ayg->aqg           592  7.37e+07 ok    (3*natm,nocc,blk=4096)          6.77e+09 PfPMT
   fastxchess._deriv1_block:352                 yqg,ayg->aqg           844  4.75e+07 ok    (3*natm,nocc,blk=4096)          6.77e+09 PfPMT
   df.df_jk.proc:558                            Lij,njk->nikL          144  5.06e+07 ok    (5,nao,nocc,blk=256)            6.52e+09 PfPMT
-  _dfhessip_u._jk_energy_per_atom:336          xrnuj,sr->xsnuj        102  6.54e+07 ok    (3,naux_c,2,blk=36,nocc)        6.36e+09 PfPMT
-  _dfhessip_u._jk_energy_per_atom:338          ysnij,nui->ysnuj       102  6.54e+07 ok    (3,naux_c,2,blk=36,nocc)        6.36e+09 PfPMT
-  _dfhessip_u._get_veff:927                    rniq,ar->aniq          87  6.49e+06 ok    (natm,2,nocc,nao_c)             5.83e+09 PfPMT
+  _dfhessip_u._jk_energy_per_atom:341          xrnuj,sr->xsnuj        102  6.54e+07 ok    (3,naux_c,2,blk=36,nocc)        6.36e+09 PfPMT
+  _dfhessip_u._jk_energy_per_atom:343          ysnij,nui->ysnuj       102  6.54e+07 ok    (3,naux_c,2,blk=36,nocc)        6.36e+09 PfPMT
+  _dfhessip_u._get_veff:946                    rniq,ar->aniq          87  6.49e+06 ok    (natm,2,nocc,nao_c)             5.83e+09 PfPMT
   fastxchess._deriv1_block:348                 ypg,ayg->apg           844  4.11e+08 ok    (3*natm,blk=797,blk=4096)       5.34e+09 taxol
-  fastdfhessip._jk_energy_per_atom:656         rs,pir->spi            39  4.14e+07 ok    (blk=992,nao_c,nocc)            5.31e+09 PfPMT
-  _dfhessip_u._jk_energy_per_atom:151          pqr,pi->iqr            58  5.36e+07 ok    (nocc,nao_c,blk=990)            5.30e+09 PfPMT
+  fastdfhessip._jk_energy_per_atom:711         rs,pir->spi            39  4.14e+07 ok    (blk=992,nao_c,nocc)            5.31e+09 PfPMT
+  _dfhessip_u._jk_energy_per_atom:156          pqr,pi->iqr            58  5.36e+07 ok    (nocc,nao_c,blk=990)            5.30e+09 PfPMT
   fastdfgrad.ip1_loop:1135                     rji,qj->iqr            310  2.57e+08 ok    (nocc,nao_c,blk=960)            5.14e+09 PfPMT
-  fastdfhessip._get_veff:1956                  pqr,pi->riq            80  2.46e+08 ok    (blk=920,nocc,nao_c)            4.92e+09 PfPMT
-  fastdfhessip._get_veff:2086                  pqr,qi->pri            201  2.46e+08 ok    (nao_c,blk=920,nocc)            4.92e+09 PfPMT
-  fastdfhessip._get_veff:2190                  pqr,pi->riq            240  2.46e+08 ok    (blk=920,nocc,nao_c)            4.92e+09 PfPMT
-  fastdfhessip._get_veff:2079                  ui,rij->urj            28  2.46e+08 ok    (nao_c,blk=920,nocc)            4.92e+09 PfPMT
-  fastdfhessip._jk_energy_per_atom:421         pqr,pi->iqr            73  3.23e+07 ok    (nocc,nao_c,blk=774)            4.14e+09 PfPMT
-  fastdfhessip._ejk_ip2:1737                   rji,qj->iqr            73  3.23e+07 ok    (nocc,nao_c,blk=774)            4.14e+09 PfPMT
-  fastdfhessip._ipaux_batch:1127               pqr,pi->iqr            219  3.23e+07 ok    (nocc,nao_c,blk=774)            4.14e+09 PfPMT
-  fastdfhessip._jk_energy_per_atom:651         pqr,qi->pir            219  3.23e+07 ok    (nao_c,nocc,blk=774)            4.14e+09 PfPMT
-  fastdfhessip._chol_d4_d5:1377                ysji,ui->ysuj          239  2.90e+07 ok    (3,naux,blk=48,nocc)            3.60e+09 PfPMT
-  fastdfhessip._jk_energy_per_atom:663         rs,pir->spi            180  2.69e+07 ok    (blk=645,nao_c,nocc)            3.45e+09 PfPMT
+  fastdfhessip._get_veff:2046                  pqr,pi->riq            80  2.46e+08 ok    (blk=920,nocc,nao_c)            4.92e+09 PfPMT
+  fastdfhessip._get_veff:2176                  pqr,qi->pri            201  2.46e+08 ok    (nao_c,blk=920,nocc)            4.92e+09 PfPMT
+  fastdfhessip._get_veff:2280                  pqr,pi->riq            240  2.46e+08 ok    (blk=920,nocc,nao_c)            4.92e+09 PfPMT
+  fastdfhessip._get_veff:2169                  ui,rij->urj            28  2.46e+08 ok    (nao_c,blk=920,nocc)            4.92e+09 PfPMT
+  fastdfhessip._jk_energy_per_atom:473         pqr,pi->iqr            73  3.23e+07 ok    (nocc,nao_c,blk=774)            4.14e+09 PfPMT
+  fastdfhessip._ejk_ip2:1815                   rji,qj->iqr            73  3.23e+07 ok    (nocc,nao_c,blk=774)            4.14e+09 PfPMT
+  fastdfhessip._ipaux_batch:1189               pqr,pi->iqr            219  3.23e+07 ok    (nocc,nao_c,blk=774)            4.14e+09 PfPMT
+  fastdfhessip._jk_energy_per_atom:706         pqr,qi->pir            219  3.23e+07 ok    (nao_c,nocc,blk=774)            4.14e+09 PfPMT
+  fastdfhessip._chol_d4_d5:1439                ysji,ui->ysuj          239  2.90e+07 ok    (3,naux,blk=48,nocc)            3.60e+09 PfPMT
+  fastdfhessip._jk_energy_per_atom:718         rs,pir->spi            180  2.69e+07 ok    (blk=645,nao_c,nocc)            3.45e+09 PfPMT
   fastxchess._deriv1_block_u:614               ypg,ayg->apg           592  3.38e+08 ok    (3*natm,blk=458,blk=4096)       3.07e+09 taxol
-  fastdfhessip._get_veff:2162                  riq,ar->aiq            201  1.75e+06 ok    (natm,nocc,nao_c)               2.92e+09 HcgC
+  fastdfhessip._get_veff:2252                  riq,ar->aiq            201  1.75e+06 ok    (natm,nocc,nao_c)               2.92e+09 HcgC
   fastdfhess._jk_once:563                      Lpq,sqj->spjL          441  2.64e+07 ok    (2,nao,nocc,blk=256)            2.61e+09 PfPMT
-  fastdfhessip._h_aux_block:1264               xrij,sij->xrs          7  2.75e+07 ok    (3,naux_c,naux_c)               2.54e+09 PfPMT
-  fastdfhessip._h_aux_block:1267               xr,t->xrt              6  2.75e+07 ok    (3,naux_c,naux_c)               2.54e+09 PfPMT
-  fastdfhessip._h_aux_block:1270               xrt,st->xrs            7  2.75e+07 ok    (3,naux_c,naux_c)               2.54e+09 PfPMT
-  fastdfhessip._j_energy_per_atom:928          xrt,st->xrs            1  2.01e+07 ok    (3,naux_c,naux_c)               2.54e+09 PfPMT
-  fastdfhessip._get_veff:2008                  xrs,siq->xriq          281  1.94e+07 ok    (3,blk=155,nocc,nao_c)          2.49e+09 PfPMT
-  fastdfhessip._get_veff:2002                  xrs,siq->xriq          42  1.94e+07 ok    (3,blk=155,nocc,nao_c)          2.49e+09 PfPMT
-  _dfhessip_u._get_veff:745                    rs,sniq->rniq          25  2.62e+07 ok    (naux_c,2,8,nao_c)              2.47e+09 PfPMT
-  fastdfhessip._get_veff:1983                  uv,vij->uij            45  1.88e+07 ok    (naux_c,16,nao_c)               2.47e+09 PfPMT
-  fastdfhessip._h_aux_block:1217               xrs,st->xrt            7  2.30e+07 ok    (3,naux_c,naux)                 2.16e+09 PfPMT
-  _dfhessip_u._oo_gram:487                     ys,sr->ysr             2  2.30e+07 ok    (3,naux_c,naux)                 2.16e+09 PfPMT
-  _dfhessip_u._jk_energy_per_atom:346          xrnuj,snuj->xsr        102  2.30e+07 ok    (3,naux_c,naux)                 2.16e+09 PfPMT
-  fastdfhessip._j_energy_per_atom:917          xrs,st->xrt            1  1.70e+07 ok    (3,naux_c,naux)                 2.16e+09 PfPMT
-  _dfhessip_u._jk_energy_per_atom:345          snij,nui->snuj         102  2.18e+07 ok    (naux_c,2,blk=36,nocc)          2.12e+09 PfPMT
-  _dfhessip_u._get_veff:743                    rs,rniq->sniq          25  2.19e+07 ok    (naux,2,8,nao_c)                2.09e+09 PfPMT
-  fastdfhessip._get_veff:1981                  uv,uij->vij            45  1.59e+07 ok    (naux,16,nao_c)                 2.09e+09 PfPMT
-  _dfhessip_u._ipaux_batch:440                 niqr,nqj->rnij         87  1.98e+07 ok    (blk=990,2,nocc,nocc)           2.02e+09 PfPMT
-  fastdfhessip._chol_d4_d5:1385                suj,xtuj->xst          239  1.44e+07 ok    (3,naux,naux)                   1.83e+09 HcgC
-  fastdfhessip._jk_energy_per_atom:717         xruj,sr->xsuj          42  1.36e+07 ok    (3,naux_c,blk=19,nocc)          1.68e+09 HcgC
-  fastdfhessip._jk_energy_per_atom:719         ysji,ui->ysuj          42  1.36e+07 ok    (3,naux_c,blk=19,nocc)          1.68e+09 HcgC
-  fastdfhessip._chol_d4_d5:1381                sji,ui->suj            239  1.14e+07 ok    (naux_c,blk=48,nocc)            1.41e+09 HcgC
+  fastdfhessip._h_aux_block:1326               xrij,sij->xrs          7  2.75e+07 ok    (3,naux_c,naux_c)               2.54e+09 PfPMT
+  fastdfhessip._h_aux_block:1329               xr,t->xrt              6  2.75e+07 ok    (3,naux_c,naux_c)               2.54e+09 PfPMT
+  fastdfhessip._h_aux_block:1332               xrt,st->xrs            7  2.75e+07 ok    (3,naux_c,naux_c)               2.54e+09 PfPMT
+  fastdfhessip._j_energy_per_atom:990          xrt,st->xrs            1  2.01e+07 ok    (3,naux_c,naux_c)               2.54e+09 PfPMT
+  fastdfhessip._get_veff:2098                  xrs,siq->xriq          281  1.94e+07 ok    (3,blk=155,nocc,nao_c)          2.49e+09 PfPMT
+  fastdfhessip._get_veff:2092                  xrs,siq->xriq          42  1.94e+07 ok    (3,blk=155,nocc,nao_c)          2.49e+09 PfPMT
+  _dfhessip_u._get_veff:764                    rs,sniq->rniq          25  2.62e+07 ok    (naux_c,2,8,nao_c)              2.47e+09 PfPMT
+  fastdfhessip._get_veff:2073                  uv,vij->uij            45  1.88e+07 ok    (naux_c,16,nao_c)               2.47e+09 PfPMT
+  fastdfhessip._h_aux_block:1279               xrs,st->xrt            7  2.30e+07 ok    (3,naux_c,naux)                 2.16e+09 PfPMT
+  _dfhessip_u._oo_gram:492                     ys,sr->ysr             2  2.30e+07 ok    (3,naux_c,naux)                 2.16e+09 PfPMT
+  _dfhessip_u._jk_energy_per_atom:351          xrnuj,snuj->xsr        102  2.30e+07 ok    (3,naux_c,naux)                 2.16e+09 PfPMT
+  fastdfhessip._j_energy_per_atom:979          xrs,st->xrt            1  1.70e+07 ok    (3,naux_c,naux)                 2.16e+09 PfPMT
+  _dfhessip_u._jk_energy_per_atom:350          snij,nui->snuj         102  2.18e+07 ok    (naux_c,2,blk=36,nocc)          2.12e+09 PfPMT
+  _dfhessip_u._get_veff:762                    rs,rniq->sniq          25  2.19e+07 ok    (naux,2,8,nao_c)                2.09e+09 PfPMT
+  fastdfhessip._get_veff:2071                  uv,uij->vij            45  1.59e+07 ok    (naux,16,nao_c)                 2.09e+09 PfPMT
+  _dfhessip_u._ipaux_batch:445                 niqr,nqj->rnij         87  1.98e+07 ok    (blk=990,2,nocc,nocc)           2.02e+09 PfPMT
+  fastdfhessip._chol_d4_d5:1447                suj,xtuj->xst          239  1.44e+07 ok    (3,naux,naux)                   1.83e+09 HcgC
+  fastdfhessip._jk_energy_per_atom:772         xruj,sr->xsuj          42  1.36e+07 ok    (3,naux_c,blk=19,nocc)          1.68e+09 HcgC
+  fastdfhessip._jk_energy_per_atom:774         ysji,ui->ysuj          42  1.36e+07 ok    (3,naux_c,blk=19,nocc)          1.68e+09 HcgC
+  fastdfhessip._chol_d4_d5:1443                sji,ui->suj            239  1.14e+07 ok    (naux_c,blk=48,nocc)            1.41e+09 HcgC
   fastdfgrad._fill_from_cderi:703              pqr,pi->iqr            284  1.32e+07 ok    (nocc,nao,blk=256)              1.30e+09 HcgC
   df.df_jk.proc:555                            Lij,jk->ikL            144  1.01e+07 ok    (nao,nocc,blk=256)              1.30e+09 HcgC
-  _dfhessip_u._jk_energy_per_atom:152          iqr,qj->rij            58  9.90e+06 ok    (blk=990,nocc,nocc)             1.01e+09 HcgC
+  _dfhessip_u._jk_energy_per_atom:157          iqr,qj->rij            58  9.90e+06 ok    (blk=990,nocc,nocc)             1.01e+09 HcgC
   fastdf._get_jk:994                           Lij,njk->nikL          2266  2.08e+08 ok    (2,nao,blk=361,blk=256)         9.31e+08 HcgC
   fastdfgrad._metric_pass:815                  nrk,nsk->rs            18  9.16e+06 ok    (naux_c,naux_c)                 8.48e+08 HcgC
-  fastdfhessip._h_aux_block:1249               r,s->rs                6  9.16e+06 ok    (naux_c,naux_c)                 8.48e+08 HcgC
-  fastdfhessip._h_aux_block:1259               rs,ts->rt              63  9.16e+06 ok    (naux_c,naux_c)                 8.48e+08 HcgC
-  fastdfhessip._jk_energy_per_atom:422         iqr,qj->rij            73  6.55e+06 ok    (blk=774,nocc,nocc)             7.91e+08 HcgC
-  fastdfhessip._ipaux_batch:1129               iqr,qj->rij            219  6.55e+06 ok    (blk=774,nocc,nocc)             7.91e+08 HcgC
-  fastdfhessip._jk_energy_per_atom:725         sji,ui->suj            42  4.53e+06 ok    (naux_c,blk=19,nocc)            5.59e+08 HcgC
+  fastdfhessip._h_aux_block:1311               r,s->rs                6  9.16e+06 ok    (naux_c,naux_c)                 8.48e+08 HcgC
+  fastdfhessip._h_aux_block:1321               rs,ts->rt              63  9.16e+06 ok    (naux_c,naux_c)                 8.48e+08 HcgC
+  fastdfhessip._jk_energy_per_atom:474         iqr,qj->rij            73  6.55e+06 ok    (blk=774,nocc,nocc)             7.91e+08 HcgC
+  fastdfhessip._ipaux_batch:1191               iqr,qj->rij            219  6.55e+06 ok    (blk=774,nocc,nocc)             7.91e+08 HcgC
+  fastdfhessip._jk_energy_per_atom:780         sji,ui->suj            42  4.53e+06 ok    (naux_c,blk=19,nocc)            5.59e+08 HcgC
 ```
