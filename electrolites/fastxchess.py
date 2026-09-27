@@ -370,6 +370,8 @@ def _wv2(dR_rho1, wf, out, tau=None):
 
 
 _SCALE_SUM_SRC = r'''
+#define AG 4
+#define PT 8
 extern "C" __global__
 void scale_sum4(const double* __restrict__ src, const double* __restrict__ w,
                 double* __restrict__ out, int nb, int np, int ng,
@@ -377,23 +379,34 @@ void scale_sum4(const double* __restrict__ src, const double* __restrict__ w,
                 double tau_fac)
 {
     // out[a, p, 0, g] = sum_{y<4} src[y, p, g] w[a, y, g]
-    // out[a, p, 1+j, g] = tau_fac src[1+j, p, g] w[a, 4, g]   (j < ntau)
+    // out[a, p, 1+j, g] = tau_fac src[1+j, p, g] w[a, 4, g]   (j < 3)
+    // one thread: one g, AG atoms-directions held in registers, PT AOs
     int g = blockIdx.x * blockDim.x + threadIdx.x;
-    int p = blockIdx.y;
     if (g >= ng) return;
+    int p0 = blockIdx.y * PT;
+    int a0 = blockIdx.z * AG;
+    double wr[AG][5];
+    int na = min(AG, nb - a0);
+    for (int k = 0; k < AG; k++) {
+        const double* wa = w + (long long)(a0 + (k < na ? k : 0)) * w_a + g;
+        for (int y = 0; y < 4; y++) wr[k][y] = wa[y * ng];
+        wr[k][4] = ntau ? tau_fac * wa[4 * ng] : 0.;
+    }
     long long png = (long long)np * ng;
-    long long pg = (long long)p * ng + g;
-    double s0 = src[pg], s1 = src[png + pg], s2 = src[2 * png + pg],
-           s3 = src[3 * png + pg];
-    for (int a = blockIdx.z; a < nb; a += gridDim.z) {
-        const double* wa = w + a * w_a + g;
-        double* oa = out + a * o_a + p * o_p + g;
-        oa[0] = s0 * wa[0] + s1 * wa[ng] + s2 * wa[2 * ng] + s3 * wa[3 * ng];
-        if (ntau) {
-            double t = tau_fac * wa[4 * ng];
-            oa[ng] = s1 * t;
-            oa[2 * ng] = s2 * t;
-            oa[3 * ng] = s3 * t;
+    int p1 = min(p0 + PT, np);
+    for (int p = p0; p < p1; p++) {
+        long long pg = (long long)p * ng + g;
+        double s0 = src[pg], s1 = src[png + pg], s2 = src[2 * png + pg],
+               s3 = src[3 * png + pg];
+        for (int k = 0; k < na; k++) {
+            double* oa = out + (a0 + k) * o_a + p * o_p + g;
+            oa[0] = s0 * wr[k][0] + s1 * wr[k][1] + s2 * wr[k][2]
+                  + s3 * wr[k][3];
+            if (ntau) {
+                oa[ng] = s1 * wr[k][4];
+                oa[2 * ng] = s2 * wr[k][4];
+                oa[3 * ng] = s3 * wr[k][4];
+            }
         }
     }
 }
@@ -402,15 +415,16 @@ _scale_sum_mod = None
 
 
 def _scale_sum(src, w, out, tau_fac=None):
-    """``out[a,p,g] = sum_{y<4} src[y,p,g] w[a,y,g]``, at memory bandwidth.
+    """``out[a,p,g] = sum_{y<4} src[y,p,g] w[a,y,g]``, as one kernel.
 
-    ``aow`` and ``mow`` of ``_get_vxc_deriv1``.  As a cuTENSOR contraction
-    (``'ypg,ayg->apg'``: ``g`` is a mode of all three operands, which that
-    library does not handle as a batch) this ran at a tenth of the card's
-    bandwidth, and on a 42-atom meta-GGA it was 0.64 s of a 2.5 s function
-    against 0.64 s for the GEMMs it feeds, which run at 16 TF/s
-    (``docs/README_fastxchessmgga.md`` §3).  One thread per ``(p, g)`` keeps
-    the four ``src`` values in registers across the atom block.
+    ``aow`` and ``mow`` of ``_get_vxc_deriv1``.  As the cuTENSOR contraction
+    ``'ypg,ayg->apg'`` (``g`` is a mode of all three operands, a batch index
+    that library does not treat as one) this wrote ``aow`` at 139 GB/s, and on
+    a 42-atom meta-GGA it was 0.64 s of a 2.5 s function -- as much as the
+    GEMMs it feeds, which run at 16 TF/s (``docs/README_fastxchessmgga.md``
+    §3).  Here a thread holds one grid point's weights for four rows of ``a``
+    in registers and walks eight AOs, so each ``src`` value is read once per
+    four outputs: 766 GB/s, 0.115 s.
 
     With ``tau_fac`` it also writes the meta-GGA slabs of ``_deriv1_gemms``'
     stacked operand, ``out[a,p,1+j,g] = tau_fac src[1+j,p,g] w[a,4,g]``;
@@ -428,7 +442,7 @@ def _scale_sum(src, w, out, tau_fac=None):
     ntau = 0 if tau_fac is None else 1
     o_p = ng * (4 if ntau else 1)
     threads = 128
-    grid = ((ng + threads - 1) // threads, np_, min(nb, 8))
+    grid = ((ng + threads - 1) // threads, (np_ + 7) // 8, (nb + 3) // 4)
     k(grid, (threads,), (src, w, out, np.int32(nb), np.int32(np_),
                          np.int32(ng), np.int64(w.shape[1] * ng),
                          np.int64(np_ * o_p), np.int64(o_p), np.int32(ntau),
