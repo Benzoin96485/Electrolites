@@ -19,6 +19,7 @@ the rows are the unrestricted entry points (W25).
 """
 import importlib
 import json
+import sys
 import time
 from collections import OrderedDict
 
@@ -96,6 +97,11 @@ if uks:
     wrap('gpu4pyscf.hessian.uks', '_get_vxc_deriv1', '.. _get_vxc_deriv1')
     wrap('gpu4pyscf.grad.rhf', 'get_grad_hcore', '.. get_grad_hcore')
     wrap('gpu4pyscf.dft.numint', 'NumInt.nr_uks_fxc', '.. nr_uks_fxc')
+    # W33's route does not call `nr_uks_fxc`: the replaced CPHF method calls
+    # the blocked function itself.  Same row.  Only if the patch is already
+    # loaded -- importing the module here would apply it (§5.13).
+    if 'electrolites.fastxcfxc' in sys.modules:
+        wrap('electrolites.fastxcfxc', '_nr_uks_fxc_blocked', '.. nr_uks_fxc')
 else:
     wrap('gpu4pyscf.df.hessian.rks', 'Hessian.partial_hess_elec',
          'partial_hess_elec')

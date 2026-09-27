@@ -24,7 +24,8 @@ Checked:
   occupied batches with ``dm_oo`` on the host, by forcing the batch
   (``FASTDFHESSIP_OCC_BATCH``);
 * **the CPHF grid half** for LDA, GGA and meta-GGA at one, three and six
-  right-hand sides, and that a density without the CPHF's tags is handed
+  right-hand sides, with W33's occupied-side route on every block, on the
+  default share of them and on none, and that a density without the CPHF's tags is handed
   back;
 * **a whole Hessian**, patched against unpatched.
 
@@ -273,7 +274,7 @@ def cphf_density(mf, n_dm, seed=0):
     return tag_array(dm1, mo1=mo1_ao, occ_coeff=orbo, symmetrize=1)
 
 
-for xc in ('svwn', 'b3lyp', 'tpss'):
+for xc in ('svwn', 'b3lyp', 'tpss', 'r2scan'):
     mfx = scf(ETHANOL, xc)
     ni = mfx._numint
     mo_coeff = cp.asarray(mfx.mo_coeff)
@@ -308,7 +309,19 @@ for xc in ('svwn', 'b3lyp', 'tpss'):
         os.environ.pop('FASTXCFXC_FACTORS')
         check(f'nr_rks_fxc_mo {xc:6s} n_dm={n_dm} [FACTORS=0] vs AO path',
               got0, ref)
-        if xc != 'tpss':
+        # W33: every block on the occupied side, and none of them
+        for label, env in (('OCC ratio 0', {'FASTXCFXC_OCC_RATIO': '0',
+                                            'FASTXCFXC_OCC_RATIO_GGA': '0'}),
+                           ('OCC=0', {'FASTXCFXC_OCC': '0'})):
+            os.environ.update(env)
+            got1 = fastxcfxc._nr_rks_fxc_mo(ni, mfx.mol, grids, xc, None,
+                                            dm1, mo_coeff, 0, 1, rho0, vxc,
+                                            fxc, max_memory=None)
+            for k in env:
+                os.environ.pop(k)
+            check(f'nr_rks_fxc_mo {xc:6s} n_dm={n_dm} [{label}] vs AO path',
+                  got1, ref)
+        if xc not in ('tpss', 'r2scan'):
             check(f'nr_rks_fxc_mo {xc:6s} n_dm={n_dm} vs upstream', got, up)
         else:
             sc = float(cp.abs(ref).max())
@@ -335,6 +348,12 @@ if nfb == 0:
     fails.append('the factor route was never taken')
 print(f'  {"ok  " if nfb else "FAIL"} '
       f'{"the factor route was taken on some blocks":60s} {nfb} blocks')
+nob = fastxcfxc.stats().get('occ_blocks', 0)
+if nob == 0:
+    fails.append('the occupied-side route was never taken')
+print(f'  {"ok  " if nob else "FAIL"} '
+      f'{"the occupied-side route (W33) was taken on some blocks":60s} '
+      f'{nob} blocks')
 
 if not a.no_hessian:
     print('\n## a whole Hessian, patched against unpatched')

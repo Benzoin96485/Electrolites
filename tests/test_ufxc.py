@@ -58,6 +58,7 @@ from pyscf import gto                                        # noqa: E402
 from gpu4pyscf import dft                                    # noqa: E402
 from gpu4pyscf.dft import numint as NI                       # noqa: E402
 from electrolites import fastxcfxc                           # noqa: E402
+from gpu4pyscf.hessian import uks as UKSHESS                 # noqa: E402
 
 O2 = 'O 0. 0. 0.; O 0. 0. 1.208'
 CH3 = '''C 0. 0. 0.; H 1.079 0. 0.
@@ -256,12 +257,16 @@ for label, atom, basis, xc, level, charge, spin in HESS:
     NI.nr_uks_fxc = NI.NumInt.nr_uks_fxc = FAST
     hf = cp.asarray(h.kernel())
     n_mo = fastxcfxc.stats()['ours_u_mo'] - n0
+    # W33 replaced the CPHF method that calls `nr_uks_fxc` as well, and its
+    # occupied-side route does not call it at all: put both back
     NI.nr_uks_fxc = NI.NumInt.nr_uks_fxc = ORIG
+    UKSHESS.Hessian.get_veff_resp_mo = fastxcfxc._get_veff_resp_mo_u_orig
     h.de = np.zeros((0, 0, 3, 3))
     ho = cp.asarray(h.kernel())
     h.de = np.zeros((0, 0, 3, 3))
     ho2 = cp.asarray(h.kernel())
     NI.nr_uks_fxc = NI.NumInt.nr_uks_fxc = FAST
+    UKSHESS.Hessian.get_veff_resp_mo = fastxcfxc._get_veff_resp_mo_u
     eh = float(cp.abs(hf - ho).max())
     ehs = float(cp.abs(ho2 - ho).max())
     nrm = float(cp.abs(ho).max())
