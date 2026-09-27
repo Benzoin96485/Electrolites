@@ -131,6 +131,11 @@ SWITCHES = [('default', {}),
             ('H1ATOM=batched', {'H1ATOM': 'batched'}),
             ('H1ATOM=occ', {'H1ATOM': 'occ'}),
             ('K0=compute', {'K0': 'compute'}),
+            # W32's grouped stage C: W30's per-atom loop, one atom a group,
+            # and groups of a few atoms
+            ('H1C=atom', {'H1C': 'atom'}),
+            ('H1C_ROWS=3', {'H1C_ROWS': 3}),
+            ('H1C_ROWS=240', {'H1C_ROWS': 240}),
             ('JPAIR=0', {'JPAIR': 0}),
             ('IP2_TILE=0', {'IP2_TILE': 0}),
             ('IP2_KCHUNK=3', {'IP2_KCHUNK': 3}),
@@ -228,8 +233,18 @@ try:
     check(f'ethanol+ h1 without the per-atom AO matrices ({cap / 1e6:.1f} MB)',
           got, ref['h1'])
     reached.add('h1 mem_insufficient')
+    for lbl, sw in (('H1C=atom', {'H1C': 'atom'}),
+                    ('H1C_ROWS=240', {'H1C_ROWS': 240})):
+        with env(MEM=cap, **sw):
+            got = U._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
+        check(f'ethanol+ h1 without the per-atom AO matrices [{lbl}]', got,
+              ref['h1'])
 except (AssertionError, MemoryError):
     pass
+# and forced, the grouped form with the rest of the memory it would have
+with env(H1KAO=0):
+    got = U._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
+check('ethanol+ h1, exchange on the occupied side (forced)', got, ref['h1'])
 ok = {'v', 'v fused', 'h1 mem_insufficient'} <= reached
 if not ok:
     fails.append(f'memory caps did not reach the batched paths: {reached}')

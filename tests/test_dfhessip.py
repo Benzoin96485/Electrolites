@@ -134,6 +134,11 @@ SWITCHES = [('default', {}),
             ('H1ATOM=batched', {'H1ATOM': 'batched'}),
             ('H1ATOM=occ', {'H1ATOM': 'occ'}),
             ('K0=compute', {'K0': 'compute'}),
+            # W32's grouped stage C: W30's per-atom loop, one atom a group,
+            # and groups of a few atoms
+            ('H1C=atom', {'H1C': 'atom'}),
+            ('H1C_ROWS=3', {'H1C_ROWS': 3}),
+            ('H1C_ROWS=240', {'H1C_ROWS': 240}),
             ('JPAIR=0', {'JPAIR': 0}),
             ('METRIC=eigen', {'METRIC': 'eigen'}),
             ('TRI=solve', {'TRI': 'solve'}),
@@ -250,7 +255,19 @@ for nb in (8, 5):
               f'(occ_batches={st["occ_batches"]})', got, ref[term[:3].strip()])
         if st['occ_batches'] > 1:
             reached[term[:3].strip()].add('occ')
-ok = reached['ip2'] == {'occ', 'v', 'v fused'} and 'occ' in reached['h1']
+# the memory-short exchange branch (the per-atom AO matrices do not fit),
+# forced: no cap the sizing survives reaches it on ethanol.  W32's grouped
+# stage C has its own form of it
+for lbl, sw in (('', {}), (' [H1C=atom]', {'H1C': 'atom'}),
+                (' [H1C_ROWS=240]', {'H1C_ROWS': 240}),
+                (' 5 occupied per batch', {'OCC_BATCH': 5})):
+    with env(H1KAO=0, **sw):
+        got = fastdfhessip._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
+    if fastdfhessip.stats()['h1_kocc']:
+        reached['h1'].add('k occ')
+    check(f'ethanol h1, exchange on the occupied side{lbl}', got, ref['h1'])
+ok = (reached['ip2'] == {'occ', 'v', 'v fused'} and
+      reached['h1'] == {'occ', 'k occ'})
 if not ok:
     fails.append(f'memory cap did not reach the batched paths: {reached}')
 print(f'  {"ok  " if ok else "FAIL"} {"the ladder reached the batched paths":60s}'

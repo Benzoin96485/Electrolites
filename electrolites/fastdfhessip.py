@@ -128,6 +128,18 @@ how two of the Rys kernels are launched, and nothing inside them:
     pass and first, h1's, the Coulomb-only term's -- gets it.
     ``FASTDFHESSIP_FILL_TILE=0`` is item 1's; the default is 2 passes.
 
+``docs/DF_WORK_LIST.md`` **W32** (``docs/README_fastdfh1c.md``) changed stage C
+of ``_get_veff``, in both spin cases (``_h1_stage_c``):
+
+17. **The per-auxiliary-atom ``j2c_10`` term grouped.**  One cuBLAS GEMM
+    per group of consecutive auxiliary atoms (up to 3072 rows, in stage D's
+    buffer before D uses it) instead of one ``3 naux_A``-row contraction
+    per atom, each atom's exchange contraction as ``3 ns`` cuBLAS calls,
+    and the Coulomb term formed without ``j3c_1`` at all: one
+    ``(natm 3, naux)`` matrix and one GEMM, which with ``k_factor = 0`` is
+    the whole stage.  ``FASTDFHESSIP_H1C=atom`` is W30's per-atom loop;
+    ``FASTDFHESSIP_H1C_ROWS`` the group's GEMM rows.
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -146,6 +158,9 @@ the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
                              item 12 forced on or off, or its threshold
                              (default auto, 4e6)
     FASTDFHESSIP_K0=compute  item 14 off
+    FASTDFHESSIP_H1C=atom, FASTDFHESSIP_H1C_ROWS=<n>
+                             item 17 off, or its group size in GEMM rows
+                             (3072)
     FASTDFHESSIP_H1METRIC=inverse
                              item 6 on
     FASTDFHESSIP_IP2_GOUT=<n>
@@ -165,7 +180,7 @@ the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
                              auxiliary chunk; the default asks cuTENSOR
                              (`docs/DF_WORK_LIST.md` W21)
     FASTDFHESSIP_MEM=<bytes>, FASTDFHESSIP_VCHUNK=<n>,
-    FASTDFHESSIP_OCC_BATCH=<n>
+    FASTDFHESSIP_OCC_BATCH=<n>, FASTDFHESSIP_H1KAO=0
                              test-only: reach the paths upstream takes when
                              memory is short (``tests/test_dfhessip.py``)
 """
@@ -1879,6 +1894,153 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
 # --------------------------------------------------------------------------
 # W18: the h1 term of make_h1
 # --------------------------------------------------------------------------
+def _gemm_rm(ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc):
+    """Row-major ``C[m,n] = alpha op(A) op(B) + beta C`` on device pointers.
+
+    ``lda``, ``ldb`` and ``ldc`` are the stored row strides in elements, so a
+    strided operand -- one spin of ``(naux, 2, nocc, nao)``, or a run of an
+    atom's rows inside a larger buffer -- goes in without the copy
+    ``cupy.cublas.gemm`` would make of it.  Row-major ``C`` is column-major
+    ``C^T = op(B)^T op(A)^T``, which is the call below.
+    """
+    from cupy.cuda import cublas
+    op = {'N': cublas.CUBLAS_OP_N, 'T': cublas.CUBLAS_OP_T}
+    al = np.array([alpha], dtype=np.float64)
+    be = np.array([beta], dtype=np.float64)
+    cublas.dgemm(cp.cuda.device.get_cublas_handle(), op[tb], op[ta],
+                 n, m, k, al.ctypes.data, b, ldb, a, lda, be.ctypes.data,
+                 c, ldc)
+
+
+def _h1c_groups(aux_slices, cap):
+    """Consecutive auxiliary atoms, as many as fit ``cap`` functions."""
+    groups = []
+    g0 = 0
+    for i in range(len(aux_slices)):
+        if aux_slices[i, 1] - aux_slices[g0, 0] > cap and i > g0:
+            groups.append((g0, i))
+            g0 = i
+    groups.append((g0, len(aux_slices)))
+    return groups
+
+
+def _h1_stage_c(j2c_10, dm_3c, dm_oo, aux_idx, aux_slices, auxvec,
+                auxvec_by_atm, vhf_j, vhf_ao, vhf_occ, kf, j_factor, st):
+    """Stage C of both spin cases' h1 term, the auxiliary atoms grouped: item 17.
+
+    Upstream (and W18's copy) runs, for every auxiliary atom ``A``,
+
+        j3c_1[x,r,i,q] = sum_s j2c_10[x,r,s] dm_3c[s,i,q]      r in A
+
+    and contracts it with ``A``'s rows of ``dm_3c`` (the exchange matrix of
+    ``A``) and with ``auxvec`` (the Coulomb term).  Here
+
+    * the ``j3c_1`` GEMM is one cuBLAS call per *group* of consecutive
+      auxiliary atoms, ``3 x`` a few hundred to a thousand rows against
+      ``naux x nocc nao``, instead of one per atom at ``3 naux_A`` (about
+      150) rows, which runs 15-16 TF/s on an A100 against 18.5-19 grouped
+      (``benchmarks/df_h1c_probe.py``);
+    * each atom's exchange contraction is one cuBLAS GEMM per direction and
+      spin (``3 ns``) on the group's buffer, where cuTENSOR's
+      ``'xrnip,rniq->xnpq'`` ran at 12.7 TF/s against 17.3;
+    * the Coulomb term does not use ``j3c_1`` at all: ``sum_{r in A}
+      auxvec[r] j3c_1[x,r] = (sum_{r in A} auxvec[r] j2c_10[x,r]) dm_3c``, so
+      both of its halves are one ``(natm 3, naux)`` matrix and one GEMM for
+      every atom, ``naux / natm`` times less arithmetic -- and with
+      ``k_factor = 0`` (a pure functional) that is all stage C is.
+
+    ``dm_3c`` is ``(naux, ns, nocc_b, nao)`` and ``dm_oo`` ``(naux, ns,
+    nocc_b, nocc)``, both C-contiguous; ``vhf_j`` is ``(natm, 3, ns, nocc_b,
+    nao)`` (a view), ``vhf_ao`` ``(natm, 3, ns, nao, nao)`` (memory-rich
+    exchange) and ``vhf_occ`` ``(natm, 3, ns, nocc, nao)`` (memory-short
+    exchange), each ``None`` when the term is not wanted.  The group's
+    operands take at most 80 % of what is free when the stage starts --
+    stage D's buffer is allocated after it, when all of this is released.
+    """
+    naux, ns, nocc_b, nao = dm_3c.shape
+    nn = nocc_b * nao
+    natm_aux = len(aux_slices)
+    counts = aux_slices[:, 1] - aux_slices[:, 0]
+
+    if j_factor != 0:
+        # both Coulomb halves, as one (natm_aux, 3, naux) matrix in dm_3c's
+        # row order: sum_{r in A} auxvec[r] j2c_10[x,r,s], plus
+        # (sum_s' j2c_10[x,r,s'] auxvec[s']) at s = aux_idx[r]
+        atm_of = cp.asarray(np.repeat(np.arange(natm_aux), counts))
+        ind = cp.zeros((natm_aux, naux))
+        ind[atm_of, cp.arange(naux)] = auxvec_by_atm
+        w = contract('ap,xps->axs', ind, j2c_10)
+        tmp = contract('xps,s->px', j2c_10, auxvec)
+        w[atm_of, :, cp.asarray(aux_idx)] += tmp
+        contract('axs,sniq->axniq', w, dm_3c, j_factor, beta=1, out=vhf_j)
+        ind = w = tmp = atm_of = None
+        st('C J')
+    if vhf_ao is None and vhf_occ is None:
+        return
+
+    noo = nocc_b * dm_oo.shape[-1] if vhf_occ is not None else 0
+    per = 3 * naux + 4 * ns * (nn + noo)
+    cap = int(_env('FASTDFHESSIP_H1C_ROWS', '3072')) // 3
+    cap = min(cap, int(_avail() // 8 * .8) // per)
+    # at least the largest atom: W30's loop held that much, per atom
+    cap = max(cap, int(counts.max()))
+    work = cp.empty(cap * per)
+    groups = _h1c_groups(aux_slices, cap)
+    _S['h1c_groups'] = len(groups)
+    it = work.itemsize
+    for g0, g1 in groups:
+        q0, q1 = int(aux_slices[g0, 0]), int(aux_slices[g1-1, 1])
+        m = q1 - q0
+        if m == 0:
+            continue
+        off = 0
+        a = ndarray((3, m, naux), buffer=work[off:])
+        off += a.size
+        a[:] = j2c_10[:, q0:q1]
+        j3 = ndarray((ns, 3*m, nn), buffer=work[off:])
+        off += j3.size
+        dmg = ndarray((ns, m, nocc_b, nao), buffer=work[off:])
+        off += dmg.size
+        idx = cp.asarray(aux_idx[q0:q1])
+        for n in range(ns):
+            _gemm_rm('N', 'N', 3*m, nn, naux, 1., a.data.ptr, naux,
+                     dm_3c.data.ptr + n*nn*it, ns*nn, 0., j3[n].data.ptr, nn)
+            cp.take(dm_3c[:, n], idx, axis=0, out=dmg[n])
+        if vhf_occ is not None:
+            nocc = dm_oo.shape[-1]
+            oo = ndarray((ns, 3*m, noo), buffer=work[off:])
+            off += oo.size
+            oog = ndarray((ns, m, nocc_b, nocc), buffer=work[off:])
+            for n in range(ns):
+                _gemm_rm('N', 'N', 3*m, noo, naux, 1., a.data.ptr, naux,
+                         dm_oo.data.ptr + n*noo*it, ns*noo, 0.,
+                         oo[n].data.ptr, noo)
+                cp.take(dm_oo[:, n], idx, axis=0, out=oog[n])
+        st('C gemm')
+        for i in range(g0, g1):
+            p0 = int(aux_slices[i, 0]) - q0
+            nr = int(counts[i]) * nocc_b
+            if nr == 0:
+                continue
+            for x in range(3):
+                for n in range(ns):
+                    jp = j3[n].data.ptr + (x*m + p0) * nn * it
+                    dp = dmg[n].data.ptr + p0 * nn * it
+                    if vhf_ao is not None:
+                        _gemm_rm('T', 'N', nao, nao, nr, kf, jp, nao, dp, nao,
+                                 1., vhf_ao[i, x, n].data.ptr, nao)
+                    else:
+                        # (j2c_10 dm_oo)^T dm_3c_A + dm_oo_A^T j3c_1
+                        out = vhf_occ[i, x, n].data.ptr
+                        op_ = oo[n].data.ptr + (x*m + p0) * noo * it
+                        ogp = oog[n].data.ptr + p0 * noo * it
+                        _gemm_rm('T', 'N', nocc, nao, nr, kf, op_, nocc,
+                                 dp, nao, 1., out, nao)
+                        _gemm_rm('T', 'N', nocc, nao, nr, kf, ogp, nocc,
+                                 jp, nao, 1., out, nao)
+        st('C K')
+
+
 def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
               omega=None, verbose=None):
     if not _usable():
@@ -1938,9 +2100,11 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     word_avail -= naux*nocc*nocc_per_batch  # dm_oo ~ (aux,i,j)
     assert word_avail > 0, 'Insufficient GPU memory'
 
-    mem_sufficient = natm*3*nao*nao < word_avail * .6
+    mem_sufficient = (natm*3*nao*nao < word_avail * .6 and
+                      _env('FASTDFHESSIP_H1KAO', '1') != '0')
     # the per-atom AO-pair matrices hold exchange terms only
     k_ao = mem_sufficient and do_k
+    _S['h1_kocc'] = do_k and not mem_sufficient
     if k_ao:
         word_avail -= natm * 3 * nao * nao
 
@@ -2082,45 +2246,65 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         inv_aux_sorting = cp.empty(naux, dtype=int)
         inv_aux_sorting[_aux_sorting] = cp.arange(naux)
         j2c_10 = j2c_10[:, inv_aux_sorting[aux_idx, None], inv_aux_sorting]
-        buf = cp.empty((3, naux_in_atm, nocc_in_batch, nao))
-        buf1 = cp.empty((naux_in_atm, nocc_in_batch, nao))
-        for i, (p0, p1) in enumerate(aux_slices):
-            if not do_k:
-                dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
-                                    out=buf1[:p1-p0])
-                tmp = ndarray((3, p1-p0, nocc_in_batch, nao), buffer=buf)
-                j3c_1 = contract('xrs,siq->xriq', j2c_10[:, p0:p1], dm_3c,
-                                 out=tmp)
-            elif mem_sufficient:
-                dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
-                                    out=buf1[:p1-p0])
-                tmp = ndarray((3, p1-p0, nocc_in_batch, nao), buffer=buf)
-                j3c_1 = contract('xrs,siq->xriq', j2c_10[:, p0:p1], dm_3c,
-                                 out=tmp)
-                contract('xrip,riq->xpq', j3c_1, dm_3c_atm, -.5*k_factor,
-                         beta=1, out=vhf_atm_ao[i])
-            else:
-                dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
-                                    out=buf1[:p1-p0])
-                dm_oo_atm = dm_oo[aux_idx[p0:p1]]
-                tmp = ndarray((3, p1-p0, nocc_in_batch, nocc), buffer=buf)
-                tmp = contract('xrs,sij->xrij', j2c_10[:, p0:p1], dm_oo,
-                               out=tmp)
-                contract('riq,xrij->xjq', dm_3c_atm, tmp, -.5*k_factor,
-                         beta=1, out=vhf_atm[i])
-                tmp = ndarray((3, p1-p0, nocc_in_batch, nao), buffer=buf)
-                j3c_1 = contract('xrs,siq->xriq', j2c_10[:, p0:p1], dm_3c,
-                                 out=tmp)
-                contract('xriq,rij->xjq', j3c_1, dm_oo_atm, -.5*k_factor,
-                         beta=1, out=vhf_atm[i])
-            if j_factor != 0:
-                contract('xriq,r->xiq', j3c_1, auxvec_by_atm[p0:p1],
-                         j_factor, beta=1, out=vhf_atm[i, :, nocc0:nocc1])
-                tmp = cp.einsum('xrs,s->xr', j2c_10[:, p0:p1], auxvec)
-                contract('riq,xr->xiq', dm_3c_atm, tmp, j_factor, beta=1,
-                         out=vhf_atm[i, :, nocc0:nocc1])
-        tmp = j3c_1 = dm_3c_atm = dm_oo_atm = None
-        buf = buf1 = j2c_10 = None
+        st('C int2c2e_ip1')
+        if _env('FASTDFHESSIP_H1C', 'grouped') != 'atom':
+            # item 17 (W32): the auxiliary atoms grouped into GEMMs of a few
+            # thousand rows, the exchange contractions as cuBLAS calls, and
+            # the Coulomb term without j3c_1
+            v5 = vhf_atm.reshape(natm, 3, 1, nocc, nao)
+            _h1_stage_c(
+                j2c_10, dm_3c.reshape(naux, 1, nocc_in_batch, nao),
+                dm_oo.reshape(naux, 1, nocc_in_batch, nocc) if do_k else None,
+                aux_idx, aux_slices,
+                auxvec if j_factor != 0 else None,
+                auxvec_by_atm if j_factor != 0 else None,
+                v5[:, :, :, nocc0:nocc1],
+                vhf_atm_ao.reshape(natm, 3, 1, nao, nao) if k_ao else None,
+                v5 if do_k and not mem_sufficient else None,
+                -.5*k_factor, j_factor, st)
+            v5 = None
+        else:
+            buf = cp.empty((3, naux_in_atm, nocc_in_batch, nao))
+            buf1 = cp.empty((naux_in_atm, nocc_in_batch, nao))
+            for i, (p0, p1) in enumerate(aux_slices):
+                if not do_k:
+                    dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
+                                        out=buf1[:p1-p0])
+                    tmp = ndarray((3, p1-p0, nocc_in_batch, nao), buffer=buf)
+                    j3c_1 = contract('xrs,siq->xriq', j2c_10[:, p0:p1], dm_3c,
+                                     out=tmp)
+                elif mem_sufficient:
+                    dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
+                                        out=buf1[:p1-p0])
+                    tmp = ndarray((3, p1-p0, nocc_in_batch, nao), buffer=buf)
+                    j3c_1 = contract('xrs,siq->xriq', j2c_10[:, p0:p1], dm_3c,
+                                     out=tmp)
+                    contract('xrip,riq->xpq', j3c_1, dm_3c_atm, -.5*k_factor,
+                             beta=1, out=vhf_atm_ao[i])
+                else:
+                    dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
+                                        out=buf1[:p1-p0])
+                    dm_oo_atm = dm_oo[aux_idx[p0:p1]]
+                    tmp = ndarray((3, p1-p0, nocc_in_batch, nocc), buffer=buf)
+                    tmp = contract('xrs,sij->xrij', j2c_10[:, p0:p1], dm_oo,
+                                   out=tmp)
+                    contract('riq,xrij->xjq', dm_3c_atm, tmp, -.5*k_factor,
+                             beta=1, out=vhf_atm[i])
+                    tmp = ndarray((3, p1-p0, nocc_in_batch, nao), buffer=buf)
+                    j3c_1 = contract('xrs,siq->xriq', j2c_10[:, p0:p1], dm_3c,
+                                     out=tmp)
+                    contract('xriq,rij->xjq', j3c_1, dm_oo_atm, -.5*k_factor,
+                             beta=1, out=vhf_atm[i])
+                if j_factor != 0:
+                    contract('xriq,r->xiq', j3c_1, auxvec_by_atm[p0:p1],
+                             j_factor, beta=1, out=vhf_atm[i, :, nocc0:nocc1])
+                    tmp = cp.einsum('xrs,s->xr', j2c_10[:, p0:p1], auxvec)
+                    contract('riq,xr->xiq', dm_3c_atm, tmp, j_factor, beta=1,
+                             out=vhf_atm[i, :, nocc0:nocc1])
+            tmp = j3c_1 = dm_3c_atm = dm_oo_atm = None
+            buf = buf1 = j2c_10 = None
+            st('C j2c_10')
+        j2c_10 = None
         st('C j2c_10')
 
         # (10|0)(0|0)(0|00)
@@ -2136,6 +2320,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         t_buf = work[work_size:work_size+t_size] if hoist else None
         s_buf = work[work_size+t_size:work_size+t_size+s_size] if occ_k else None
         p_buf = work[work_size+t_size+s_size:] if pri_full else None
+
         aux0 = aux1 = 0
         for kbatch in range(num_aux_batches):
             naux_in_batch = aux_offsets[kbatch+1] - aux_offsets[kbatch]

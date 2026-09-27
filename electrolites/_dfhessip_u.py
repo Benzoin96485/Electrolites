@@ -32,7 +32,9 @@ are the same ``FASTDFHESSIP_*`` ones and mean the same thing:
   **Item 12** (the per-atom exchange term on the occupied side, chosen by a
   shape score) started here and was carried back to the restricted function
   by W30, which also added **item 14** to both (no exchange contraction at
-  all when ``k_factor = 0``).
+  all when ``k_factor = 0``).  **Item 17** (W32: stage C's per-auxiliary-
+  atom term grouped into cuBLAS GEMMs, and its Coulomb half without
+  ``j3c_1``) is ``fastdfhessip._h1_stage_c`` on the spin index.
 
 Item 8 (the metric as its Cholesky factor, W24) is not carried over: it
 lives in ``_chol_d4_d5``, whose five contractions would all need the spin
@@ -678,9 +680,11 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     word_avail -= 2 * naux*nocc**2  # dm_oo ~ (aux,i,j)
     assert word_avail > 0, 'Insufficient GPU memory'
 
-    mem_sufficient = natm*3*2*nao**2 < word_avail * .6
+    mem_sufficient = (natm*3*2*nao**2 < word_avail * .6 and
+                      _env('FASTDFHESSIP_H1KAO', '1') != '0')
     # the per-atom AO-pair matrices hold exchange terms only
     k_ao = mem_sufficient and do_k
+    _S['h1_kocc'] = do_k and not mem_sufficient
     if k_ao:
         vhf_atm_ao = cp.zeros((natm, 3, 2, nao, nao))
         word_avail -= vhf_atm_ao.size
@@ -777,42 +781,54 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     inv_aux_sorting = cp.empty(naux, dtype=int)
     inv_aux_sorting[aux_sorting] = cp.arange(naux)
     j2c_10 = j2c_10[:, inv_aux_sorting[aux_idx, None], inv_aux_sorting]
-    naux_in_atm = (aux_slices[:, 1] - aux_slices[:, 0]).max()
-    buf = cp.empty((3, naux_in_atm, 2, nocc, nao))
-    buf1 = cp.empty((naux_in_atm, 2, nocc, nao))
-    for i, (p0, p1) in enumerate(aux_slices):
-        if not do_k:
-            dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
-                                out=buf1[:p1-p0])
-            j3c_1 = ndarray((3, p1-p0, 2, nocc, nao), buffer=buf)
-            contract('xrs,sniq->xrniq', j2c_10[:, p0:p1], dm_3c, out=j3c_1)
-        elif mem_sufficient:
-            dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
-                                out=buf1[:p1-p0])
-            j3c_1 = ndarray((3, p1-p0, 2, nocc, nao), buffer=buf)
-            contract('xrs,sniq->xrniq', j2c_10[:, p0:p1], dm_3c, out=j3c_1)
-            contract('xrnip,rniq->xnpq', j3c_1, dm_3c_atm, -k_factor, beta=1,
-                     out=vhf_atm_ao[i])
-        else:
-            dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
-                                out=buf1[:p1-p0])
-            dm_oo_atm = dm_oo[aux_idx[p0:p1]]
-            tmp = ndarray((3, p1-p0, 2, nocc, nocc), buffer=buf)
-            tmp = contract('xrs,snij->xrnij', j2c_10[:, p0:p1], dm_oo, out=tmp)
-            contract('rniq,xrnij->xnjq', dm_3c_atm, tmp, -k_factor, beta=1,
-                     out=vhf_atm[i])
-            j3c_1 = ndarray((3, p1-p0, 2, nocc, nao), buffer=buf)
-            contract('xrs,sniq->xrniq', j2c_10[:, p0:p1], dm_3c, out=j3c_1)
-            contract('xrniq,rnij->xnjq', j3c_1, dm_oo_atm, -k_factor, beta=1,
-                     out=vhf_atm[i])
-        if j_factor != 0:
-            contract('xrniq,r->xniq', j3c_1, auxvec_by_atm[p0:p1], j_factor,
-                     beta=1, out=vhf_atm[i])
-            tmp = cp.einsum('xrs,s->xr', j2c_10[:, p0:p1], auxvec)
-            contract('rniq,xr->xniq', dm_3c_atm, tmp, j_factor, beta=1,
-                     out=vhf_atm[i])
-    tmp = j3c_1 = dm_3c_atm = dm_oo_atm = None
-    buf = buf1 = j2c_10 = None
+    st('C int2c2e_ip1')
+    if _env('FASTDFHESSIP_H1C', 'grouped') != 'atom':
+        # item 17 (W32): fastdfhessip's grouped stage C, on the spin index
+        H._h1_stage_c(
+            j2c_10, dm_3c, dm_oo if do_k else None, aux_idx, aux_slices,
+            auxvec if j_factor != 0 else None,
+            auxvec_by_atm if j_factor != 0 else None, vhf_atm,
+            vhf_atm_ao if k_ao else None,
+            vhf_atm if do_k and not mem_sufficient else None,
+            -k_factor, j_factor, st)
+    else:
+        naux_in_atm = (aux_slices[:, 1] - aux_slices[:, 0]).max()
+        buf = cp.empty((3, naux_in_atm, 2, nocc, nao))
+        buf1 = cp.empty((naux_in_atm, 2, nocc, nao))
+        for i, (p0, p1) in enumerate(aux_slices):
+            if not do_k:
+                dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
+                                    out=buf1[:p1-p0])
+                j3c_1 = ndarray((3, p1-p0, 2, nocc, nao), buffer=buf)
+                contract('xrs,sniq->xrniq', j2c_10[:, p0:p1], dm_3c, out=j3c_1)
+            elif mem_sufficient:
+                dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
+                                    out=buf1[:p1-p0])
+                j3c_1 = ndarray((3, p1-p0, 2, nocc, nao), buffer=buf)
+                contract('xrs,sniq->xrniq', j2c_10[:, p0:p1], dm_3c, out=j3c_1)
+                contract('xrnip,rniq->xnpq', j3c_1, dm_3c_atm, -k_factor, beta=1,
+                         out=vhf_atm_ao[i])
+            else:
+                dm_3c_atm = cp.take(dm_3c, aux_idx[p0:p1], axis=0,
+                                    out=buf1[:p1-p0])
+                dm_oo_atm = dm_oo[aux_idx[p0:p1]]
+                tmp = ndarray((3, p1-p0, 2, nocc, nocc), buffer=buf)
+                tmp = contract('xrs,snij->xrnij', j2c_10[:, p0:p1], dm_oo, out=tmp)
+                contract('rniq,xrnij->xnjq', dm_3c_atm, tmp, -k_factor, beta=1,
+                         out=vhf_atm[i])
+                j3c_1 = ndarray((3, p1-p0, 2, nocc, nao), buffer=buf)
+                contract('xrs,sniq->xrniq', j2c_10[:, p0:p1], dm_3c, out=j3c_1)
+                contract('xrniq,rnij->xnjq', j3c_1, dm_oo_atm, -k_factor, beta=1,
+                         out=vhf_atm[i])
+            if j_factor != 0:
+                contract('xrniq,r->xniq', j3c_1, auxvec_by_atm[p0:p1], j_factor,
+                         beta=1, out=vhf_atm[i])
+                tmp = cp.einsum('xrs,s->xr', j2c_10[:, p0:p1], auxvec)
+                contract('rniq,xr->xniq', dm_3c_atm, tmp, j_factor, beta=1,
+                         out=vhf_atm[i])
+        tmp = j3c_1 = dm_3c_atm = dm_oo_atm = None
+        buf = buf1 = j2c_10 = None
+    j2c_10 = None
     st('C j2c_10')
 
     # (10|0)(0|0)(0|00)
