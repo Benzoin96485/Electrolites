@@ -135,7 +135,8 @@ SWITCHES = [('default', {}),
             ('IP2_TILE=0', {'IP2_TILE': 0}),
             ('IP2_KCHUNK=3', {'IP2_KCHUNK': 3}),
             ('FILL_TILE=0', {'FILL_TILE': 0}),
-            ('FILL_TILE=0.05', {'FILL_TILE': 0.05})]
+            ('FILL_TILE=0.05', {'FILL_TILE': 0.05}),
+            ('IP2_KERNEL=upstream', {'IP2_KERNEL': 'upstream'})]
 
 
 def terms(mf):

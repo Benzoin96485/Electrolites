@@ -17,8 +17,10 @@ Per class it prints the time, the number of shell triples and primitive
 triples, and the time per primitive triple and Rys root; ``--whole`` also
 times the production launch (every pair class at once, one auxiliary batch
 per launch), which is what the per-class sum is compared against.  With
-``--ours`` the same table is taken for ``electrolites/_ip2k.py``'s kernels
-and each class's output is compared element-wise with GPU4PySCF's.
+``--ours`` the same table is taken for W31's kernel (``libmyip2``, what
+``electrolites/_ip2launch.py`` launches; ``--lib`` another build of the same
+entry point) and each class's output is compared element-wise with
+GPU4PySCF's.
 
     python benchmarks/df_ip2_class_probe.py --cases penicillinV,tmc_ni_dithiolene:-1:1
 """
@@ -41,7 +43,7 @@ ap.add_argument('--auxbasis', default=None)
 ap.add_argument('--reps', type=int, default=3)
 ap.add_argument('--omega', type=float, default=0.)
 ap.add_argument('--ours', action='store_true',
-                help="also time electrolites/_ip2k.py's kernels")
+                help="also time W31's kernel (electrolites/_ip2launch.kernel)")
 ap.add_argument('--lib', default='',
                 help='with --ours: a shared library exporting '
                      'ejk_int3c2e_ip2 to use as ours')
@@ -260,8 +262,8 @@ def run(spec):
         if a.lib:
             k = ctypes.CDLL(os.path.abspath(a.lib)).ejk_int3c2e_ip2
         else:
-            from electrolites import _ip2k
-            k = _ip2k.kernel()
+            from electrolites import _ip2launch
+            k = _ip2launch.kernel()
         kerns.append(('ours', k))
     print(f'\n## {name}  {mol.natm} atoms  nao {s.smol.nao}  naux {s.naux}  '
           f'pair classes ' + ' '.join(

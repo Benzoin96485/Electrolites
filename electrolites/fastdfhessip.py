@@ -128,6 +128,17 @@ how two of the Rys kernels are launched, and nothing inside them:
     pass and first, h1's, the Coulomb-only term's -- gets it.
     ``FASTDFHESSIP_FILL_TILE=0`` is item 1's; the default is 2 passes.
 
+``docs/DF_WORK_LIST.md`` **W31** (``docs/README_fastdfhessip4.md``) replaced
+the kernel item 15 launches:
+
+17. **``ejk_int3c2e_ip2`` rewritten** (``electrolites/kernels/cuda/myip2``,
+    built by ``_nvcc.ip2_library``, chosen in ``_ip2launch.kernel``): the
+    same entry point and arguments; the light classes' triples in registers
+    with every index a literal, the contraction down to the 21 sums that are
+    not linear combinations of the others, the rest on twice upstream's
+    threads, and the atomics summed per block first.  Only under item 15's
+    launch.  ``FASTDFHESSIP_IP2_KERNEL=upstream``.
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -159,6 +170,8 @@ the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
     FASTDFHESSIP_IP2_KCHUNK=<n>, FASTDFHESSIP_IP2_PCHUNK=tile|upstream|<n>,
     FASTDFHESSIP_FILL_TILE=<passes>
                              their tile shapes (16, tile, 2)
+    FASTDFHESSIP_IP2_KERNEL=upstream
+                             item 17 off: GPU4PySCF's kernel under item 15
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
                              also times the ip2 kernel per auxiliary l
     FASTDFHESSIP_RCHUNK=<n>  W17's 1.2e8-element bound on the Gram form's
