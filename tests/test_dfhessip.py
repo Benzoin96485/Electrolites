@@ -140,7 +140,15 @@ SWITCHES = [('default', {}),
             ('SYRK=0', {'SYRK': 0}),
             ('D4=gemm', {'D4': 'gemm'}),
             ('T2SPH=0', {'T2SPH': 0}),
-            ('CARVE=0', {'CARVE': 0})]
+            ('CARVE=0', {'CARVE': 0}),
+            # W29's launch: item 1's instead, a forced split of every
+            # auxiliary batch (3 shells a range), one range, fixed pairs
+            ('IP2_TILE=0', {'IP2_TILE': 0}),
+            ('IP2_KCHUNK=3', {'IP2_KCHUNK': 3}),
+            ('IP2_KCHUNK=0', {'IP2_KCHUNK': 0}),
+            ('IP2_PCHUNK=5', {'IP2_PCHUNK': 5}),
+            ('FILL_TILE=0', {'FILL_TILE': 0}),
+            ('FILL_TILE=0.05', {'FILL_TILE': 0.05})]
 
 
 def run_terms(mf, tag, factors, switches=SWITCHES, mem=None):

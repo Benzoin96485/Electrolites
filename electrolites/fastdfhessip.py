@@ -106,6 +106,28 @@ more to ``_jk_energy_per_atom``:
     call, which upstream computes in full and scales by zero.
     ``FASTDFHESSIP_K0=compute`` puts it back.
 
+``docs/DF_WORK_LIST.md`` **W29** (``docs/README_fastdfhessip3.md``) changed
+how two of the Rys kernels are launched, and nothing inside them:
+
+15. **``ejk_int3c2e_ip2`` launched as its own tile**
+    (``electrolites/_ip2launch.py``).  Its blocks got item 1's pair count and
+    a whole auxiliary batch -- a few hundred shells in series, on a card that
+    holds one 255-register block per SM -- so a launch was a few waves with
+    a tail as long as its heaviest block.  Now a block is as many pairs as
+    it runs side by side at the batch's ``lk`` and 16 auxiliary shells, with
+    the pseudo-density's columns permuted into the layout that cut implies.
+    Used by ``_ejk_ip2`` (both spins) and ``_j_energy_per_atom``.
+    ``FASTDFHESSIP_IP2_TILE=0``; ``FASTDFHESSIP_IP2_KCHUNK``,
+    ``FASTDFHESSIP_IP2_PCHUNK`` move the tile.
+16. **The two derivative fills sized the same way.**
+    ``fill_int3c2e_ip1``/``fill_int3c2e_ipaux`` walk a block's (pair,
+    auxiliary shell) triples as one flat list, so only the pair count needs
+    changing (the auxiliary range stays the batch, and so does the output's
+    layout): ``ceil(FILL_TILE nst / nksh)`` pairs per block, per ``(li, lj)``
+    at the batch's ``lk``.  Every ``_ip1_evaluator`` caller -- ip2's second
+    pass and first, h1's, the Coulomb-only term's -- gets it.
+    ``FASTDFHESSIP_FILL_TILE=0`` is item 1's; the default is 2 passes.
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -132,6 +154,11 @@ the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
     FASTDFHESSIP_METRIC=chol|eigen|mixed, FASTDFHESSIP_TRI=mult|solve,
     FASTDFHESSIP_SYRK=0, FASTDFHESSIP_D4=gemm, FASTDFHESSIP_T2SPH=0,
     FASTDFHESSIP_CARVE=0     items 8-11 off, or measured variants of them
+    FASTDFHESSIP_IP2_TILE=0, FASTDFHESSIP_FILL_TILE=0
+                             items 15 and 16 off (item 1's launch);
+    FASTDFHESSIP_IP2_KCHUNK=<n>, FASTDFHESSIP_IP2_PCHUNK=tile|upstream|<n>,
+    FASTDFHESSIP_FILL_TILE=<passes>
+                             their tile shapes (16, tile, 2)
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
                              also times the ip2 kernel per auxiliary l
     FASTDFHESSIP_RCHUNK=<n>  W17's 1.2e8-element bound on the Gram form's
@@ -168,6 +195,7 @@ from gpu4pyscf.lib import multi_gpu
 
 from ._dfaux import _spmult, trmm_left_lower
 from . import _cuplan
+from . import _ip2launch
 
 
 def _env(name, default):
@@ -265,6 +293,11 @@ def _ip1_evaluator(int3c2e_opt, scheme, batch_size, kern, omega, spmult):
     kernel = getattr(libvhf_rys, kern)
     int3c2e_envs = int3c2e_opt.int3c2e_envs
     npair_batches = len(shl_pair_offsets) - 1
+    # item 16 (W29): pairs per block from the batch's own shape
+    fill_tile = float(_env('FASTDFHESSIP_FILL_TILE', '2'))
+    if fill_tile > 0:
+        nst = 256 // np.asarray(gout_stride.get())
+        tiled = {}
 
     def evaluate_j3c(batch_id, out=None):
         ksh0 = ksh_offsets_cpu[batch_id]
@@ -274,15 +307,34 @@ def _ip1_evaluator(int3c2e_opt, scheme, batch_size, kern, omega, spmult):
         out = ndarray((3, nao_pair, naux), buffer=out)
         if out.size == 0:
             return out
+        spo, nb = shl_pair_offsets, npair_batches
+        if fill_tile > 0:
+            # The fill kernels walk a block's (pair, auxiliary shell)
+            # triples as one flat list, nst_per_block at a time, and the
+            # auxiliary range is the whole batch (its layout is
+            # component-major over the batch, so the range cannot be cut
+            # without permuting the output).  So the pairs are what is
+            # sized: enough per block for `fill_tile` passes of the
+            # block's threads, per (li, lj) at this batch's lk.
+            lk = int(auxmol._bas[ksh0, 1])
+            nksh = int(ksh1 - ksh0)
+            key = (lk, nksh)
+            if key not in tiled:
+                size = np.maximum(1, np.ceil(
+                    nst[lk] * fill_tile / nksh)).astype(int)
+                tiled[key] = _ip2launch.pair_offsets(
+                    mol, int3c2e_opt.bas_ij_cache, size)
+            spo = tiled[key]
+            nb = len(spo) - 1
         err = kernel(
             ctypes.cast(out.data.ptr, ctypes.c_void_p),
             ctypes.byref(int3c2e_envs),
             ctypes.c_double(omega),
             ctypes.c_double(lr_factor), ctypes.c_double(sr_factor),
             ctypes.c_int(shm_size_max),
-            ctypes.c_int(npair_batches),
+            ctypes.c_int(nb),
             ctypes.c_int(1),
-            ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+            ctypes.cast(spo.data.ptr, ctypes.c_void_p),
             ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
             ctypes.cast(ksh_offsets_gpu[batch_id:].data.ptr, ctypes.c_void_p),
             ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
@@ -616,6 +668,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             j3c_full[:] = 0.
             buf0, work1 = _allocate((3, nao_pair, batch_size), work1)
             buf1, work1 = _allocate((3, nao_pair, batch_size), work1)
+            # the second pass's buffers, charged to a stage of their own
+            # (W29: they were half of what 'D3 integrals' reported)
+            st('D3 buffers')
             aux0 = aux1 = 0
             for kbatch in range(num_aux_batches):
                 compressed_di = eval_ip1(kbatch, out=buf0)
@@ -803,22 +858,29 @@ def _j_energy_per_atom(int3c2e_opt, dm, verbose=None):
     ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu + mol.nbas, dtype=np.int32)
     int3c2e_envs = int3c2e_opt.int3c2e_envs
     ej = cp.zeros_like(ej_aux)
-    err = libvhf_rys.ejk_int3c2e_ip2(
-        ctypes.cast(ej.data.ptr, ctypes.c_void_p),
-        ctypes.cast(dm.data.ptr, ctypes.c_void_p),
-        ctypes.cast(auxvec.data.ptr, ctypes.c_void_p),
-        ctypes.byref(int3c2e_envs), ctypes.c_double(0.),
-        ctypes.c_double(1.), ctypes.c_double(1.),
-        ctypes.c_int(shm_size_max),
-        ctypes.c_int(len(shl_pair_offsets) - 1),
-        ctypes.c_int(len(ksh_offsets_cpu) - 1),
-        ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
-        ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
-        ctypes.cast(ksh_offsets_gpu.data.ptr, ctypes.c_void_p),
-        ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
-        ctypes.cast(ao_pair_loc.data.ptr, ctypes.c_void_p),
-        ctypes.c_int(0),
-        ctypes.c_int(naux))
+    tiles = _ip2_tiles(int3c2e_opt, 0., spmult, None, ao_pair_loc)
+    if tiles is not None:
+        # item 15 (W29): one launch per auxiliary l, as tiles
+        tiles.launch_auxvec(ej, dm, auxvec, int3c2e_envs, 0., 1., 1.,
+                            ksh_offsets_cpu)
+        err = 0
+    else:
+        err = libvhf_rys.ejk_int3c2e_ip2(
+            ctypes.cast(ej.data.ptr, ctypes.c_void_p),
+            ctypes.cast(dm.data.ptr, ctypes.c_void_p),
+            ctypes.cast(auxvec.data.ptr, ctypes.c_void_p),
+            ctypes.byref(int3c2e_envs), ctypes.c_double(0.),
+            ctypes.c_double(1.), ctypes.c_double(1.),
+            ctypes.c_int(shm_size_max),
+            ctypes.c_int(len(shl_pair_offsets) - 1),
+            ctypes.c_int(len(ksh_offsets_cpu) - 1),
+            ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+            ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
+            ctypes.cast(ksh_offsets_gpu.data.ptr, ctypes.c_void_p),
+            ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
+            ctypes.cast(ao_pair_loc.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(0),
+            ctypes.c_int(naux))
     if err != 0:
         raise RuntimeError('ejk_int3c2e_ip2 failed')
     ej = ej + ej.transpose(1, 0, 3, 2)
@@ -1676,6 +1738,19 @@ def _oo_atm_block(j3c_100, k0, k1, v0, work, natm, nocc, aoslices,
                  h_ao_aux)
 
 
+
+def _ip2_tiles(int3c2e_opt, omega, spmult, gout, ao_pair_loc):
+    """Item 15 (W29): ``ejk_int3c2e_ip2`` launched as its own tile
+    (``electrolites/_ip2launch.py``); ``None`` is item 1's launch.
+    ``FASTDFHESSIP_IP2_TILE=0``."""
+    if _env('FASTDFHESSIP_IP2_TILE', '1') == '0':
+        return None
+    from ._ip2launch import Tiles
+    t = Tiles(int3c2e_opt, omega, spmult, gout)
+    t.set_ao_pair_loc(ao_pair_loc)
+    _S['ip2_tiles'] = _S.get('ip2_tiles', 0) + 1
+    return t
+
 def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
              k_factor, omega, lr_factor, sr_factor, pair_addresses, nao_pair,
              batch_size, blksize, spmult, st):
@@ -1714,6 +1789,9 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
     buf = cp.empty((nao_pair*batch_size))
     buf2 = cp.empty((blksize, nao, nao))
     buf1 = cp.empty((blksize, nao, nocc))
+    tiles = _ip2_tiles(int3c2e_opt, omega, spmult, gout, ao_pair_loc)
+    if tiles is not None:
+        bufp = cp.empty((nao_pair*batch_size))
     per_class = _env('FASTDFHESSIP_TIME', '0') == '2'
     if per_class:
         # `FASTDFHESSIP_TIME=2`: the ip2 kernel timed per auxiliary batch,
@@ -1743,24 +1821,36 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
         if per_class:
             e0 = cp.cuda.Event()
             e0.record()
-        err = kern_ip2(
-            ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
-            ctypes.cast(compressed.data.ptr, ctypes.c_void_p),
-            lib.c_null_ptr(),
-            ctypes.byref(int3c2e_envs), ctypes.c_double(omega),
-            ctypes.c_double(lr_factor), ctypes.c_double(sr_factor),
-            ctypes.c_int(shm_size_max),
-            ctypes.c_int(len(shl_pair_offsets) - 1),
-            ctypes.c_int(1),
-            ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
-            ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
-            ctypes.cast(ksh_offsets_gpu[kbatch:].data.ptr, ctypes.c_void_p),
-            ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
-            ctypes.cast(ao_pair_loc.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(aux_ao_offset),
-            ctypes.c_int(naux_in_batch))
-        if err != 0:
-            raise RuntimeError('ejk_int3c2e_ip2 failed')
+        if tiles is not None:
+            # item 15 (W29): the same kernel launched as its own tile
+            ks0, ks1 = ksh_offsets_cpu[kbatch], ksh_offsets_cpu[kbatch+1]
+            perm = tiles.permutation(ks0, ks1)
+            if perm is not None:
+                compressed = cp.take(compressed, perm, axis=1, out=ndarray(
+                    (nao_pair, naux_in_batch), buffer=bufp))
+            tiles.launch(ejk, compressed, None, int3c2e_envs, omega,
+                         lr_factor, sr_factor, ks0, ks1, aux_ao_offset,
+                         naux_in_batch)
+        else:
+            err = kern_ip2(
+                ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
+                ctypes.cast(compressed.data.ptr, ctypes.c_void_p),
+                lib.c_null_ptr(),
+                ctypes.byref(int3c2e_envs), ctypes.c_double(omega),
+                ctypes.c_double(lr_factor), ctypes.c_double(sr_factor),
+                ctypes.c_int(shm_size_max),
+                ctypes.c_int(len(shl_pair_offsets) - 1),
+                ctypes.c_int(1),
+                ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+                ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
+                ctypes.cast(ksh_offsets_gpu[kbatch:].data.ptr,
+                            ctypes.c_void_p),
+                ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
+                ctypes.cast(ao_pair_loc.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(aux_ao_offset),
+                ctypes.c_int(naux_in_batch))
+            if err != 0:
+                raise RuntimeError('ejk_int3c2e_ip2 failed')
         if per_class:
             e1 = cp.cuda.Event()
             e1.record()

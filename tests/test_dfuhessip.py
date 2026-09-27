@@ -131,7 +131,11 @@ SWITCHES = [('default', {}),
             ('H1ATOM=batched', {'H1ATOM': 'batched'}),
             ('H1ATOM=occ', {'H1ATOM': 'occ'}),
             ('K0=compute', {'K0': 'compute'}),
-            ('JPAIR=0', {'JPAIR': 0})]
+            ('JPAIR=0', {'JPAIR': 0}),
+            ('IP2_TILE=0', {'IP2_TILE': 0}),
+            ('IP2_KCHUNK=3', {'IP2_KCHUNK': 3}),
+            ('FILL_TILE=0', {'FILL_TILE': 0}),
+            ('FILL_TILE=0.05', {'FILL_TILE': 0.05})]
 
 
 def terms(mf):

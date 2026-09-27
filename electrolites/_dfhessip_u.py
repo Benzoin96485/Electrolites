@@ -37,6 +37,11 @@ are the same ``FASTDFHESSIP_*`` ones and mean the same thing:
 Item 8 (the metric as its Cholesky factor, W24) is not carried over: it
 lives in ``_chol_d4_d5``, whose five contractions would all need the spin
 index, and W24 measured it at 1.05x-1.06x of the call below 42 atoms.
+
+W29's two launch items apply here unchanged: **item 15** (the
+``ejk_int3c2e_ip2`` kernel as its own tile, both spins' pseudo-density
+permuted into the tile's layout) in ``_ejk_ip2``, and **item 16** (the
+derivative fills' pair count) through ``fastdfhessip._ip1_evaluator``.
 """
 import ctypes
 
@@ -558,6 +563,9 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo, auxvec, j_factor, k_factor,
     buf = cp.empty((nao_pair*batch_size))
     buf2 = cp.empty((blksize, nao, nao))
     buf1 = cp.empty((2, blksize, nao, nocc))
+    tiles = H._ip2_tiles(int3c2e_opt, omega, spmult, None, ao_pair_loc)
+    if tiles is not None:
+        bufp = cp.empty((nao_pair*batch_size))
     aux0 = aux1 = 0
 
     def plans(m):
@@ -583,6 +591,17 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo, auxvec, j_factor, k_factor,
                      out=dm_tensor)
             cp.take(dm_tensor.reshape(-1, dk), pair_addresses, axis=0,
                     out=compressed[:, k0:k1])
+        if tiles is not None:
+            # fastdfhessip item 15 (W29): the kernel launched as its tile
+            ks0, ks1 = ksh_offsets_cpu[kbatch], ksh_offsets_cpu[kbatch+1]
+            perm = tiles.permutation(ks0, ks1)
+            if perm is not None:
+                compressed = cp.take(compressed, perm, axis=1, out=ndarray(
+                    (nao_pair, naux_in_batch), buffer=bufp))
+            tiles.launch(ejk, compressed, None, int3c2e_envs, omega,
+                         lr_factor, sr_factor, ks0, ks1, aux_ao_offset,
+                         naux_in_batch)
+            continue
         err = kern_ip2(
             ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
             ctypes.cast(compressed.data.ptr, ctypes.c_void_p),
