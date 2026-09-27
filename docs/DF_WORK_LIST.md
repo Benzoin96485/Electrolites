@@ -2405,7 +2405,44 @@ def2-SVP case up to 60 atoms.  `fastdfhessip._get_veff` has the same term
   spins' in the same launch, so the launches are a larger share of it and
   the crossover can sit higher than 4e6, or past every size that fits.
 
-### W31 — The ip2 kernel's contraction over shared-memory `g`, and its atomics
+### W31 — The ip2 kernel's contraction over shared-memory `g`, and its atomics — **done: 1.39x–1.95x on the kernel, 1.95x at 113 atoms and 1.53x on the metal complexes; literal indices pay only where `g` fits in registers**
+
+`electrolites/kernels/cuda/myip2/ejk_int3c2e_ip2.cu` (built by
+`_nvcc.ip2_library`, chosen by `_ip2launch.kernel`; `fastdfhessip` item 17,
+`FASTDFHESSIP_IP2_KERNEL=upstream` restores W29's), `tests/test_dfhessip.py`,
+`tests/test_dfuhessip.py`, `benchmarks/df_ip2_class_probe.py --ours`;
+write-up in `docs/README_fastdfhessip4.md`.
+
+`ncu` works with `--perf=generic` on the allocation, and it said what the
+ablation could not: one block per SM (254 registers, 155 KB of `g`), eight
+warps, the FP64 pipe 54 % busy and stalled on dependency latency, more
+integer instructions than floating-point ones in the loop.  Four changes, the
+same entry point and launch: the contraction accumulates **21 sums instead
+of 51** (the kk/ik/jk blocks follow from translational invariance, once per
+triple; 1.20x–1.30x alone); the **light classes** (`(ss|s–g)` … `(pp|s–p)`,
+`(dd|s)`: `g` ≤ 24 doubles per direction) run a triple per thread with `g`
+in registers, recurrences and contraction compiled per class with literal
+indices, as a kernel of their own — 3.7x–4.7x per class; the heavy classes
+keep shared-memory `g` on 512 threads (16 warps per SM); and a block sums
+its triples' results before one `atomicAdd` per target (1.41x at 113 atoms).
+**The kernel is 1.39x–1.95x W29's on eleven systems** (1.95x taxol, 1.83x
+the 113-atom Co complex, 1.78x penicillin V, 1.69x in def2-TZVPP) and
+**1.53x on the Fe, Ni and Pt complexes** — the success bar is met at 113
+atoms and missed on the metals.  **The falsification fires for the design
+the entry named**: with `g` in shared memory the unrolled literal-index
+contraction spills at 255 registers and is at most 1.16x the generic loop
+(0.76x–0.92x once the block reduction is in the same kernel); literal indices
+pay only in registers.  What is left is the heavy classes' shared-memory
+contraction — 58 % of the kernel on penicillin V, **76 % on the Pt complex**,
+50 % at 113 atoms — which needs occupancy this kernel's shared-memory layout
+does not have.  The ip2 term moves 1.01x–1.24x (1.15x Pt, 1.24x DF-PBE, 1.04x
+at 113 atoms; 1.6x–3.6x GPU4PySCF's) and whole Hessians 1.00x–1.05x,
+because the kernel is now 7 % of the call at 42 atoms and a **buffer
+allocation** ("D3 buffers", two `cp.empty` after the call's
+`free_all_blocks`) is 557–637 ms of its 1.84 s.  Traces unchanged; whole
+Hessians patched against unpatched 7.8e-12 (RKS) and 3.8e-12 (UKS).
+
+The original entry, for the record:
 
 *(Found by W29.)*
 
