@@ -105,7 +105,10 @@ mf.conv_tol = 1e-10
 mf.kernel()
 mo_c, mo_o = mf.mo_coeff, mf.mo_occ
 hs = mf.Hessian()
-g = [RKSHESS._get_vxc_deriv1(hs, mo_c, mo_o, 4000) for _ in range(3)]
+# upstream's function, which is what W23 repaired; `fastxchess` has covered
+# meta-GGAs since W28, and its own comparison is tests/test_xchess_mgga.py
+_d1 = getattr(RKSHESS, '_get_vxc_deriv1_orig', RKSHESS._get_vxc_deriv1)
+g = [_d1(hs, mo_c, mo_o, 4000) for _ in range(3)]
 report('three calls, bit for bit', max(rel(x, g[0]) for x in g[1:]), 0.)
 from pyscf import dft as cdft                                # noqa: E402
 from pyscf.hessian import rks as crks                        # noqa: E402

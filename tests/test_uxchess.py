@@ -64,13 +64,19 @@ CASES = [
     ('Pt amine', M + 'tmc_pt_amine.xyz', 'def2-svp', 'b3lyp', 3, 0, 2),  # ECP
     ('Ni dithiolene', M + 'tmc_ni_dithiolene.xyz', 'def2-svp', 'b3lyp',
      3, -1, 1),
-    # declined paths: they must fall through, and still agree exactly
+    # meta-GGAs (W28)
+    ('CH3', CH3, 'def2-svp', 'tpss', 3, 0, 1),
+    ('NO', NO, 'def2-tzvpp', 'r2scan', 3, 0, 1),
+    ('FeCl4-', M + 'tmc_fecl4.xyz', 'def2-svp', 'tpss', 3, -1, 5),
+    ('Ni dithiolene', M + 'tmc_ni_dithiolene.xyz', 'def2-svp', 'm06-l',
+     3, -1, 1),
+    # a declined path: it must fall through, and still agree exactly
     ('O2', O2, 'def2-svp', 'svwn', 3, 0, 2),                  # LDA
     ('O2', O2, 'def2-svp', 'm06-2x', 3, 0, 2),                # meta-GGA
 ]
 
 #: the functionals this module hands back to GPU4PySCF
-DECLINED = ('svwn', 'm06-2x')
+DECLINED = ('svwn',)
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--quick', action='store_true')
@@ -80,7 +86,7 @@ ap.add_argument('--hess-max-atoms', type=int, default=6,
                      'for a column that the two term-by-term columns above '
                      'it already cover.')
 a = ap.parse_args()
-cases = CASES[:3] + CASES[-2:] if a.quick else CASES
+cases = CASES[:3] + CASES[9:11] + CASES[-2:] if a.quick else CASES
 
 FAST1, FAST2 = hess_uks._get_vxc_deriv1, hess_uks._get_vxc_deriv2
 ORIG1, ORIG2 = hess_uks._get_vxc_deriv1_orig, hess_uks._get_vxc_deriv2_orig
