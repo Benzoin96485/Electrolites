@@ -39,9 +39,18 @@ its own, **W31**.
   Every caller of `_ip1_evaluator` — the ip2 term's two passes, `h1`, the
   Coulomb-only term — gets it.
 * **The kernel alone** (`benchmarks/df_ip2_class_probe.py --whole`, §2.3):
-  RESULTS_KERNEL
-* **The functions** (§4): RESULTS_FUNCTIONS
-* **Whole Hessians** (§4.2): RESULTS_HESSIAN
+  the same kernel binary is **2.2x–6.4x** faster on eleven systems from 5 to
+  113 atoms — 6.4x on penicillin V, 4.7x on the Ni(II) complex, 4.9x on the
+  Cu(II) macrocycle, 4.3x in def2-TZVPP, 2.2x–2.4x at 113 atoms, 1.4x on
+  FeCl₄⁻ (1.33 s → 0.22 s of the call at 42 atoms).
+* **The functions** (§4): the ip2 term is **1.15x–2.03x** W24's
+  (1.56x at 42 atoms, 2.0x on Ni(II) and in DF-PBE, 1.77x in def2-TZVPP,
+  1.73x on the Cu(II) open shell, 1.15x at 113 atoms) and **1.3x–3.3x**
+  GPU4PySCF's; h1, through item 16 alone, is 1.05x–1.48x W24's at 21–113
+  atoms and flat at 5–10.
+* **Whole Hessians** (§4.2): **1.04x–1.22x** on seven: 1.14x at 42 atoms,
+  1.22x on the Ni(II) complex, 1.13x in DF-PBE, 1.07x in def2-TZVPP, and
+  the traces agree to the kernel's own spread (5e-10).
 * **What bounds it now** (§6): an ablation of the kernel's four parts at
   equal launch geometry.  Removing the Rys roots saves 1–3 %; the `gout`
   contraction over the shared-memory `g` arrays is 53 % (taxol), 62 %
@@ -82,9 +91,9 @@ So a block of `(ss|` pairs against the 237-shell batch runs 16 pairs x 16
 shells at a time, 16 x 15 times in series, and a block of `(dd|` pairs
 against the `g` batch runs one triple at a time.  The launch is a few hundred
 such blocks, on 108 SMs holding one each (254 registers x 256 threads is the
-whole register file).  The first probe made this visible by accident: the
-kernel restricted to one class of 49 shell pairs against one auxiliary
-shell took **0.3 ms**, and against 237 shells **1.5 ms** — a single block's
+whole register file).  The first probe made this visible by accident: on glycine, the kernel
+restricted to one class of pairs against one auxiliary batch took
+**0.3–1.5 ms** per launch (`nsys`), whatever the class — a single block's
 latency, not throughput.
 
 `benchmarks/df_ip2_class_probe.py --whole` launches the production loop —
@@ -291,7 +300,32 @@ is within one process.
 
 ### 4.2 Whole Hessians
 
-RESULTS_HESS_TABLE
+`benchmarks/df_hess_anatomy.py --rounds 2`, before (`FASTDFHESSIP_IP2_TILE=0
+FASTDFHESSIP_FILL_TILE=0`) and after in alternating processes on one GPU,
+the pair run twice; round 1 (warm) of each, both pairs:
+
+| system | basis | before | after | | ip2 before → after | h1 before → after | traces |
+|---|---|---|---|---|---|---|---|
+| alanine dipeptide, 22 atoms | SVP | 2.97, 2.96 s | **2.76, 2.76 s** | 1.07x | 0.56 → 0.24–0.29 s | 0.31 → 0.35 s | 20.730986922(8) both |
+| Pt(II) amine, 23, ECP | SVP | 6.61, 6.73 s | **6.27, 6.26 s** | 1.06x | 1.16 → 0.72–0.78 s | 0.55–0.59 → 0.49–0.51 s | 20.80278306 ± 1.2e-9 both |
+| Ni(II) dithiolene²⁻, 21 | SVP | 8.58, 8.64 s | **7.05, 7.08 s** | **1.22x** | 2.46 → 1.16–1.19 s | 1.08–1.11 → 0.81–0.82 s | 21.95901039(5) ± 2e-9 both |
+| Ni(II) dithiolene⁻, 21, UKS | SVP | 15.90, 16.07 s | **14.36, 14.23 s** | 1.12x | 2.93–2.96 → 1.63–1.70 s | 1.34 → 1.04–1.11 s | 22.03359042(6) ± 2e-9 both |
+| penicillin V, 42 | SVP | 15.50, 15.55 s | **13.30, 13.63 s** | **1.15x** | 2.89–2.94 → 1.30–1.40 s | 1.50–1.55 → 1.07–1.10 s | 41.785822457 ± 4e-10 both |
+| penicillin V, 42, DF-PBE | SVP | 8.31, 8.19 s | **7.27, 7.30 s** | 1.13x | 1.11–1.13 → 0.61–0.62 s | 1.30 → 0.87–0.90 s | 40.764712845 ± 4e-10 both |
+| penicillin V, 42 | TZVPP | 45.68, 45.65 s | **42.49, 42.53 s** | 1.07x | 6.53 → 3.74–3.77 s | 4.75–4.82 → 4.35 s | 39.777317038 ± 7e-10 both |
+
+The two terms were 25–41 % of a whole Hessian before and are 18–28 % after;
+what is left is the CPHF (`_get_jk`, W8, and `nr_rks_fxc_mo`, W16), which
+is 51–60 % of the 42-atom one.  The alanine dipeptide's h1 row moves the
+wrong way by 40 ms in both pairs, inside a 2.8 s Hessian that is 1.07x
+faster; §4's function table has the same call at 1.06x the other way, so it
+is not claimed either way.  No 113-atom Hessian was run: the restricted one
+is 700 s, of which the two terms are now 43 s (from 47 s), and the function
+table above is the measurement.  These were taken before
+`docs/DF_WORK_LIST.md` W27/W30 (commit d59e6dc) landed; the branch is
+rebased on it, the tests below were rerun on the rebased tree, and the
+42-atom function row was re-measured there (ip2 2905 → 1826 ms, h1
+1472 → 1081 ms, the same as before the rebase).
 
 ---
 
@@ -307,7 +341,7 @@ element, with new switch columns for items 15 and 16:
 | the same with `IP2_KCHUNK=3` (every batch cut into three-shell ranges and permuted), `IP2_KCHUNK=0`, `IP2_PCHUNK=5`, `IP2_TILE=0` | 3.7e-13 / 3.3e-16 |
 | `FILL_TILE=0`, `FILL_TILE=0.05` (one pair per block) | 5.4e-13 / 4.5e-16 |
 | the long-range operator (`omega = 0.3`), water | 5.4e-14 (`KCHUNK=3`), 1.8e-15 otherwise |
-| the unrestricted twins, ethanol⁺, every switch | RESULTS_UTEST |
+| the unrestricted twins, ethanol⁺, every switch | 3.9e-13 / 1e-15 (ip2 / h1), and whole Hessians patched against unpatched: **6.2e-12** (RKS) and **6.0e-12 Eh/bohr²** (UKS) |
 
 The ip2 term's spread is the kernel's atomics, which are unordered with any
 launch: upstream against itself is 3e-14–4e-13 on these molecules
@@ -344,7 +378,7 @@ So, of the kernel:
 | the `gout` contraction over shared-memory `g` | **62 %** | **83 %** | **53 %** |
 | the `g` recurrences (`BUILD_3C_GXYZ`) | 12 % | 9 % | 11 % |
 | per-triple atomics into `ejk` | 9 % | 0 % | **18 %** |
-| the rest: primitive loops, `exp`, barriers | ~14 % | ~8 % | ~15 % |
+| the rest: primitive loops, `exp`, barriers | ~15 % | ~8 % | ~15 % |
 
 The entry's falsification criterion asked whether the high classes are
 "already at the card's rate for the arithmetic a Rys second derivative
@@ -382,7 +416,7 @@ Switches added by this round (read at call time): `FASTDFHESSIP_IP2_TILE`,
 `FASTDFHESSIP_IP2_KCHUNK` (16), `FASTDFHESSIP_IP2_PCHUNK` (`tile`),
 `FASTDFHESSIP_FILL_TILE` (2).
 
-**The node.**  Every number here is from one interactive allocation whose
+**The node.**  Every number here is from interactive allocations whose
 other three GPUs ran other jobs throughout.  The kernel tables are CUDA-event
 times of kernels alone and were stable to 1 % run to run; the function and
 Hessian tables are wall clock with host work in them and are what §5.2 of
