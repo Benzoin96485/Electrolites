@@ -58,6 +58,21 @@ ap.add_argument('--ballast', type=float, default=0,
                 help='GB held on the device for the whole run, before the '
                      'SCF: 40 on an 80 GB card is the memory of a 40 GB one '
                      '(W35; FASTDFHESSIP_MEM only caps the sizing)')
+ap.add_argument('--free-after', type=float, default=0,
+                help='GB left free after the SCF, by a ballast allocated '
+                     'then: the terms at a 40 GB card\'s memory (44.6) for '
+                     'a molecule whose SCF does not fit one (W38)')
+ap.add_argument('--save-out', default='',
+                help='save each term\'s first-variant result to <path>.<term>.npy')
+ap.add_argument('--ref-out', default='',
+                help='check every variant against <path>.<term>.npy, saved by '
+                     '--save-out in another process (e.g. on the full card)')
+ap.add_argument('--prefree-env', default=None,
+                help="with --free-after: each term's reference is 'ours' "
+                     "with these switches ('VAR=val;...'), computed in this "
+                     "process on this SCF *before* the ballast -- e.g. "
+                     "'FASTDFHESSIP_H1UBATCH=0', upstream's one batch, which "
+                     "does not fit after it (W38)")
 a = ap.parse_args()
 if a.ballast:
     _ballast = cp.empty(int(a.ballast * 1e9) // 8)
@@ -106,6 +121,29 @@ e = mf.kernel()
 print(f'# {natm} atoms  nao {mol.nao}  basis {a.basis}  xc {a.xc}  '
       f'{"UKS spin " + str(mol.spin) if uks else "RKS"}')
 print(f'# DF-SCF {time.perf_counter() - t0:.2f} s   E = {e:.10f}', flush=True)
+PREFREE = {}
+
+
+def _prefree_refs():
+    # called once the term closures exist; see --prefree-env
+    env = dict(x.split('=', 1) for x in a.prefree_env.split(';') if x)
+    saved = _set_env(env)
+    try:
+        for term in terms:
+            PREFREE[term] = cp.asnumpy(SETUP[term]()(_ours(term)))
+    finally:
+        _restore(saved)
+    print(f'# references before the ballast, {env}', flush=True)
+
+
+def _free_after():
+    cp.get_default_memory_pool().free_all_blocks()
+    global _ballast2
+    _free = cp.cuda.runtime.memGetInfo()[0]
+    _ballast2 = cp.empty(max(0, int(_free - a.free_after * 1e9)) // 8)
+    _ballast2[:] = 0
+    print(f'# ballast after the SCF {_ballast2.nbytes / 1e9:.1f} GB, '
+          f'{cp.cuda.runtime.memGetInfo()[0] / 1e9:.1f} GB free', flush=True)
 
 mo_coeff = cp.asarray(mf.mo_coeff)
 mo_occ = cp.asarray(mf.mo_occ)
@@ -255,6 +293,11 @@ def setup_h1():
 
 SETUP = {'fxc': setup_fxc, 'ip2': setup_ip2, 'h1': setup_h1}
 
+if a.free_after:
+    if a.prefree_env is not None:
+        _prefree_refs()
+    _free_after()
+
 if a.nvtx:
     # one capture range for the whole of the timed part: nsys's default
     # ends the process at the first cudaProfilerStop
@@ -280,6 +323,8 @@ for term in terms:
         if label == 'stock' or (ref is None and 'stock' not in variants):
             # without GPU4PySCF's column the first variant is the reference
             ref = outs[label]
+    if term in PREFREE:
+        ref = PREFREE[term]
     cp.get_default_memory_pool().free_all_blocks()
     ts = {label: [] for label, _, _ in vs}
     for r in range(a.reps):
@@ -314,6 +359,19 @@ for term in terms:
         print(line, flush=True)
         res[label] = {'ms': tmin * 1e3, 'all_ms': [x * 1e3 for x in ts[label]],
                       'rel_err': err}
+    if a.save_out:
+        np.save(f'{a.save_out}.{term}.npy', outs[vs[0][0]])
+    if a.ref_out:
+        import os
+        fn = f'{a.ref_out}.{term}.npy'
+        if os.path.exists(fn):
+            r0 = np.load(fn)
+            for label, _, _ in vs:
+                d = np.abs(outs[label] - r0).max()
+                e0 = float(d / max(np.abs(r0).max(), 1e-300))
+                res[label]['rel_err_saved'] = e0
+                print(f'  {label:14s} against {fn}: max|d| {d:.2e}  '
+                      f'rel {e0:.2e}', flush=True)
     results['terms'][term] = res
     call = None
     cp.get_default_memory_pool().free_all_blocks()
@@ -326,4 +384,4 @@ for name in ('fastdfhessip', 'fastxcfxc'):
     if mod is not None:
         results.setdefault('stats', {})[name] = mod.stats()
         print(f'# {name}.stats() = {mod.stats()}')
-print('\n@@JSON ' + json.dumps(results))
+print('\n@@JSON ' + json.dumps(results, default=float))
