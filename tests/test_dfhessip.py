@@ -170,7 +170,17 @@ SWITCHES = [('default', {}),
             ('WORK=upstream', {'WORK': 'upstream'}),
             ('D4_ROWS=7', {'D4_ROWS': 7}),
             ('D4_ROWS=7 D4=gemm', {'D4_ROWS': 7, 'D4': 'gemm'}),
-            ('D4_ROWS=100000', {'D4_ROWS': 100000})]
+            ('D4_ROWS=100000', {'D4_ROWS': 100000}),
+            # W37's packed pairs in the h_aux block: off, in chunks of a
+            # few pairs, and the same with the block's temporaries allocated
+            ('PACK=0', {'PACK': 0}),
+            ('D1D3=0', {'D1D3': 0}),
+            ('D3SCATTER=0', {'D3SCATTER': 0}),
+            ('TRMM=blocked TRMM_BLK=16', {'TRMM': 'blocked', 'TRMM_BLK': 16}),
+            ('D5=atom', {'D5': 'atom'}),
+            ('D5_GROUP=1', {'D5_GROUP': 1}),
+            ('PACK_CHUNK=7', {'PACK_CHUNK': 7}),
+            ('PACK_CHUNK=7 CARVE=0', {'PACK_CHUNK': 7, 'CARVE': 0})]
 
 
 def run_terms(mf, tag, factors, switches=SWITCHES, mem=None):

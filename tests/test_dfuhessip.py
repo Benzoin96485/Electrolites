@@ -146,7 +146,24 @@ SWITCHES = [('default', {}),
             ('IP2_KCHUNK=3', {'IP2_KCHUNK': 3}),
             ('FILL_TILE=0', {'FILL_TILE': 0}),
             ('FILL_TILE=0.05', {'FILL_TILE': 0.05}),
-            ('IP2_KERNEL=upstream', {'IP2_KERNEL': 'upstream'})]
+            ('IP2_KERNEL=upstream', {'IP2_KERNEL': 'upstream'}),
+            # W37's packed pairs in the h_aux block: off, in chunks of a
+            # few pairs, and the same with the block's temporaries allocated
+            ('PACK=0', {'PACK': 0}),
+            ('D1D3=0', {'D1D3': 0}),
+            ('D3SCATTER=0', {'D3SCATTER': 0}),
+            ('TRMM=blocked TRMM_BLK=16', {'TRMM': 'blocked', 'TRMM_BLK': 16}),
+            ('D5=atom', {'D5': 'atom'}),
+            ('D5_GROUP=1', {'D5_GROUP': 1}),
+            ('PACK_CHUNK=7', {'PACK_CHUNK': 7}),
+            ('PACK_CHUNK=7 CARVE=0', {'PACK_CHUNK': 7, 'CARVE': 0}),
+            # W37's item 8 on the spin index: off (the eigenbasis), one
+            # spin per pass, and with the other D4 and without the fusion
+            ('UCHOL=0', {'UCHOL': 0}),
+            ('METRIC=eigen', {'METRIC': 'eigen'}),
+            ('USPIN=1', {'USPIN': 1}),
+            ('USPIN=1 FUSE=0', {'USPIN': 1, 'FUSE': 0}),
+            ('USPIN=1 D4=gemm', {'USPIN': 1, 'D4': 'gemm'})]
 
 
 def terms(mf):
@@ -224,6 +241,10 @@ for mem in 6e7 * 0.8 ** np.arange(14):
         if term == 'ip2':
             fused = st['fused'] > fused0
             extra = f'vchunks={st["vchunks"]}{" fused" if fused else ""}'
+            if st.get('u_spin_passes'):
+                # W37: item 8 on the spin index, both spins or one a pass
+                extra += f' chol, {st["u_spin_passes"]} spin pass(es)'
+                reached.add(f'chol {st["u_spin_passes"]}')
             if not fused:
                 reached.add('unfused by memory')
         elif st.get('h1_rebalanced'):
@@ -287,7 +308,10 @@ _cuplan.planable = lambda pattern, *ops, **kw: (
     False if pattern in REFUSE else _planable(pattern, *ops, **kw))
 n0 = fastdfhessip.stats().get('plan_gemm', 0)
 for jf, kf in ((1., 0.2), (1., 1.)):
-    got = U._jk_energy_per_atom(intopt, dm0, jf, kf)
+    # W37's items 22 and 25 do not call two of the four (the packed h_aux
+    # head is cuBLAS already, and item 8's (10|0) is a pass over memory)
+    with env(PACK=0, UCHOL=0):
+        got = U._jk_energy_per_atom(intopt, dm0, jf, kf)
     check(f'ethanol+ ip2 j={jf} k={kf} through cuBLAS', got,
           UP_IP2(intopt, dm0, jf, kf))
 _cuplan.planable = _planable
