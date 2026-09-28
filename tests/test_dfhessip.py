@@ -159,7 +159,13 @@ SWITCHES = [('default', {}),
             # launches (every triple in a few-shell range; the long-range
             # operator's classes all take its shared-memory path)
             ('IP2_KERNEL=upstream', {'IP2_KERNEL': 'upstream'}),
-            ('IP2_KCHUNK=3 IP2_PCHUNK=5', {'IP2_KCHUNK': 3, 'IP2_PCHUNK': 5})]
+            ('IP2_KCHUNK=3 IP2_PCHUNK=5', {'IP2_KCHUNK': 3, 'IP2_PCHUNK': 5}),
+            # W34's buffer: upstream's size, the Gram form in chunks of a
+            # few rows (both D4 forms), and the Gram form in one chunk
+            ('WORK=upstream', {'WORK': 'upstream'}),
+            ('D4_ROWS=7', {'D4_ROWS': 7}),
+            ('D4_ROWS=7 D4=gemm', {'D4_ROWS': 7, 'D4': 'gemm'}),
+            ('D4_ROWS=100000', {'D4_ROWS': 100000})]
 
 
 def run_terms(mf, tag, factors, switches=SWITCHES, mem=None):
