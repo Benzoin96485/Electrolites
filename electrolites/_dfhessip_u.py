@@ -38,9 +38,12 @@ are the same ``FASTDFHESSIP_*`` ones and mean the same thing:
   **item 20** (W35: item 12's per-atom products as batched GEMMs,
   ``_h1d2``) batches over the atoms and both spins at once.
 
-Item 8 (the metric as its Cholesky factor, W24) is not carried over: it
-lives in ``_chol_d4_d5``, whose five contractions would all need the spin
-index, and W24 measured it at 1.05x-1.06x of the call below 42 atoms.
+Item 8 (the metric as its Cholesky factor, W24) was not carried over by
+W25 -- W24 had measured it at 1.05x-1.06x of the restricted call below 42
+atoms -- and at 113 atoms its absence was most of the call: the eigenbasis
+GEMMs of D3 and D5 were 26 of the Co(II) sextet's 42 s.  **W37** carried it
+over as **item 25** (``_chol_d4_d5_u``, a pass per spin where both do not
+fit), with **items 22, 24, 26 and 28** (``fastdfhessip``'s docstring).
 
 W29's two launch items apply here unchanged: **item 15** (the
 ``ejk_int3c2e_ip2`` kernel as its own tile, both spins' pseudo-density
@@ -164,16 +167,38 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     j3c_full = buf = buf1 = eval_j3c = j3c = tmp = compressed = None
     st('A j3c_oo')
 
-    metric_w, metric_v = _factorize_j2c(auxmol, aux_sorting, omega)
+    # item 8 on the spin index (W37): the metric as its Cholesky factor on
+    # the spherical auxiliary index, in every line of the call, as the
+    # restricted function has it -- the terms cancel, so one J^-1 must
+    # serve all of them (W24)
+    sa = None
+    if (_env('FASTDFHESSIP_METRIC', 'chol') == 'chol' and
+            _env('FASTDFHESSIP_UCHOL', '1') != '0' and omega == 0 and
+            oosum == 'gram' and not auxmol.mol.cart):
+        try:
+            sa = H._SphAux(auxmol, aux_sorting, omega,
+                           _bas_atom_labels(auxmol, aux_sorting))
+        except RuntimeError:
+            sa = None
+    if sa is not None:
+        metric_v = sa.factor()
+        metric_w = cp.ones(sa.nsph)
+        _S['chol_u'] = _S.get('chol_u', 0) + 1
+    else:
+        metric_w, metric_v = _factorize_j2c(auxmol, aux_sorting, omega)
     metric_size = metric_v.shape[1]
     # item 13: the contractions whose output can pass cuTENSOR's 2**29
     # elements go to cuBLAS when cuTENSOR would refuse them
     # (`docs/DF_WORK_LIST.md` W21, W27) -- upstream's own function stops
     # here, or at the pseudo-density, on a 113-atom open shell
-    dm_oo = cp.empty((metric_size, 2, nocc, nocc))
-    _mm('uv,unij->vnij', metric_v, j3c_oo, dm_oo, 'T', 'N')
-    dm_oo /= metric_w[:, None, None, None]
-    _mm('uv,vnij->unij', metric_v, dm_oo, j3c_oo, 'N', 'N')
+    if _env('FASTDFHESSIP_PACK', '1') != '0' and omega == 0:
+        # item 22: stage B on packed pairs (both spins)
+        H._metric_packed(metric_v, metric_w, j3c_oo, 2)
+    else:
+        dm_oo = cp.empty((metric_size, 2, nocc, nocc))
+        _mm('uv,unij->vnij', metric_v, j3c_oo, dm_oo, 'T', 'N')
+        dm_oo /= metric_w[:, None, None, None]
+        _mm('uv,vnij->unij', metric_v, dm_oo, j3c_oo, 'N', 'N')
     dm_oo = j3c_oo
     j3c_oo = None
     auxvec = None
@@ -216,8 +241,29 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     assert blksize1 > 0, 'Insufficient GPU memory'
     blksize1 = min(blksize1, batch_size)
     gram = oosum != 'transpose'
+    # item 8's second pass needs the whole spherical index in one chunk; if
+    # both spins' (10|0) do not fit, it takes them one spin at a time, which
+    # walks the integrals twice (the eigen form would walk them once per
+    # chunk anyway).  j10s, its spherical j2c_10, is held beside it.
+    nsp = 2
+    if sa is not None:
+        chol_w = word_avail - 3 * metric_size**2
+        for nsp in (2, 1):
+            try:
+                pl = _plan_v(chol_w, naux, nao, nocc, nao_pair, batch_size,
+                             nao_on_atom, natm, metric_size, gram, nsp)
+            except AssertionError:
+                continue
+            if pl[0] >= metric_size:
+                word_avail = chol_w
+                break
+        else:
+            nsp = 2
+            sa = None
+        if _env('FASTDFHESSIP_USPIN', '') == '1' and sa is not None:
+            nsp = 1
     plan = _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size,
-                   nao_on_atom, natm, metric_size, gram)
+                   nao_on_atom, natm, metric_size, gram, nsp)
     do_fuse = False
     carve = False
     plan_f = (None,)
@@ -232,19 +278,27 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         margin = (10 if carve else 24) * naux**2
         try:
             plan_f = _plan_v(word_avail - margin, naux, nao, nocc, nao_pair,
-                             batch_size, nao_on_atom, natm, metric_size, gram)
+                             batch_size, nao_on_atom, natm, metric_size, gram,
+                             nsp)
         except AssertionError:
             plan_f = (0,)
         if plan_f[0] > 0 and (-(-metric_size // plan_f[0]) <=
                               -(-metric_size // plan[0])):
             plan, do_fuse = plan_f, True
     aux_batch_size, aux_blksize, blksize2 = plan
+    chol = sa if (sa is not None and aux_batch_size >= metric_size) else None
+    if chol is None:
+        nsp = 2
+    if sa is not None and chol is None:
+        _S['chol_chunked'] = _S.get('chol_chunked', 0) + 1
+    st.note(chol=chol is not None, spin_passes=2 // nsp)
+    _S['u_spin_passes'] = 2 // nsp if chol is not None else 0
     st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
             plan_fused=plan_f[0], nao=nao, nocc=nocc, naux=naux,
             metric_size=metric_size, nao_pair=nao_pair,
             batch_size=batch_size, num_aux_batches=num_aux_batches,
             vchunk=aux_batch_size, blksize2=blksize2, fused=do_fuse)
-    _S['vchunks'] = (metric_size + aux_batch_size - 1) // aux_batch_size
+    _S['vchunks'] = int(-(-metric_size // aux_batch_size))
     if do_fuse:
         _S['fused'] += 1
 
@@ -265,28 +319,47 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             dm_oo.reshape(naux, 2*nocc, nocc),
             j3c_oo1.reshape(3, naux, 2*nocc, nocc), naux, metric_size,
             2*k_factor, j_factor, 0, auxvec_ipauxp, auxvec, natm,
-            aux_atm_labels, work=work)
-        return o1p.reshape(3, naux, 2, nocc, nocc), parts[0], parts[1]
+            aux_atm_labels, work=work, nspin=2)
+        return (o1p.reshape(3, naux, 2, nocc, nocc), parts[0], parts[1],
+                parts[2])
 
     st('D0 plan')
     if not do_fuse:
         _ipaux_pass(eval_ipaux, num_aux_batches, blksize1, nao, nao_pair,
                     batch_size, nocc, pair_addresses, dm_factor_l, j3c_oo1)
         st('D1 ipaux pass')
-        j3c_oo1p, e_aux, j2c_10v = h_aux()
+        j3c_oo1p, e_aux, j2c_10v, j2c_10 = h_aux()
         ejk_ao += e_aux
+        j2c_10c = H._j2c_10c(chol, j2c_10)
+        j2c_10 = None
         st('D2 h_aux')
 
-    j3c_buf = cp.empty((3, aux_batch_size, 2, nao, nocc))
-    work = cp.empty(
-        max(0 if gram else natm*3*2*nocc*nocc*2*aux_blksize,
+    j3c_buf = cp.empty((3, aux_batch_size, nsp, nao, nocc))
+    wuse = [0 if gram else natm*3*2*nocc*nocc*2*aux_blksize,
             3*nao_pair*batch_size * 2 + (nocc*2+nao)*nao * blksize2,
             3*naux*2*nao_on_atom*nocc * 2,
-            3*naux*2*nao_on_atom*nocc + 3*aux_batch_size*naux))
+            3*naux*2*nao_on_atom*nocc + 3*aux_batch_size*naux]
+    if chol is not None:
+        ns_, nc_ = chol.nsph, chol.ncart
+        wuse += [3*nsp*nao*nocc + 3*nao*nao, 3*nc_*ns_,
+                 3*ns_*nsp*nao_on_atom*nocc + nc_*nsp*nao_on_atom*nocc +
+                 3*ns_*ns_]
+    work = cp.empty(max(wuse))
     st('D3 alloc')
-    for v0, v1 in lib.prange(0, metric_size, aux_batch_size):
+    # the spin groups of the second pass: both at once, or with item 8 on a
+    # short card one at a time, the integrals walked once per group
+    groups = [(0, 2)] if nsp == 2 else [(0, 1), (1, 2)]
+    # item 24: the fused first pass from the second pass's M C, which needs
+    # both spins in the pass that runs it
+    d1d3 = (do_fuse and nsp == 2 and
+            _env('FASTDFHESSIP_D1D3', '1') != '0')
+    ud = {}
+    for (n0, n1), v0 in ((g, v) for g in groups
+                         for v in range(0, metric_size, aux_batch_size)):
+        v1 = min(metric_size, v0 + aux_batch_size)
         dv = v1 - v0
-        j3c_100 = ndarray((3, dv, 2, nao, nocc), buffer=j3c_buf)
+        first = n0 == 0
+        j3c_100 = ndarray((3, dv, n1-n0, nao, nocc), buffer=j3c_buf)
         j3c_100[:] = 0.
         j3c_full, work1 = _allocate((nao, nao, blksize2), work)
         j3c_full[:] = 0.
@@ -299,7 +372,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             compressed_dk = eval_ipaux(kbatch, out=buf1)
             naux_in_batch = compressed_di.shape[-1]
             st('D3 integrals')
-            if do_fuse and v0 == 0:
+            if do_fuse and v0 == 0 and first and not d1d3:
                 # item 3: the first pass, on this batch's ipaux integrals
                 # before they are folded into dj
                 _ipaux_batch(compressed_dk, aux1, naux_in_batch, blksize2,
@@ -307,29 +380,55 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                              dm_factor_l, j3c_oo1)
                 st('D1 ipaux (fused)')
             # (di/dr j|k) + (i dj/dr|k) + (i j|dk/dr) = 0
-            compressed_dk += compressed_di
-            compressed_dj = compressed_dk
-            compressed_di *= -1
+            d3sc = _env('FASTDFHESSIP_D3SCATTER', '1') != '0'
+            if not d3sc:
+                compressed_dk += compressed_di
+                compressed_dj = compressed_dk
+                compressed_di *= -1
             for k0, k1 in lib.prange(0, naux_in_batch, blksize2):
                 dk = k1 - k0
                 aux0, aux1 = aux1, aux1 + dk
                 j3c = j3c_full[:, :, :dk]
-                tmp = _allocate((2, nao, nocc, dk), work1)[0]
+                tmp = _allocate((n1-n0, nao, nocc, dk), work1)[0]
                 for x in range(3):
-                    j3c[j_addr, i_addr] = compressed_dj[x, :, k0:k1]
-                    j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
-                    tmp = contract('pqr,nqi->npir', j3c, dm_factor_l, out=tmp)
-                    _mm('rs,npir->snpi', metric_v[aux0:aux1, v0:v1], tmp,
-                        j3c_100[x], 'T', 'T', beta=1.)
+                    if d3sc:
+                        # item 28
+                        H._scatter_d3(compressed_di[x], compressed_dk[x], k0,
+                                      k1, pair_addresses, nao, j3c)
+                    else:
+                        j3c[j_addr, i_addr] = compressed_dj[x, :, k0:k1]
+                        j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
+                    tmp = contract('pqr,nqi->npir', j3c, dm_factor_l[n0:n1],
+                                   out=tmp)
+                    if d1d3 and v0 == 0:
+                        H._d1_from_d3(tmp, dm_factor_l, j3c_oo1[x, aux0:aux1],
+                                      None, nspin=2)
+                    if chol is None:
+                        _mm('rs,npir->snpi', metric_v[aux0:aux1, v0:v1],
+                            tmp, j3c_100[x], 'T', 'T', beta=1.)
+                    else:
+                        # item 8: the spherical (10|0), shell block by
+                        # shell block -- a pass over memory, not a GEMM
+                        c0, c1 = chol.cols(aux0, aux1)
+                        contract('rs,npir->snpi', chol.ms[aux0:aux1, c0:c1],
+                                 tmp, beta=1, out=j3c_100[x, c0:c1])
             st('D3 j3c_100')
         j3c_full = buf0 = buf1 = tmp = None
         compressed_di = compressed_dj = compressed_dk = None
 
-        if do_fuse and v0 == 0:
-            j3c_oo1p, e_aux, j2c_10v = h_aux(work if carve else None)
+        if do_fuse and v0 == 0 and first:
+            j3c_oo1p, e_aux, j2c_10v, j2c_10 = h_aux(work if carve else None)
             ejk_ao += e_aux
+            j2c_10c = H._j2c_10c(chol, j2c_10)
+            j2c_10 = None
             st('D2 h_aux')
 
+        if chol is not None:
+            _chol_d4_d5_u(chol, j3c_100, n0, n1, work, natm, nocc, atm_ind,
+                          aoslices, dm_factor_l, dm_oo, j3c_oo1p, j2c_10c,
+                          k_factor, j_factor, ejk_ao, h_ao_aux, auxvec,
+                          auxvec_ipauxp, ud, n1 == 2, st)
+            continue
         if gram:
             _oo_gram(j3c_100, v0, dv, work, natm, nocc, atm_ind, dm_factor_l,
                      metric_w, metric_v, k_factor, j_factor, ejk_ao,
@@ -366,6 +465,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     j2c_10v = j3c_oo1p = j3c_oo1 = None
 
     ejk_ao_aux = _aggregate_to_atoms(h_ao_aux, natm, aux_atm_labels, axis=1)
+    if 'h_sph' in ud:
+        ejk_ao_aux += _aggregate_to_atoms(ud['h_sph'], natm, chol.atm, axis=1)
+    ud = None
     ejk += ejk_ao_aux
     ejk += ejk_ao_aux.transpose(1, 0, 3, 2)
     ejk += ejk_ao
@@ -373,6 +475,106 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     st.report()
     log.timer_debug1('_jk_energy_per_atom UHF (fastdfhessip)', *t0)
     return ejk
+
+
+def _chol_d4_d5_u(sa, ksph, n0, n1, work, natm, nocc, atm_ind, aoslices,
+                  dm_factor_l, dm_oo, j3c_oo1p, j2c_10c, k_factor, j_factor,
+                  ejk, h_ao_aux, auxvec, auxvec_ipauxp, ud, last, st):
+    """Item 8 on the spin index (W37): ``fastdfhessip._chol_d4_d5`` for the
+    spins ``n0:n1`` of ``ksph`` (``(3, nsph, n1-n0, nao, nocc)``).
+
+    Every term is a sum over the two spins of the restricted term, with
+    ``-k`` on each spin density where the restricted function has ``-k/2``
+    on the total -- except the Coulomb half of D4, which squares the trace
+    summed over both spins; with the spins in two groups its trace is
+    accumulated in ``ud`` and squared after the ``last`` one.  The partners
+    that go spherical in place (``j3c_oo1p``) are converted once, in the
+    first group; ``j2c_10c`` stays Cartesian (the Coulomb half of D5 needs
+    it so) and its spherical copy ``j10s`` is kept in ``ud``.
+    """
+    nsph = sa.nsph
+    nao = dm_factor_l.shape[1]
+    ns = n1 - n0
+    C = dm_factor_l[n0:n1]
+    for x in range(3):
+        H._trmm(sa, ksph[x].reshape(nsph, -1))
+    st('D8 L^-1 K')
+    # D4 on Y = L^-1 K, unit weights: each spin's P o R + Q (fastdfhessip's
+    # _oo_gram per spin, as this module's _oo_gram does)
+    rq = (H._oo_gram_rq_syrk if _env('FASTDFHESSIP_D4', 'syrk') == 'syrk'
+          else H._oo_gram_rq)
+    need = 3*nao*nocc + 3*nao*nao
+    wk = work if work.size >= need else cp.empty(need)
+    ones = cp.ones(nsph)
+    acc = None
+    for g in range(ns):
+        R, Q = rq(ksph[:, :, g], 0, nsph, wk, nocc, C[g], ones)
+        R *= C[g].dot(C[g].T)
+        R += Q
+        Q = None
+        if acc is None:
+            acc = R
+        else:
+            acc += R
+        R = None
+    t = contract('au,xyuv->axyv', atm_ind, acc)
+    acc = None
+    contract('axyv,bv->abxy', t, atm_ind, -k_factor*2, beta=1, out=ejk)
+    t = None
+    if j_factor != 0:
+        d = contract('xrnui,nui->xru', ksph, C)
+        if 'dY' in ud:
+            ud['dY'] += d
+        else:
+            ud['dY'] = d
+        d = None
+        if last:
+            a = contract('au,xru->axr', atm_ind, ud.pop('dY'), alpha=2.)
+            contract('pxr,qyr->pqxy', a, a, j_factor, beta=1, out=ejk)
+            a = None
+    st('D4 oo_atm')
+    for x in range(3):
+        H._trmm(sa, ksph[x].reshape(nsph, -1), trans=True)
+    z = ksph
+    st('D8 L^-T Y')
+    if j_factor != 0:
+        # (10|0)(0|1)(0|00): linear in Z, so each group adds its spins
+        d = contract('xtnui,nui->xtu', z, C)
+        at = contract('au,xtu->axt', atm_ind, d, alpha=2.)
+        tmp, _ = _allocate((3, sa.ncart, nsph), work)
+        cp.multiply(j2c_10c, -auxvec[None, :, None], out=tmp)
+        tmp += auxvec_ipauxp[:, :, None] * sa.ms
+        contract('pxt,yst->psxy', at, tmp, j_factor, 1, h_ao_aux)
+        d = at = tmp = None
+    if 'j10s' not in ud:
+        for x in range(3):
+            sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
+        j10s = cp.empty((3, nsph, nsph))
+        for y in range(3):
+            sa.to_sph(j2c_10c[y], j10s[y])
+        ud['j10s'] = j10s
+        ud['h_sph'] = cp.zeros((natm, nsph, 3, 3))
+    j10s = ud['j10s']
+    h_sph = ud['h_sph']
+    t1s = j3c_oo1p[:, :nsph, n0:n1]
+    if _env('FASTDFHESSIP_D5', 'group') != 'atom':
+        # item 26
+        H._d5_chol(sa, z, t1s, dm_oo[:, n0:n1], C, aoslices, -k_factor*2,
+                   k_factor*2, j10s, h_sph, work)
+        st('D5 per-atom')
+        return
+    for i, (p0, p1) in enumerate(zip(aoslices[:-1], aoslices[1:])):
+        t1, work1 = _allocate((3, nsph, ns, p1-p0, nocc), work)
+        contract('ysnji,nui->ysnuj', t1s, C[:, p0:p1], out=t1)
+        contract('xsnuj,ysnuj->sxy', z[:, :, :, p0:p1], t1, -k_factor*2, 1,
+                 h_sph[i])
+        pa, work1 = _allocate((sa.ncart, ns, p1-p0, nocc), work)
+        contract('snji,nui->snuj', dm_oo[:, n0:n1], C[:, p0:p1], out=pa)
+        ps = sa.to_sph_pinv(pa, pa)
+        m, work1 = _allocate((3, nsph, nsph), work1)
+        contract('snuj,xtnuj->xst', ps, z[:, :, :, p0:p1], out=m)
+        contract('xst,yst->sxy', m, j10s, k_factor*2, 1, h_sph[i])
+    st('D5 per-atom')
 
 
 def _mm(pattern, a, b, out, ta, tb, alpha=1., beta=0.):
@@ -392,7 +594,7 @@ def _mm(pattern, a, b, out, ta, tb, alpha=1., beta=0.):
 
 
 def _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size, nao_on_atom,
-            natm, metric_size, gram):
+            natm, metric_size, gram, nsp=2):
     """Upstream's sizing of the unrestricted second pass.
 
     One change: upstream asserts that one auxiliary function's per-atom
@@ -401,7 +603,7 @@ def _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size, nao_on_atom,
     """
     word_avail -= 4 * naux**2  # j2c_10v, which the h_aux block leaves
     word_avail -= 3 * batch_size * nao_pair * 2  # eval_ip1, eval_ipaux
-    aux_unit1 = 3*2*nao*nocc + 3*naux  # j3c_100
+    aux_unit1 = 3*nsp*nao*nocc + 3*naux  # j3c_100, nsp spins of it
     aux_batch_size = (min(int(word_avail*.85),
                           word_avail-12*naux*nao_on_atom*nocc)
                       // (aux_unit1 * 8) * 8)

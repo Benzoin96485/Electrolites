@@ -2752,7 +2752,52 @@ GEMMs' 16.5; `docs/README_fastxcfxcmgga.md` §7).
   the index it screened on — stored AO pairs — reached every orbital; count
   on the block's AO subset before writing code.
 
-### W37 — The ip2 call's D stages at 113 atoms
+### W37 — The ip2 call's D stages at 113 atoms — **done: 1.63x unrestricted (item 8 on the spin index), 1.25x restricted, where every stage now runs at 15–18 TF/s and the rest is arithmetic**
+
+`electrolites/fastdfhessip.py` items 22, 24–28 (`FASTDFHESSIP_PACK=0`,
+`_D1D3=0`, `_UCHOL=0`, `_USPIN=1`, `_D5=atom`, `_TRMM=blocked`,
+`_D3SCATTER=0`), `electrolites/_dfhessip_u.py` (`_chol_d4_d5_u`),
+`benchmarks/df_ip2_stage_profile.py` (every stage's kernels from an nsys
+report, `FASTDFHESSIP_NVTX=1`), `df_d5_bench.py`, `df_trmm_bench.py`,
+`df_hess_metric_sens.py --spin`; write-up in `docs/README_fastdfhessip6.md`.
+
+**Both halves of the falsification were true.**  Profiled kernel by
+kernel, D2 ran at 16.3 TF/s, the triangular multiplies at 15.1, D4 at 12.8
+— at rate — while D5 was 3.6 s of cuTENSOR `sxy` reductions at 0.12 TF/s
+and per-atom products that re-read all of `t1s` for 14 columns, and the
+fused D1 repeated a `2 nao² nocc` contraction D3 already does.  So:
+item 22 packs the occupied pair index where `dm_oo`, `j3c_oo1` and
+`j3c_oo1p` are symmetric (stage B and the `h_aux` block at
+`(nocc+1)/2nocc` of the arithmetic; not for `omega != 0`, where it moved
+a triplet by 6e-10); item 24 takes D1's `(1|00)` from D3's own `M C`
+(`M + M^T` is the `ipaux` block exactly); item 26 runs D5 by atom groups
+with batched GEMMs and two reduction kernels around its product, which
+was already at 18.6 TF/s; item 28 fuses D3's scatter.  And the
+falsification's "next thing", item 25, is W24's Cholesky form in the
+unrestricted twin, a pass per spin where both spins' spherical `(10|0)`
+do not fit.  Blocking the triangular multiplies into GEMMs (item 27) was
+measured and is off: 15.2–15.4 against `dtrmm`'s 15.1–15.2 TF/s.
+
+| 113 atoms, ip2 call | before | after | |
+|---|---|---|---|
+| taxol RKS, call | 21.21 s | 16.59 s | 1.28x |
+| taxol, inside a whole Hessian | 20.81 | 16.65 | 1.25x |
+| Co(II) sextet UKS, call | 42.31 | 25.81 | 1.64x |
+| Co(II) sextet, inside a whole Hessian | 42.25 | 25.97 | 1.63x |
+
+**The success bar is met unrestricted and missed restricted** (1.25x
+inside a Hessian, 1.28x in the call, against 1.3x); what is left there is arithmetic at rate, and the one
+measured lead is W39.  Faster or unchanged at every other size and class
+(1.03x–1.27x from glycine to the Cu macrocycle, 1.17x in def2-TZVPP); on
+a 40 GB card item 8 fits neither spin case and only item 22 applies
+(1.06x–1.07x).  Whole Hessians 675.4/677.5 s (taxol) and 1147/1163 s (Co)
+— they are 92 % CPHF.  The Cholesky twin differs from the eigenbasis by
+what a one-ulp metric perturbation moves it (3.0e-11 on the Ni complex,
+1.2e-10 on the Co sextet's metric of condition 3.3e10); tests within
+5.5e-13 of GPU4PySCF, Hessians against unpatched 9.0e-12 (RKS),
+5.4e-12 Eh/bohr² (UKS).
+
+The original entry, for the record:
 
 *(Found by W34.)*
 
@@ -2797,6 +2842,28 @@ The restricted function batches the occupied index when that does not fit
 * **Falsified if**: the occupied batches repeat stage A/B's integral passes
   enough to cost more than the memory-short branch at 54.6 GB — then the
   next thing is keeping `dm_3c` on the host for the batches not in use.
+
+### W39 — The ip2 call's `(nao, nao)` products on the stored pairs only
+
+*(Found by W37.)*
+
+After W37 every contraction stage of the restricted ip2 call on taxol runs
+at 15–18 TF/s, and three of them multiply zeros: D3's `M C`, stage A's
+`C^T J` and the pseudo-density's `C X C^T` are dense `(nao, nao)` products
+on blocks filled only at the stored AO pairs, and at 113 atoms
+`2 nao_pair / nao²` is 50 % (taxol, the Co(II) sextet), at 284 atoms 22 %.
+Together they are 1.7 s of taxol's 16.6 s call, and the unrestricted
+call has the same three with two spins (`docs/README_fastdfhessip6.md`
+§4).
+
+* **Do**: tile the AO index (W5's `_dfblock` tiles are the precedent) and
+  form each product only on the tile pairs that hold stored pairs, as
+  batched GEMMs; measure at 113 and 284 atoms, both spin cases.
+* **Success**: the three stages in proportion to the fill, and the
+  restricted call past W37's 1.3x at 113 atoms.
+* **Falsified if**: the tile pairs that hold any stored pair cover most of
+  the block at a tile size the GEMMs still run well at — then the fill is
+  not tile-shaped, and the products stay dense.
 
 ### Not on this list
 
@@ -3104,6 +3171,9 @@ python benchmarks/df_hess_terms_probe.py --xyz ... --xc b3lyp --patch all \
 python benchmarks/df_hess_terms_probe.py --xyz ... --terms ip2,h1 \
     --variants stock,stock_sp1,stock_sp2        # the launch constant, upstream's code
 FASTDFHESSIP_TIME=1 python benchmarks/df_hess_terms_probe.py ...  # stage tables
+FASTDFHESSIP_TIME=1 FASTDFHESSIP_NVTX=1 nsys profile ... --nvtx
+python benchmarks/df_ip2_stage_profile.py $SCRATCH/p.sqlite  # W37: kernels per stage
+python benchmarks/df_hess_metric_sens.py --xyz ... --spin 1  # the twin's metric
 python benchmarks/df_hess_anatomy.py --xyz ... --patch all --rounds 2
 FASTDFHESSIP_OFF=1 FASTXCFXC_MO=0 python benchmarks/df_hess_anatomy.py ...
 ```

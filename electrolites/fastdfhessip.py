@@ -183,6 +183,50 @@ D2 of ``_get_veff`` where item 12 is taken, in both spin cases:
     ``FASTDFHESSIP_H1BLK_MIN`` (32) the batch shrinks to give the block
     that many, where the batch can still hold the largest shell.
 
+``docs/DF_WORK_LIST.md`` **W37** (``docs/README_fastdfhessip6.md``) changed
+the auxiliary-index stages of ``_jk_energy_per_atom``, in both spin cases
+unless a line says otherwise (item 23 is W38's, in ``_get_veff``):
+
+22. **The occupied pair index packed where it is symmetric.**  ``j3c_oo``,
+    ``dm_oo``, ``j3c_oo1`` and ``j3c_oo1p`` are symmetric in ``(i, j)``, and
+    every product stage B and the ``h_aux`` block form from them sums over
+    ``(i, j)`` or keeps it as a free index; on the ``i <= j`` pairs,
+    weighted ``sqrt 2`` off the diagonal, each is the same product at
+    ``(nocc + 1) / 2 nocc`` of the arithmetic (``_Pairs``,
+    ``_metric_packed``, ``_h_aux_head_packed``).  Not on the long-range
+    operator (``omega != 0``), whose ill-conditioned metric turns the
+    last-bit asymmetry of the unpacked blocks into 6e-10 of the answer.
+    ``FASTDFHESSIP_PACK=0``; ``FASTDFHESSIP_PACK_CHUNK=<n>`` pairs a chunk.
+24. **The fused first pass's ``(1|00)`` from the second pass's ``M C``.**
+    The second pass scatters each batch into ``M`` with ``M + M^T`` the
+    ``ipaux`` block the first pass fills, and multiplies it by ``C``; the
+    first pass's ``-C^T A C`` is then ``-(C^T M C + h.c.)``, ``2 nao nocc^2``
+    flops per auxiliary function where the first pass spent ``2 nao^2
+    nocc`` and a symmetric fill (``_d1_from_d3``).  Where item 3 fuses, in
+    one occupied batch, and (unrestricted) with both spins in one pass.
+    ``FASTDFHESSIP_D1D3=0``.
+25. **Item 8 in the unrestricted twin** (``_dfhessip_u``): the metric as its
+    Cholesky factor on the spherical index in every line of the call, and
+    D4/D5 in ``_chol_d4_d5_u``.  Where the two spins' spherical ``(10|0)``
+    do not fit in one chunk the second pass runs once per spin, which walks
+    the integrals as often as the eigen form's two chunks did.
+    ``FASTDFHESSIP_UCHOL=0``; ``FASTDFHESSIP_USPIN=1`` forces a pass per
+    spin.
+26. **Item 8's D5 by atom groups** (``_d5_chol``): the two per-atom
+    products that re-read all of ``t1s`` or ``dm_oo`` for ``nA`` columns
+    are strided-batched GEMMs over a group of atoms, the two ``sxy``
+    reductions cuTENSOR ran at 0.12 TF/s are two kernels; the
+    ``nsph x 3 nsph`` product per atom, already at the GEMM rate, stays.
+    ``FASTDFHESSIP_D5=atom``; ``FASTDFHESSIP_D5_GROUP=<n>`` caps a group in
+    AOs.
+27. *(Measured and off.)*  D8's triangular multiplies blocked into GEMMs
+    (``_trmm``): 15.2-15.4 TF/s against ``dtrmm``'s 15.1-15.2.
+    ``FASTDFHESSIP_TRMM=blocked``, ``FASTDFHESSIP_TRMM_BLK=<n>``.
+28. **The second pass's scatter in one kernel** (``_scatter_d3``): both
+    triangles of a direction from the ``ip1`` and ``ipaux`` batches as they
+    come, instead of two batch-wide elementwise passes and two indexed
+    assignments.  ``FASTDFHESSIP_D3SCATTER=0``.
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -231,8 +275,16 @@ the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
                              measurement only: no ``free_all_blocks`` at
                              the call's start, or the second pass's two
                              buffers kept across calls (W34)
+    FASTDFHESSIP_PACK=0, FASTDFHESSIP_PACK_CHUNK=<n>, FASTDFHESSIP_D1D3=0,
+    FASTDFHESSIP_UCHOL=0, FASTDFHESSIP_USPIN=1, FASTDFHESSIP_D5=atom,
+    FASTDFHESSIP_D5_GROUP=<n>, FASTDFHESSIP_TRMM=blocked,
+    FASTDFHESSIP_TRMM_BLK=<n>, FASTDFHESSIP_D3SCATTER=0
+                             W37's items 22 and 24-28 off, or their
+                             shapes (above)
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
-                             also times the ip2 kernel per auxiliary l
+                             also times the ip2 kernel per auxiliary l;
+                             with FASTDFHESSIP_NVTX=1 each stage's end is
+                             an NVTX mark (``df_ip2_stage_profile.py``)
     FASTDFHESSIP_RCHUNK=<n>  W17's 1.2e8-element bound on the Gram form's
                              auxiliary chunk; the default asks cuTENSOR
                              (`docs/DF_WORK_LIST.md` W21)
@@ -293,6 +345,10 @@ _orig_jk_energy_per_atom = DFHESS._jk_energy_per_atom
 _orig_get_veff = DFHESS._get_veff
 
 
+_NVTX = _env('FASTDFHESSIP_TIME', '0') != '0' and \
+    _env('FASTDFHESSIP_NVTX', '0') != '0'
+
+
 class _Stages:
     """Synchronised stage timers, printed when FASTDFHESSIP_TIME is set."""
 
@@ -316,6 +372,11 @@ class _Stages:
             self.order.append(label)
         self.t[label] += now - self.last
         self.last = now
+        if _NVTX:
+            # the end of a stage, for `benchmarks/df_ip2_stage_profile.py`
+            # (W37): every kernel between two marks belongs to the second
+            from cupy.cuda import nvtx
+            nvtx.Mark(f'{self.tag}|{label}')
 
     def note(self, **kw):
         """Sizes to print with the table, e.g. the second pass's plan."""
@@ -577,9 +638,15 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         if sa is not None and metric_v.shape[1] != sa.nsph:
             sa = None
     metric_size = metric_v.shape[1]
-    dm_oo = contract('uv,uij->vij', metric_v, j3c_oo)
-    dm_oo /= metric_w[:, None, None]
-    dm_oo = contract('uv,vij->uij', metric_v, dm_oo, out=j3c_oo)
+    if _env('FASTDFHESSIP_PACK', '1') != '0' and omega == 0:
+        # item 22: stage B on packed pairs
+        dm_oo = _metric_packed(metric_v, metric_w,
+                               j3c_oo.reshape(naux, 1, nocc, nocc),
+                               1).reshape(naux, nocc, nocc)
+    else:
+        dm_oo = contract('uv,uij->vij', metric_v, j3c_oo)
+        dm_oo /= metric_w[:, None, None]
+        dm_oo = contract('uv,vij->uij', metric_v, dm_oo, out=j3c_oo)
     j3c_oo = None
     if j_factor != 0:
         auxvec = dm_oo.trace(axis1=1, axis2=2)
@@ -696,9 +763,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 nao_pair=nao_pair, batch_size=batch_size,
                 num_aux_batches=num_aux_batches, vchunk=aux_batch_size,
                 blksize2=blksize2, fused=do_fuse, occ_batches=num_occ_batches)
-        _S['vchunks'] = (metric_size + aux_batch_size - 1) // aux_batch_size
+        _S['vchunks'] = int(-(-metric_size // aux_batch_size))
         if do_fuse:
             _S['fused'] += 1
+        # item 24 (W37): the fused first pass's (1|00) from the second
+        # pass's own M C instead of a second walk over the ipaux integrals
+        d1d3 = (do_fuse and batch_id == 0 and num_occ_batches == 1 and
+                _env('FASTDFHESSIP_D1D3', '1') != '0')
+        d3sc = _env('FASTDFHESSIP_D3SCATTER', '1') != '0'
         st('D0 plan')
 
         if not do_fuse:
@@ -760,7 +832,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 compressed_dk = eval_ipaux(kbatch, out=buf1)
                 naux_in_batch = compressed_di.shape[-1]
                 st('D3 integrals')
-                if do_fuse and v0 == 0:
+                if do_fuse and v0 == 0 and not d1d3:
                     # item 3: upstream's first pass, on this batch's
                     # ipaux integrals before they are folded into dj
                     _ipaux_batch(compressed_dk, aux1, naux_in_batch,
@@ -771,9 +843,10 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                                                    batch_id == 0) else None,
                                  dm if j_factor != 0 else None)
                     st('D1 ipaux (fused)')
-                compressed_dk += compressed_di
-                compressed_dj = compressed_dk
-                compressed_di *= -1
+                if not d3sc:
+                    compressed_dk += compressed_di
+                    compressed_dj = compressed_dk
+                    compressed_di *= -1
                 for k0, k1 in lib.prange(0, naux_in_batch, blksize2):
                     dk = k1 - k0
                     aux0, aux1 = aux1, aux1 + dk
@@ -783,10 +856,19 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                     else:
                         tmp = ndarray((nao, nocc_in_batch, dk), buffer=work1)
                     for x in range(3):
-                        j3c[j_addr, i_addr] = compressed_dj[x, :, k0:k1]
-                        j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
+                        if d3sc:
+                            _scatter_d3(compressed_di[x], compressed_dk[x],
+                                        k0, k1, pair_addresses, nao, j3c)
+                        else:
+                            j3c[j_addr, i_addr] = compressed_dj[x, :, k0:k1]
+                            j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
                         if batch_id == 0:
                             contract('pqr,qi->pir', j3c, _dm_factor_l, out=tmp)
+                            if d1d3 and v0 == 0:
+                                _d1_from_d3(tmp, _dm_factor_l,
+                                            j3c_oo1[x, aux0:aux1],
+                                            auxvec_ipauxp[x, aux0:aux1]
+                                            if j_factor != 0 else None)
                         else:
                             contract('pqr,qi->pir', j3c,
                                      _dm_factor_l[:, nocc0:nocc1], out=tmp)
@@ -1298,6 +1380,76 @@ def _work_words(atm_words, nao, nocc, nocc_in_batch, naux, nao_pair,
     return max(uses)
 
 
+_SCATTER_D3 = cp.RawKernel(r"""
+extern "C" __global__
+void scatter_d3(const double* __restrict__ di, const double* __restrict__ dk,
+                const int* __restrict__ pair, double* __restrict__ out,
+                const int nao, const int npair, const int ld, const int k0,
+                const int nk, const int lo)
+{
+    // pair p = i nao + j, column r of this block:
+    //   out[j][i][r] = dk[p][k0+r] + di[p][k0+r],  out[i][j][r] = -di[p][k0+r]
+    // (upstream's two scatters, the second last, so on the diagonal it wins)
+    const int r = threadIdx.x;
+    const int p = blockIdx.x * blockDim.y + threadIdx.y;
+    if (p >= npair || r >= nk) return;
+    const int a = pair[p];
+    const int i = a / nao, j = a - i * nao;
+    const double vi = di[(long long)p*ld + k0 + r];
+    const double vk = dk[(long long)p*ld + k0 + r];
+    if (i != j) out[((long long)j*nao + i)*lo + r] = vk + vi;
+    out[(long long)a*lo + r] = -vi;
+}
+""", 'scatter_d3')
+
+
+def _scatter_d3(di, dk, k0, k1, pair_addresses, nao, out):
+    """Item 28 (W37): the second pass's two scatters of one direction, from
+    the ``ip1`` and ``ipaux`` batches as they come -- instead of the
+    batch-wide ``dk += di`` and ``di *= -1`` and two indexed assignments.
+    ``di``/``dk`` are ``(nao_pair, naux_in_batch)``, ``out`` the
+    ``(nao, nao, k1-k0)`` block, which may be a slice of a wider one along
+    its last axis.  ``FASTDFHESSIP_D3SCATTER=0`` is upstream's."""
+    npair, ld = di.shape
+    nk = k1 - k0
+    assert di.flags.c_contiguous and dk.flags.c_contiguous and nk <= 1024
+    assert out.shape[2] == nk and out.strides[2] == 8
+    lo = out.strides[1] // 8
+    assert out.strides[0] // 8 == nao * lo
+    ty = max(1, 256 // nk)
+    _SCATTER_D3(((npair + ty - 1) // ty,), (nk, ty),
+                (di, dk, pair_addresses, out, np.int32(nao), np.int32(npair),
+                 np.int32(ld), np.int32(k0), np.int32(nk), np.int32(lo)))
+
+
+def _d1_from_d3(tmp, c, out, trace_out, nspin=0):
+    """Item 24 (W37): the first pass's ``(1|00)`` block from the second's.
+
+    The second pass scatters each batch into ``M`` with ``M[j,i] = dk + di``
+    and ``M[i,j] = -di`` for every stored pair, so ``M + M^T`` is the
+    ``ipaux`` block ``A`` that the first pass fills symmetrically -- and it
+    has just formed ``T = M C`` for its own contraction.  The first pass's
+    ``-C^T A C`` is then ``-(E + E^T)`` with ``E = C^T T``, which is
+    ``2 nao nocc^2`` flops per auxiliary function and direction instead of
+    the ``2 nao^2 nocc`` of ``C^T A`` (and without the symmetric fill).
+    ``tmp`` is ``(nao, nocc, dk)`` (``nspin``: ``(n, nao, nocc, dk)``),
+    ``out`` ``(dk, nocc, nocc)`` (``(dk, n, nocc, nocc)``); ``trace_out``
+    gets the trace, the first pass's ``-sum_pq A_pq D_pq``.
+    """
+    if nspin:
+        contract('npi,npjr->rnij', c, tmp, alpha=-1, out=out)
+        o3 = out.reshape(-1, out.shape[-2], out.shape[-1])
+    else:
+        contract('pi,pjr->rij', c, tmp, alpha=-1, out=out)
+        o3 = out
+    transpose_sum(o3, inplace=True)
+    if trace_out is not None:
+        if nspin:
+            trace_out[:] = cp.einsum('rnii->r', out)
+        else:
+            trace_out[:] = cp.einsum('rii->r', out)
+
+
 def _ipaux_pass(eval_ipaux, num_aux_batches, blksize, nao, nao_pair,
                 batch_size, nocc_in_batch, pair_addresses, dm_factor_l,
                 nocc0, nocc1, j3c_oo1, auxvec_ipauxp, dm):
@@ -1384,6 +1536,167 @@ def _gram(a, alpha, out=None):
     return out
 
 
+_PACK = cp.RawKernel(r"""
+extern "C" __global__
+void pack_pairs(const double* __restrict__ a, double* __restrict__ out,
+                const int* __restrict__ src, const double* __restrict__ w,
+                const long long lda, const int np, const int nrow)
+{
+    // out[r][q] = w[q] a[r][src[q]], q < np: one chunk of packed pairs
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= np) return;
+    for (int r = blockIdx.y; r < nrow; r += gridDim.y)
+        out[(long long)r*np + q] = w[q] * a[(long long)r*lda + src[q]];
+}
+""", 'pack_pairs')
+
+_UNPACK = cp.RawKernel(r"""
+extern "C" __global__
+void unpack_pairs(const double* __restrict__ p, double* __restrict__ a,
+                  const int* __restrict__ src, const int* __restrict__ dst,
+                  const double* __restrict__ w, const long long lda,
+                  const int np, const int nrow)
+{
+    // a[r][src[q]] = a[r][dst[q]] = p[r][q] / w[q]: both triangles
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= np) return;
+    for (int r = blockIdx.y; r < nrow; r += gridDim.y) {
+        const double v = p[(long long)r*np + q] / w[q];
+        a[(long long)r*lda + src[q]] = v;
+        a[(long long)r*lda + dst[q]] = v;
+    }
+}
+""", 'unpack_pairs')
+
+
+class _Pairs:
+    """The ``i <= j`` pairs of ``nspin`` symmetric ``nocc x nocc`` blocks,
+    as offsets into one ``(nspin, nocc, nocc)`` row and weights: ``1`` on
+    the diagonal and ``sqrt 2`` off it, so that the dot product of two
+    packed rows is the dot product of the two full ones (item 22, W37)."""
+
+    def __init__(self, nocc, nspin=1):
+        i, j = np.triu_indices(nocc)
+        n2 = nocc * nocc
+        s = np.repeat(np.arange(nspin), len(i))
+        i, j = np.tile(i, nspin), np.tile(j, nspin)
+        self.src = cp.asarray(s*n2 + i*nocc + j, dtype=np.int32)
+        self.dst = cp.asarray(s*n2 + j*nocc + i, dtype=np.int32)
+        self.w = cp.asarray(np.where(i == j, 1., np.sqrt(2.)))
+        self.n = len(i)
+        self.lda = nspin * n2
+
+    def pack(self, a2, q0, q1, out):
+        """``out[r, :q1-q0]`` = the weighted pairs ``q0:q1`` of row ``r``."""
+        nrow = a2.shape[0]
+        nq = q1 - q0
+        o = ndarray((nrow, nq), buffer=out)
+        _PACK(((nq + 127) // 128, min(nrow, 65535)), (128,),
+              (a2, o, self.src[q0:], self.w[q0:], np.int64(self.lda),
+               np.int32(nq), np.int32(nrow)))
+        return o
+
+    def unpack(self, p, a2, q0, q1):
+        nrow = a2.shape[0]
+        nq = q1 - q0
+        _UNPACK(((nq + 127) // 128, min(nrow, 65535)), (128,),
+                (p, a2, self.src[q0:], self.dst[q0:], self.w[q0:],
+                 np.int64(self.lda), np.int32(nq), np.int32(nrow)))
+
+
+def _syrk_acc(a, n, k, lda, alpha, beta, c):
+    """Row-major ``c[:n, :n] (upper) = alpha a a^T + beta c``, ``a`` n x k."""
+    from cupy.cuda import cublas
+    al = np.array([alpha], dtype=np.float64)
+    be = np.array([beta], dtype=np.float64)
+    cublas.dsyrk(cp.cuda.device.get_cublas_handle(),
+                 cublas.CUBLAS_FILL_MODE_LOWER, cublas.CUBLAS_OP_T,
+                 n, k, al.ctypes.data, a.data.ptr, lda, be.ctypes.data,
+                 c.data.ptr, n)
+
+
+def _mirror(c):
+    n = c.shape[0]
+    bs = 32
+    _MIRROR(((n + bs - 1) // bs, (n + bs - 1) // bs), (bs, bs),
+            (c, np.int64(n)))
+    return c
+
+
+def _metric_packed(metric_v, metric_w, j3c_oo, nspin):
+    """Item 22 in stage B: ``j3c_oo <- V W^-1 V^T j3c_oo`` in place, on the
+    packed ``i <= j`` pairs of its symmetric blocks, a chunk of pairs at a
+    time -- the two GEMMs at ``(nocc + 1) / 2 nocc`` of the arithmetic.
+    ``j3c_oo`` is ``(naux, nspin, nocc, nocc)``; returns it."""
+    naux, nsph = metric_v.shape
+    nocc = j3c_oo.shape[-1]
+    pr = _Pairs(nocc, nspin)
+    a2 = j3c_oo.reshape(naux, -1)
+    words = max(256, min(pr.n, int(_avail() * .25) // (8 * (naux + nsph))))
+    qc = min(pr.n, int(_env('FASTDFHESSIP_PACK_CHUNK', '0')) or words)
+    buf = cp.empty((naux + nsph) * qc)
+    rw = 1. / metric_w
+    for q0, q1 in lib.prange(0, pr.n, qc):
+        nq = q1 - q0
+        p = pr.pack(a2, q0, q1, buf)
+        d = ndarray((nsph, nq), buffer=buf[naux*nq:])
+        _gemm_rm('T', 'N', nsph, nq, naux, 1., metric_v.data.ptr, nsph,
+                 p.data.ptr, nq, 0., d.data.ptr, nq)
+        d *= rw[:, None]
+        _gemm_rm('N', 'N', naux, nq, nsph, 1., metric_v.data.ptr, nsph,
+                 d.data.ptr, nq, 0., p.data.ptr, nq)
+        pr.unpack(p, a2, q0, q1)
+    return j3c_oo
+
+
+def _h_aux_head_packed(j2c_10, dm_oo, j3c_oo1, nspin, k_factor, h_out,
+                       dmaux_out, dmaux1_out):
+    """Item 22 (W37): the head of the ``h_aux`` block on packed pairs.
+
+    ``dm_oo[r]`` and ``j3c_oo1[x,r]`` are symmetric in ``(i, j)`` -- the
+    first is ``C^T (pq|r) C`` through the metric, the second the same with
+    the derivative on the auxiliary function -- and so is
+    ``j3c_oo1p = j3c_oo1 - j2c_10 dm_oo``.  Every product the block forms
+    from them sums over ``(i, j)``: the GEMM that makes ``j3c_oo1p`` and
+    the three Gram-like products ``j3c_oo1p j3c_oo1p^T``,
+    ``dm_oo dm_oo^T`` and ``j3c_oo1p dm_oo^T``.  On the ``i <= j`` pairs,
+    weighted ``sqrt 2`` off the diagonal, each is the same sum at
+    ``(nocc + 1) / 2 nocc`` of the arithmetic.  The pairs are taken a chunk
+    at a time, so the packed copies are a few hundred MB; ``j3c_oo1p`` is
+    written back unpacked into ``j3c_oo1`` (both triangles), which is what
+    D5 reads.  ``FASTDFHESSIP_PACK=0`` is the unpacked block.
+    """
+    n = dm_oo.shape[0]
+    n3 = 3 * n
+    nocc = dm_oo.shape[-1]
+    pr = _Pairs(nocc, nspin)
+    d2 = dm_oo.reshape(n, -1)
+    o2 = j3c_oo1.reshape(n3, -1)
+    j2 = j2c_10.reshape(n3, n)
+    # a chunk of packed columns for both: 4 n words per pair
+    words = max(256, min(pr.n, int(_avail() * .25) // (8 * 4 * n)))
+    qc = min(pr.n, int(_env('FASTDFHESSIP_PACK_CHUNK', '0')) or words)
+    buf = cp.empty(4 * n * qc)
+    alpha = -.5 * k_factor
+    for q0, q1 in lib.prange(0, pr.n, qc):
+        nq = q1 - q0
+        dp = pr.pack(d2, q0, q1, buf)
+        op = pr.pack(o2, q0, q1, buf[n*nq:])
+        # j3c_oo1p = j3c_oo1 - j2c_10 dm_oo, on these pairs
+        _gemm_rm('N', 'N', n3, nq, n, -1., j2.data.ptr, n, dp.data.ptr, nq,
+                 1., op.data.ptr, nq)
+        beta = 0. if q0 == 0 else 1.
+        _syrk_acc(op, n3, nq, nq, alpha, beta, h_out)
+        _syrk_acc(dp, n, nq, nq, alpha, beta, dmaux_out)
+        _gemm_rm('N', 'T', n3, n, nq, alpha, op.data.ptr, nq, dp.data.ptr,
+                 nq, beta, dmaux1_out.data.ptr, n)
+        pr.unpack(op, o2, q0, q1)
+    buf = None
+    _mirror(h_out)
+    _mirror(dmaux_out)
+    return j3c_oo1
+
+
 def _h_aux_words(naux, metric_size):
     """What ``_h_aux_block``'s temporaries take from ``work``, in words."""
     return 15 * naux**2 + naux * metric_size
@@ -1391,7 +1704,8 @@ def _h_aux_words(naux, metric_size):
 
 def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
                  j3c_oo1, naux, metric_size, k_factor, j_factor, batch_id,
-                 auxvec_ipauxp, _auxvec, natm, aux_atm_labels, work=None):
+                 auxvec_ipauxp, _auxvec, natm, aux_atm_labels, work=None,
+                 nspin=1):
     """Upstream's code between the two passes, in upstream's order.
 
     With ``work`` -- the second pass's integral buffers, which the fused
@@ -1419,7 +1733,32 @@ def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
     j2c_10v = contract('xrs,st->xrt', j2c_10, _metric_v)
     tmp = None
 
-    if _cuplan.planable('xuv,vij->xuij', j2c_10, dm_oo, j3c_oo1):
+    # item 22: the four (i, j) sums on packed pairs, where the blocks are
+    # square (one occupied batch); the layout of the carved temporaries is
+    # then dm_aux1 [0, 3n^2), dm_aux [3n^2, 4n^2), the rest after
+    nocc = dm_oo.shape[-1]
+    # Not on the long-range operator: its metric is ill-conditioned enough
+    # that reading one triangle of j3c_oo1 for both -- a change at the last
+    # bit of each element -- moves a triplet's ip2 term by 6e-10 relative
+    # against upstream's (tests/test_dfuhessip.py), as reassociating stage A
+    # does by 1e-10; every omega = 0 case agrees to 1e-13
+    packed = (_env('FASTDFHESSIP_PACK', '1') != '0' and omega == 0 and
+              j3c_oo1.shape[-2] == nspin * nocc and
+              dm_oo.shape[-2] == nspin * nocc)
+    if packed:
+        _S['packed'] = _S.get('packed', 0) + 1
+        h_aux = ndarray((3*n, 3*n), buffer=h_buf) if carve else \
+            cp.empty((3*n, 3*n))
+        dm_aux1 = take((3, n, n), 0)
+        dm_aux = take((n, n), 3*n*n)
+        _h_aux_head_packed(
+            j2c_10, dm_oo.reshape(n, nspin, nocc, nocc),
+            j3c_oo1.reshape(3, n, nspin, nocc, nocc), nspin, k_factor,
+            h_aux, dm_aux, dm_aux1)
+        j3c_oo1p = j3c_oo1
+        h_aux = h_aux.reshape(3, n, 3, n)
+        o0 = 4*n*n
+    elif _cuplan.planable('xuv,vij->xuij', j2c_10, dm_oo, j3c_oo1):
         j3c_oo1p = contract('xuv,vij->xuij', j2c_10, dm_oo, alpha=-1, beta=1,
                             out=j3c_oo1)
     else:
@@ -1433,28 +1772,31 @@ def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
                            out=j3c_oo1[x].reshape(j3c_oo1.shape[1], -1),
                            alpha=-1., beta=1.)
         j3c_oo1p = j3c_oo1
-    h_aux = _gram(j3c_oo1p, -.5*k_factor,
-                  out=ndarray((3*n, 3*n), buffer=h_buf) if carve else None
-                  ).reshape(3, n, 3, n)
+    if not packed:
+        h_aux = _gram(j3c_oo1p, -.5*k_factor,
+                      out=ndarray((3*n, 3*n), buffer=h_buf) if carve else None
+                      ).reshape(3, n, 3, n)
+        o0 = 0
     if j_factor != 0 and batch_id == 0:
         contract('xuv,v->xu', j2c_10, _auxvec, -1, 1, out=auxvec_ipauxp)
         contract('xr,ys->xrys', auxvec_ipauxp, auxvec_ipauxp, j_factor, 1,
                  h_aux)
-    vw = take((n, metric_size), n*n)
+    vw = take((n, metric_size), o0 + n*n)
     cp.divide(_metric_v, _metric_w, out=vw)
-    j2c_inv = cp.dot(vw, _metric_v.T, out=take((n, n), 0))
+    j2c_inv = cp.dot(vw, _metric_v.T, out=take((n, n), o0))
     h_aux *= j2c_inv[None, :, None, :]
     j2c_inv = vw = None
 
-    dm_aux = _gram(dm_oo, -.5*k_factor, out=take((n, n), 0))
+    if not packed:
+        dm_aux = _gram(dm_oo, -.5*k_factor, out=take((n, n), 0))
     if j_factor != 0 and batch_id == 0:
         contract('r,s->rs', _auxvec, _auxvec, j_factor, 1, dm_aux)
     ejk_aux = _int2c2e_ip2_per_atom(
         auxmol, dm_aux[_aux_sorting[:, None], _aux_sorting], omega)
     ejk = -ejk_aux
 
-    j2c_10v_w = take((n, metric_size), n*n)
-    j2c_ip2 = take((n, n), n*n + n*metric_size)
+    j2c_10v_w = take((n, metric_size), o0 + n*n)
+    j2c_ip2 = take((n, n), o0 + n*n + n*metric_size)
     for x in range(3):
         cp.divide(j2c_10v[x], _metric_w, out=j2c_10v_w)
         for y in range(3):
@@ -1463,8 +1805,9 @@ def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
             h_aux[x, :, y] += j2c_ip2
     dm_aux = j2c_ip2 = j2c_10v_w = None
 
-    dm_aux1 = contract('xrij,sij->xrs', j3c_oo1p, dm_oo, -.5*k_factor,
-                       out=take((3, n, n), 0))
+    if not packed:
+        dm_aux1 = contract('xrij,sij->xrs', j3c_oo1p, dm_oo, -.5*k_factor,
+                           out=take((3, n, n), 0))
     if j_factor != 0 and batch_id == 0:
         contract('xr,t->xrt', auxvec_ipauxp, _auxvec, j_factor, 1, out=dm_aux1)
     vw = take((n, metric_size), 3*n*n)
@@ -1494,6 +1837,227 @@ def _j2c_10c(sa, j2c_10):
     for x in range(3):
         cp.dot(j2c_10[x], sa.ms, out=out[x])
     return out
+
+
+_D5_H1 = cp.RawKernel(r"""
+extern "C" __global__
+void d5_h1(const double* __restrict__ z, const double* __restrict__ t1,
+           double* __restrict__ h, const int* __restrict__ au0,
+           const int* __restrict__ anu, const int* __restrict__ aid,
+           const int nsph, const int ns, const int nao, const int nocc,
+           const int ng, const int q0, const double f)
+{
+    // h[A][s][x][y] += f sum_{n, u in A, j} z[x][s][n][q0+u][j] t1[y][s][n][u][j]
+    const int a = blockIdx.x, s = blockIdx.y;
+    const int u0 = au0[a];
+    const long long len = (long long)anu[a] * nocc;
+    double acc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (int n = 0; n < ns; n++) {
+        const double* zp[3];
+        const double* tp[3];
+        for (int x = 0; x < 3; x++) {
+            zp[x] = z + (((long long)x*nsph + s)*ns + n)*nao*nocc
+                      + (long long)(q0 + u0)*nocc;
+            tp[x] = t1 + (((long long)x*nsph + s)*ns + n)*ng*nocc
+                       + (long long)u0*nocc;
+        }
+        for (long long k = threadIdx.x; k < len; k += blockDim.x) {
+            const double z0 = zp[0][k], z1 = zp[1][k], z2 = zp[2][k];
+            const double t0 = tp[0][k], t1v = tp[1][k], t2 = tp[2][k];
+            acc[0] += z0*t0; acc[1] += z0*t1v; acc[2] += z0*t2;
+            acc[3] += z1*t0; acc[4] += z1*t1v; acc[5] += z1*t2;
+            acc[6] += z2*t0; acc[7] += z2*t1v; acc[8] += z2*t2;
+        }
+    }
+    __shared__ double red[9][32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int c = 0; c < 9; c++) {
+        double v = acc[c];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o);
+        if (lane == 0) red[c][warp] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 9) {
+        double v = 0;
+        for (int w = 0; w < (blockDim.x >> 5); w++) v += red[threadIdx.x][w];
+        h[((long long)aid[a]*nsph + s)*9 + threadIdx.x] += f * v;
+    }
+}
+""", 'd5_h1')
+
+_D5_H2 = cp.RawKernel(r"""
+extern "C" __global__
+void d5_h2(const double* __restrict__ m, const double* __restrict__ j10s,
+           double* __restrict__ h, const int nsph, const long long ss,
+           const double f)
+{
+    // h[s][x][y] += f sum_t m[s][x][t] j10s[y][s][t], j10s's y stride ss
+    const int s = blockIdx.x;
+    const double* mp = m + (long long)s*3*nsph;
+    const double* jp = j10s + (long long)s*nsph;
+    double acc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (int t = threadIdx.x; t < nsph; t += blockDim.x) {
+        const double m0 = mp[t], m1 = mp[nsph + t], m2 = mp[2*nsph + t];
+        const double j0 = jp[t], j1 = jp[ss + t], j2 = jp[2*ss + t];
+        acc[0] += m0*j0; acc[1] += m0*j1; acc[2] += m0*j2;
+        acc[3] += m1*j0; acc[4] += m1*j1; acc[5] += m1*j2;
+        acc[6] += m2*j0; acc[7] += m2*j1; acc[8] += m2*j2;
+    }
+    __shared__ double red[9][32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int c = 0; c < 9; c++) {
+        double v = acc[c];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o);
+        if (lane == 0) red[c][warp] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 9) {
+        double v = 0;
+        for (int w = 0; w < (blockDim.x >> 5); w++) v += red[threadIdx.x][w];
+        h[(long long)s*9 + threadIdx.x] += f * v;
+    }
+}
+""", 'd5_h2')
+
+
+def _batched_occ(src, c, out, nb, sa_stride, off_a, sc_stride, off_c, nocc,
+                 ng):
+    """``out_b[u, j] = sum_i src_b[j, i] c[u, i]`` for ``nb`` batches:
+    ``src_b`` the ``nocc x nocc`` block at ``off_a + b sa_stride``,
+    ``out_b`` the ``ng x nocc`` block at ``off_c + b sc_stride`` (words)."""
+    from cupy.cuda import cublas
+    one = np.ones(1)
+    zero = np.zeros(1)
+    cublas.dgemmStridedBatched(
+        cp.cuda.device.get_cublas_handle(), cublas.CUBLAS_OP_T,
+        cublas.CUBLAS_OP_N, nocc, ng, nocc, one.ctypes.data,
+        src.data.ptr + 8*off_a, nocc, sa_stride, c.data.ptr, nocc, 0,
+        zero.ctypes.data, out.data.ptr + 8*off_c, nocc, sc_stride, nb)
+
+
+def _d5_chol(sa, z, t1s, dm_oo, c, aoslices, f1, f2, j10s, h_sph, work):
+    """Item 26 (W37): item 8's D5 by atom groups, in two kernels and cuBLAS.
+
+    ``z`` is ``(3, nsph, ns, nao, nocc)``, ``t1s`` the spherical partner
+    ``(3, nsph, ns, nocc, nocc)`` (a strided view is fine), ``dm_oo``
+    ``(ncart, ns, nocc, nocc)`` and ``c`` ``(ns, nao, nocc)``; for each atom
+    ``A`` this adds to ``h_sph[A]``
+
+        f1 sum_{n,u in A,j} z[x,s,n,u,j] (t1s[y,s,n] C[n,A]^T)[u,j]
+      + f2 sum_t j10s[y,s,t] sum_{n,u in A,j} P[s,n,u,j] z[x,t,n,u,j]
+
+    with ``P`` the spherical ``dm_oo C^T``.  Upstream's order formed the
+    first factor and ``P`` once per atom, each a batched product that read
+    all of ``t1s`` or ``dm_oo`` again for an ``nA``-column output (2.9-3.2
+    TF/s), and the two ``sxy`` reductions through cuTENSOR at 0.12 TF/s;
+    here both products are formed for a group of atoms at a time as strided
+    batched GEMMs, the reductions are two kernels that read their operands
+    once; the ``nsph x 3 nsph`` product per atom stays one contraction per
+    spin, which already ran at the GEMM rate.  ``FASTDFHESSIP_D5=atom`` is the per-atom loop.
+    """
+    nsph, ncart = sa.nsph, sa.ncart
+    ns, nao, nocc = z.shape[2], z.shape[3], z.shape[4]
+    natm = len(aoslices) - 1
+    na = np.diff(aoslices)
+    # groups of consecutive atoms: the larger of the two products and the
+    # per-atom (nsph, 3 nsph) product in the buffer
+    per_u = max(3*nsph, ncart) * ns * nocc
+    nam = int(na.max())
+    fixed = 3*nsph*nsph
+    cap = max(nam, (work.size - fixed) // per_u)
+    cap = min(cap, int(_env('FASTDFHESSIP_D5_GROUP', '0')) or cap)
+    if work.size < fixed + per_u * nam:
+        work = cp.empty(fixed + per_u * max(cap, nam))
+    m = ndarray((nsph, 3, nsph), buffer=work)
+    gbuf = work[fixed:]
+    groups = []
+    a0 = 0
+    for a in range(1, natm + 1):
+        if a == natm or aoslices[a+1] - aoslices[a0] > cap:
+            groups.append((a0, a))
+            a0 = a
+    for a0, a1 in groups:
+        q0, q1 = int(aoslices[a0]), int(aoslices[a1])
+        ng = q1 - q0
+        au0 = cp.asarray(aoslices[a0:a1] - q0, dtype=np.int32)
+        anu = cp.asarray(na[a0:a1], dtype=np.int32)
+        aid = cp.arange(a0, a1, dtype=np.int32)
+        # the first factor for the group: t1s[y,s,n] C[n,group]^T
+        t1 = ndarray((3, nsph, ns, ng, nocc), buffer=gbuf)
+        st_y, st_s, st_n = (x // 8 for x in t1s.strides[:3])
+        for y in range(3):
+            for n in range(ns):
+                _batched_occ(t1s, c[n, q0:q1], t1, nsph, st_s,
+                             y*st_y + n*st_n, ns*ng*nocc,
+                             (y*nsph*ns + n)*ng*nocc, nocc, ng)
+        _D5_H1((a1 - a0, nsph), (256,),
+               (z, t1, h_sph, au0, anu, aid, np.int32(nsph), np.int32(ns),
+                np.int32(nao), np.int32(nocc), np.int32(ng), np.int32(q0),
+                np.float64(f1)))
+        t1 = None
+        # P for the group, spherical in s
+        pa = ndarray((ncart, ns, ng, nocc), buffer=gbuf)
+        dm_s, dm_n = (x // 8 for x in dm_oo.strides[:2])
+        for n in range(ns):
+            _batched_occ(dm_oo, c[n, q0:q1], pa, ncart, dm_s, n*dm_n,
+                         ns*ng*nocc, n*ng*nocc, nocc, ng)
+        ps = sa.to_sph_pinv(pa, pa)
+        for a in range(a0, a1):
+            u0 = int(aoslices[a]) - q0
+            nu = int(na[a])
+            for n in range(ns):
+                # m[s,x,t] = sum_{u in A, j} P[s,n,u,j] z[x,t,n,u,j]:
+                # cuTENSOR takes the strided operands at 18.6 TF/s, where
+                # cuBLAS needed them copied contiguous to reach 18.3
+                contract('suj,xtuj->sxt', ps[:, n, u0:u0+nu],
+                         z[:, :, n, q0+u0:q0+u0+nu],
+                         beta=0. if n == 0 else 1., out=m)
+            _D5_H2((nsph,), (256,), (m, j10s, h_sph[a], np.int32(nsph),
+                                     np.int64(j10s.strides[0] // 8),
+                                     np.float64(f2)))
+        ps = pa = None
+
+
+def _trmm(sa, x, trans=False):
+    """``x <- L^-1 x`` (``L^-T x`` with ``trans``) in place, ``x`` C-ordered
+    ``(nsph, m)``: item 27 (W37).
+
+    cuBLAS's ``dtrmm`` ran D8 at 14-15 TF/s.  Blocked by rows of ``b``, the
+    same product is a small ``dtrmm`` on each diagonal block and one GEMM
+    per block row against the rows already done -- bottom up for ``L^-1``,
+    whose block row ``i`` reads the old rows above it, top down for
+    ``L^-T`` -- and nearly all of the arithmetic is then in GEMMs.  The
+    diagonal blocks are copied contiguous once per factor.
+    ``FASTDFHESSIP_TRMM=cublas`` is one ``dtrmm``; ``FASTDFHESSIP_TRMM_BLK``
+    the block (1024).
+    """
+    mode = _env('FASTDFHESSIP_TRMM', 'cublas')
+    n, m = x.shape
+    b = int(_env('FASTDFHESSIP_TRMM_BLK', '1024'))
+    if mode == 'cublas' or n <= b:
+        return trmm_left_lower(sa.linv, x, trans=trans)
+    t = sa.linv
+    cuts = list(range(0, n, b)) + [n]
+    key = ('diag', b)
+    if getattr(sa, '_diag_key', None) != key:
+        sa._diag = [cp.ascontiguousarray(t[i0:i1, i0:i1])
+                    for i0, i1 in zip(cuts[:-1], cuts[1:])]
+        sa._diag_key = key
+    nb = len(cuts) - 1
+    order = range(nb) if trans else range(nb - 1, -1, -1)
+    for i in order:
+        i0, i1 = cuts[i], cuts[i+1]
+        trmm_left_lower(sa._diag[i], x[i0:i1], trans=trans)
+        if not trans and i0 > 0:
+            # x_i += L_i,<i x_<i
+            _gemm_rm('N', 'N', i1 - i0, m, i0, 1., t[i0].data.ptr, n,
+                     x.data.ptr, m, 1., x[i0].data.ptr, m)
+        elif trans and i1 < n:
+            # x_i += (L_>i,i)^T x_>i
+            _gemm_rm('T', 'N', i1 - i0, m, n - i1, 1.,
+                     t[i1, i0:].data.ptr, n, x[i1].data.ptr, m, 1.,
+                     x[i0].data.ptr, m)
+    return x
 
 
 def _chol_d4_d5(sa, ksph, work, natm, nocc, atm_ind, aoslices, dm_factor_l,
@@ -1535,7 +2099,7 @@ def _chol_d4_d5(sa, ksph, work, natm, nocc, atm_ind, aoslices, dm_factor_l,
             ksph[x] = solve_triangular(low, ksph[x].reshape(nsph, -1),
                                        lower=True).reshape(ksph[x].shape)
         else:
-            trmm_left_lower(sa.linv, ksph[x].reshape(nsph, -1))
+            _trmm(sa, ksph[x].reshape(nsph, -1))
     st('D8 L^-1 K')
     _oo_gram(ksph, 0, nsph, work, natm, nocc, atm_ind, dm_factor_l,
              cp.ones(nsph), None, k_factor, j_factor, ejk, None, None,
@@ -1547,7 +2111,7 @@ def _chol_d4_d5(sa, ksph, work, natm, nocc, atm_ind, aoslices, dm_factor_l,
                                        lower=True, trans='T'
                                        ).reshape(ksph[x].shape)
         else:
-            trmm_left_lower(sa.linv, ksph[x].reshape(nsph, -1), trans=True)
+            _trmm(sa, ksph[x].reshape(nsph, -1), trans=True)
     z = ksph
     st('D8 L^-T Y')
     if j_factor != 0:
@@ -1574,6 +2138,15 @@ def _chol_d4_d5(sa, ksph, work, natm, nocc, atm_ind, aoslices, dm_factor_l,
             sa.to_sph(j2c_10c[y], j2c_10c[y])
         j10s = j2c_10c[:, :nsph]
     h_sph = cp.zeros((natm, nsph, 3, 3))
+    if t2sph and _env('FASTDFHESSIP_D5', 'group') != 'atom':
+        # item 26
+        _d5_chol(sa, z.reshape(3, nsph, 1, nao, nocc),
+                 t1s.reshape(3, nsph, 1, nocc, nocc),
+                 dm_oo.reshape(dm_oo.shape[0], 1, nocc, nocc),
+                 dm_factor_l.reshape(1, nao, nocc), aoslices, -k_factor,
+                 k_factor, j10s, h_sph, work)
+        st('D5 per-atom')
+        return _aggregate_to_atoms(h_sph, natm, sa.atm, axis=1)
     for i, (p0, p1) in enumerate(zip(aoslices[:-1], aoslices[1:])):
         t1, work1 = _allocate((3, nsph, p1-p0, nocc), work)
         contract('ysji,ui->ysuj', t1s, dm_factor_l[p0:p1], out=t1)
