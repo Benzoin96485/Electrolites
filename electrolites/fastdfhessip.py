@@ -183,6 +183,22 @@ D2 of ``_get_veff`` where item 12 is taken, in both spin cases:
     ``FASTDFHESSIP_H1BLK_MIN`` (32) the batch shrinks to give the block
     that many, where the batch can still hold the largest shell.
 
+``docs/DF_WORK_LIST.md`` **W38** (``docs/README_fastdfuh1batch.md``) gave the
+unrestricted twin of ``_get_veff`` (``_dfhessip_u``) what this module's
+already had:
+
+23. **The unrestricted h1 term's occupied index in batches** when both
+    spins' density factors, ``2 naux nocc (nao + nocc)`` words, would take
+    more than 70 % of what the metric leaves -- the restricted function's
+    rule with the spin index.  Upstream's twin holds them for every
+    occupied orbital and asserts at 113 atoms on a 40 GB card.  Each batch
+    holds ``dm_3c[r,n,i,q]`` and ``dm_oo[r,n,i,j]`` for its own ``i`` and
+    every ``j``; the terms with output index ``i`` are formed per batch,
+    those summed over ``i`` accumulate, D2 takes D1's ``j3c C_o`` over every
+    orbital (as item 12 does here), and the two Coulomb traces come from the
+    total density.  ``FASTDFHESSIP_H1UBATCH=0`` is upstream's single batch;
+    ``FASTDFHESSIP_OCC_BATCH`` forces a batch size, as here.
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -208,6 +224,8 @@ the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
     FASTDFHESSIP_H1D2=atom   item 20 off: W30's per-atom D2 loop
     FASTDFHESSIP_H1BLK_MIN=<n>
                              item 21's minimum block (32; 0 is off)
+    FASTDFHESSIP_H1UBATCH=0  item 23 off: the unrestricted h1 term in one
+                             occupied batch, as upstream
     FASTDFHESSIP_H1METRIC=inverse
                              item 6 on
     FASTDFHESSIP_IP2_GOUT=<n>

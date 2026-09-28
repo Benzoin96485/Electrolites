@@ -10,7 +10,7 @@ are ``(2, nao, nocc)`` with ``nocc = max(nocca, noccb)`` and the beta columns
 past ``noccb`` zero, every ``(i, j)`` pair becomes ``(n, i, j)``, and the
 exchange factor is ``-k`` on each spin density instead of ``-k/2`` on the
 total.  Nothing else differs, except that upstream's unrestricted functions
-have no occupied batching.
+have no occupied batching (``_get_veff`` has it here: item 23).
 
 So ``fastdfhessip``'s items transplant, as the entry said.  This module is
 the unrestricted half of that module, loaded and patched by it; the switches
@@ -36,7 +36,10 @@ are the same ``FASTDFHESSIP_*`` ones and mean the same thing:
   atom term grouped into cuBLAS GEMMs, and its Coulomb half without
   ``j3c_1``) is ``fastdfhessip._h1_stage_c`` on the spin index, and
   **item 20** (W35: item 12's per-atom products as batched GEMMs,
-  ``_h1d2``) batches over the atoms and both spins at once.
+  ``_h1d2``) batches over the atoms and both spins at once.  **Item 23**
+  (W38) is the restricted function's occupied batching, which upstream's
+  twin does not have: without it the call needs ``2 naux nocc (nao +
+  nocc)`` words of density factors at once, 29 GB at 113 atoms.
 
 Item 8 (the metric as its Cholesky factor, W24) is not carried over: it
 lives in ``_chol_d4_d5``, whose five contractions would all need the spin
