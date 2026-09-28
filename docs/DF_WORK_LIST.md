@@ -2813,7 +2813,7 @@ stream, whose order is the only one CuPy's pool keeps — without that wait a
 def2-TZVPP test read a buffer's previous owner (1.5e-2).  Correct to 4.1e-15
 against GPU4PySCF on every h1 branch forced into 2–3 batches in all three
 layouts, doublet and triplet; 1.1e-13–1.3e-13 against the unbatched call on
-the same SCF at 113 atoms; whole ethanol⁺ UKS Hessian 3.4e-12.  Whole
+the same SCF at 113 atoms; whole ethanol⁺ UKS Hessian 2.6e-12–3.4e-12.  Whole
 Hessians at 40 GB were not run (W40).
 
 The original entry, for the record:

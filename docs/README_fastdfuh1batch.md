@@ -72,7 +72,7 @@ the previous batch's work.
   SCF 1.1e-13 (Co sextet) and 1.3e-13 (taxol⁺); every branch of the call,
   forced into 2–3 batches on ethanol⁺ and the triplet ethanol²⁺, in all
   three modes, at most 4.1e-15 against GPU4PySCF; the whole ethanol⁺ UKS
-  Hessian 3.4e-12 Eh/bohr² against unpatched.
+  Hessian 2.6e-12–3.4e-12 Eh/bohr² against unpatched.
 
 Everything is one A100-SXM4-80GB of a whole Perlmutter node (`--qos=debug`,
 one GPU visible), GPU4PySCF 1.8.1, def2-SVP and its jkfit set, B3LYP,
@@ -254,7 +254,7 @@ and why the default keeps D and E whole and moves `dm_3c` instead: at
 | h1, occupied batches forced (`FASTDFHESSIP_OCC_BATCH=8, 5`: 2 and 3 batches) × host async / host synchronous / `occ`, on ethanol⁺ (doublet, `nocca − noccb = 1`) for B3LYP, HF, `k = 0`, and the long-range operator; on the triplet ethanol²⁺, whose padded beta columns fall in the last batch; every h1 branch (`H1ATOM=batched|upstream|occ`, `H1D2=atom`, `H1KAO=0` with and without `H1D2=atom`/`H1C=atom`, `H1C=atom`, `H1J=upstream`, `K0=compute`, `H1BLK=24`) | **4.1e-15** |
 | `H1UBATCH=0` with `OCC_BATCH=5` (one batch, asserted) | 8.7e-16 |
 | the rest of the file, unchanged | as before |
-| whole ethanol⁺ UKS B3LYP Hessian, patched against unpatched | 3.4e-12 Eh/bohr² |
+| whole ethanol⁺ UKS B3LYP Hessian, patched against unpatched | 2.6e-12, 3.4e-12 Eh/bohr² (two jobs) |
 
 At 113 atoms, on the same SCF (`--prefree-env FASTDFHESSIP_H1UBATCH=0`: the
 unbatched call made before memory is withheld): the Co sextet's three
