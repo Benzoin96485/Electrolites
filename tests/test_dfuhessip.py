@@ -296,14 +296,16 @@ for tag, mfu, factors in (
         f = f'j={jf} k={kf}' + ('' if om is None else f' omega={om}')
         r = UP_H1(iu, mcu, mou, jf, kf, om)
         for nb in (8, 5):
-            for mode in ('host', 'occ'):
+            for mode in ('host', 'occ', 'host sync'):
                 for lbl, sw in (UB if (nb == 5 and jf == 1. and kf == 0.2)
                                 else UB[:1] + UB[4:5]):
-                    with env(OCC_BATCH=nb, H1UBATCH=mode, **sw):
+                    hs = {'H1UHOST_ASYNC': 0} if mode == 'host sync' else {}
+                    with env(OCC_BATCH=nb, H1UBATCH=mode.split()[0], **hs,
+                             **sw):
                         got = U._get_veff(iu, mcu, mou, jf, kf, om)
                     st = fastdfhessip.stats()
                     nbu = st['occ_batches_u']
-                    assert st['h1_host'] == (mode == 'host')
+                    assert st['h1_host'] == (mode != 'occ')
                     check(f'{tag} h1 {f}, {nb} occupied per batch, {mode} '
                           f'({nbu} batches){lbl}', got, r)
                     if nbu > 1:

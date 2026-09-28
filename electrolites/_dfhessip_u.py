@@ -712,6 +712,12 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
             # test-only: forced, the batching is taken whatever fits
             num_occ_batches = max(num_occ_batches, 2)
     host = num_occ_batches > 1 and ubatch == 'host'
+    # the host copies on a stream of their own, each behind the stage that
+    # does not need it: a batch's copy out behind its stage C, and the next
+    # auxiliary batch's rows in behind the D and E work of this one, in two
+    # device buffers.  FASTDFHESSIP_H1UHOST_ASYNC=0 copies synchronously,
+    # into one
+    hasync = host and _env('FASTDFHESSIP_H1UHOST_ASYNC', '1') != '0'
     if num_occ_batches > 1 and not host:
         nocc_per_batch = (nocc + num_occ_batches - 1) // num_occ_batches
         nocc_per_batch = min(nocc, (nocc_per_batch + 7) & 0xffffff8)
@@ -741,7 +747,8 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     pair_size_max = max(nao_pair, 2*nb*nao)
     # with dm_3c on the host, each auxiliary function of a batch is also a
     # row of the device copy of its dm_3c
-    _unit = 6*pair_size_max + (2*nocc*nao if host else 0)
+    _unit = 6*pair_size_max + (2*nocc*nao * (2 if hasync else 1) if host
+                               else 0)
     largest_shell_nao = int((aux_loc[1:] - aux_loc[:-1]).max())
     batch_size = int(word_avail*.8 / _unit)
     if batch_size < largest_shell_nao:
@@ -898,10 +905,24 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         for kbatch in range(num_aux_batches):
             naux_in_batch = aux_offsets[kbatch+1] - aux_offsets[kbatch]
             aux0, aux1 = aux1, aux1 + naux_in_batch
-            if dm_3c is None:
+            if dm_3c is None and hasync:
+                # item 23: this auxiliary batch's rows of dm_3c, every
+                # occupied orbital, fetched from the host while the previous
+                # batch ran, and the next batch's fetch issued behind it
+                bi = kbatch % 2
+                if kbatch == 0:
+                    _fetch(0, 0)
+                cp.cuda.Stream.null.wait_event(ready[bi])
+                if kbatch + 1 < num_aux_batches:
+                    if used[1 - bi] is not None:
+                        xs.wait_event(used[1 - bi])
+                    _fetch(kbatch + 1, 1 - bi)
+                dm3k = stage_bufs[bi][:naux_in_batch]
+                st('D dm_3c in')
+            elif dm_3c is None:
                 # item 23: this auxiliary batch's rows of dm_3c, every
                 # occupied orbital, back from the host
-                dm3k = stage_buf[:naux_in_batch]
+                dm3k = stage_bufs[0][:naux_in_batch]
                 runtime.memcpy(int(dm3k.data.ptr),
                                dm3_host.ctypes.data +
                                int(aux0) * int(dm3k[0].nbytes),
@@ -1158,6 +1179,10 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
                     contract('xrniq,r->xniq', j3c_aux[:, p0:p1],
                              auxvec_batch[p0:p1], j_factor, beta=1,
                              out=vhf_i[i])
+            if dm_3c is None and hasync:
+                # the buffer is free for the fetch two batches on
+                used[bi] = cp.cuda.Event(disable_timing=True)
+                used[bi].record(cp.cuda.Stream.null)
             st('E per-aux-atom')
         work = work1 = buf0 = buf1 = oo_buf = dm_3c_batch = dm_oo_batch = None
         j3c_full = j3c = j3c_1 = j3c_aux = j3c_aux_tmp = tmp = tmp1 = None
@@ -1171,6 +1196,8 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         # item 23: every batch's dm_3c, page-locked (the pool keeps it for
         # the next call of the same size), and dm_oo whole on the device
         dm3_host = _dfpin.empty_mapped_pooled((naux, 2, nocc, nao))
+        xs = cp.cuda.Stream(non_blocking=True) if hasync else None
+        assert int(aux_offsets[0]) == 0
         dm_oo_all = cp.empty((naux, 2, nocc, nocc))
 
     for it in range(num_occ_batches):
@@ -1219,6 +1246,17 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         if not batched:
             metric_v = metric_w = None
         st('B metric')
+        if hasync:
+            # item 23: the batch's dm_3c to the host behind stage C, which
+            # only reads it: each (r, n) row of it a contiguous run of
+            # nob*nao into a row of nocc*nao
+            ev = cp.cuda.Event(disable_timing=True)
+            ev.record(cp.cuda.Stream.null)
+            xs.wait_event(ev)
+            runtime.memcpy2DAsync(
+                dm3_host.ctypes.data + int(nocc0*nao*8), int(nocc*nao*8),
+                int(dm_3c.data.ptr), int(nob*nao*8), int(nob*nao*8),
+                int(naux*2), runtime.memcpyDeviceToHost, xs.ptr)
 
         # (00|0)(1|0)(0|00)
         j2c_10 = int2c2e_ip1(auxmol, sort_output=False, omega=omega)
@@ -1279,7 +1317,11 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         j2c_10 = None
         st('C j2c_10')
 
-        if host:
+        if hasync:
+            dm_oo_all[:, :, nocc0:nocc1] = dm_oo
+            xs.synchronize()
+            st('C dm_3c out')
+        elif host:
             # item 23: this batch's dm_3c to the host, each (r, n) row of it
             # a contiguous run of nob*nao into a row of nocc*nao, and its
             # dm_oo into the whole one
@@ -1293,9 +1335,24 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
             _stage_de(nocc0, nocc1, dm_3c, dm_oo, it == 0)
         dm_oo = dm_3c = None
     if host:
-        stage_buf = cp.empty((batch_size, 2, nocc, nao))
+        stage_bufs = [cp.empty((batch_size, 2, nocc, nao))
+                      for _ in range(2 if hasync else 1)]
+        ready = [None, None]
+        used = [None, None]
+
+        def _fetch(k, b):
+            r0, r1 = int(aux_offsets[k]), int(aux_offsets[k+1])
+            row = int(2 * nocc * nao * 8)
+            runtime.memcpyAsync(int(stage_bufs[b].data.ptr),
+                                dm3_host.ctypes.data + r0 * row,
+                                (r1 - r0) * row, runtime.memcpyHostToDevice,
+                                xs.ptr)
+            ready[b] = cp.cuda.Event(disable_timing=True)
+            ready[b].record(xs)
         _stage_de(0, nocc, None, dm_oo_all, True)
-        stage_buf = dm_oo_all = dm3_host = None
+        if hasync:
+            xs.synchronize()
+        stage_bufs = ready = used = dm_oo_all = dm3_host = None
     eval_j3c = eval_ip1 = eval_ipaux = metric_v = metric_w = None
 
     if k_ao:
