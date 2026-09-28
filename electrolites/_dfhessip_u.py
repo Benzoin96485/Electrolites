@@ -835,11 +835,10 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     _S['h1_blksize'] = blksize
     if host:
         # stages A-C: one occupied batch of dm_3c (and of dm_oo, before it
-        # joins the whole one) beside stage A's two buffers and the kept
-        # j2c_10, in what the D loop's budget leaves before its own buffers
-        # are allocated
-        nb = int((word_avail*.9 - nao*nao*blksize - batch_size*nao_pair -
-                  (3*naux**2 if hasync else 0)) / (2*naux*(nao+nocc)))
+        # joins the whole one) beside stage A's two buffers, in what the D
+        # loop's budget leaves before its own buffers are allocated
+        nb = int((word_avail*.9 - nao*nao*blksize - batch_size*nao_pair) /
+                 (2*naux*(nao+nocc)))
         nb = min(nocc, nb // 8 * 8 if nb >= 8 else nb)
         assert nb > 0, 'Insufficient GPU memory'
         nb = _forced_occ_batch(nb)
@@ -1199,6 +1198,8 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         dm3_host = _dfpin.empty_mapped_pooled((naux, 2, nocc, nao))
         xs = cp.cuda.Stream(non_blocking=True) if hasync else None
         assert int(aux_offsets[0]) == 0
+        # page-locking it is paid once per size: the pool keeps it (W12)
+        st('A host buffer')
         dm_oo_all = cp.empty((naux, 2, nocc, nocc))
 
     def _j2c_10():
@@ -1207,10 +1208,6 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         inv_aux_sorting[aux_sorting] = cp.arange(naux)
         return j2c_10[:, inv_aux_sorting[aux_idx, None], inv_aux_sorting]
 
-    # item 23: with the host copies behind stage C, the metric derivative is
-    # formed once, before any of them, and kept: a cudaFree waits for every
-    # stream, and forming it frees a copy of its own size
-    j2c_10_all = _j2c_10() if hasync else None
     for it in range(num_occ_batches):
         nocc0 = it * nb
         nocc1 = min(nocc, nocc0 + nb)
@@ -1257,9 +1254,14 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         if not batched:
             metric_v = metric_w = None
         st('B metric')
+
+        # (00|0)(1|0)(0|00)
+        j2c_10 = _j2c_10()
+        st('C int2c2e_ip1')
         if hasync:
             # item 23: the batch's dm_3c to the host behind stage C, which
-            # only reads it: each (r, n) row of it a contiguous run of
+            # only reads it (issued after j2c_10 is formed, whose sorting
+            # frees a copy of it: a cudaFree waits for every stream): each (r, n) row of it a contiguous run of
             # nob*nao into a row of nocc*nao
             ev = cp.cuda.Event(disable_timing=True)
             ev.record(cp.cuda.Stream.null)
@@ -1268,10 +1270,6 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
                 dm3_host.ctypes.data + int(nocc0*nao*8), int(nocc*nao*8),
                 int(dm_3c.data.ptr), int(nob*nao*8), int(nob*nao*8),
                 int(naux*2), runtime.memcpyDeviceToHost, xs.ptr)
-
-        # (00|0)(1|0)(0|00)
-        j2c_10 = _j2c_10() if j2c_10_all is None else j2c_10_all
-        st('C int2c2e_ip1')
         if _env('FASTDFHESSIP_H1C', 'grouped') != 'atom':
             # item 18 (W32): fastdfhessip's grouped stage C, on the spin index
             H._h1_stage_c(
@@ -1342,12 +1340,18 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         else:
             _stage_de(nocc0, nocc1, dm_3c, dm_oo, it == 0)
         dm_oo = dm_3c = None
-    j2c_10_all = None
     if host:
         stage_bufs = [cp.empty((batch_size, 2, nocc, nao))
                       for _ in range(2 if hasync else 1)]
         ready = [None, None]
         used = [None, None]
+        if hasync:
+            # the two buffers come from the pool, whose blocks are ordered
+            # on the null stream only: the copies on `xs` must not start
+            # before the kernels of the block's previous owner are done
+            ev = cp.cuda.Event(disable_timing=True)
+            ev.record(cp.cuda.Stream.null)
+            xs.wait_event(ev)
 
         def _fetch(k, b):
             r0, r1 = int(aux_offsets[k]), int(aux_offsets[k+1])
