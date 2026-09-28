@@ -35,6 +35,9 @@ not to write the code),
 is W32), `docs/README_fastdfhessip4.md` **W31** (whose finding is W34),
 `docs/README_fastdfh1c.md` **W32** (whose finding is W35),
 `docs/README_fastxcfxcmgga.md` **W33** (whose finding is W36),
+`docs/README_fastdfhessip5.md` **W34** (whose finding is W37),
+`docs/README_fastdfh1d2.md` **W35** (whose finding is W38),
+`docs/README_fastxcfxclocal.md` **W36** (falsified by its count),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -234,6 +237,17 @@ this page and it is what re-ranked §4.
 Ranked by (value × confidence) / cost, **after** §3.3.  Each item gives what
 to change, the evidence it rests on, what would count as success, and what
 would falsify it.
+
+**W34, W35 and W36 are done; W37 and W38 are what they found.**  W34's
+"D3 buffers" row was one 37 GB `cudaMalloc` of a buffer the patched D4 never
+uses: sized to what is built in it, back-to-back ip2 calls are 1.53x at 42
+atoms, but a whole Hessian never paid the wait, so Hessians do not move
+(§5.17 is the rule that would have caught it).  W35's 40 GB D2 was 87 µs of
+host time per `contract` call, not arithmetic: as batched GEMMs the 40 GB
+h1 call on taxol is 1.04x the 80 GB one (was 1.62x), and the full card gains
+1.02x–1.29x.  W36 is falsified by the count it asked for first: at any
+tolerance the route can use, every grid block sees every occupied orbital up
+to 113 atoms, and the fusion's ceiling is below break-even.
 
 **W28 is done, and W33 is what it found.**  `fastxchess` now covers
 meta-GGAs on both references: the atom loop was 92–95 % of both upstream
@@ -2583,7 +2597,37 @@ per block where a GGA needs one, so part of that gap is arithmetic.
   B3LYP.
 * **Falsified if**: it is already at the GEMM rate for four products.
 
-### W34 — The ip2 term's "D3 buffers"
+### W34 — The ip2 term's "D3 buffers" — **done: one 37 GB `cudaMalloc` of a buffer the patched D4 never uses; 1.53x on back-to-back calls at 42 atoms, nothing in a whole Hessian, where it never waited**
+
+`fastdfhessip._work_words` (item 19; `FASTDFHESSIP_WORK=upstream`,
+`FASTDFHESSIP_D4_ROWS`, `FASTDFHESSIP_D3PROBE=nofree|hold`),
+`benchmarks/df_ip2_alloc_probe.py`, `benchmarks/with_ballast.py`,
+`tests/test_dfhessip.py`; write-up in `docs/README_fastdfhessip5.md`.
+
+The row was one `cudaMalloc` of the second pass's `work`: **37.4 GB** on
+penicillin V (`j3c_buf`, the other, is 2.2 GB and 0.9 ms).  Upstream sizes
+it for `_oo_atm_block`'s `X` at an `aux_blksize` that `_plan_v` sets to
+everything the plan leaves, and the Gram form and item 8, which every
+patched call takes, never build `X`.  GPU4PySCF sends every allocation over
+100 MB straight to `cudaMalloc`, so neither the pool nor `free_all_blocks`
+is involved (removing the free: 639–655 ms), and it is not first touch
+(writing all 37 GB: 21 ms).  What costs is a `cudaMalloc` of tens of GB
+within about a second of freeing tens of GB: held across calls the row is
+0.0 ms, after a 0.5 s sleep 81–103 ms, after 2 s 2 ms.  Counting `X` only
+where it is built takes the row from 543–669 ms to **0.6–1.7 ms** and the
+call from **1845 to 1204 ms (1.53x)**, with a peak 33 GB lower.  Nothing
+moves at 10–22 atoms (the buffer was ≤ 1.6 GB), in def2-TZVPP, at 113 atoms
+or on a 40 GB card (there the buffers are really used and the row stays at
+about 0.2 s); the unrestricted twin already left `X` out and is unchanged.
+**In a whole Hessian it was never paying**: upstream's row is 2–8 ms there,
+and Hessians are 1.00x (12.81 → 12.61 s penicillin V, 37.95 → 37.79 s in
+def2-TZVPP, 680.6 → 679.9 s taxol, 9.08 → 9.03 s Pt UKS), traces to 1e-9.
+The falsification does not fire; the success bar is met on the row, and on
+the call only when calls follow each other — which is what W31's stage
+table measured; a round robin hides it (§5.17).  Whole Hessians
+patched against unpatched 3.5e-12 (RKS), 4.0e-12 (UKS).
+
+The original entry, for the record:
 
 *(Found by W31.)*
 
@@ -2609,7 +2653,38 @@ describe — the pool handing memory back and the driver mapping it again.
   complex, 50 % at 113 atoms), whose occupancy is capped by 155 KB of `g`
   per block.
 
-### W35 — W30's occupied-side D2 at a smaller auxiliary block
+### W35 — W30's occupied-side D2 at a smaller auxiliary block — **done: it was 87 µs of host time per `contract` call, not arithmetic; batched, the 40 GB call is 1.04x the 80 GB one, and W30's threshold goes**
+
+`electrolites/_h1d2.py` (items 20–21 of `fastdfhessip`, both spin cases;
+`FASTDFHESSIP_H1D2=atom` restores W30's loop and its threshold,
+`FASTDFHESSIP_H1BLK_MIN` sets the minimum block, `FASTDFHESSIP_H1BLK` caps
+it for tests), `benchmarks/df_h1d2_probe.py`, `df_hess_terms_probe.py
+--ballast`; write-up in `docs/README_fastdfh1d2.md`.
+
+At 40 GB the D block is 32 functions against 392, and D2 was about 152,000
+per-atom `contract` calls at 87 µs of host time each — 1.9 TF/s against 9.9;
+up to `dk = 128` one block's wall time equals the time the host spends
+issuing its calls.  The falsification does not fire.  D2's block of `j3c` is
+now held transposed, so each atom's two products are row-major GEMMs, and
+the atoms of one size are one `cublasDgemmBatched`: 4 launches per block and
+direction on taxol instead of 226, both spins in one batch, up to 8 on the
+metal complexes.  Taxol B3LYP h1 at 40 GB: D2 **13.2 → 2.0 s**, the call
+**28.8 → 17.7 s** against 17.0 s at 80 GB (**1.04x, was 1.62x**); the
+closed-shell Co(III) complex 17.6 → 13.5 s against 13.7 s.  **The
+unrestricted twin does not fit 40 GB at 113 atoms**, before or after — its
+own setup asserts before a block is sized (W38); at 54.6 GB its
+memory-short branch goes 75.6 → 34.6 s against 30.5 s, item 21 taking a
+minimum block of 32 from the integral batch.  With batched products the
+occupied form wins or ties at every size, so its score threshold is 0: the
+h1 call on the full card is 1.02x–1.29x at 10–60 atoms in both bases and
+1.04x–1.10x at 113 atoms, restricted and unrestricted (1.6x–2.4x
+GPU4PySCF's); DF-PBE has no D2 and is unchanged.  Correct to 3.4e-15 on
+every new branch, including `FASTDFHESSIP_H1KAO=0` and the memory-cap
+ladder, within 2.7e-14 of GPU4PySCF on every system; whole Hessians against
+unpatched 1.2e-11 (RKS), 2.4e-12 (UKS).  Whole-Hessian timings and 40 GB
+runs below 113 atoms were not taken.
+
+The original entry, for the record:
 
 *(Found by W32.)*
 
@@ -2628,7 +2703,33 @@ shrinks while the arithmetic does not.
 * **Falsified if**: D2's rate is the same at both block sizes and the extra
   time is recomputation the smaller block forces elsewhere.
 
-### W36 — A local `nocc` for W33's occupied-side route
+### W36 — A local `nocc` for W33's occupied-side route — **done: falsified by the count; every block sees every orbital at any usable tolerance, and the fusion's ceiling is 10 % against a GEMM that reaches 81–91 % of cuBLAS**
+
+`benchmarks/fxc_local_occ_probe.py`, `benchmarks/fxc_dmma_probe.py`/`.cu`,
+`benchmarks/fxc_occ_probe.py --routes`; write-up in
+`docs/README_fastxcfxclocal.md`.  Nothing in `electrolites/` changes.
+
+**The falsification fires as written, and was established before any code
+was written.**  On the CPHF grid (SG-1, 4096-point blocks), an orbital is
+kept on a block when max|C_oᵀ ao| exceeds τ; dropping one leaves an error
+of about τ in its potential column, so the route needs τ ≤ 1e-8, and there
+the count is `nocc` on every block — at 113 atoms (taxol 226.0/226, the UKS
+Co sextet 207/202 per spin) and at 42 atoms in def2-TZVPP (92.0/92), for
+canonical, Cholesky and Pipek–Mezey orbitals, closed-shell organics and UKS
+Cu and Co complexes alike.  It first falls below `nocc` at 284 atoms
+(0.92·nocc), where `nsub/nloc` is already 0.83.  Smaller blocks (256
+points) do not help: a block's AO subset is a third of the molecule (400 of
+1123 at 113 atoms), and orbital tails stay above 1e-8 across it.  On the
+second step, nsys shows the route is 87–89 % cuBLAS DGEMMs at 15.9–17.6
+TF/s; the `Y`/`W` kernels are 10.6 % of a 113-atom call (8.8 % in
+def2-TZVPP), not 20 % — the entry's figure was W33's effective-rate
+estimate — and both run at 1.4 TB/s.  A plain fp64 tensor-core GEMM with no
+epilogue, the ceiling of any fused kernel, reaches 91 % of cuBLAS on
+taxol's `Y` shape and 81 % at def2-TZVPP size, below the 88–90 %
+break-even, so the fusion was not written.  W33's margin, `nsub/nocc`, is
+set by GPU4PySCF's AO screen and grid blocking, not by this route.
+
+The original entry, for the record:
 
 *(Found by W33.)*
 
@@ -2650,6 +2751,52 @@ GEMMs' 16.5; `docs/README_fastxcfxcmgga.md` §7).
   local (266 AOs of 2697 at 284 atoms) and its item failed anyway, because
   the index it screened on — stored AO pairs — reached every orbital; count
   on the block's AO subset before writing code.
+
+### W37 — The ip2 call's D stages at 113 atoms
+
+*(Found by W34.)*
+
+With the kernel at 1.0 s and the allocation at 0.2 s of a 21 s ip2 call on
+taxol, 13.7 s is the auxiliary-index contractions: D5 per atom 4.7 s, D2
+`h_aux` 3.4 s, the two `L^-1` triangular multiplies 3.5 s, D4 2.1 s
+(`FASTDFHESSIP_TIME=1`, `docs/README_fastdfhessip5.md` §4).  The Co(II)
+sextet's unrestricted call is worse: D5 16.6 s and D3 `j3c_100` 9.5 s of
+42.4 s.
+
+* **Do**: measure each stage's rate against its flop count at 113 atoms,
+  restricted and unrestricted, and batch or fuse whichever runs well below
+  the GEMM rate — D5's per-atom loop (`natm` launches of `3 naux nao_A
+  nocc` shapes; W35's batched GEMMs are the precedent) and the triangular
+  multiplies as blocked GEMMs (W4's `dtrsm` ladder).
+* **Success**: the D stages at the card's rate, and the ip2 call 1.3x or
+  more at 113 atoms in both spin cases, measured inside a whole Hessian
+  (§5.17).
+* **Falsified if**: they already run at 15 TF/s or more — then the
+  arithmetic is the cost, and the next thing is the spherical auxiliary
+  index in D5's unrestricted form, which item 8 does not reach.
+* The heavy classes' shared-memory contraction inside the kernel (58–76 %
+  of it after W31) is still open, but it is now 5 % of the call at 113
+  atoms and 10 % at 42.
+
+### W38 — The unrestricted h1 term on a 40 GB card
+
+*(Found by W35.)*
+
+At 113 atoms `_dfhessip_u._get_veff` asserts "Insufficient GPU memory" at
+44.6 GB free, before a block is sized: its budget holds `dm_3c` and `dm_oo`
+for both spins, `2 naux nocc (nao + nocc)` words, about 29 GB on taxol⁺.
+The restricted function batches the occupied index when that does not fit
+(`num_occ_batches`); the twin has no such loop.
+
+* **Do**: batch the twin's occupied index as the restricted function does
+  (per-batch `dm_3c`/`dm_oo`, D1's `j3c · C_o` over all occupied orbitals
+  where item 12 needs it), and measure taxol⁺ and the Co(II) sextet at a
+  40 GB ballast.
+* **Success**: the unrestricted h1 call runs at 40 GB at 113 atoms, within
+  about 1.3x of its 80 GB time.
+* **Falsified if**: the occupied batches repeat stage A/B's integral passes
+  enough to cost more than the memory-short branch at 54.6 GB — then the
+  next thing is keeping `dm_3c` on the host for the batches not in use.
 
 ### Not on this list
 
@@ -2792,6 +2939,18 @@ four are cheap to avoid and none is detectable from the number itself.
    GPU4PySCF's own run did not (W22).  A test that makes one call, or one
    tensor, cannot see it; `benchmarks/df_rsh_bench.py --veff-reps` is three
    calls after both builds.
+
+17. **A term timed back to back with itself sees allocator waits a Hessian
+   never does, and a round robin hides them.**  W31's stage table charged
+   0.56–0.64 s of a 1.84 s ip2 call to "D3 buffers": a 37 GB `cudaMalloc`
+   waiting on the driver because the previous call of the same term had
+   just freed as much.  A round robin between variants puts other work in
+   between and the wait disappears (with GPU4PySCF's function between
+   calls, W34's size and upstream's read 1239 and 1200 ms), and inside a
+   whole Hessian the same row is 2–8 ms.
+   Before a stage-table row becomes an item, check it inside a whole
+   Hessian with `FASTDFHESSIP_TIME=1` (`benchmarks/df_hess_anatomy.py`);
+   `docs/README_fastdfhessip5.md` has the sleep ladder that shows it.
 
 And one that is not about timing: **a patch target is not a code path.**
 Three rounds in this repository have now shipped a module that was loaded,
