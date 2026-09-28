@@ -19,6 +19,9 @@ Checked:
   chunk (``FASTDFHESSIP_VCHUNK``); the ``mem_sufficient = False`` branches of
   h1 and the unfused plan of ip2, by capping the memory the module sees
   (``FASTDFHESSIP_MEM``);
+* **the occupied index in batches** (W38's item 23), forced
+  (``FASTDFHESSIP_OCC_BATCH``) on every branch of h1, on the doublet and
+  the triplet;
 * **the cuBLAS route** item 13 takes for a contraction cuTENSOR refuses,
   with the refusal simulated;
 * **a whole UKS Hessian**, patched against unpatched.
@@ -270,7 +273,47 @@ for lbl, sw in (('', {}), (' [H1D2=atom]', {'H1D2': 'atom'}),
         assert fastdfhessip.stats()['h1_d2_batched'] == ('H1D2' not in sw)
     check(f'ethanol+ h1, exchange on the occupied side (forced){lbl}', got,
           ref['h1'])
-ok = {'v', 'v fused', 'h1 mem_insufficient', 'h1 rebalanced'} <= reached
+# W38's item 23: the occupied index in batches, forced (ethanol+'s 13
+# occupied orbitals never need it at a cap the sizing survives), on every
+# branch of the call and every set of factors, on the doublet and on the
+# triplet, whose padded beta columns fall in the last batch
+UB = [('', {}), (' [H1ATOM=batched]', {'H1ATOM': 'batched'}),
+      (' [H1ATOM=upstream]', {'H1ATOM': 'upstream'}),
+      (' [H1ATOM=occ H1D2=atom]', {'H1ATOM': 'occ', 'H1D2': 'atom'}),
+      (' [H1KAO=0]', {'H1KAO': 0}),
+      (' [H1KAO=0 H1D2=atom]', {'H1KAO': 0, 'H1D2': 'atom'}),
+      (' [H1KAO=0 H1C=atom]', {'H1KAO': 0, 'H1C': 'atom'}),
+      (' [H1C=atom]', {'H1C': 'atom'}), (' [H1J=upstream]', {'H1J': 'upstream'}),
+      (' [K0=compute]', {'K0': 'compute'}),
+      (' [H1BLK=24]', {'H1BLK': 24}),
+      (' [H1KAO=0 H1BLK=24]', {'H1KAO': 0, 'H1BLK': 24})]
+for tag, mfu, factors in (
+        ('ethanol+', mf, [(1., 0.2, None), (1., 1., None), (1., 0., None),
+                          (0., 0.6, 0.3)]),
+        ('ethanol2+ T', mft, [(1., 0.2, None)])):
+    iu, mcu, mou, _ = terms(mfu)
+    for jf, kf, om in factors:
+        f = f'j={jf} k={kf}' + ('' if om is None else f' omega={om}')
+        r = UP_H1(iu, mcu, mou, jf, kf, om)
+        for nb in (8, 5):
+            for lbl, sw in (UB if (nb == 5 and jf == 1. and kf == 0.2)
+                            else UB[:1] + UB[4:5]):
+                with env(OCC_BATCH=nb, **sw):
+                    got = U._get_veff(iu, mcu, mou, jf, kf, om)
+                nbu = fastdfhessip.stats()['occ_batches_u']
+                check(f'{tag} h1 {f}, {nb} occupied per batch '
+                      f'({nbu} batches){lbl}', got, r)
+                if nbu > 1:
+                    reached.add('h1 occ batches')
+# FASTDFHESSIP_H1UBATCH=0 is upstream's single batch, whatever is forced
+with env(OCC_BATCH=5, H1UBATCH=0):
+    got = U._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
+    ok = fastdfhessip.stats()['occ_batches_u'] == 1
+check('ethanol+ h1 [H1UBATCH=0]', got, ref['h1'])
+if not ok:
+    fails.append('H1UBATCH=0 batched the occupied index')
+ok = {'v', 'v fused', 'h1 mem_insufficient', 'h1 rebalanced',
+      'h1 occ batches'} <= reached
 if not ok:
     fails.append(f'memory caps did not reach the batched paths: {reached}')
 print(f'  {"ok  " if ok else "FAIL"} {"the caps reached the batched paths":62s}'
