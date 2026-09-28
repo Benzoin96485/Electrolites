@@ -36,6 +36,9 @@ ap.add_argument('--ratio', type=float, default=None,
                 help='FASTXCFXC_OCC_RATIO (meta-GGA) for the occupied route')
 ap.add_argument('--ratio-gga', type=float, default=None,
                 help='FASTXCFXC_OCC_RATIO_GGA for the occupied route')
+ap.add_argument('--routes', default='mat,occ',
+                help='which routes to time; `occ` alone for a profile of '
+                     'the occupied route that no matrix-route kernel mixes into')
 a = ap.parse_args()
 apply_patch(a.patch or 'fastxcfxc')
 
@@ -185,7 +188,12 @@ def run(env):
                 os.environ[k] = v
 
 
-res = {'mat': run({'FASTXCFXC_OCC': '0'}), 'occ': run({})}
+routes = a.routes.split(',')
+cp.cuda.profiler.start()       # `nsys -c cudaProfilerApi` sees the calls only
+res = {r: run({'FASTXCFXC_OCC': '0'} if r == 'mat' else {}) for r in routes}
+cp.cuda.profiler.stop()
+if len(routes) == 1:
+    res[{'mat': 'occ', 'occ': 'mat'}[routes[0]]] = res[routes[0]]
 print(f'\n| stage | AO-matrix route | | occupied route | |')
 print('|---|---|---|---|---|')
 for k in ('prep', 'gemm1', 'rho1', 'wv', 'scale', 'gemm2', 'accum'):
