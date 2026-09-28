@@ -384,4 +384,4 @@ for name in ('fastdfhessip', 'fastxcfxc'):
     if mod is not None:
         results.setdefault('stats', {})[name] = mod.stats()
         print(f'# {name}.stats() = {mod.stats()}')
-print('\n@@JSON ' + json.dumps(results))
+print('\n@@JSON ' + json.dumps(results, default=float))

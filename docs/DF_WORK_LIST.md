@@ -2778,7 +2778,45 @@ sextet's unrestricted call is worse: D5 16.6 s and D3 `j3c_100` 9.5 s of
   of it after W31) is still open, but it is now 5 % of the call at 113
   atoms and 10 % at 42.
 
-### W38 — The unrestricted h1 term on a 40 GB card
+### W38 — The unrestricted h1 term on a 40 GB card — **done: it runs at 1.11x of the full card (1.25x on the call that page-locks its host buffer), with the occupied index batched in stages A–C and `dm_3c` on the host for one pass of D and E**
+
+`_dfhessip_u._get_veff` (item 23 of `fastdfhessip`;
+`FASTDFHESSIP_H1UBATCH=host|occ|0`, `FASTDFHESSIP_H1UHOST_ASYNC=0`,
+`FASTDFHESSIP_OCC_BATCH` forces a batch), `tests/test_dfuhessip.py`,
+`df_hess_terms_probe.py --free-after/--prefree-env/--save-out/--ref-out`;
+write-up in `docs/README_fastdfuh1batch.md`.
+
+The twin now batches the occupied index when both spins' density factors
+would take more than 70 % of what the metric leaves (the restricted rule
+with the spin index); on the full card that never fires and the call is
+W35's, 1.00x–1.04x of `main` on five open-shell systems.  The restricted
+function's layout, transplanted, runs but is 1.43x–1.50x: stages D and E
+contract the batch's `i` away, so D2's `pri = j3c C_o` over every orbital
+and D's and E's integrals are repeated per batch (D2 3.9 → 11.3 s on
+taxol⁺).  The default instead batches only A–C, copies each batch's
+`dm_3c` (27 GB at taxol⁺) into page-locked host memory from W12's pool
+behind stage C, keeps `dm_oo` whole on the device, and runs D and E once,
+fetching each auxiliary batch's rows of `dm_3c` on a second stream behind
+the previous batch.  taxol⁺ at a 40 GB card's memory (27.6 GB left after
+its SCF): **33.5 s against 30.1 s** on the full card (1.11x), 37.6 s
+(1.25x) on the first call, which page-locks the buffer (3.4 s, pooled
+after); W35's code asserts there.  The Co(II) sextet, whose SCF does not
+fit 40 GB, with memory withheld after it to the same 27.6 GB: **26.4 s
+against 23.1–23.8 s** (1.11x–1.14x; first call 1.21x–1.24x); at 44.6 GB it
+fits one batch, 1.04x–1.07x.  **Success is met**; the falsification does
+not fire — what is repeated is stage A's integrals, 0.9–1.0 s per extra
+batch, and at half the memory the call beats the 54.6 GB memory-short
+branch (34.6 s after W35).  The copies cost 2.4 s synchronously and 0.35 s
+on their own stream, once the copy out waits for `j2c_10`'s sort (a
+`cudaFree` waits for every stream) and the fetches wait once for the null
+stream, whose order is the only one CuPy's pool keeps — without that wait a
+def2-TZVPP test read a buffer's previous owner (1.5e-2).  Correct to 4.1e-15
+against GPU4PySCF on every h1 branch forced into 2–3 batches in all three
+layouts, doublet and triplet; 1.1e-13–1.3e-13 against the unbatched call on
+the same SCF at 113 atoms; whole ethanol⁺ UKS Hessian 3.4e-12.  Whole
+Hessians at 40 GB were not run (W40).
+
+The original entry, for the record:
 
 *(Found by W35.)*
 
@@ -2797,6 +2835,44 @@ The restricted function batches the occupied index when that does not fit
 * **Falsified if**: the occupied batches repeat stage A/B's integral passes
   enough to cost more than the memory-short branch at 54.6 GB — then the
   next thing is keeping `dm_3c` on the host for the batches not in use.
+
+### W40 — The unrestricted ip2 term on a 40 GB card
+
+*(Found by W38.)*
+
+With h1 fitting, a 40 GB UKS Hessian at 113 atoms reaches
+`_dfhessip_u._jk_energy_per_atom`, and taxol⁺'s runs in **195.3 s against
+58.6 s** on the full card (3.3x; one call each, `df_hess_terms_probe.py
+--terms ip2 --ballast 40`, no stage table taken) — 5x the h1 term at the
+same memory.  The twin has no Cholesky metric (item 8) and its second pass
+is chunked over the metric dimension when memory is short, each chunk a
+full walk over the derivative integrals.
+
+* **Do**: take the stage table at 40 GB (`FASTDFHESSIP_TIME=1`) and count
+  the chunks and occupied batches; if it is the walks, keep the integrals'
+  contraction per chunk small enough to take the whole metric dimension, or
+  move the `(10|0)` block to the host as W38 did with `dm_3c`.
+* **Success**: the ip2 call within about 1.5x of its 80 GB time at 113
+  atoms, restricted and unrestricted, and a whole 40 GB UKS Hessian of
+  taxol⁺ measured.
+* **Falsified if**: the extra time is arithmetic that the smaller card
+  forces (the same flops at a lower rate would say it is not).
+
+### W41 — Stage A of the batched unrestricted h1 term, once
+
+*(Found by W38.)*
+
+Of item 23's 3.4 s at 40 GB on taxol⁺, 2.6 s is stage A's `(00|0)`
+integrals evaluated once per occupied batch (1.5 → 4.1 s at four batches).
+With `dm_3c` already going to the host, stage A could evaluate each
+integral batch once and write every occupied batch's contraction into the
+host array, leaving only the metric (B) and `j2c_10` (C) per batch.
+
+* **Do**: one integral pass writing `j3c_00` for all orbitals to the host
+  in auxiliary batches, then B and C per occupied batch from the host.
+* **Success**: stage A at its full-card time, the 40 GB call within 1.05x.
+* **Falsified if**: B then has to read `j3c_00` back at PCIe rate faster
+  than it is hidden (27 GB each way, 1 s at 26 GB/s).
 
 ### Not on this list
 
