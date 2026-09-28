@@ -151,6 +151,19 @@ of ``_get_veff``, in both spin cases (``_h1_stage_c``):
     the whole stage.  ``FASTDFHESSIP_H1C=atom`` is W30's per-atom loop;
     ``FASTDFHESSIP_H1C_ROWS`` the group's GEMM rows.
 
+``docs/DF_WORK_LIST.md`` **W34** (``docs/README_fastdfhessip5.md``) resized
+one buffer of ``_jk_energy_per_atom``:
+
+19. **The second pass's ``work`` buffer sized to what is built in it**
+    (``_work_words``).  Upstream's includes ``X`` at ``aux_blksize``, which
+    ``_plan_v`` sets to everything the plan leaves -- all the free memory on
+    the card, 37 GB on penicillin V -- and the Gram form (item 2) and item 8
+    never build ``X``.  A ``cudaMalloc`` that size right after the process
+    freed as much waits for the driver (0.45-0.67 s of a 1.8 s call when
+    calls follow each other); the buffer is now 4 GB there, and the peak of
+    the call 33 GB lower.  ``FASTDFHESSIP_WORK=upstream``.  The unrestricted
+    twin already left ``X`` out of its Gram form's buffer.
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -187,6 +200,14 @@ the same switches: items 1-5, 7 and 9-11 on the spin index; not item 8.
                              their tile shapes (16, tile, 2)
     FASTDFHESSIP_IP2_KERNEL=upstream
                              item 17 off: GPU4PySCF's kernel under item 15
+    FASTDFHESSIP_WORK=upstream
+                             item 19 off: upstream's size for ``work``;
+    FASTDFHESSIP_D4_ROWS=<n> the Gram form's auxiliary chunk, in rows (the
+                             default is what ``work``'s other uses hold);
+    FASTDFHESSIP_D3PROBE=nofree|hold
+                             measurement only: no ``free_all_blocks`` at
+                             the call's start, or the second pass's two
+                             buffers kept across calls (W34)
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
                              also times the ip2 kernel per auxiliary l
     FASTDFHESSIP_RCHUNK=<n>  W17's 1.2e8-element bound on the Gram form's
@@ -458,7 +479,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     naux = int(aux_loc[-1])
     largest_shell_nao = int((aux_loc[1:] - aux_loc[:-1]).max())
 
-    cp.get_default_memory_pool().free_all_blocks()
+    d3probe = _env('FASTDFHESSIP_D3PROBE', '')
+    if d3probe != 'nofree':
+        cp.get_default_memory_pool().free_all_blocks()
     mem_avail = _avail()
     word_avail = mem_avail // 8
     num_occ_batches = int(nocc*nocc*naux*4*8 / (mem_avail*0.4) + 1)
@@ -573,6 +596,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     eval_ip1 = _ip1_evaluator(
         int3c2e_opt, int3c2e_scheme_ip1(omega, 27), batch_size,
         'fill_int3c2e_ip1', omega, spmult)[0]
+    st('D0 evaluators')
 
     if j_factor != 0:
         auxvec_ipauxp = cp.empty((3, naux))
@@ -650,6 +674,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         _S['vchunks'] = (metric_size + aux_batch_size - 1) // aux_batch_size
         if do_fuse:
             _S['fused'] += 1
+        st('D0 plan')
 
         if not do_fuse:
             _ipaux_pass(eval_ipaux, num_aux_batches, blksize1, nao, nao_pair,
@@ -675,16 +700,21 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             j2c_10v = j2c_10c = None
 
         # the second pass: (10|0), and with item 3 the (1|00) of the first
-        if batch_id == 0:
-            j3c_buf = cp.empty((3, aux_batch_size, nao, nocc))
-        else:
-            j3c_buf = cp.empty((3, aux_batch_size, nao, nocc_in_batch))
+        nj = 3 * aux_batch_size * nao * (nocc if batch_id == 0
+                                         else nocc_in_batch)
         aux_unit2 = natm*3*nocc*nocc*2 if batch_id == 0 else 0
-        work = cp.empty(
-            max(aux_unit2*aux_blksize,
-                3*nao_pair*batch_size * 2 + (nocc+nao)*nao * blksize2,
-                3*naux*nao_on_atom*nocc_in_batch * 2,
-                3*naux*nao_on_atom*nocc_in_batch + 3*aux_batch_size*naux))
+        nw = _work_words(
+            aux_unit2*aux_blksize, nao, nocc, nocc_in_batch, naux, nao_pair,
+            batch_size, blksize2, nao_on_atom, aux_batch_size, metric_size,
+            chol, batch_id == 0 and oosum == 'gram')
+        if d3probe == 'hold':
+            # measurement only (W34): the two buffers kept across calls
+            j3c_buf = _held('j3c_buf', nj)
+            work = _held('work', nw)
+        else:
+            j3c_buf = cp.empty(nj)
+            work = cp.empty(nw)
+        st('D3 alloc')
         for v0, v1 in lib.prange(0, metric_size, aux_batch_size):
             dv = v1 - v0
             if batch_id == 0:
@@ -1186,6 +1216,63 @@ def _plan_v(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair, batch_size,
     return aux_batch_size, aux_blksize, blksize
 
 
+_HELD = {}
+
+
+def _held(key, n):
+    """``FASTDFHESSIP_D3PROBE=hold``: a buffer kept across calls, to price
+    the second pass's allocation against none at all (W34; measurement)."""
+    b = _HELD.get(key)
+    if b is None or b.size < n:
+        _HELD[key] = None
+        b = _HELD[key] = cp.empty(n)
+    return b[:n]
+
+
+def _work_words(atm_words, nao, nocc, nocc_in_batch, naux, nao_pair,
+                batch_size, blksize2, nao_on_atom, aux_batch_size,
+                metric_size, chol, gram):
+    """Words of the second pass's ``work`` buffer (item 19, W34).
+
+    Upstream sizes it as the largest of four uses, one of which is
+    ``_oo_atm_block``'s ``X`` at ``aux_blksize`` -- and ``aux_blksize`` is
+    itself *everything the plan leaves* (``_plan_v``), so the buffer is all
+    the free memory on the card: 37 GB on penicillin V, of which the Gram
+    form and item 8's path, which never build ``X``, touch 4.  GPU4PySCF
+    sends every allocation over 100 MB straight to ``cudaMalloc``
+    (``set_conditional_mempool_malloc``), and a ``cudaMalloc`` of tens of
+    GB within a second of the process freeing tens of GB waits for the
+    driver to take them back: 0.45-0.67 s a call when calls follow each
+    other, nothing when a second has passed (``docs/README_fastdfhessip5.md``).
+    Here the ``X`` term counts only where ``X`` is built (upstream's D4,
+    ``FASTDFHESSIP_OOSUM=transpose|gemm`` without item 8), and the Gram
+    form's auxiliary chunk, which upstream's buffer left unbounded, is what
+    the other uses hold (``FASTDFHESSIP_D4_ROWS=<n>`` makes it ``n`` rows).
+    ``FASTDFHESSIP_WORK=upstream`` is upstream's size.
+    """
+    uses = [3*nao_pair*batch_size * 2 + (nocc+nao)*nao * blksize2,
+            3*naux*nao_on_atom*nocc_in_batch * 2,
+            3*naux*nao_on_atom*nocc_in_batch + 3*aux_batch_size*naux]
+    if _env('FASTDFHESSIP_WORK', '') == 'upstream':
+        return max([atm_words] + uses)
+    if chol is not None:
+        nsph, ncart = chol.nsph, chol.ncart
+        uses += [3*ncart*nsph,
+                 3*nsph*nao_on_atom*nocc + ncart*nao_on_atom*nocc +
+                 3*ncart*nsph]
+    elif not gram:
+        uses.append(atm_words)
+    if gram:
+        rows = nsph if chol is not None else min(metric_size, aux_batch_size)
+        if _env('FASTDFHESSIP_D4', 'syrk') == 'syrk':
+            per_r = 3*nao*nocc + 3*nao*nao
+        else:
+            per_r = 3*nao*nocc + 6*nao*nao
+        forced = int(_env('FASTDFHESSIP_D4_ROWS', '0'))
+        uses.append(per_r * max(1, min(rows, forced)))
+    return max(uses)
+
+
 def _ipaux_pass(eval_ipaux, num_aux_batches, blksize, nao, nao_pair,
                 batch_size, nocc_in_batch, pair_addresses, dm_factor_l,
                 nocc0, nocc1, j3c_oo1, auxvec_ipauxp, dm):
@@ -1482,6 +1569,13 @@ def _chol_d4_d5(sa, ksph, work, natm, nocc, atm_ind, aoslices, dm_factor_l,
     return _aggregate_to_atoms(h_sph, natm, sa.atm, axis=1)
 
 
+def _d4_rows(kb):
+    """``FASTDFHESSIP_D4_ROWS=<n>``: the Gram form's chunk, exactly ``n``
+    rows where the buffer holds them (``_work_words`` sizes it so)."""
+    forced = int(_env('FASTDFHESSIP_D4_ROWS', '0'))
+    return min(kb, forced) if forced > 0 else kb
+
+
 def _oo_gram_rq(j3c_100, v0, dv, work, nocc, _dm_factor_l, _metric_w):
     """W17's ``R`` and ``Q``: ``R`` as one contraction, ``Q`` from ``M`` and
     its transpose as two GEMMs.  ``FASTDFHESSIP_D4=gemm``."""
@@ -1496,7 +1590,7 @@ def _oo_gram_rq(j3c_100, v0, dv, work, nocc, _dm_factor_l, _metric_w):
     # (`electrolites/_cuplan.py`); `FASTDFHESSIP_RCHUNK=<elements>` puts
     # W17's back, and `_accumulate_r` still halves along r if a plan is
     # refused anyway
-    kb = max(1, min(dv, work.size // per_r))
+    kb = _d4_rows(max(1, min(dv, work.size // per_r)))
     if _RCHUNK:
         kb = max(1, min(kb, int(_RCHUNK // (3*nao*nao))))
     else:
@@ -1540,7 +1634,7 @@ def _oo_gram_rq_syrk(j3c_100, v0, dv, work, nocc, _dm_factor_l, _metric_w):
     from cupy.cuda import cublas
     nao = _dm_factor_l.shape[0]
     per_r = 3*nao*nocc + 3*nao*nao
-    kb = max(1, min(dv, work.size // per_r))
+    kb = _d4_rows(max(1, min(dv, work.size // per_r)))
     n3 = 3 * nao
     R2 = cp.zeros((n3, n3))
     Q = cp.zeros((3, 3, nao, nao))

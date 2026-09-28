@@ -265,6 +265,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             aux_atm_labels, work=work)
         return o1p.reshape(3, naux, 2, nocc, nocc), parts[0], parts[1]
 
+    st('D0 plan')
     if not do_fuse:
         _ipaux_pass(eval_ipaux, num_aux_batches, blksize1, nao, nao_pair,
                     batch_size, nocc, pair_addresses, dm_factor_l, j3c_oo1)
@@ -279,6 +280,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             3*nao_pair*batch_size * 2 + (nocc*2+nao)*nao * blksize2,
             3*naux*2*nao_on_atom*nocc * 2,
             3*naux*2*nao_on_atom*nocc + 3*aux_batch_size*naux))
+    st('D3 alloc')
     for v0, v1 in lib.prange(0, metric_size, aux_batch_size):
         dv = v1 - v0
         j3c_100 = ndarray((3, dv, 2, nao, nocc), buffer=j3c_buf)
@@ -287,6 +289,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         j3c_full[:] = 0.
         buf0, work1 = _allocate((3, nao_pair, batch_size), work1)
         buf1, work1 = _allocate((3, nao_pair, batch_size), work1)
+        st('D3 buffers')
         aux0 = aux1 = 0
         for kbatch in range(num_aux_batches):
             compressed_di = eval_ip1(kbatch, out=buf0)
