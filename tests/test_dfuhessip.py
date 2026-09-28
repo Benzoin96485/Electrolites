@@ -296,15 +296,18 @@ for tag, mfu, factors in (
         f = f'j={jf} k={kf}' + ('' if om is None else f' omega={om}')
         r = UP_H1(iu, mcu, mou, jf, kf, om)
         for nb in (8, 5):
-            for lbl, sw in (UB if (nb == 5 and jf == 1. and kf == 0.2)
-                            else UB[:1] + UB[4:5]):
-                with env(OCC_BATCH=nb, **sw):
-                    got = U._get_veff(iu, mcu, mou, jf, kf, om)
-                nbu = fastdfhessip.stats()['occ_batches_u']
-                check(f'{tag} h1 {f}, {nb} occupied per batch '
-                      f'({nbu} batches){lbl}', got, r)
-                if nbu > 1:
-                    reached.add('h1 occ batches')
+            for mode in ('host', 'occ'):
+                for lbl, sw in (UB if (nb == 5 and jf == 1. and kf == 0.2)
+                                else UB[:1] + UB[4:5]):
+                    with env(OCC_BATCH=nb, H1UBATCH=mode, **sw):
+                        got = U._get_veff(iu, mcu, mou, jf, kf, om)
+                    st = fastdfhessip.stats()
+                    nbu = st['occ_batches_u']
+                    assert st['h1_host'] == (mode == 'host')
+                    check(f'{tag} h1 {f}, {nb} occupied per batch, {mode} '
+                          f'({nbu} batches){lbl}', got, r)
+                    if nbu > 1:
+                        reached.add(f'h1 occ batches {mode}')
 # FASTDFHESSIP_H1UBATCH=0 is upstream's single batch, whatever is forced
 with env(OCC_BATCH=5, H1UBATCH=0):
     got = U._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
@@ -313,7 +316,7 @@ check('ethanol+ h1 [H1UBATCH=0]', got, ref['h1'])
 if not ok:
     fails.append('H1UBATCH=0 batched the occupied index')
 ok = {'v', 'v fused', 'h1 mem_insufficient', 'h1 rebalanced',
-      'h1 occ batches'} <= reached
+      'h1 occ batches host', 'h1 occ batches occ'} <= reached
 if not ok:
     fails.append(f'memory caps did not reach the batched paths: {reached}')
 print(f'  {"ok  " if ok else "FAIL"} {"the caps reached the batched paths":62s}'

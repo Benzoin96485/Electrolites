@@ -67,6 +67,12 @@ ap.add_argument('--save-out', default='',
 ap.add_argument('--ref-out', default='',
                 help='check every variant against <path>.<term>.npy, saved by '
                      '--save-out in another process (e.g. on the full card)')
+ap.add_argument('--prefree-env', default=None,
+                help="with --free-after: each term's reference is 'ours' "
+                     "with these switches ('VAR=val;...'), computed in this "
+                     "process on this SCF *before* the ballast -- e.g. "
+                     "'FASTDFHESSIP_H1UBATCH=0', upstream's one batch, which "
+                     "does not fit after it (W38)")
 a = ap.parse_args()
 if a.ballast:
     _ballast = cp.empty(int(a.ballast * 1e9) // 8)
@@ -115,8 +121,24 @@ e = mf.kernel()
 print(f'# {natm} atoms  nao {mol.nao}  basis {a.basis}  xc {a.xc}  '
       f'{"UKS spin " + str(mol.spin) if uks else "RKS"}')
 print(f'# DF-SCF {time.perf_counter() - t0:.2f} s   E = {e:.10f}', flush=True)
-if a.free_after:
+PREFREE = {}
+
+
+def _prefree_refs():
+    # called once the term closures exist; see --prefree-env
+    env = dict(x.split('=', 1) for x in a.prefree_env.split(';') if x)
+    saved = _set_env(env)
+    try:
+        for term in terms:
+            PREFREE[term] = cp.asnumpy(SETUP[term]()(_ours(term)))
+    finally:
+        _restore(saved)
+    print(f'# references before the ballast, {env}', flush=True)
+
+
+def _free_after():
     cp.get_default_memory_pool().free_all_blocks()
+    global _ballast2
     _free = cp.cuda.runtime.memGetInfo()[0]
     _ballast2 = cp.empty(max(0, int(_free - a.free_after * 1e9)) // 8)
     _ballast2[:] = 0
@@ -271,6 +293,11 @@ def setup_h1():
 
 SETUP = {'fxc': setup_fxc, 'ip2': setup_ip2, 'h1': setup_h1}
 
+if a.free_after:
+    if a.prefree_env is not None:
+        _prefree_refs()
+    _free_after()
+
 if a.nvtx:
     # one capture range for the whole of the timed part: nsys's default
     # ends the process at the first cudaProfilerStop
@@ -296,6 +323,8 @@ for term in terms:
         if label == 'stock' or (ref is None and 'stock' not in variants):
             # without GPU4PySCF's column the first variant is the reference
             ref = outs[label]
+    if term in PREFREE:
+        ref = PREFREE[term]
     cp.get_default_memory_pool().free_all_blocks()
     ts = {label: [] for label, _, _ in vs}
     for r in range(a.reps):
