@@ -130,6 +130,11 @@ SWITCHES = [('default', {}),
             ('H1ATOM=upstream', {'H1ATOM': 'upstream'}),
             ('H1ATOM=batched', {'H1ATOM': 'batched'}),
             ('H1ATOM=occ', {'H1ATOM': 'occ'}),
+            # W35's batched D2 (the default under H1ATOM=occ), W30's per-atom
+            # loop, and item 5 off, which takes the per-atom loop too
+            ('H1ATOM=occ H1D2=atom', {'H1ATOM': 'occ', 'H1D2': 'atom'}),
+            ('H1D2=atom', {'H1D2': 'atom'}),
+            ('H1ATOM=occ H1J=upstream', {'H1ATOM': 'occ', 'H1J': 'upstream'}),
             ('K0=compute', {'K0': 'compute'}),
             # W32's grouped stage C: W30's per-atom loop, one atom a group,
             # and groups of a few atoms
@@ -221,6 +226,10 @@ for mem in 6e7 * 0.8 ** np.arange(14):
             extra = f'vchunks={st["vchunks"]}{" fused" if fused else ""}'
             if not fused:
                 reached.add('unfused by memory')
+        elif st.get('h1_rebalanced'):
+            # W35's item 21: the block's minimum taken from the batch
+            reached.add('h1 rebalanced')
+            extra = f'blksize={st["h1_blksize"]}, rebalanced'
         check(f'ethanol+ {term} at {mem / 1e6:.1f} MB ({extra})', got,
               ref[term])
 nao = mf.mol.nao
@@ -242,11 +251,26 @@ try:
               ref['h1'])
 except (AssertionError, MemoryError):
     pass
+# W35: the occupied form's D loop at small auxiliary blocks, whose last
+# block in a batch is shorter (item 20 relays it contiguously)
+for blk in (40, 24):
+    for lbl, sw in (('', {}), (' H1D2=atom', {'H1D2': 'atom'})):
+        with env(H1ATOM='occ', H1BLK=blk, **sw):
+            got = U._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
+            st = fastdfhessip.stats()
+            assert st['h1_blksize'] == blk and st['h1_occ']
+            assert st['h1_d2_batched'] == ('H1D2' not in sw)
+        check(f'ethanol+ h1 occ, blocks of {blk}{lbl}', got, ref['h1'])
 # and forced, the grouped form with the rest of the memory it would have
-with env(H1KAO=0):
-    got = U._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
-check('ethanol+ h1, exchange on the occupied side (forced)', got, ref['h1'])
-ok = {'v', 'v fused', 'h1 mem_insufficient'} <= reached
+for lbl, sw in (('', {}), (' [H1D2=atom]', {'H1D2': 'atom'}),
+                (' blocks of 24', {'H1BLK': 24})):
+    with env(H1KAO=0, **sw):
+        got = U._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
+        # W35's item 20 is this branch's D2 too
+        assert fastdfhessip.stats()['h1_d2_batched'] == ('H1D2' not in sw)
+    check(f'ethanol+ h1, exchange on the occupied side (forced){lbl}', got,
+          ref['h1'])
+ok = {'v', 'v fused', 'h1 mem_insufficient', 'h1 rebalanced'} <= reached
 if not ok:
     fails.append(f'memory caps did not reach the batched paths: {reached}')
 print(f'  {"ok  " if ok else "FAIL"} {"the caps reached the batched paths":62s}'

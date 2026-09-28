@@ -134,6 +134,11 @@ SWITCHES = [('default', {}),
             ('H1ATOM=upstream', {'H1ATOM': 'upstream'}),
             ('H1ATOM=batched', {'H1ATOM': 'batched'}),
             ('H1ATOM=occ', {'H1ATOM': 'occ'}),
+            # W35's batched D2 (the default under H1ATOM=occ), W30's per-atom
+            # loop, and item 5 off, which takes the per-atom loop too
+            ('H1ATOM=occ H1D2=atom', {'H1ATOM': 'occ', 'H1D2': 'atom'}),
+            ('H1D2=atom', {'H1D2': 'atom'}),
+            ('H1ATOM=occ H1J=upstream', {'H1ATOM': 'occ', 'H1J': 'upstream'}),
             ('K0=compute', {'K0': 'compute'}),
             # W32's grouped stage C: W30's per-atom loop, one atom a group,
             # and groups of a few atoms
@@ -234,6 +239,10 @@ for mem, term, fuse in [(m, t, f) for m in 4e7 * 0.85 ** np.arange(16)
     fused = st['fused'] > fused0
     shape = (f'occ_batches={st["occ_batches"]} vchunks={st["vchunks"]}'
              + (' fused' if fused else '') if term == 'ip2' else '')
+    if term == 'h1' and st.get('h1_rebalanced'):
+        # W35's item 21: the block's minimum taken from the batch
+        reached['h1'].add('rebalanced')
+        shape = f'blksize={st["h1_blksize"]}, rebalanced'
     check(f'ethanol {term} at {mem / 1e6:.1f} MB ({shape})', got, ref[term])
     if st['occ_batches'] > 1:
         reached[term].add('occ')
@@ -256,7 +265,7 @@ for vchunk in (160, 64):
 # need it at any cap its sizing survives
 for nb in (8, 5):
     for term in ('ip2', 'h1', 'h1 occ'):
-        with env(OCC_BATCH=nb, H1ATOM='occ' if term == 'h1 occ' else 'auto'):
+        with env(OCC_BATCH=nb, H1ATOM='occ' if term == 'h1 occ' else 'batched'):
             if term == 'ip2':
                 got = fastdfhessip._jk_energy_per_atom(intopt, dm0, 1., 0.2)
             else:
@@ -267,19 +276,38 @@ for nb in (8, 5):
               f'(occ_batches={st["occ_batches"]})', got, ref[term[:3].strip()])
         if st['occ_batches'] > 1:
             reached[term[:3].strip()].add('occ')
+# W35: the occupied form's D loop at small auxiliary blocks, whose last
+# block in a batch is shorter (item 20 relays it contiguously), batched D2
+# and W30's per-atom loop, with and without the occupied index batched
+for blk in (40, 24):
+    for lbl, sw in (('', {}), (' H1D2=atom', {'H1D2': 'atom'}),
+                    (' 5 occupied per batch', {'OCC_BATCH': 5})):
+        with env(H1ATOM='occ', H1BLK=blk, **sw):
+            got = fastdfhessip._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
+            st = fastdfhessip.stats()
+            assert st['h1_blksize'] == blk and st['h1_occ']
+            assert st['h1_d2_batched'] == ('H1D2' not in sw)
+        check(f'ethanol h1 occ, blocks of {blk}{lbl}', got, ref['h1'])
 # the memory-short exchange branch (the per-atom AO matrices do not fit),
 # forced: no cap the sizing survives reaches it on ethanol.  W32's grouped
 # stage C has its own form of it
 for lbl, sw in (('', {}), (' [H1C=atom]', {'H1C': 'atom'}),
                 (' [H1C_ROWS=240]', {'H1C_ROWS': 240}),
-                (' 5 occupied per batch', {'OCC_BATCH': 5})):
+                (' 5 occupied per batch', {'OCC_BATCH': 5}),
+                # W35's item 20 is this branch's D2 too: W30's per-atom
+                # loop, and blocks with a short last one
+                (' [H1D2=atom]', {'H1D2': 'atom'}),
+                (' blocks of 24', {'H1BLK': 24}),
+                (' blocks of 24, 5 occupied per batch',
+                 {'H1BLK': 24, 'OCC_BATCH': 5})):
     with env(H1KAO=0, **sw):
         got = fastdfhessip._get_veff(intopt, mo_coeff, mo_occ, 1., 0.2)
+        assert fastdfhessip.stats()['h1_d2_batched'] == ('H1D2' not in sw)
     if fastdfhessip.stats()['h1_kocc']:
         reached['h1'].add('k occ')
     check(f'ethanol h1, exchange on the occupied side{lbl}', got, ref['h1'])
 ok = (reached['ip2'] == {'occ', 'v', 'v fused'} and
-      reached['h1'] == {'occ', 'k occ'})
+      reached['h1'] == {'occ', 'k occ', 'rebalanced'})
 if not ok:
     fails.append(f'memory cap did not reach the batched paths: {reached}')
 print(f'  {"ok  " if ok else "FAIL"} {"the ladder reached the batched paths":60s}'

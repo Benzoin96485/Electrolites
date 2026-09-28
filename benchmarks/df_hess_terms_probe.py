@@ -54,7 +54,15 @@ ap.add_argument('--uks', action='store_true',
 ap.add_argument('--env', default='',
                 help="extra variants as 'label:VAR=val;VAR2=val2,...' -- each "
                      "runs 'ours' with those module switches set")
+ap.add_argument('--ballast', type=float, default=0,
+                help='GB held on the device for the whole run, before the '
+                     'SCF: 40 on an 80 GB card is the memory of a 40 GB one '
+                     '(W35; FASTDFHESSIP_MEM only caps the sizing)')
 a = ap.parse_args()
+if a.ballast:
+    _ballast = cp.empty(int(a.ballast * 1e9) // 8)
+    print(f'# ballast {a.ballast} GB, '
+          f'{cp.cuda.runtime.memGetInfo()[0] / 1e9:.1f} GB free', flush=True)
 apply_patch(a.patch)
 
 from gpu4pyscf import dft                                    # noqa: E402
@@ -269,7 +277,8 @@ for term in terms:
             _restore(saved)
         _sync()
         outs[label] = cp.asnumpy(out)
-        if label == 'stock':
+        if label == 'stock' or (ref is None and 'stock' not in variants):
+            # without GPU4PySCF's column the first variant is the reference
             ref = outs[label]
     cp.get_default_memory_pool().free_all_blocks()
     ts = {label: [] for label, _, _ in vs}
@@ -297,7 +306,8 @@ for term in terms:
         if base:
             line += f'   {base / tmin:5.2f}x'
         err = None
-        if ref is not None and not a.no_check and label != 'stock':
+        if (ref is not None and not a.no_check and label != 'stock'
+                and outs[label] is not ref):
             d = np.abs(outs[label] - ref).max()
             err = float(d / max(np.abs(ref).max(), 1e-300))
             line += f'   max|d| {d:.2e}  rel {err:.2e}'

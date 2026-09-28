@@ -34,7 +34,9 @@ are the same ``FASTDFHESSIP_*`` ones and mean the same thing:
   by W30, which also added **item 14** to both (no exchange contraction at
   all when ``k_factor = 0``).  **Item 17** (W32: stage C's per-auxiliary-
   atom term grouped into cuBLAS GEMMs, and its Coulomb half without
-  ``j3c_1``) is ``fastdfhessip._h1_stage_c`` on the spin index.
+  ``j3c_1``) is ``fastdfhessip._h1_stage_c`` on the spin index, and
+  **item 20** (W35: item 12's per-atom products as batched GEMMs,
+  ``_h1d2``) batches over the atoms and both spins at once.
 
 Item 8 (the metric as its Cholesky factor, W24) is not carried over: it
 lives in ``_chol_d4_d5``, whose five contractions would all need the spin
@@ -65,6 +67,7 @@ from gpu4pyscf.hessian.rhf import _aggregate_to_atoms
 
 from ._dfaux import _spmult
 from . import _cuplan
+from . import _h1d2
 from . import fastdfhessip as H
 from .fastdfhessip import (_env, _S, _Stages, _ip1_evaluator, _avail,
                            _atom_indicator, _usable)
@@ -727,15 +730,59 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     # 3e4-1.7e6) and wins at 113 atoms (7.7e6-9.1e6) and in def2-TZVPP at
     # 42 (3.0e7).  `=occ` and `=batched` force either form
     score = nao / natm * nao * max(nao - 2*nocc, 0)
+    # W30's threshold (4e6) priced the occupied form with 2 natm launches
+    # per block and direction; with item 20's batched D2 it wins or ties at
+    # every size measured (`docs/README_fastdfh1d2.md` §3), so it is taken
+    # wherever it saves arithmetic
+    d2_batch_on = jbatch and _env('FASTDFHESSIP_H1D2', 'batched') != 'atom'
     occ_k = hoist and (h1atom == 'occ' or
                        (h1atom == 'auto' and score > float(
-                           _env('FASTDFHESSIP_H1OCC_SCORE', '4e6'))))
+                           _env('FASTDFHESSIP_H1OCC_SCORE',
+                                '0' if d2_batch_on else '4e6'))))
     _S['h1_occ'] = bool(occ_k)
+    # item 20 (W35): D2's per-atom products as a few batched GEMMs; the
+    # memory-short branch (no per-atom AO matrices) forms the same two
+    # products per atom and takes it too, with item 12's hoisted arrays
+    kshort = do_k and not mem_sufficient and h1atom != 'upstream'
+    d2_batched = (occ_k or kshort) and d2_batch_on
+    _S['h1_d2_batched'] = bool(d2_batched)
+    t_on = hoist or d2_batched
+    s_on = occ_k or d2_batched
     blk_unit = (nao**2 + (nao+nocc*2) * max(nao_on_atom, nocc) +
-                (2*nao*(nao + (nocc if occ_k else 0)) if hoist else 0))
+                (2*nao*(nao + (nocc if s_on else 0)) if t_on else 0))
     blksize = int((word_avail*.95 - batch_size*_unit) / blk_unit) // 8 * 8
     assert blksize > 0, 'Insufficient GPU memory'
     blksize = min(blksize, batch_size)
+    # item 21 (W35): the integral batch takes 80 % of the budget and the D
+    # loop's block what is left, so on a short card the block falls to a
+    # few functions while the batch still holds dozens.  Below
+    # FASTDFHESSIP_H1BLK_MIN functions the batch gives the block that many
+    # (the integral evaluator is rebuilt for the smaller batch)
+    blk_min = int(_env('FASTDFHESSIP_H1BLK_MIN', '32'))
+    _S['h1_rebalanced'] = False
+    if blksize < min(blk_min, batch_size):
+        b2 = int((word_avail*.95 - blk_min*blk_unit) / _unit)
+        if b2 >= max(largest_shell_nao, blk_min):
+            batch_size = min(b2, max(largest_shell_nao, naux))
+            with _spmult(spmult, short_range=omega < 0):
+                eval_j3c, aux_sorting, _, aux_offsets = \
+                    int3c2e_opt.int3c2e_evaluator(
+                        aux_batch_size=batch_size, reorder_aux=True,
+                        cart=True, omega=omega)
+            batch_size = min(batch_size,
+                             int((aux_offsets[1:]-aux_offsets[:-1]).max()))
+            num_aux_batches = len(aux_offsets) - 1
+            blksize = min(blk_min, batch_size)
+            _S['h1_rebalanced'] = True
+    # test-only: a smaller block, as a smaller card would leave (W35)
+    blksize = min(blksize, int(_env('FASTDFHESSIP_H1BLK', blksize)))
+    _S['h1_blksize'] = blksize
+    st.note(naux=naux, batch_size=batch_size, blksize=blksize,
+            aux_batches=num_aux_batches, occ_k=int(bool(occ_k)),
+            k_ao=int(bool(k_ao)),
+            d2=('batched' if d2_batched else 'atom' if occ_k else
+                'short' if do_k and not k_ao else 'ao' if do_k else '-'))
+    d2_plan = _h1d2.AtomGroups(aoslices) if d2_batched else None
     st('setup')
 
     aux0 = aux1 = 0
@@ -849,11 +896,11 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         (nao*nao + (nao+nocc)*2 * max(nao_on_atom, nocc)) * blksize)
     # item 4's array lives at the tail of the same buffer: it is dead before
     # the (00|1) half of each batch reuses that space
-    t_size = 2*nao*nao*blksize if hoist else 0
-    s_size = 2*nao*nocc*blksize if occ_k else 0
+    t_size = 2*nao*nao*blksize if t_on else 0
+    s_size = 2*nao*nocc*blksize if s_on else 0
     work = cp.empty(work_size + t_size + s_size)
-    t_buf = work[work_size:work_size+t_size] if hoist else None
-    s_buf = work[work_size+t_size:] if occ_k else None
+    t_buf = work[work_size:work_size+t_size] if t_on else None
+    s_buf = work[work_size+t_size:] if s_on else None
     aux0 = aux1 = 0
     for kbatch in range(num_aux_batches):
         naux_in_batch = aux_offsets[kbatch+1] - aux_offsets[kbatch]
@@ -877,17 +924,44 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
             dk = k1 - k0
             _aux0, _aux1 = _aux1, _aux1 + dk
             j3c = j3c_full[:, :, :dk]
-            if hoist:
+            if t_on:
                 # item 4: the occupied-contracted density of both spins for
                 # every AO at once, which upstream forms per atom and per x
                 t_all = ndarray((2, nao, dk, nao), buffer=t_buf)
                 contract('nui,rniq->nurq', orbo, dm_3c[_aux0:_aux1],
                          out=t_all)
-            if occ_k:
+            if s_on:
                 s_all = ndarray((2, nao, dk, nocc), buffer=s_buf)
                 contract('nui,rnij->nurj', orbo, dm_oo[_aux0:_aux1],
                          out=s_all)
             for x in range(3):
+                if d2_batched:
+                    # item 20: j3c held as jT[q,p,r] and D1's product with
+                    # C_o as (n, i, p, r); D1 and D3 read it with the two
+                    # AO indices swapped (fastdfhessip's restricted loop)
+                    jT = _h1d2.contiguous_block(j3c_full, dk, x == 0)
+                    jT[i_addr, j_addr] = compressed_dj[x, :, k0:k1]
+                    jT[j_addr, i_addr] = compressed_di[x, :, k0:k1]
+                    priT = ndarray((2, nocc, nao, dk), buffer=work1)
+                    contract('qpr,nqi->nipr', jT, orbo, out=priT)
+                    contract('nipr,rniq->npq', priT, dm_3c[_aux0:_aux1],
+                             -k_factor, beta=1, out=vhf1[x])
+                    st('D1 vhf1')
+                    d2_plan.d2(jT, s_all, priT, t_all, vhf_atm[:, x],
+                               -k_factor)
+                    priT = None
+                    st('D2 K per-atom')
+                    if j_factor != 0:
+                        vj1 = contract('qpr,r->pq', jT, auxvec[_aux0:_aux1])
+                        vhf1[x, 0] += j_factor * vj1
+                        vhf1[x, 1] += j_factor * vj1
+                        w_pr = contract('qpr,pq->pr', jT, dm)
+                        av_atm = atm_ind.dot(w_pr)
+                        contract('rniq,ar->aniq', dm_3c[_aux0:_aux1], av_atm,
+                                 2*j_factor, beta=1, out=vhf_atm[:, x])
+                        vj1 = w_pr = av_atm = None
+                    st('D3 J per-atom')
+                    continue
                 j3c[j_addr, i_addr] = compressed_dj[x, :, k0:k1]
                 j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
                 if do_k:
@@ -975,6 +1049,8 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
                                      out=vhf_atm[i, x])
                 st('D3 J per-atom')
 
+        if d2_batched:
+            _h1d2.restore(j3c_full, naux_in_batch)
         # (00|1)(0|0)(0|00)
         compressed_dk += compressed_di
         j3c_aux, work1 = _allocate((3, naux_in_batch, 2, nocc, nao), work)
