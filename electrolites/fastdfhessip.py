@@ -844,12 +844,15 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 # block's products run on them in place, and D5 unpacks a
                 # block of rows at a time; half of both, which is what does
                 # not fit beside the h_aux block on a 40 GB card
-                j3c_oo1 = None
-                dmp = _SymRows(naux, 1, nocc)
+                # both packed arrays in the unpacked one's buffer
+                npr = nocc*(nocc + 1)//2
+                buf = j3c_oo1.reshape(-1)
+                dmp = _SymRows(naux, 1, nocc, buf=buf[3*naux*npr:])
                 dmp.put(0, dm_oo.reshape(naux, 1, nocc, nocc))
                 dm_oo = dm_oo_full = None
                 dm_oo = dmp
-                j3c_oo1 = _SymRows(3*naux, 1, nocc, xstride=naux)
+                j3c_oo1 = _SymRows(3*naux, 1, nocc, xstride=naux, buf=buf)
+                buf = None
         st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
                 plan_fused=plan_f[0])
         st.note(chol=chol is not None, nao=nao, nocc=nocc, naux=naux, metric_size=metric_size,
@@ -2491,9 +2494,13 @@ class _SymRows:
     are ``(x, r)`` (``3 naux`` of them).  Item 22 has already made both
     triangles of these from one, so no information is lost."""
 
-    def __init__(self, nrow, ns, nocc, xstride=0):
+    def __init__(self, nrow, ns, nocc, xstride=0, buf=None):
         self.pr = _Pairs(nocc, ns)
-        self.p = cp.empty((nrow, self.pr.n))
+        # `buf`: carved from a buffer that is done with (item 34 puts both
+        # packed arrays in the unpacked (1|00)'s own, which saves the
+        # cudaMalloc beside its cudaFree)
+        self.p = (cp.empty((nrow, self.pr.n)) if buf is None else
+                  ndarray((nrow, self.pr.n), buffer=buf))
         self.shape = (nrow, ns, nocc, nocc)
         self.xstride = xstride
 

@@ -332,11 +332,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         if pack34:
             # item 34: dm_oo and (1|00) as their weighted pairs from the
             # first pass on (fastdfhessip's note)
-            j3c_oo1 = None
-            dmp = H._SymRows(naux, 2, nocc)
+            # both packed arrays in the unpacked one's buffer
+            npr = nocc*(nocc + 1)
+            buf = j3c_oo1.reshape(-1)
+            dmp = H._SymRows(naux, 2, nocc, buf=buf[3*naux*npr:])
             dmp.put(0, dm_oo)
             dm_oo = dmp
-            j3c_oo1 = H._SymRows(3*naux, 2, nocc, xstride=naux)
+            j3c_oo1 = H._SymRows(3*naux, 2, nocc, xstride=naux, buf=buf)
+            buf = None
     st.note(chol=chol is not None, spin_passes=2 // nsp)
     _S['u_spin_passes'] = 2 // nsp if chol is not None else 0
     st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
