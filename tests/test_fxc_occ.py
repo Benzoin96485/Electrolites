@@ -196,7 +196,13 @@ for label, atom, basis, xc, charge, spin in UCASES:
     tag = (f'{label}/{basis} {xc} nao={mf.mol.nao} '
            f'nocc={nocca}/{noccb}')
     print(f'# {tag}')
-    for vl, env in VARIANTS[:2] + VARIANTS[3:]:
+    # W40: the sets in groups of 2 (5 sets: 2, 2, 1), and every block on
+    # the occupied side with them
+    for vl, env in VARIANTS[:2] + VARIANTS[3:] + (
+            ('SETS=2', {'FASTXCFXC_SETS': '2'}),
+            ('SETS=2, every block', {'FASTXCFXC_SETS': '2',
+                                     'FASTXCFXC_OCC_RATIO': '0',
+                                     'FASTXCFXC_OCC_RATIO_GGA': '0'})):
         got = with_env(env, lambda: run(OURS, FAST))
         check(f'{label} {xc} [{vl}]', got, ref)
     mf = h = None
@@ -204,7 +210,8 @@ for label, atom, basis, xc, charge, spin in UCASES:
 
 st = fastxcfxc.stats()
 for key, n in (('occ_blocks', st.get('occ_blocks', 0)),
-               ('occ_u_calls', st.get('occ_u_calls', 0) - n_u0)):
+               ('occ_u_calls', st.get('occ_u_calls', 0) - n_u0),
+               ('u_set_groups', st.get('u_set_groups', 0))):
     ok = n > 0
     if not ok:
         fails.append(f'{key} = 0: the route was never taken')
