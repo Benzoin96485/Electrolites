@@ -314,8 +314,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         # item 34, as in fastdfhessip (FASTDFHESSIP_PACKROWS=0: item 33
         # alone); either holds its spherical j2c_10v back
         if _env('FASTDFHESSIP_PACKROWS', '1') != '0':
-            plan, plan_f, do_fuse, carve = make_plan(
-                word_avail - 3*naux*metric_size, True)
+            try:
+                plan, plan_f, do_fuse, carve = make_plan(
+                    word_avail - 3*naux*metric_size, True)
+            except AssertionError:
+                # not a row before the packing: unfused, and planned after
+                # it
+                plan, plan_f, do_fuse, carve = ((metric_size, 0, 0), (0,),
+                                                False, False)
             aux_batch_size, aux_blksize, blksize2 = plan
             pack34 = not do_fuse
             rows34 = True
