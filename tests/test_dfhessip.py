@@ -180,7 +180,16 @@ SWITCHES = [('default', {}),
             ('D5=atom', {'D5': 'atom'}),
             ('D5_GROUP=1', {'D5_GROUP': 1}),
             ('PACK_CHUNK=7', {'PACK_CHUNK': 7}),
-            ('PACK_CHUNK=7 CARVE=0', {'PACK_CHUNK': 7, 'CARVE': 0})]
+            ('PACK_CHUNK=7 CARVE=0', {'PACK_CHUNK': 7, 'CARVE': 0}),
+            # W39's items 29-32: the pseudo-density and stage A on the whole
+            # block, the nine j2c_ip2 GEMMs, the metric's pattern on the
+            # host, and the lower triangle in tiles that cut shells
+            ('PDLOW=0', {'PDLOW': 0}),
+            ('ALOW=0', {'ALOW': 0}),
+            ('IP2SYM=0', {'IP2SYM': 0}),
+            ('SPHHOST=1', {'SPHHOST': 1}),
+            ('LOW_TILE=16', {'LOW_TILE': 16}),
+            ('LOW_TILE=7', {'LOW_TILE': 7})]
 
 
 def run_terms(mf, tag, factors, switches=SWITCHES, mem=None):

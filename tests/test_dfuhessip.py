@@ -166,7 +166,16 @@ SWITCHES = [('default', {}),
             ('METRIC=eigen', {'METRIC': 'eigen'}),
             ('USPIN=1', {'USPIN': 1}),
             ('USPIN=1 FUSE=0', {'USPIN': 1, 'FUSE': 0}),
-            ('USPIN=1 D4=gemm', {'USPIN': 1, 'D4': 'gemm'})]
+            ('USPIN=1 D4=gemm', {'USPIN': 1, 'D4': 'gemm'}),
+            # W39's items 29-32: the pseudo-density and stage A on the whole
+            # block, the nine j2c_ip2 GEMMs, the metric's pattern on the
+            # host, and the lower triangle in tiles that cut shells
+            ('PDLOW=0', {'PDLOW': 0}),
+            ('ALOW=0', {'ALOW': 0}),
+            ('IP2SYM=0', {'IP2SYM': 0}),
+            ('SPHHOST=1', {'SPHHOST': 1}),
+            ('LOW_TILE=16', {'LOW_TILE': 16}),
+            ('LOW_TILE=7', {'LOW_TILE': 7})]
 
 
 def terms(mf):
