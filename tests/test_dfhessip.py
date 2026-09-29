@@ -260,14 +260,18 @@ for mem, term, fuse in [(m, t, f) for m in 4e7 * 0.85 ** np.arange(16)
         reached[term].add('v fused' if fused else 'v')
 # a multi-chunk second pass with the first pass fused into it, forced: the
 # fusion's own memory margin keeps it off at every cap above
-# W40's item 30 is the Cholesky factor in chunks of rows (the default
+# W40's item 33 is the Cholesky factor in chunks of rows (the default
 # wherever item 8's whole index does not fit); CROWS=0 is the chunked
-# eigen-style arithmetic it replaces, D5_GROUP=8 its D5 in many groups
+# eigen-style arithmetic it replaces, D5_GROUP=8 and D5_ROWS=7 its D5 in
+# many groups and row blocks; unfused, item 34 packs D5's partners
+# (PACKROWS=0 does not)
 CROWS = [('', {}), (' [CROWS=0]', {'CROWS': 0}),
-         (' [D5_GROUP=8]', {'D5_GROUP': 8})]
+         (' [D5_GROUP=8]', {'D5_GROUP': 8}),
+         (' [D5_ROWS=7]', {'D5_ROWS': 7}),
+         (' [PACKROWS=0]', {'PACKROWS': 0})]
 for vchunk in (160, 64, 40):
     for fuse in (1, 0):
-      for lbl, sw in (CROWS if fuse else CROWS[:2]):
+      for lbl, sw in (CROWS if fuse else CROWS[:2] + CROWS[3:]):
         fused0 = fastdfhessip.stats()['fused']
         rows0 = fastdfhessip.stats().get('chol_rows', 0)
         with env(VCHUNK=vchunk, FUSE=fuse, **sw):

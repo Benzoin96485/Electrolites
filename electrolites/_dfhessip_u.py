@@ -265,19 +265,20 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         else:
             nsp = 2
             if _env('FASTDFHESSIP_CROWS', '1') != '0':
-                # item 30 (W40): the factor in chunks of rows, with room
+                # item 33 (W40): the factor in chunks of rows, with room
                 # for its spherical j2c_10v
                 word_avail = chol_w
             else:
                 sa = None
         if _env('FASTDFHESSIP_USPIN', '') == '1' and sa is not None:
             nsp = 1
-    plan = _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size,
-                   nao_on_atom, natm, metric_size, gram, nsp)
-    do_fuse = False
-    carve = False
-    plan_f = (None,)
-    if fuse:
+    def make_plan(word_avail, rows):
+      plan = _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size,
+                     nao_on_atom, natm, metric_size, gram, nsp, rows)
+      do_fuse = False
+      carve = False
+      plan_f = (None,)
+      if fuse:
         # as in fastdfhessip: fused, the h_aux block runs while the second
         # pass's buffers are held, so the plan is made against what its
         # temporaries leave and taken only if it costs no chunk; item 11
@@ -289,24 +290,34 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         try:
             plan_f = _plan_v(word_avail - margin, naux, nao, nocc, nao_pair,
                              batch_size, nao_on_atom, natm, metric_size, gram,
-                             nsp)
+                             nsp, rows)
         except AssertionError:
             plan_f = (0,)
         if plan_f[0] > 0 and (-(-metric_size // plan_f[0]) <=
                               -(-metric_size // plan[0])):
             plan, do_fuse = plan_f, True
+      return plan, plan_f, do_fuse, carve
+    plan, plan_f, do_fuse, carve = make_plan(word_avail, False)
     aux_batch_size, aux_blksize, blksize2 = plan
     chol = sa if (sa is not None and aux_batch_size >= metric_size) else None
     if chol is None:
         nsp = 2
     if sa is not None and chol is None:
         _S['chol_chunked'] = _S.get('chol_chunked', 0) + 1
-    # item 30 (W40): fastdfhessip's chunks of rows of Y, both spins in each
+    # item 33 (W40): fastdfhessip's chunks of rows of Y, both spins in each
     crow = None
+    pack34 = rows34 = False
     if (sa is not None and chol is None and
             _env('FASTDFHESSIP_CROWS', '1') != '0'):
         crow = H._CholRows(sa)
         _S['chol_rows'] = _S.get('chol_rows', 0) + 1
+        # item 34, as in fastdfhessip (FASTDFHESSIP_PACKROWS=0: item 33
+        # alone)
+        if _env('FASTDFHESSIP_PACKROWS', '1') != '0':
+            plan, plan_f, do_fuse, carve = make_plan(word_avail, True)
+            aux_batch_size, aux_blksize, blksize2 = plan
+            pack34 = not do_fuse
+            rows34 = True
     st.note(chol=chol is not None, spin_passes=2 // nsp)
     _S['u_spin_passes'] = 2 // nsp if chol is not None else 0
     st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
@@ -338,7 +349,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             aux_atm_labels, work=work, nspin=2)
         o1p = o1p.reshape(3, naux, 2, nocc, nocc)
         if crow is not None:
-            # item 30: D5's partners, spherical once
+            # item 33: D5's partners, spherical once
             crow.set_j2c_10v(parts[1])
             for x in range(3):
                 sa.to_sph(o1p[x], o1p[x])
@@ -353,6 +364,24 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         ejk_ao += e_aux
         j2c_10c = H._j2c_10c(chol, j2c_10)
         j2c_10 = None
+        if pack34:
+            # item 34: D5's partners as their i <= j pairs, and the second
+            # pass planned on what that frees
+            nsph_ = sa.nsph
+            t1p = H._SymRows(3*nsph_, 2, nocc)
+            for x in range(3):
+                t1p.put(x*nsph_, j3c_oo1p[x, :nsph_])
+            dmp = H._SymRows(naux, 2, nocc)
+            dmp.put(0, dm_oo)
+            j3c_oo1p = j3c_oo1 = dm_oo = None
+            word_avail = _avail() // 8
+            plan = _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size,
+                           nao_on_atom, natm, metric_size, gram, nsp, True)
+            aux_batch_size, aux_blksize, blksize2 = plan
+            _S['vchunks'] = int(-(-metric_size // aux_batch_size))
+            _S['packrows'] = _S.get('packrows', 0) + 1
+            st.note(free_gb_packed=round(word_avail * 8e-9, 1),
+                    vchunk_packed=aux_batch_size)
         st('D2 h_aux')
 
     j3c_buf = cp.empty((3, aux_batch_size, nsp, nao, nocc))
@@ -360,6 +389,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             3*nao_pair*batch_size * 2 + (nocc*2+nao)*nao * blksize2,
             3*naux*2*nao_on_atom*nocc * 2,
             3*naux*2*nao_on_atom*nocc + 3*aux_batch_size*naux]
+    if rows34:
+        # item 34: item 33's D5 in place of upstream's per-atom one
+        wuse[2:] = [H._D5_ROWS_WORDS]
     if chol is not None:
         ns_, nc_ = chol.nsph, chol.ncart
         wuse += [3*nsp*nao*nocc + 3*nao*nao, 3*nc_*ns_,
@@ -377,7 +409,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     ud = {}
     vchunks = list(lib.prange(0, metric_size, aux_batch_size))
     if crow is not None:
-        # item 30: the last rows first, whose walk is the whole one
+        # item 33: the last rows first, whose walk is the whole one
         vchunks = vchunks[::-1]
         h_raw = cp.zeros((natm, sa.nsph, 3, 3))
     for ci, ((n0, n1), (v0, v1)) in enumerate(
@@ -396,7 +428,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         aux0 = aux1 = 0
         for kbatch in range(num_aux_batches):
             if aux1 >= ncp:
-                # item 30: no row past here reaches this chunk
+                # item 33: no row past here reaches this chunk
                 break
             compressed_di = eval_ip1(kbatch, out=buf0)
             compressed_dk = eval_ipaux(kbatch, out=buf1)
@@ -472,7 +504,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         st('D4 oo_atm')
 
         if crow is not None:
-            crow.d5(j3c_100, v0, v1, j3c_oo1p[:, :sa.nsph], dm_oo,
+            crow.d5(j3c_100, v0, v1,
+                    t1p if pack34 else j3c_oo1p[:, :sa.nsph],
+                    dmp if pack34 else dm_oo,
                     dm_factor_l, aoslices, -k_factor*2, k_factor*2, h_raw,
                     work)
             st('D5 per-atom')
@@ -505,7 +539,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         ejk_ao_aux += _aggregate_to_atoms(ud['h_sph'], natm, chol.atm, axis=1)
     if crow is not None:
         ejk_ao_aux += _aggregate_to_atoms(h_raw, natm, sa.atm, axis=1)
-        h_raw = crow = None
+        h_raw = crow = t1p = dmp = None
     ud = None
     ejk += ejk_ao_aux
     ejk += ejk_ao_aux.transpose(1, 0, 3, 2)
@@ -633,7 +667,7 @@ def _mm(pattern, a, b, out, ta, tb, alpha=1., beta=0.):
 
 
 def _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size, nao_on_atom,
-            natm, metric_size, gram, nsp=2):
+            natm, metric_size, gram, nsp=2, rows=False):
     """Upstream's sizing of the unrestricted second pass.
 
     One change: upstream asserts that one auxiliary function's per-atom
@@ -642,9 +676,11 @@ def _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size, nao_on_atom,
     """
     word_avail -= 4 * naux**2  # j2c_10v, which the h_aux block leaves
     word_avail -= 3 * batch_size * nao_pair * 2  # eval_ip1, eval_ipaux
-    aux_unit1 = 3*nsp*nao*nocc + 3*naux  # j3c_100, nsp spins of it
-    aux_batch_size = (min(int(word_avail*.85),
-                          word_avail-12*naux*nao_on_atom*nocc)
+    # j3c_100, nsp spins of it; with `rows` (item 34, W40) item 33's D5,
+    # which has none of upstream's naux-sized per-atom temporaries
+    aux_unit1 = 3*nsp*nao*nocc + (0 if rows else 3*naux)
+    held = H._D5_ROWS_WORDS if rows else 12*naux*nao_on_atom*nocc
+    aux_batch_size = (min(int(word_avail*.85), word_avail-held)
                       // (aux_unit1 * 8) * 8)
     assert aux_batch_size > 0, 'Insufficient GPU memory'
     forced = int(_env('FASTDFHESSIP_VCHUNK', '0'))
