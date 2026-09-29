@@ -199,6 +199,16 @@ already had:
     total density.  ``FASTDFHESSIP_H1UBATCH=0`` is upstream's single batch;
     ``FASTDFHESSIP_OCC_BATCH`` forces a batch size, as here.
 
+``docs/DF_WORK_LIST.md`` **W41** (``docs/README_fastdfuh1a.md``) took the one
+repeated pass out of item 23's host mode:
+
+35. **Stage A once**: the ``(00|0)`` integrals contracted with every occupied
+    orbital in one pass and written into the host array that ``dm_3c``
+    takes batch by batch (the same columns, read before they are
+    overwritten), each occupied batch's columns fetched back eight orbitals
+    at a time behind stage B's work on the eight before.
+    ``FASTDFHESSIP_H1UA1=0`` is W38's stage A per batch.
+
 ``docs/DF_WORK_LIST.md`` **W37** (``docs/README_fastdfhessip6.md``) changed
 the auxiliary-index stages of ``_jk_energy_per_atom``, in both spin cases
 unless a line says otherwise:
@@ -296,6 +306,7 @@ as item 25 (W37).
                              item 21's minimum block (32; 0 is off)
     FASTDFHESSIP_H1UBATCH=0  item 23 off: the unrestricted h1 term in one
                              occupied batch, as upstream
+    FASTDFHESSIP_H1UA1=0     item 35 off: stage A per occupied batch
     FASTDFHESSIP_H1METRIC=inverse
                              item 6 on
     FASTDFHESSIP_IP2_GOUT=<n>

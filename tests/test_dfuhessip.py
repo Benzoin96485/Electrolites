@@ -326,16 +326,27 @@ for tag, mfu, factors in (
         f = f'j={jf} k={kf}' + ('' if om is None else f' omega={om}')
         r = UP_H1(iu, mcu, mou, jf, kf, om)
         for nb in (8, 5):
-            for mode in ('host', 'occ', 'host sync'):
-                for lbl, sw in (UB if (nb == 5 and jf == 1. and kf == 0.2)
+            # W41's item 35 is `host` and `host sync`; `A0` is W38's stage
+            # A per batch, `B3` stage B's fetch in chunks of 3 orbitals
+            for mode in ('host', 'occ', 'host sync', 'host B3',
+                         'host sync B3', 'host A0', 'host sync A0'):
+                for lbl, sw in (UB if (nb == 5 and jf == 1. and kf == 0.2
+                                       and mode in ('host', 'occ',
+                                                    'host sync'))
                                 else UB[:1] + UB[4:5]):
-                    hs = {'H1UHOST_ASYNC': 0} if mode == 'host sync' else {}
+                    hs = {'H1UHOST_ASYNC': 0} if 'sync' in mode else {}
+                    if 'A0' in mode:
+                        hs['H1UA1'] = 0
+                    if 'B3' in mode:
+                        hs['H1UB_CHUNK'] = 3
                     with env(OCC_BATCH=nb, H1UBATCH=mode.split()[0], **hs,
                              **sw):
                         got = U._get_veff(iu, mcu, mou, jf, kf, om)
                     st = fastdfhessip.stats()
                     nbu = st['occ_batches_u']
                     assert st['h1_host'] == (mode != 'occ')
+                    assert st['h1_a_once'] == (mode != 'occ' and
+                                               'A0' not in mode)
                     check(f'{tag} h1 {f}, {nb} occupied per batch, {mode} '
                           f'({nbu} batches){lbl}', got, r)
                     if nbu > 1:
