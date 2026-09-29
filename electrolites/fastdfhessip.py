@@ -243,6 +243,27 @@ unless a line says otherwise:
     come, instead of two batch-wide elementwise passes and two indexed
     assignments.  ``FASTDFHESSIP_D3SCATTER=0``.
 
+``docs/DF_WORK_LIST.md`` **W40** (``docs/README_fastdfhessip8.md``) gave item
+8 the cards and molecules where its whole spherical index does not fit (a
+40 GB card at 113 atoms in both spin cases, and taxol's unrestricted call on
+an 80 GB one), which had fallen back to upstream's chunked arithmetic:
+
+33. **The Cholesky factor in chunks of rows of ``Y = L^-1 K``**
+    (``_CholRows``): a chunk ``[v0, v1)`` is the factor's columns applied to
+    ``(10|0) C`` as upstream's chunk is, but reaches only the Cartesian rows
+    whose shell starts below ``v1``, so it walks only their integral
+    batches, and the chunks run last first; D4 is the Gram form on the
+    chunk; D5's first half is ``L^-T[:v1, v0:v1]`` times the chunk, a GEMM
+    per atom group, and its second half the chunk against ``(C^T
+    j2c_10v)[:, :, v0:v1]`` -- no ``Z = L^-T Y`` by rows, which nothing
+    needs.  ``FASTDFHESSIP_CROWS=0`` is the chunked eigen-style arithmetic.
+34. **Item 33's memory**: the second pass sized without upstream's per-atom
+    D5 temporaries, and, unfused, D5's two partners (the spherical
+    ``j3c_oo1p`` and ``dm_oo``) held as their ``i <= j`` pairs and unpacked
+    a block of rows at a time (``_SymRows``), the pass re-planned on what
+    that frees.  ``FASTDFHESSIP_PACKROWS=0`` is item 33 alone;
+    ``FASTDFHESSIP_D5_ROWS=<n>`` caps D5's row blocks (test-only).
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -300,6 +321,8 @@ as item 25 (W37).
     FASTDFHESSIP_TRMM_BLK=<n>, FASTDFHESSIP_D3SCATTER=0
                              W37's items 22 and 24-28 off, or their
                              shapes (above)
+    FASTDFHESSIP_CROWS=0, FASTDFHESSIP_PACKROWS=0
+                             W40's items 33 and 34 off
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
                              also times the ip2 kernel per auxiliary l;
                              with FASTDFHESSIP_NVTX=1 each stage's end is
@@ -841,14 +864,17 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             if pack34:
                 # item 34: D5's two partners as their i <= j pairs, and the
                 # second pass planned on what that frees
+                # dm_oo first: its packed copy fits beside both, and
+                # freeing it makes room for the larger one
                 nsph_ = sa.nsph
+                dmp = _SymRows(naux, 1, nocc)
+                dmp.put(0, dm_oo.reshape(naux, 1, nocc, nocc))
+                dm_oo = dm_oo_full = None
                 t1p = _SymRows(3*nsph_, 1, nocc)
                 for x in range(3):
                     t1p.put(x*nsph_, j3c_oo1p[x, :nsph_].reshape(
                         nsph_, 1, nocc, nocc))
-                dmp = _SymRows(naux, 1, nocc)
-                dmp.put(0, dm_oo.reshape(naux, 1, nocc, nocc))
-                j3c_oo1p = j3c_oo1 = dm_oo = dm_oo_full = None
+                j3c_oo1p = j3c_oo1 = None
                 word_avail = _avail() // 8
                 plan = _plan_v(word_avail, naux, nao, nocc, nocc_in_batch,
                                nao_pair, batch_size, nao_on_atom, natm,
@@ -2245,11 +2271,15 @@ class _CholRows:
         tpk = isinstance(t1s, _SymRows)
         dpk = isinstance(dm_oo, _SymRows)
         size = work.size
-        # the groups: as many AOs as the buffer holds beside a block of
-        # at least 256 rows, at least the largest atom
+        # the groups: as many AOs as the buffer holds beside a block of at
+        # least 256 spherical rows (first half) and the largest shell block
+        # of Cartesian rows (second half), at least the largest atom
         per_s1 = natm*9 + (3*ns*nocc*nocc if tpk else 0)
         per_su = 6*ns*nocc
-        cap = (size // min(v1, 256) - per_s1) // per_su
+        per_r1 = (ns*nocc*nocc if dpk else 0) + 3*dv
+        blk2 = max(b[1] - b[0] for b in sa.blocks)
+        cap = min((size // min(v1, 256) - per_s1) // per_su,
+                  (size // blk2 - per_r1) // (2*ns*nocc))
         cap = max(nam, min(nao, cap))
         cap = min(cap, int(_env('FASTDFHESSIP_D5_GROUP', '0')) or cap)
         groups = []
@@ -2314,7 +2344,7 @@ class _CholRows:
         # the second half: Cartesian rows of whole shells, their spherical
         # rows of P, and every atom's product against the chunk
         mp = sa.pinv_blocks()
-        per_r = (ns*nocc*nocc if dpk else 0) + 2*ns*ngm*nocc + 3*dv
+        per_r = per_r1 + 2*ns*ngm*nocc
         rb = max(1, size // per_r)
         rb = min(rb, int(_env('FASTDFHESSIP_D5_ROWS', '0')) or rb)
         sup = []

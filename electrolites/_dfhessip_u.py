@@ -367,13 +367,16 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         if pack34:
             # item 34: D5's partners as their i <= j pairs, and the second
             # pass planned on what that frees
+            # dm_oo first: its packed copy fits beside both, and freeing
+            # it makes room for the larger one
             nsph_ = sa.nsph
+            dmp = H._SymRows(naux, 2, nocc)
+            dmp.put(0, dm_oo)
+            dm_oo = None
             t1p = H._SymRows(3*nsph_, 2, nocc)
             for x in range(3):
                 t1p.put(x*nsph_, j3c_oo1p[x, :nsph_])
-            dmp = H._SymRows(naux, 2, nocc)
-            dmp.put(0, dm_oo)
-            j3c_oo1p = j3c_oo1 = dm_oo = None
+            j3c_oo1p = j3c_oo1 = None
             word_avail = _avail() // 8
             plan = _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size,
                            nao_on_atom, natm, metric_size, gram, nsp, True)
