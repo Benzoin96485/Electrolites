@@ -1438,14 +1438,16 @@ def _plan_v(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair, batch_size,
             after_h_aux=False):
     """Upstream's sizing of the second pass, unchanged -- except with
     ``rows`` (item 34, W40): item 33's D5 has no ``naux``-sized per-atom
-    temporaries, so neither the ``6 naux nao_A nocc`` words held back for
-    them nor the ``3 naux`` per auxiliary function are; ``after_h_aux``:
+    temporaries, so the ``6 naux nao_A nocc`` words held back for them are
+    not; ``after_h_aux``:
     planned on what is free after the h_aux block, which already holds its
     j2c_10v."""
     if not after_h_aux:
         word_avail -= 4 * naux**2  # j2c_10v
     word_avail -= 3 * batch_size * nao_pair * 2  # eval_ip1, eval_ipaux
-    per_aux = 0 if rows else 3*naux
+    # (the 3 naux words per auxiliary function are _oo_gram's Coulomb
+    # temporary as well as upstream's per-atom D5's, so rows keeps them)
+    per_aux = 3*naux
     if batch_id == 0:
         aux_unit1 = 3*nao*nocc + per_aux
     else:

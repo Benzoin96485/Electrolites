@@ -689,9 +689,10 @@ def _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size, nao_on_atom,
     if not after_h_aux:
         word_avail -= 4 * naux**2  # j2c_10v, which the h_aux block leaves
     word_avail -= 3 * batch_size * nao_pair * 2  # eval_ip1, eval_ipaux
-    # j3c_100, nsp spins of it; with `rows` (item 34, W40) item 33's D5,
-    # which has none of upstream's naux-sized per-atom temporaries
-    aux_unit1 = 3*nsp*nao*nocc + (0 if rows else 3*naux)
+    # j3c_100, nsp spins of it, and _oo_gram's Coulomb temporary; with
+    # `rows` (item 34, W40) item 33's D5, which has none of upstream's
+    # naux-sized per-atom temporaries
+    aux_unit1 = 3*nsp*nao*nocc + 3*naux
     held = H._D5_ROWS_WORDS if rows else 12*naux*nao_on_atom*nocc
     aux_batch_size = (min(int(word_avail*.85), word_avail-held)
                       // (aux_unit1 * 8) * 8)
