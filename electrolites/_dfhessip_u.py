@@ -149,6 +149,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     buf = cp.empty((batch_size, nao_pair))
     buf1 = cp.empty((2, blksize, nocc, nao))
     j3c_oo = cp.empty((naux, 2, nocc, nocc))
+    # item 30 (W39): fastdfhessip's lower-triangle stage A, per spin; not
+    # on the long-range operator (below)
+    low = (H._LowTri(pair_addresses, nao)
+           if _env('FASTDFHESSIP_ALOW', '1') != '0' and omega == 0 else None)
+    if low is not None:
+        _S['a_low'] = _S.get('a_low', 0) + 1
+        g = cp.empty((blksize, nocc, nocc))
+        cs = [cp.ascontiguousarray(dm_factor_l[n]) for n in range(2)]
     for kbatch in range(num_aux_batches):
         compressed = eval_j3c(aux_batch_id=kbatch, out=buf)
         naux_in_batch = compressed.shape[1]
@@ -156,6 +164,16 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             dk = k1 - k0
             aux0, aux1 = aux1, aux1 + dk
             j3c = j3c_full[:, :, :dk]
+            if low is not None:
+                low.scatter(compressed, k0, k1, j3c)
+                tmpf = ndarray((nocc, nao, blksize), buffer=buf1)
+                for n in range(2):
+                    low.lt_c(cs[n], j3c_full, blksize, tmpf)
+                    gk = contract('iqr,qj->rij', tmpf[:, :, :dk], cs[n],
+                                  out=g[:dk])
+                    cp.add(gk, gk.transpose(0, 2, 1),
+                           out=j3c_oo[aux0:aux1, n])
+                continue
             fill_symmetric(compressed, pair_addresses, nao, k0, k1, out=j3c)
             # one spin at a time, in upstream's order.  This is the one
             # stage whose rounding the answer does not forgive: with both
@@ -170,6 +188,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 contract('iqr,qj->rij', tmp, dm_factor_l[n],
                          out=j3c_oo[aux0:aux1, n])
     j3c_full = buf = buf1 = eval_j3c = j3c = tmp = compressed = None
+    tmpf = g = gk = cs = low = None
     st('A j3c_oo')
 
     # item 8 on the spin index (W37): the metric as its Cholesky factor on
@@ -782,6 +801,17 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo, auxvec, j_factor, k_factor,
     if tiles is not None:
         bufp = cp.empty((nao_pair*batch_size))
     aux0 = aux1 = 0
+    # item 29 (W39): the pseudo-density on the lower triangle's row tiles,
+    # both spins in one GEMM of depth 2 nocc
+    low = (H._LowTri(pair_addresses, nao)
+           if _env('FASTDFHESSIP_PDLOW', '1') != '0' and omega == 0
+           else None)
+    if low is not None:
+        _S['pd_low'] = _S.get('pd_low', 0) + 1
+        cn = cp.ascontiguousarray(dm_factor_l.transpose(1, 0, 2)).reshape(
+            nao, 2*nocc)
+        if j_factor != 0:
+            dm_pairs = dm.ravel()[low.addr]
 
     def plans(m):
         # the pseudo-density's (nao, nao, m) output, item 13
@@ -796,6 +826,17 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo, auxvec, j_factor, k_factor,
             aux0, aux1 = aux1, aux1 + dk
             dm_tensor = ndarray((nao, nao, dk), buffer=buf2)
             tmp = ndarray((2, nocc, nao, dk), buffer=buf1)
+            if low is not None:
+                contract('rnji,nqj->niqr', dm_oo[aux0:aux1], dm_factor_l,
+                         out=tmp)
+                low.c_t(cn, tmp, dk, -k_factor, dm_tensor)
+                cp.take(dm_tensor.reshape(-1, dk), low.addr, axis=0,
+                        out=compressed[:, k0:k1])
+                if j_factor != 0:
+                    H._ADD_OUTER(dm_pairs, auxvec[aux0:aux1],
+                                 np.float64(j_factor), np.int32(dk),
+                                 compressed[:, k0:k1])
+                continue
             beta = 0
             if j_factor != 0:
                 cp.multiply(dm[:, :, None], auxvec[aux0:aux1], out=dm_tensor)

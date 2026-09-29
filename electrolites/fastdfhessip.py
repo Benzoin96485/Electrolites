@@ -617,6 +617,16 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     buf = cp.empty((batch_size, nao_pair))
     buf1 = cp.empty((blksize, nocc, nao))
     j3c_oo = cp.empty((naux, nocc, nocc))
+    # item 30 (W39): C^T J C = G + G^T with G = C^T L C and L the lower
+    # triangle of J with half its diagonal, whose first product reads the
+    # rows p >= q only.  Not on the long-range operator, whose stage A
+    # rounding the answer does not forgive (the twin's note on it)
+    low = (_LowTri(pair_addresses, nao)
+           if _env('FASTDFHESSIP_ALOW', '1') != '0' and omega == 0 else None)
+    if low is not None:
+        _S['a_low'] = _S.get('a_low', 0) + 1
+        g = cp.empty((blksize, nocc, nocc))
+        cl = cp.ascontiguousarray(dm_factor_l)
     for kbatch in range(num_aux_batches):
         compressed = eval_j3c(aux_batch_id=kbatch, out=buf)
         naux_in_batch = compressed.shape[1]
@@ -624,11 +634,20 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             dk = k1 - k0
             aux0, aux1 = aux1, aux1 + dk
             j3c = j3c_full[:, :, :dk]
+            if low is not None:
+                low.scatter(compressed, k0, k1, j3c)
+                tmpf = ndarray((nocc, nao, blksize), buffer=buf1)
+                low.lt_c(cl, j3c_full, blksize, tmpf)
+                gk = contract('iqr,qj->rij', tmpf[:, :, :dk], cl,
+                              out=g[:dk])
+                cp.add(gk, gk.transpose(0, 2, 1), out=j3c_oo[aux0:aux1])
+                continue
             fill_symmetric(compressed, pair_addresses, nao, k0, k1, out=j3c)
             tmp = ndarray((nocc, nao, dk), buffer=buf1)
             contract('pqr,pi->iqr', j3c, dm_factor_l, out=tmp)
             contract('iqr,qj->rij', tmp, dm_factor_l, out=j3c_oo[aux0:aux1])
     j3c_full = buf = buf1 = eval_j3c = j3c = tmp = compressed = None
+    tmpf = g = gk = None
     st('A j3c_oo')
 
     # item 8: the metric as its Cholesky factor, everywhere in this call.
@@ -1235,14 +1254,21 @@ class _SphAux:
         mc = cp.empty_like(mc0)
         mc[cp.asarray(aux_sorting)] = mc0
         mc0 = None
-        nz = cp.asnumpy(mc != 0)
+        # item 32 (W39): the pattern's first and last columns found on the
+        # device -- on the host these argmax passes over the ncart x nsph
+        # pattern were 0.2-0.7 s of stage B.  FASTDFHESSIP_SPHHOST=1 is that
+        host = _env('FASTDFHESSIP_SPHHOST', '0') == '1'
+        nz = (mc != 0).astype(np.int8)
+        if host:
+            nz = cp.asnumpy(nz)
         # columns in the order of the first row that reaches them
-        perm = np.lexsort((np.arange(nsph), nz.argmax(axis=0)))
+        first = nz.argmax(axis=0)
+        perm = np.lexsort((np.arange(nsph), cp.asnumpy(first)))
         self.ms = cp.ascontiguousarray(mc[:, cp.asarray(perm)])
         mc = None
-        nzp = nz[:, perm]
-        self.lo = nzp.argmax(axis=1)
-        self.hi = nsph - nzp[:, ::-1].argmax(axis=1)
+        nzp = nz[:, cp.asarray(perm) if not host else perm]
+        self.lo = cp.asnumpy(nzp.argmax(axis=1))
+        self.hi = nsph - cp.asnumpy(nzp[:, ::-1].argmax(axis=1))
         # a row may start a block when every earlier row maps below every
         # later one
         pre = np.maximum.accumulate(self.hi)
@@ -1266,7 +1292,7 @@ class _SphAux:
         from cupyx.scipy.linalg import solve_triangular
         self.linv = cp.ascontiguousarray(solve_triangular(
             low, cp.eye(nsph), lower=True))
-        self.atm = np.asarray(aux_atm_labels)[nzp.argmax(axis=0)]
+        self.atm = np.asarray(aux_atm_labels)[cp.asnumpy(nzp.argmax(axis=0))]
 
     def cols(self, a0, a1):
         return int(self.lo[a0:a1].min()), int(self.hi[a0:a1].max())
@@ -1816,13 +1842,35 @@ def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
 
     j2c_10v_w = take((n, metric_size), o0 + n*n)
     j2c_ip2 = take((n, n), o0 + n*n + n*metric_size)
+    # item 31 (W39): h_aux is symmetrised below (transpose_sum), and the
+    # (y, x) block of this sum is the (x, y) block transposed -- dm_aux is
+    # symmetric -- so the six blocks x <= y are formed, the off-diagonal ones
+    # counted twice, and the three diagonal ones as dsyrk on V/sqrt(w).
+    # FASTDFHESSIP_IP2SYM=0 is upstream's nine GEMMs
+    sym = _env('FASTDFHESSIP_IP2SYM', '1') != '0'
+    rsw = 1. / cp.sqrt(_metric_w) if sym else None
     for x in range(3):
+        if sym:
+            cp.multiply(j2c_10v[x], rsw, out=j2c_10v_w)
+            _syrk_acc(j2c_10v_w, n, metric_size, metric_size, 1., 0.,
+                      j2c_ip2)
+            _mirror(j2c_ip2)
+            j2c_ip2 *= dm_aux
+            h_aux[x, :, x] += j2c_ip2
+            j2c_10v_w *= rsw
+            for y in range(x + 1, 3):
+                j2c_ip2 = contract('rs,ts->rt', j2c_10v_w, j2c_10v[y],
+                                   out=j2c_ip2)
+                j2c_ip2 *= dm_aux
+                j2c_ip2 *= 2.
+                h_aux[x, :, y] += j2c_ip2
+            continue
         cp.divide(j2c_10v[x], _metric_w, out=j2c_10v_w)
         for y in range(3):
             j2c_ip2 = contract('rs,ts->rt', j2c_10v_w, j2c_10v[y], out=j2c_ip2)
             j2c_ip2 *= dm_aux
             h_aux[x, :, y] += j2c_ip2
-    dm_aux = j2c_ip2 = j2c_10v_w = None
+    dm_aux = j2c_ip2 = j2c_10v_w = rsw = None
 
     if not packed:
         dm_aux1 = contract('xrij,sij->xrs', j3c_oo1p, dm_oo, -.5*k_factor,
@@ -2478,6 +2526,105 @@ def _oo_atm_block(j3c_100, k0, k1, v0, work, natm, nocc, aoslices,
 
 
 
+_SCATTER_LOW = cp.RawKernel(r"""
+extern "C" __global__
+void scatter_low(const double* __restrict__ c, const int* __restrict__ pair,
+                 double* __restrict__ out, const int nao, const int npair,
+                 const int ld, const int k0, const int nk, const int lo)
+{
+    // the lower triangle of the symmetric block, half its diagonal:
+    //   out[max(i,j)][min(i,j)][r] = c[p][k0+r] (/2 where i == j)
+    const int r = threadIdx.x;
+    const int p = blockIdx.x * blockDim.y + threadIdx.y;
+    if (p >= npair || r >= nk) return;
+    const int a = pair[p];
+    const int i = a / nao, j = a - i * nao;
+    const int hi = i > j ? i : j, lw = i > j ? j : i;
+    double v = c[(long long)p*ld + k0 + r];
+    if (i == j) v *= .5;
+    out[((long long)hi*nao + lw)*lo + r] = v;
+}
+""", 'scatter_low')
+
+_ADD_OUTER = cp.ElementwiseKernel(
+    'raw T d, raw T v, T f, int32 n', 'T y',
+    'y += f * d[i / n] * v[i % n]', 'add_outer')
+
+
+class _LowTri:
+    """Items 29 and 30 (W39): the pair list's symmetric ``(nao, nao)``
+    blocks on their lower triangle, in row or column tiles of AOs.
+
+    The stored pairs of ``pair_and_diag_indices`` are in both triangles
+    (55/44 % on taxol, and a diagonal shell block holds both orders), so each
+    is addressed at ``(max(i,j), min(i,j))``; a block that is symmetric has
+    every stored value there.  ``rows`` are the row tiles ``(p0, p1, q1)``
+    with ``q1`` one past the last column any pair of the tile reaches
+    (``p1`` or less), ``cols`` the column tiles ``(q0, q1)``.  A tile is not
+    screened: W39's count finds 94-100 % of a 113-atom block in tiles that
+    hold a pair (``benchmarks/df_ip2_tile_probe.py``); the triangle is the
+    half a GEMM can leave out.  ``FASTDFHESSIP_LOW_TILE`` is the tile (64).
+    """
+
+    def __init__(self, pair_addresses, nao):
+        a = pair_addresses.get().astype(np.int64)
+        i, j = a // nao, a % nao
+        hi, lo = np.maximum(i, j), np.minimum(i, j)
+        self.addr = cp.asarray(hi * nao + lo, dtype=np.int32)
+        self.pair = pair_addresses
+        self.nao = nao
+        t = int(_env('FASTDFHESSIP_LOW_TILE', '64'))
+        nt = (nao + t - 1) // t
+        qmax = np.zeros(nt, dtype=np.int64)
+        np.maximum.at(qmax, hi // t, lo + 1)
+        self.rows = [(k*t, min(nao, k*t + t), int(qmax[k]))
+                     for k in range(nt) if qmax[k] > 0]
+        self.cols = [(k*t, min(nao, k*t + t)) for k in range(nt)]
+
+    def scatter(self, compressed, k0, k1, out):
+        """``out`` (``(nao, nao, dk)``, a slice along the last axis of a
+        wider block is fine) gets the lower triangle of the symmetric fill,
+        half its diagonal; the upper triangle is never written."""
+        npair, ld = compressed.shape
+        nk = k1 - k0
+        assert compressed.flags.c_contiguous and nk <= 1024
+        assert out.shape[2] == nk and out.strides[2] == 8
+        lo = out.strides[1] // 8
+        assert out.strides[0] // 8 == self.nao * lo
+        ty = max(1, 256 // nk)
+        _SCATTER_LOW(((npair + ty - 1) // ty,), (nk, ty),
+                     (compressed, self.pair, out,
+                      np.int32(self.nao), np.int32(npair), np.int32(ld),
+                      np.int32(k0), np.int32(nk), np.int32(lo)))
+
+    def lt_c(self, c, full, ldr, out):
+        """Item 30: ``out[i, q, :] = sum_p c[p, i] L[p, q, :]`` for the lower
+        ``L`` in ``full`` (``(nao, nao, ldr)``), by column tiles: tile
+        ``Q`` reads the rows ``p >= q0`` only.  ``out`` is ``(k, nao, ldr)``
+        and ``c`` ``(nao, k)``, both C-contiguous."""
+        nao = self.nao
+        k = c.shape[1]
+        ldr = int(ldr)
+        for q0, q1 in self.cols:
+            _gemm_rm('T', 'N', k, (q1 - q0)*ldr, nao - q0, 1.,
+                     c.data.ptr + 8*q0*k, k,
+                     full.data.ptr + 8*(q0*nao + q0)*ldr, nao*ldr, 0.,
+                     out.data.ptr + 8*q0*ldr, nao*ldr)
+
+    def c_t(self, c, tmp, dk, alpha, out):
+        """Item 29: ``out[p, q, :] = alpha sum_i c[p, i] tmp[i, q, :]`` on
+        the row tiles' columns ``q < q1`` only: the lower triangle and the
+        tiles' diagonal blocks.  ``tmp`` is ``(k, nao, dk)``, ``out``
+        ``(nao, nao, dk)``, ``c`` ``(nao, k)``, all C-contiguous."""
+        nao = self.nao
+        k = c.shape[1]
+        dk = int(dk)
+        for p0, p1, q1 in self.rows:
+            _gemm_rm('N', 'N', p1 - p0, q1*dk, k, alpha,
+                     c.data.ptr + 8*p0*k, k, tmp.data.ptr, nao*dk, 0.,
+                     out.data.ptr + 8*p0*nao*dk, nao*dk)
+
+
 def _ip2_tiles(int3c2e_opt, omega, spmult, gout, ao_pair_loc):
     """Item 15 (W29): ``ejk_int3c2e_ip2`` launched as its own tile
     (``electrolites/_ip2launch.py``); ``None`` is item 1's launch.
@@ -2528,6 +2675,19 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
     buf = cp.empty((nao_pair*batch_size))
     buf2 = cp.empty((blksize, nao, nao))
     buf1 = cp.empty((blksize, nao, nocc))
+    # item 29 (W39): the pseudo-density is symmetric and read only at the
+    # stored pairs, so it is formed on the lower triangle's row tiles and
+    # read there; its Coulomb part added on the pairs after the read.  Not
+    # on the long-range operator: reading one triangle of a block symmetric
+    # to rounding moves water's long-range term by 1.1e-10 (item 22's note)
+    low = (_LowTri(pair_addresses, nao)
+           if _env('FASTDFHESSIP_PDLOW', '1') != '0' and omega == 0
+           else None)
+    if low is not None:
+        _S['pd_low'] = _S.get('pd_low', 0) + 1
+        cl = cp.ascontiguousarray(dm_factor_l)
+        if j_factor != 0:
+            dm_pairs = dm.ravel()[low.addr]
     tiles = _ip2_tiles(int3c2e_opt, omega, spmult, gout, ao_pair_loc)
     if tiles is not None:
         bufp = cp.empty((nao_pair*batch_size))
@@ -2546,6 +2706,17 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
             aux0, aux1 = aux1, aux1 + dk
             dm_tensor = ndarray((nao, nao, dk), buffer=buf2)
             tmp = ndarray((nocc, nao, dk), buffer=buf1)
+            if low is not None:
+                dm_oo = cp.asarray(dm_oo_full[aux0:aux1])
+                contract('rji,qj->iqr', dm_oo, dm_factor_l, out=tmp)
+                low.c_t(cl, tmp, dk, -.5*k_factor, dm_tensor)
+                cp.take(dm_tensor.reshape(-1, dk), low.addr, axis=0,
+                        out=compressed[:, k0:k1])
+                if j_factor != 0:
+                    _ADD_OUTER(dm_pairs, auxvec[aux0:aux1],
+                               np.float64(j_factor), np.int32(dk),
+                               compressed[:, k0:k1])
+                continue
             beta = 0
             if j_factor != 0:
                 cp.multiply(dm[:, :, None], auxvec[aux0:aux1], out=dm_tensor)
