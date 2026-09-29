@@ -1035,7 +1035,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     # test-only: a smaller block, as a smaller card would leave (W35)
     blksize = min(blksize, int(_env('FASTDFHESSIP_H1BLK', blksize)))
     _S['h1_blksize'] = blksize
-    # item 29 (W41): in host mode, stage A once over every orbital, its
+    # item 35 (W41): in host mode, stage A once over every orbital, its
     # j3c_00 written into the host array dm_3c will take column by column,
     # instead of the integrals once per occupied batch.
     # FASTDFHESSIP_H1UA1=0 is W38's stage A per batch
@@ -1045,7 +1045,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     bchunk = int(_env('FASTDFHESSIP_H1UB_CHUNK', '8'))
     if host:
         # stages A-C: one occupied batch of dm_3c (and of dm_oo, before it
-        # joins the whole one) beside stage A's two buffers (item 29: B's
+        # joins the whole one) beside stage A's two buffers (item 35: B's
         # chunk buffer instead), in what the D loop's budget leaves before
         # its own buffers are allocated
         held = (naux*2*bchunk*nao if a_once else
@@ -1415,7 +1415,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         st('A host buffer')
         dm_oo_all = cp.empty((naux, 2, nocc, nocc))
     if a_once:
-        # item 29: stage A for every orbital, one integral pass, each block
+        # item 35: stage A for every orbital, one integral pass, each block
         # of j3c_00 copied into its rows of dm3_host behind the next block's
         # integrals (two device buffers on the copy stream when asynchronous)
         j3c_full = cp.zeros((nao, nao, blksize))
@@ -1482,7 +1482,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         aux0 = aux1 = 0
         if a_once:
             j3c_00 = cp.empty((naux, 2, nob, nao))
-            # item 29: the batch's columns of j3c_00 back from the host,
+            # item 35: the batch's columns of j3c_00 back from the host,
             # eight orbitals at a time, each chunk's fetch behind stage B's
             # work on the chunk before it
             chunks = list(lib.prange(0, nob, bchunk))

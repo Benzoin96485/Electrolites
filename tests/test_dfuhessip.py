@@ -317,7 +317,7 @@ for tag, mfu, factors in (
         f = f'j={jf} k={kf}' + ('' if om is None else f' omega={om}')
         r = UP_H1(iu, mcu, mou, jf, kf, om)
         for nb in (8, 5):
-            # W41's item 29 is `host` and `host sync`; `A0` is W38's stage
+            # W41's item 35 is `host` and `host sync`; `A0` is W38's stage
             # A per batch, `B3` stage B's fetch in chunks of 3 orbitals
             for mode in ('host', 'occ', 'host sync', 'host B3',
                          'host sync B3', 'host A0', 'host sync A0'):
