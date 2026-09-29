@@ -233,7 +233,8 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         int3c2e_opt, int3c2e_scheme_ip1(omega, 27), batch_size,
         'fill_int3c2e_ip1', omega, spmult)[0]
 
-    j3c_oo1 = cp.empty((3, naux, 2, nocc, nocc))  # = (1|00)
+    # (1|00), allocated once item 34 has said in which form
+    j1_shape = (3, naux, 2, nocc, nocc)
 
     # The second pass's sizes, worked out before the first pass so that
     # item 3 can tell whether there will be one chunk.  Upstream derives
@@ -241,7 +242,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     # which free what they allocate except j2c_10v; the arithmetic is
     # upstream's, on the same words.
     cp.get_default_memory_pool().free_all_blocks()
-    word_avail = _avail() // 8
+    word_avail = H._avail_less(8 * int(np.prod(j1_shape))) // 8
     blksize1 = min(naux, word_avail // (nao**2*8) * 8)
     assert blksize1 > 0, 'Insufficient GPU memory'
     blksize1 = min(blksize1, batch_size)
@@ -332,14 +333,12 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         if pack34:
             # item 34: dm_oo and (1|00) as their weighted pairs from the
             # first pass on (fastdfhessip's note)
-            # both packed arrays in the unpacked one's buffer
-            npr = nocc*(nocc + 1)
-            buf = j3c_oo1.reshape(-1)
-            dmp = H._SymRows(naux, 2, nocc, buf=buf[3*naux*npr:])
+            j3c_oo1 = H._SymRows(3*naux, 2, nocc, xstride=naux)
+            dmp = H._SymRows(naux, 2, nocc)
             dmp.put(0, dm_oo)
             dm_oo = dmp
-            j3c_oo1 = H._SymRows(3*naux, 2, nocc, xstride=naux, buf=buf)
-            buf = None
+    if not pack34:
+        j3c_oo1 = cp.empty(j1_shape)  # = (1|00)
     st.note(chol=chol is not None, spin_passes=2 // nsp)
     _S['u_spin_passes'] = 2 // nsp if chol is not None else 0
     st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],

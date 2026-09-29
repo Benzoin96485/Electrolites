@@ -543,6 +543,17 @@ def _avail():
     return min(mem, int(float(cap))) if cap else mem
 
 
+def _avail_less(nbytes):
+    """``_avail()`` as it will read once ``nbytes`` more are allocated (a
+    buffer over GPU4PySCF's pool threshold is its own ``cudaMalloc``): item
+    34 decides the form of ``(1|00)`` after the plan, and allocating the
+    unpacked one first only to free it costs the ``cudaMalloc`` beside that
+    ``cudaFree`` its wait (0.55 s on taxol+, W34's effect)."""
+    mem = get_avail_mem(exclude_memory_pool=True) - nbytes
+    cap = _env('FASTDFHESSIP_MEM', '')
+    return min(mem, int(float(cap))) if cap else mem
+
+
 def _atom_indicator(aoslices):
     """``(natm, nao)``, 1 where the AO is on the atom.
 
@@ -748,7 +759,8 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         nocc_in_batch = nocc1 - nocc0
 
         dm_oo = cp.asarray(dm_oo_full[:, nocc0:nocc1])
-        j3c_oo1 = cp.empty((3, naux, nocc_in_batch, nocc))  # = (1|00)
+        # (1|00), allocated once item 34 has said in which form
+        j1_shape = (3, naux, nocc_in_batch, nocc)
 
         # The sizes the second pass is going to use, worked out before the
         # first so that item 3 can tell whether there will be one chunk.
@@ -756,7 +768,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         # and the h_aux block; the arithmetic below is upstream's, applied to
         # the same `word_avail` those steps leave (they free what they
         # allocate), so the chunking is the same as upstream's.
-        mem_avail = _avail()
+        mem_avail = _avail_less(8 * int(np.prod(j1_shape)))
         word_avail = mem_avail // 8
         blksize1 = min(naux, word_avail // (nao**2*8) * 8)
         assert blksize1 > 0, 'Insufficient GPU memory'
@@ -844,15 +856,13 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 # block's products run on them in place, and D5 unpacks a
                 # block of rows at a time; half of both, which is what does
                 # not fit beside the h_aux block on a 40 GB card
-                # both packed arrays in the unpacked one's buffer
-                npr = nocc*(nocc + 1)//2
-                buf = j3c_oo1.reshape(-1)
-                dmp = _SymRows(naux, 1, nocc, buf=buf[3*naux*npr:])
+                j3c_oo1 = _SymRows(3*naux, 1, nocc, xstride=naux)
+                dmp = _SymRows(naux, 1, nocc)
                 dmp.put(0, dm_oo.reshape(naux, 1, nocc, nocc))
                 dm_oo = dm_oo_full = None
                 dm_oo = dmp
-                j3c_oo1 = _SymRows(3*naux, 1, nocc, xstride=naux, buf=buf)
-                buf = None
+        if not pack34:
+            j3c_oo1 = cp.empty(j1_shape)  # = (1|00)
         st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
                 plan_fused=plan_f[0])
         st.note(chol=chol is not None, nao=nao, nocc=nocc, naux=naux, metric_size=metric_size,
