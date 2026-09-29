@@ -656,25 +656,38 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         _S['a_low'] = _S.get('a_low', 0) + 1
         g = cp.empty((blksize, nocc, nocc))
         cl = cp.ascontiguousarray(dm_factor_l)
+    ast = _env('FASTDFHESSIP_TIME', '0') == '3'
     for kbatch in range(num_aux_batches):
         compressed = eval_j3c(aux_batch_id=kbatch, out=buf)
         naux_in_batch = compressed.shape[1]
+        if ast:
+            # FASTDFHESSIP_TIME=3: stage A's integrals, fill and products
+            # apart (W39)
+            st('A integrals')
         for k0, k1 in lib.prange(0, naux_in_batch, blksize):
             dk = k1 - k0
             aux0, aux1 = aux1, aux1 + dk
             j3c = j3c_full[:, :, :dk]
             if low is not None:
                 low.scatter(compressed, k0, k1, j3c)
+                if ast:
+                    st('A fill')
                 tmpf = ndarray((nocc, nao, blksize), buffer=buf1)
                 low.lt_c(cl, j3c_full, blksize, tmpf)
                 gk = contract('iqr,qj->rij', tmpf[:, :, :dk], cl,
                               out=g[:dk])
                 cp.add(gk, gk.transpose(0, 2, 1), out=j3c_oo[aux0:aux1])
+                if ast:
+                    st('A products')
                 continue
             fill_symmetric(compressed, pair_addresses, nao, k0, k1, out=j3c)
+            if ast:
+                st('A fill')
             tmp = ndarray((nocc, nao, dk), buffer=buf1)
             contract('pqr,pi->iqr', j3c, dm_factor_l, out=tmp)
             contract('iqr,qj->rij', tmp, dm_factor_l, out=j3c_oo[aux0:aux1])
+            if ast:
+                st('A products')
     j3c_full = buf = buf1 = eval_j3c = j3c = tmp = compressed = None
     tmpf = g = gk = None
     st('A j3c_oo')
