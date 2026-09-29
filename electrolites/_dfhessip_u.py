@@ -264,7 +264,12 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 break
         else:
             nsp = 2
-            sa = None
+            if _env('FASTDFHESSIP_CROWS', '1') != '0':
+                # item 30 (W40): the factor in chunks of rows, with room
+                # for its spherical j2c_10v
+                word_avail = chol_w
+            else:
+                sa = None
         if _env('FASTDFHESSIP_USPIN', '') == '1' and sa is not None:
             nsp = 1
     plan = _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size,
@@ -296,6 +301,12 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         nsp = 2
     if sa is not None and chol is None:
         _S['chol_chunked'] = _S.get('chol_chunked', 0) + 1
+    # item 30 (W40): fastdfhessip's chunks of rows of Y, both spins in each
+    crow = None
+    if (sa is not None and chol is None and
+            _env('FASTDFHESSIP_CROWS', '1') != '0'):
+        crow = H._CholRows(sa)
+        _S['chol_rows'] = _S.get('chol_rows', 0) + 1
     st.note(chol=chol is not None, spin_passes=2 // nsp)
     _S['u_spin_passes'] = 2 // nsp if chol is not None else 0
     st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
@@ -325,8 +336,13 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             j3c_oo1.reshape(3, naux, 2*nocc, nocc), naux, metric_size,
             2*k_factor, j_factor, 0, auxvec_ipauxp, auxvec, natm,
             aux_atm_labels, work=work, nspin=2)
-        return (o1p.reshape(3, naux, 2, nocc, nocc), parts[0], parts[1],
-                parts[2])
+        o1p = o1p.reshape(3, naux, 2, nocc, nocc)
+        if crow is not None:
+            # item 30: D5's partners, spherical once
+            crow.set_j2c_10v(parts[1])
+            for x in range(3):
+                sa.to_sph(o1p[x], o1p[x])
+        return (o1p, parts[0], parts[1], parts[2])
 
     st('D0 plan')
     if not do_fuse:
@@ -359,11 +375,17 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     d1d3 = (do_fuse and nsp == 2 and
             _env('FASTDFHESSIP_D1D3', '1') != '0')
     ud = {}
-    for (n0, n1), v0 in ((g, v) for g in groups
-                         for v in range(0, metric_size, aux_batch_size)):
-        v1 = min(metric_size, v0 + aux_batch_size)
+    vchunks = list(lib.prange(0, metric_size, aux_batch_size))
+    if crow is not None:
+        # item 30: the last rows first, whose walk is the whole one
+        vchunks = vchunks[::-1]
+        h_raw = cp.zeros((natm, sa.nsph, 3, 3))
+    for ci, ((n0, n1), (v0, v1)) in enumerate(
+            (g, v) for g in groups for v in vchunks):
         dv = v1 - v0
         first = n0 == 0
+        vfirst = v0 == vchunks[0][0]
+        ncp = crow.ncart(v1) if crow is not None else naux
         j3c_100 = ndarray((3, dv, n1-n0, nao, nocc), buffer=j3c_buf)
         j3c_100[:] = 0.
         j3c_full, work1 = _allocate((nao, nao, blksize2), work)
@@ -373,11 +395,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         st('D3 buffers')
         aux0 = aux1 = 0
         for kbatch in range(num_aux_batches):
+            if aux1 >= ncp:
+                # item 30: no row past here reaches this chunk
+                break
             compressed_di = eval_ip1(kbatch, out=buf0)
             compressed_dk = eval_ipaux(kbatch, out=buf1)
             naux_in_batch = compressed_di.shape[-1]
             st('D3 integrals')
-            if do_fuse and v0 == 0 and first and not d1d3:
+            if do_fuse and vfirst and first and not d1d3:
                 # item 3: the first pass, on this batch's ipaux integrals
                 # before they are folded into dj
                 _ipaux_batch(compressed_dk, aux1, naux_in_batch, blksize2,
@@ -405,7 +430,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                         j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
                     tmp = contract('pqr,nqi->npir', j3c, dm_factor_l[n0:n1],
                                    out=tmp)
-                    if d1d3 and v0 == 0:
+                    if d1d3 and vfirst:
                         H._d1_from_d3(tmp, dm_factor_l, j3c_oo1[x, aux0:aux1],
                                       None, nspin=2)
                     if chol is None:
@@ -421,7 +446,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         j3c_full = buf0 = buf1 = tmp = None
         compressed_di = compressed_dj = compressed_dk = None
 
-        if do_fuse and v0 == 0 and first:
+        if do_fuse and vfirst and first:
             j3c_oo1p, e_aux, j2c_10v, j2c_10 = h_aux(work if carve else None)
             ejk_ao += e_aux
             j2c_10c = H._j2c_10c(chol, j2c_10)
@@ -446,6 +471,12 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                               auxvec_ipauxp, naux)
         st('D4 oo_atm')
 
+        if crow is not None:
+            crow.d5(j3c_100, v0, v1, j3c_oo1p[:, :sa.nsph], dm_oo,
+                    dm_factor_l, aoslices, -k_factor*2, k_factor*2, h_raw,
+                    work)
+            st('D5 per-atom')
+            continue
         for i, (p0, p1) in enumerate(zip(aoslices[:-1], aoslices[1:])):
             # (10|0)(1|0)(0|00) + (10|0)(0|0)(1|00)
             tmp0, work1 = _allocate((3, naux, 2, p1-p0, nocc), work)
@@ -472,6 +503,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     ejk_ao_aux = _aggregate_to_atoms(h_ao_aux, natm, aux_atm_labels, axis=1)
     if 'h_sph' in ud:
         ejk_ao_aux += _aggregate_to_atoms(ud['h_sph'], natm, chol.atm, axis=1)
+    if crow is not None:
+        ejk_ao_aux += _aggregate_to_atoms(h_raw, natm, sa.atm, axis=1)
+        h_raw = crow = None
     ud = None
     ejk += ejk_ao_aux
     ejk += ejk_ao_aux.transpose(1, 0, 3, 2)

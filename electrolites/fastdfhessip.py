@@ -776,6 +776,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             else None
         if sa is not None and chol is None:
             _S['chol_chunked'] = _S.get('chol_chunked', 0) + 1
+        # item 30 (W40): where it does not, the factor in chunks of rows of
+        # Y = L^-1 K, the last chunk first, each walking only the integral
+        # batches its rows reach
+        crow = None
+        if (sa is not None and chol is None and metric == 'chol' and
+                _env('FASTDFHESSIP_CROWS', '1') != '0'):
+            crow = _CholRows(sa)
+            _S['chol_rows'] = _S.get('chol_rows', 0) + 1
         st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
                 plan_fused=plan_f[0])
         st.note(chol=chol is not None, nao=nao, nocc=nocc, naux=naux, metric_size=metric_size,
@@ -810,6 +818,10 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             h_aux_parts = None
             if chol is not None:
                 j2c_10v = None
+            if crow is not None:
+                crow.set_j2c_10v(j2c_10v)
+                for x in range(3):
+                    sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
             st('D2 h_aux')
         else:
             j3c_oo1p = j3c_oo1
@@ -831,8 +843,16 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             j3c_buf = cp.empty(nj)
             work = cp.empty(nw)
         st('D3 alloc')
-        for v0, v1 in lib.prange(0, metric_size, aux_batch_size):
+        vchunks = list(lib.prange(0, metric_size, aux_batch_size))
+        if crow is not None:
+            # item 30: the last rows first -- theirs is the whole walk, which
+            # the fused first pass and the h_aux block ride on
+            vchunks = vchunks[::-1]
+            h_raw = cp.zeros((natm, sa.nsph, 3, 3))
+        for ci, (v0, v1) in enumerate(vchunks):
             dv = v1 - v0
+            vfirst = ci == 0
+            ncp = crow.ncart(v1) if crow is not None else naux
             if batch_id == 0:
                 j3c_100 = ndarray((3, dv, nao, nocc), buffer=j3c_buf)
             else:
@@ -847,11 +867,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             st('D3 buffers')
             aux0 = aux1 = 0
             for kbatch in range(num_aux_batches):
+                if aux1 >= ncp:
+                    # item 30: no row past here reaches this chunk
+                    break
                 compressed_di = eval_ip1(kbatch, out=buf0)
                 compressed_dk = eval_ipaux(kbatch, out=buf1)
                 naux_in_batch = compressed_di.shape[-1]
                 st('D3 integrals')
-                if do_fuse and v0 == 0 and not d1d3:
+                if do_fuse and vfirst and not d1d3:
                     # item 3: upstream's first pass, on this batch's
                     # ipaux integrals before they are folded into dj
                     _ipaux_batch(compressed_dk, aux1, naux_in_batch,
@@ -883,7 +906,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                             j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
                         if batch_id == 0:
                             contract('pqr,qi->pir', j3c, _dm_factor_l, out=tmp)
-                            if d1d3 and v0 == 0:
+                            if d1d3 and vfirst:
                                 _d1_from_d3(tmp, _dm_factor_l,
                                             j3c_oo1[x, aux0:aux1],
                                             auxvec_ipauxp[x, aux0:aux1]
@@ -905,7 +928,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             j3c_full = buf0 = buf1 = None
             compressed_di = compressed_dj = compressed_dk = None
 
-            if do_fuse and v0 == 0:
+            if do_fuse and vfirst:
                 # the h_aux block that upstream runs between the passes, in
                 # the integral buffers the walk has finished with
                 j3c_oo1p, h_aux_parts = _h_aux_block(
@@ -920,6 +943,10 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 h_aux_parts = None
                 if chol is not None:
                     j2c_10v = None
+                if crow is not None:
+                    crow.set_j2c_10v(j2c_10v)
+                    for x in range(3):
+                        sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
                 st('D2 h_aux')
 
             if chol is not None:
@@ -948,6 +975,15 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                                   naux, oosum)
                 st('D4 oo_atm')
 
+            if crow is not None:
+                nsph_ = sa.nsph
+                crow.d5(j3c_100.reshape(3, dv, 1, nao, nocc), v0, v1,
+                        j3c_oo1p[:, :nsph_].reshape(3, nsph_, 1, nocc, nocc),
+                        dm_oo.reshape(dm_oo.shape[0], 1, nocc, nocc),
+                        _dm_factor_l.reshape(1, nao, nocc), aoslices,
+                        -k_factor, k_factor, h_raw, work)
+                st('D5 per-atom')
+                continue
             if batch_id == 0:
                 j3c_100 = j3c_100[:, :, :, nocc0:nocc1]
             for i, (p0, p1) in enumerate(zip(aoslices[:-1], aoslices[1:])):
@@ -971,6 +1007,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         j3c_buf = work = work1 = tmp0 = tmp1 = None
         j3c = j3c_100 = None
         j2c_10v = j2c_10c = j3c_oo1p = j3c_oo1 = None
+        if crow is not None:
+            h_sph = _aggregate_to_atoms(h_raw, natm, sa.atm, axis=1)
+            h_raw = crow = None
 
     ejk_ao_aux = _aggregate_to_atoms(h_ao_aux, natm, aux_atm_labels, axis=1)
     if h_sph is not None:
@@ -2035,6 +2074,177 @@ def _d5_chol(sa, z, t1s, dm_oo, c, aoslices, f1, f2, j10s, h_sph, work):
                                      np.int64(j10s.strides[0] // 8),
                                      np.float64(f2)))
         ps = pa = None
+
+
+_D5_H2R = cp.RawKernel(r"""
+extern "C" __global__
+void d5_h2r(const double* __restrict__ m, const double* __restrict__ j,
+            double* __restrict__ h, const int dv, const long long ss,
+            const int ld, const double f)
+{
+    // h[s][x][y] += f sum_{t<dv} m[s][x][t] j[y][s][t], j's y stride ss
+    // and row stride ld (a column block of a wider array)
+    const int s = blockIdx.x;
+    const double* mp = m + (long long)s*3*dv;
+    const double* jp = j + (long long)s*ld;
+    double acc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (int t = threadIdx.x; t < dv; t += blockDim.x) {
+        const double m0 = mp[t], m1 = mp[dv + t], m2 = mp[2*dv + t];
+        const double j0 = jp[t], j1 = jp[ss + t], j2 = jp[2*ss + t];
+        acc[0] += m0*j0; acc[1] += m0*j1; acc[2] += m0*j2;
+        acc[3] += m1*j0; acc[4] += m1*j1; acc[5] += m1*j2;
+        acc[6] += m2*j0; acc[7] += m2*j1; acc[8] += m2*j2;
+    }
+    __shared__ double red[9][32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int c = 0; c < 9; c++) {
+        double v = acc[c];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o);
+        if (lane == 0) red[c][warp] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 9) {
+        double v = 0;
+        for (int w = 0; w < (blockDim.x >> 5); w++) v += red[threadIdx.x][w];
+        h[(long long)s*9 + threadIdx.x] += f * v;
+    }
+}
+""", 'd5_h2r')
+
+
+class _CholRows:
+    """Item 30 (W40): item 8 on a card too short for the whole spherical index.
+
+    Item 8 holds ``K``, the spherical ``(10|0) C``, for every auxiliary
+    function at once, because D4 needs ``Y = L^-1 K`` by rows and D5 needs
+    ``Z = L^-T Y`` by columns; where that does not fit (at 113 atoms on a
+    40 GB card, and taxol's unrestricted call on an 80 GB one) the factor
+    went through upstream's chunked arithmetic, whose every chunk is a walk
+    over the integrals and whose D5 is the eigenbasis's three
+    ``naux_cart x naux_sph`` contractions.  But nothing here needs ``Z`` by
+    rows: with ``Y`` in chunks of rows ``[v0, v1)``,
+
+    * ``Y`` for the chunk is ``V[:, v0:v1]^T`` applied to ``(10|0) C``,
+      ``V = C L^-T`` the factor as upstream's ``metric_v`` -- the chunked
+      second pass as it stands, except that ``V[r, v0:v1]`` is zero for every
+      Cartesian row whose shell's first spherical column is ``>= v1``: a
+      chunk needs only the integral batches of a prefix of the rows
+      (``ncart(v1)``), and the chunks run last first, so that the first one
+      is the whole walk the fused first pass rides on;
+    * D4 sums over ``r`` and is W17's Gram form on the chunk, unchanged;
+    * D5's first half is ``sum_{s in B} <Z[s], T1[s]>``, and ``Z`` restricted
+      to one chunk's rows of ``Y`` is ``L^-T[:v1, v0:v1] Y_c``: nonzero on
+      the rows ``s < v1`` only, one GEMM per atom group;
+    * D5's second half sums ``Z`` over its index against ``j10s``, so it is
+      ``sum_{t in chunk} (j10s L^-T)[y,s,t] (P . Y)[s,x,t]`` -- the same
+      per-atom product on the chunk's rows of ``Y``, and ``j10s L^-T`` is
+      ``C^T j2c_10v``, the spherical rows of what the h_aux block already
+      forms;
+    * the Coulomb terms are upstream's in the factor's basis (``_oo_gram``'s
+      own), which is exact for any ``V`` with ``V V^T = C J^-1 C^T``.
+
+    ``FASTDFHESSIP_CROWS=0`` is the chunked eigen-style arithmetic of before.
+    """
+
+    def __init__(self, sa):
+        self.sa = sa
+        # the first spherical column of every row from r on: within a shell
+        # the rows' first columns are not in order (a Cartesian d row can
+        # reach only its last spherical one), across shells they are
+        self.lo = np.minimum.accumulate(np.asarray(sa.lo)[::-1])[::-1]
+        self.j10l = None
+
+    def ncart(self, v1):
+        """Cartesian rows with a nonzero ``V[r, :v1]``: a prefix."""
+        return int(np.searchsorted(self.lo, v1, side='left'))
+
+    def set_j2c_10v(self, j2c_10v):
+        """``(C^T j2c_10v)[y, s, t] = (j10s L^-T)[y, s, t]``, spherical."""
+        sa = self.sa
+        out = cp.empty((3, sa.ncart, sa.nsph))
+        for y in range(3):
+            sa.to_sph(j2c_10v[y], out[y])
+        self.j10l = out[:, :sa.nsph]
+
+    def d5(self, y, v0, v1, t1s, dm_oo, c, aoslices, f1, f2, h_sph, work):
+        """D5 on the chunk ``y = Y[:, v0:v1]`` (``(3, dv, ns, nao, nocc)``);
+        ``t1s`` the spherical partner ``(3, nsph, ns, nocc, nocc)``,
+        ``dm_oo`` ``(ncart, ns, nocc, nocc)``, ``c`` ``(ns, nao, nocc)``."""
+        sa = self.sa
+        nsph, ncart = sa.nsph, sa.ncart
+        dv = v1 - v0
+        ns, nao, nocc = y.shape[2], y.shape[3], y.shape[4]
+        natm = len(aoslices) - 1
+        na = np.diff(aoslices)
+        nam = int(na.max())
+        fixed = 3*nsph*dv + natm*v1*9
+        per_u = max(6*v1, ncart) * ns * nocc
+        cap = max(nam, (work.size - fixed) // per_u)
+        cap = min(cap, int(_env('FASTDFHESSIP_D5_GROUP', '0')) or cap)
+        if work.size < fixed + per_u * nam:
+            work = cp.empty(fixed + per_u * max(cap, nam))
+        m = ndarray((nsph, 3, dv), buffer=work)
+        hb = ndarray((natm, v1, 3, 3), buffer=work[3*nsph*dv:])
+        hb[:] = 0.
+        gbuf = work[fixed:]
+        groups = []
+        a0 = 0
+        for a in range(1, natm + 1):
+            if a == natm or aoslices[a+1] - aoslices[a0] > cap:
+                groups.append((a0, a))
+                a0 = a
+        linv = sa.linv
+        ys_x, ys_r, ys_n = (x // 8 for x in y.strides[:3])
+        for a0, a1 in groups:
+            q0, q1 = int(aoslices[a0]), int(aoslices[a1])
+            ng = q1 - q0
+            au0 = cp.asarray(aoslices[a0:a1] - q0, dtype=np.int32)
+            anu = cp.asarray(na[a0:a1], dtype=np.int32)
+            aid = cp.arange(a0, a1, dtype=np.int32)
+            # the group's rows s < v1 of Z from this chunk:
+            # w[x,s,n,u,j] = sum_{t in chunk} linv[t, s] y[x,t,n,u,j]
+            w = ndarray((3, v1, ns, ng, nocc), buffer=gbuf)
+            t1 = ndarray((3, v1, ns, ng, nocc),
+                         buffer=gbuf[3*v1*ns*ng*nocc:])
+            for x in range(3):
+                for n in range(ns):
+                    _gemm_rm('T', 'N', v1, ng*nocc, dv, 1.,
+                             linv[v0].data.ptr, nsph,
+                             y.data.ptr + 8*(x*ys_x + n*ys_n + q0*nocc),
+                             ys_r, 0., w.data.ptr + 8*(x*v1*ns + n)*ng*nocc,
+                             ns*ng*nocc)
+            st_y, st_s, st_n = (x // 8 for x in t1s.strides[:3])
+            for yy in range(3):
+                for n in range(ns):
+                    _batched_occ(t1s, c[n, q0:q1], t1, v1, st_s,
+                                 yy*st_y + n*st_n, ns*ng*nocc,
+                                 (yy*v1*ns + n)*ng*nocc, nocc, ng)
+            _D5_H1((a1 - a0, v1), (256,),
+                   (w, t1, hb, au0, anu, aid, np.int32(v1), np.int32(ns),
+                    np.int32(ng), np.int32(nocc), np.int32(ng), np.int32(0),
+                    np.float64(f1)))
+            w = t1 = None
+            pa = ndarray((ncart, ns, ng, nocc), buffer=gbuf)
+            dm_s, dm_n = (x // 8 for x in dm_oo.strides[:2])
+            for n in range(ns):
+                _batched_occ(dm_oo, c[n, q0:q1], pa, ncart, dm_s, n*dm_n,
+                             ns*ng*nocc, n*ng*nocc, nocc, ng)
+            ps = sa.to_sph_pinv(pa, pa)
+            for a in range(a0, a1):
+                u0 = int(aoslices[a]) - q0
+                nu = int(na[a])
+                for n in range(ns):
+                    # m[s,x,t] = sum_{u in A, j} P[s,n,u,j] y[x,t,n,u,j]
+                    contract('suj,xtuj->sxt', ps[:, n, u0:u0+nu],
+                             y[:, :, n, q0+u0:q0+u0+nu],
+                             beta=0. if n == 0 else 1., out=m)
+                _D5_H2R((nsph,), (256,),
+                        (m, self.j10l[:, :, v0:v1], h_sph[a], np.int32(dv),
+                         np.int64(self.j10l.strides[0] // 8),
+                         np.int32(self.j10l.strides[1] // 8),
+                         np.float64(f2)))
+            ps = pa = None
+        h_sph[:, :v1] += hb
 
 
 def _trmm(sa, x, trans=False):

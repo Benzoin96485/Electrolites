@@ -213,15 +213,26 @@ intopt, mo_coeff, mo_occ, dm0 = terms(mf)
 ref = {'ip2': UP_IP2(intopt, dm0, 1., 0.2),
        'h1': UP_H1(intopt, mo_coeff, mo_occ, 1., 0.2)}
 reached = set()
-for vchunk in (160, 64):
+# W40's item 30 is the Cholesky factor in chunks of rows (the default
+# wherever item 8's whole index does not fit); CROWS=0 is the chunked
+# eigen-style arithmetic it replaces, D5_GROUP=8 its D5 in many groups
+CROWS = [('', {}), (' [CROWS=0]', {'CROWS': 0}),
+         (' [D5_GROUP=8]', {'D5_GROUP': 8})]
+for vchunk in (160, 64, 40):
     for fuse in (1, 0):
+      for lbl, sw in (CROWS if fuse else CROWS[:2]):
         fused0 = fastdfhessip.stats()['fused']
-        with env(VCHUNK=vchunk, FUSE=fuse):
+        rows0 = fastdfhessip.stats().get('chol_rows', 0)
+        with env(VCHUNK=vchunk, FUSE=fuse, **sw):
             got = U._jk_energy_per_atom(intopt, dm0, 1., 0.2)
         st = fastdfhessip.stats()
         fused = st['fused'] > fused0
+        rows = st.get('chol_rows', 0) > rows0
+        if rows:
+            reached.add('chol rows')
         check(f'ethanol+ ip2 chunk {vchunk} (vchunks={st["vchunks"]}'
-              f'{" fused" if fused else ""})', got, ref['ip2'])
+              f'{" fused" if fused else ""}{" rows" if rows else ""}){lbl}',
+              got, ref['ip2'])
         if st['vchunks'] > 1:
             reached.add('v fused' if fused else 'v')
 # Upstream's sizing asserts when the cap is too small to hold one block, so
@@ -338,7 +349,7 @@ with env(OCC_BATCH=5, H1UBATCH=0):
 check('ethanol+ h1 [H1UBATCH=0]', got, ref['h1'])
 if not ok:
     fails.append('H1UBATCH=0 batched the occupied index')
-ok = {'v', 'v fused', 'h1 mem_insufficient', 'h1 rebalanced',
+ok = {'v', 'v fused', 'chol rows', 'h1 mem_insufficient', 'h1 rebalanced',
       'h1 occ batches host', 'h1 occ batches occ'} <= reached
 if not ok:
     fails.append(f'memory caps did not reach the batched paths: {reached}')
