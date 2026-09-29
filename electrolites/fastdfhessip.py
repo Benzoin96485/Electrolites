@@ -326,6 +326,9 @@ as item 25 (W37).
                              shapes (above)
     FASTDFHESSIP_CROWS=0, FASTDFHESSIP_PACKROWS=0
                              W40's items 33 and 34 off
+    FASTDFHESSIP_MEMLOG=1    print the unrestricted second pass's memory
+                             as it is planned and allocated, and item 33's
+                             D5 blocks (W40)
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
                              also times the ip2 kernel per auxiliary l;
                              with FASTDFHESSIP_NVTX=1 each stage's end is
