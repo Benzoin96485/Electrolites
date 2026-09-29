@@ -258,10 +258,13 @@ an 80 GB one), which had fallen back to upstream's chunked arithmetic:
     j2c_10v)[:, :, v0:v1]`` -- no ``Z = L^-T Y`` by rows, which nothing
     needs.  ``FASTDFHESSIP_CROWS=0`` is the chunked eigen-style arithmetic.
 34. **Item 33's memory**: the second pass sized without upstream's per-atom
-    D5 temporaries, and, unfused, D5's two partners (the spherical
-    ``j3c_oo1p`` and ``dm_oo``) held as their ``i <= j`` pairs and unpacked
-    a block of rows at a time (``_SymRows``), the pass re-planned on what
-    that frees.  ``FASTDFHESSIP_PACKROWS=0`` is item 33 alone;
+    D5 temporaries, and, unfused, ``dm_oo`` and ``(1|00)`` held from the
+    first pass on as their weighted ``i <= j`` pairs (``_SymRows``): the
+    first pass writes them so, the h_aux block's head runs on them in place
+    (``_h_aux_head_pin``), D5 unpacks a block of rows at a time, and the
+    second pass is planned on what the h_aux block leaves -- which on a
+    40 GB card is what lets that block run at all.
+    ``FASTDFHESSIP_PACKROWS=0`` is item 33 alone;
     ``FASTDFHESSIP_D5_ROWS=<n>`` caps D5's row blocks (test-only).
 
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
