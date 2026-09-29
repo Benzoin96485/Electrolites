@@ -379,7 +379,8 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             j3c_oo1p = j3c_oo1 = None
             word_avail = _avail() // 8
             plan = _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size,
-                           nao_on_atom, natm, metric_size, gram, nsp, True)
+                           nao_on_atom, natm, metric_size, gram, nsp, True,
+                           True)
             aux_batch_size, aux_blksize, blksize2 = plan
             _S['vchunks'] = int(-(-metric_size // aux_batch_size))
             _S['packrows'] = _S.get('packrows', 0) + 1
@@ -670,14 +671,15 @@ def _mm(pattern, a, b, out, ta, tb, alpha=1., beta=0.):
 
 
 def _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size, nao_on_atom,
-            natm, metric_size, gram, nsp=2, rows=False):
+            natm, metric_size, gram, nsp=2, rows=False, after_h_aux=False):
     """Upstream's sizing of the unrestricted second pass.
 
     One change: upstream asserts that one auxiliary function's per-atom
     occupied block fits (``natm 12 nocc^2`` words), which item 2's Gram form
     never builds -- so with it on, that block's size is not a limit.
     """
-    word_avail -= 4 * naux**2  # j2c_10v, which the h_aux block leaves
+    if not after_h_aux:
+        word_avail -= 4 * naux**2  # j2c_10v, which the h_aux block leaves
     word_avail -= 3 * batch_size * nao_pair * 2  # eval_ip1, eval_ipaux
     # j3c_100, nsp spins of it; with `rows` (item 34, W40) item 33's D5,
     # which has none of upstream's naux-sized per-atom temporaries
