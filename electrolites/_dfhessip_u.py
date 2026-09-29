@@ -1035,12 +1035,22 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     # test-only: a smaller block, as a smaller card would leave (W35)
     blksize = min(blksize, int(_env('FASTDFHESSIP_H1BLK', blksize)))
     _S['h1_blksize'] = blksize
+    # item 29 (W41): in host mode, stage A once over every orbital, its
+    # j3c_00 written into the host array dm_3c will take column by column,
+    # instead of the integrals once per occupied batch.
+    # FASTDFHESSIP_H1UA1=0 is W38's stage A per batch
+    a_once = host and _env('FASTDFHESSIP_H1UA1', '1') != '0'
+    # stage B's orbitals per chunk (test-only: FASTDFHESSIP_H1UB_CHUNK, so
+    # that a small molecule's batch is fetched in several chunks)
+    bchunk = int(_env('FASTDFHESSIP_H1UB_CHUNK', '8'))
     if host:
         # stages A-C: one occupied batch of dm_3c (and of dm_oo, before it
-        # joins the whole one) beside stage A's two buffers, in what the D
-        # loop's budget leaves before its own buffers are allocated
-        nb = int((word_avail*.9 - nao*nao*blksize - batch_size*nao_pair) /
-                 (2*naux*(nao+nocc)))
+        # joins the whole one) beside stage A's two buffers (item 29: B's
+        # chunk buffer instead), in what the D loop's budget leaves before
+        # its own buffers are allocated
+        held = (naux*2*bchunk*nao if a_once else
+                nao*nao*blksize + batch_size*nao_pair)
+        nb = int((word_avail*.9 - held) / (2*naux*(nao+nocc)))
         nb = min(nocc, nb // 8 * 8 if nb >= 8 else nb)
         assert nb > 0, 'Insufficient GPU memory'
         nb = _forced_occ_batch(nb)
@@ -1049,6 +1059,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
     batched = num_occ_batches > 1
     _S['occ_batches_u'] = int(num_occ_batches)
     _S['h1_host'] = bool(host)
+    _S['h1_a_once'] = bool(a_once)
     st.note(naux=naux, batch_size=batch_size, blksize=blksize,
             aux_batches=num_aux_batches, occ_batches=num_occ_batches,
             occ_k=int(bool(occ_k)), k_ao=int(bool(k_ao)),
@@ -1403,6 +1414,56 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         # page-locking it is paid once per size: the pool keeps it (W12)
         st('A host buffer')
         dm_oo_all = cp.empty((naux, 2, nocc, nocc))
+    if a_once:
+        # item 29: stage A for every orbital, one integral pass, each block
+        # of j3c_00 copied into its rows of dm3_host behind the next block's
+        # integrals (two device buffers on the copy stream when asynchronous)
+        j3c_full = cp.zeros((nao, nao, blksize))
+        buf = cp.empty((batch_size, nao_pair))
+        abufs = [cp.empty((blksize, 2, nocc, nao))
+                 for _ in range(2 if hasync else 1)]
+        adone = [None, None]
+        if hasync:
+            ev = cp.cuda.Event(disable_timing=True)
+            ev.record(cp.cuda.Stream.null)
+            xs.wait_event(ev)
+        row = 2 * nocc * nao * 8
+        aux0 = aux1 = 0
+        nblk = 0
+        for kbatch in range(num_aux_batches):
+            compressed = eval_j3c(aux_batch_id=kbatch, out=buf)
+            naux_in_batch = compressed.shape[1]
+            for k0, k1 in lib.prange(0, naux_in_batch, blksize):
+                dk = k1 - k0
+                aux0, aux1 = aux1, aux1 + dk
+                j3c = j3c_full[:, :, :dk]
+                fill_symmetric(compressed, pair_addresses, nao, k0, k1,
+                               out=j3c)
+                b = nblk % len(abufs)
+                nblk += 1
+                if adone[b] is not None:
+                    cp.cuda.Stream.null.wait_event(adone[b])
+                out = abufs[b][:dk]
+                contract('pqr,npi->rniq', j3c, orbo, out=out)
+                if j_factor != 0:
+                    contract('pqr,pq->r', j3c, dm, out=auxvec[aux0:aux1])
+                if hasync:
+                    ev = cp.cuda.Event(disable_timing=True)
+                    ev.record(cp.cuda.Stream.null)
+                    xs.wait_event(ev)
+                    runtime.memcpyAsync(int(dm3_host.ctypes.data + aux0*row),
+                                        int(out.data.ptr), int(dk * row),
+                                        runtime.memcpyDeviceToHost, xs.ptr)
+                    adone[b] = cp.cuda.Event(disable_timing=True)
+                    adone[b].record(xs)
+                else:
+                    runtime.memcpy(int(dm3_host.ctypes.data + aux0*row),
+                                   int(out.data.ptr), int(dk * row),
+                                   runtime.memcpyDeviceToHost)
+        if hasync:
+            xs.synchronize()
+        j3c_full = j3c = buf = compressed = out = abufs = adone = None
+        st('A j3c_00 (once)')
 
     def _j2c_10():
         j2c_10 = int2c2e_ip1(auxmol, sort_output=False, omega=omega)
@@ -1419,10 +1480,37 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         vhf_i = vhf_atm[:, :, :, nocc0:nocc1]
 
         aux0 = aux1 = 0
-        j3c_full = cp.zeros((nao, nao, blksize))
-        buf = cp.empty((batch_size, nao_pair))
-        j3c_00 = cp.empty((naux, 2, nob, nao))
-        for kbatch in range(num_aux_batches):
+        if a_once:
+            j3c_00 = cp.empty((naux, 2, nob, nao))
+            # item 29: the batch's columns of j3c_00 back from the host,
+            # eight orbitals at a time, each chunk's fetch behind stage B's
+            # work on the chunk before it
+            chunks = list(lib.prange(0, nob, bchunk))
+            fdone = [None] * len(chunks)
+
+            def _fetch_a(c):
+                i0, i1 = chunks[c]
+                args = (int(j3c_00.data.ptr) + int(i0*nao*8), int(nob*nao*8),
+                        int(dm3_host.ctypes.data + (nocc0 + i0)*nao*8),
+                        int(nocc*nao*8), int((i1 - i0)*nao*8), int(naux*2),
+                        runtime.memcpyHostToDevice)
+                if hasync:
+                    runtime.memcpy2DAsync(*args, xs.ptr)
+                    fdone[c] = cp.cuda.Event(disable_timing=True)
+                    fdone[c].record(xs)
+                else:
+                    runtime.memcpy2D(*args)
+            if hasync:
+                ev = cp.cuda.Event(disable_timing=True)
+                ev.record(cp.cuda.Stream.null)
+                xs.wait_event(ev)
+            _fetch_a(0)
+            st('A j3c_00 in')
+        else:
+            j3c_full = cp.zeros((nao, nao, blksize))
+            buf = cp.empty((batch_size, nao_pair))
+            j3c_00 = cp.empty((naux, 2, nob, nao))
+        for kbatch in range(0 if a_once else num_aux_batches):
             compressed = eval_j3c(aux_batch_id=kbatch, out=buf)
             naux_in_batch = compressed.shape[1]
             for k0, k1 in lib.prange(0, naux_in_batch, blksize):
@@ -1437,8 +1525,13 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         j3c_full = j3c = buf = compressed = None
         st('A j3c_00')
 
-        work = cp.empty((nw, 2, 8, nao))
-        for i0, i1 in lib.prange(0, nob, 8):
+        work = cp.empty((nw, 2, bchunk, nao))
+        for c, (i0, i1) in enumerate(lib.prange(0, nob, bchunk)):
+            if a_once:
+                if hasync:
+                    cp.cuda.Stream.null.wait_event(fdone[c])
+                if c + 1 < len(chunks):
+                    _fetch_a(c + 1)
             tmp = ndarray((nw, 2, i1-i0, nao), buffer=work)
             contract('rs,rniq->sniq', metric_v, j3c_00[:, :, i0:i1], out=tmp)
             tmp /= metric_w[:, None, None, None]
@@ -1446,6 +1539,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         dm_3c = j3c_00
         j3c_00 = tmp = work = None
 
+        fdone = None
         dm_oo = contract('rniq,nqj->rnij', dm_3c, orbo)
         if j_factor != 0 and it == 0:
             if batched:
