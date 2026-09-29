@@ -312,12 +312,25 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         crow = H._CholRows(sa)
         _S['chol_rows'] = _S.get('chol_rows', 0) + 1
         # item 34, as in fastdfhessip (FASTDFHESSIP_PACKROWS=0: item 33
-        # alone)
+        # alone); either holds its spherical j2c_10v back
         if _env('FASTDFHESSIP_PACKROWS', '1') != '0':
-            plan, plan_f, do_fuse, carve = make_plan(word_avail, True)
+            plan, plan_f, do_fuse, carve = make_plan(
+                word_avail - 3*naux*metric_size, True)
             aux_batch_size, aux_blksize, blksize2 = plan
             pack34 = not do_fuse
             rows34 = True
+        else:
+            plan, plan_f, do_fuse, carve = make_plan(
+                word_avail - 3*naux*metric_size, False)
+            aux_batch_size, aux_blksize, blksize2 = plan
+        if pack34:
+            # item 34: dm_oo and (1|00) as their weighted pairs from the
+            # first pass on (fastdfhessip's note)
+            j3c_oo1 = None
+            dmp = H._SymRows(naux, 2, nocc)
+            dmp.put(0, dm_oo)
+            dm_oo = dmp
+            j3c_oo1 = H._SymRows(3*naux, 2, nocc, xstride=naux)
     st.note(chol=chol is not None, spin_passes=2 // nsp)
     _S['u_spin_passes'] = 2 // nsp if chol is not None else 0
     st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
@@ -338,21 +351,25 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         # runs on the spin index folded into the first occupied one, with
         # -.5 (2k) = -k
         nonlocal auxvec_ipauxp
+        pin = isinstance(j3c_oo1, H._SymRows)
         if j_factor != 0:
             # the (1|00) half of auxvec_ipauxp; the block adds the rest
-            auxvec_ipauxp = cp.einsum('xrnii->xr', j3c_oo1)
+            auxvec_ipauxp = (j3c_oo1.diag_sum().reshape(3, naux) if pin else
+                             cp.einsum('xrnii->xr', j3c_oo1))
         o1p, parts = H._h_aux_block(
             auxmol, omega, _aux_sorting, metric_v, metric_w,
-            dm_oo.reshape(naux, 2*nocc, nocc),
-            j3c_oo1.reshape(3, naux, 2*nocc, nocc), naux, metric_size,
-            2*k_factor, j_factor, 0, auxvec_ipauxp, auxvec, natm,
-            aux_atm_labels, work=work, nspin=2)
-        o1p = o1p.reshape(3, naux, 2, nocc, nocc)
+            dm_oo if pin else dm_oo.reshape(naux, 2*nocc, nocc),
+            j3c_oo1 if pin else j3c_oo1.reshape(3, naux, 2*nocc, nocc),
+            naux, metric_size, 2*k_factor, j_factor, 0, auxvec_ipauxp,
+            auxvec, natm, aux_atm_labels, work=work, nspin=2)
+        if not pin:
+            o1p = o1p.reshape(3, naux, 2, nocc, nocc)
         if crow is not None:
             # item 33: D5's partners, spherical once
             crow.set_j2c_10v(parts[1])
             for x in range(3):
-                sa.to_sph(o1p[x], o1p[x])
+                rx = o1p.p[x*naux:(x+1)*naux] if pin else o1p[x]
+                sa.to_sph(rx, rx)
         return (o1p, parts[0], parts[1], parts[2])
 
     st('D0 plan')
@@ -365,18 +382,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         j2c_10c = H._j2c_10c(chol, j2c_10)
         j2c_10 = None
         if pack34:
-            # item 34: D5's partners as their i <= j pairs, and the second
-            # pass planned on what that frees
-            # dm_oo first: its packed copy fits beside both, and freeing
-            # it makes room for the larger one
-            nsph_ = sa.nsph
-            dmp = H._SymRows(naux, 2, nocc)
-            dmp.put(0, dm_oo)
-            dm_oo = None
-            t1p = H._SymRows(3*nsph_, 2, nocc)
-            for x in range(3):
-                t1p.put(x*nsph_, j3c_oo1p[x, :nsph_])
-            j3c_oo1p = j3c_oo1 = None
+            # item 34: the second pass planned on what the packing left
+            t1p = j3c_oo1p
+            j3c_oo1p = j3c_oo1 = dm_oo = None
             word_avail = _avail() // 8
             plan = _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size,
                            nao_on_atom, natm, metric_size, gram, nsp, True,
@@ -707,10 +715,13 @@ def _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size, nao_on_atom,
 
 def _ipaux_pass(eval_ipaux, num_aux_batches, blksize, nao, nao_pair,
                 batch_size, nocc, pair_addresses, dm_factor_l, j3c_oo1):
-    """Upstream's first pass: ``(1|00)``, both spins."""
+    """Upstream's first pass: ``(1|00)``, both spins (``j3c_oo1`` a
+    ``_SymRows``: item 34, written packed)."""
     j3c_full = cp.zeros((nao, nao, blksize))
     buf = cp.empty((3, nao_pair, batch_size))
     buf1 = cp.empty(2 * blksize * nocc * nao)
+    if isinstance(j3c_oo1, H._SymRows):
+        j3c_oo1.tmp = cp.empty((blksize, 2, nocc, nocc))
     aux0 = 0
     for kbatch in range(num_aux_batches):
         compressed = eval_ipaux(kbatch, out=buf)
@@ -718,6 +729,8 @@ def _ipaux_pass(eval_ipaux, num_aux_batches, blksize, nao, nao_pair,
         _ipaux_batch(compressed, aux0, naux_in_batch, blksize, j3c_full, buf1,
                      nao, nocc, pair_addresses, dm_factor_l, j3c_oo1)
         aux0 += naux_in_batch
+    if isinstance(j3c_oo1, H._SymRows):
+        j3c_oo1.tmp = None
 
 
 def _ipaux_batch(compressed, aux0, naux_in_batch, blksize, j3c_full, work,
@@ -732,8 +745,13 @@ def _ipaux_batch(compressed, aux0, naux_in_batch, blksize, j3c_full, work,
                            out=j3c)
             contract('pqr,npi->niqr', j3c, dm_factor_l, out=tmp)
             # d/dX = -d/dr
-            contract('niqr,nqj->rnij', tmp, dm_factor_l, alpha=-1,
-                     out=j3c_oo1[i, a0:a1])
+            if isinstance(j3c_oo1, H._SymRows):
+                t = contract('niqr,nqj->rnij', tmp, dm_factor_l, alpha=-1,
+                             out=j3c_oo1.tmp[:dk])
+                j3c_oo1.put(i*j3c_oo1.xstride + a0, t)
+            else:
+                contract('niqr,nqj->rnij', tmp, dm_factor_l, alpha=-1,
+                         out=j3c_oo1[i, a0:a1])
     # the (10|0) scatter that may share this buffer writes only the stored
     # pairs and relies on the rest being zero
     j3c_full[:] = 0.

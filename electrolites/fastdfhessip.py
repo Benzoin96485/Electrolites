@@ -817,12 +817,30 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             # its partners packed and the pass re-planned after the h_aux
             # block (fused, that block runs inside the first chunk, whose
             # buffers are already sized)
-            # (FASTDFHESSIP_PACKROWS=0: item 33 alone)
+            # (FASTDFHESSIP_PACKROWS=0: item 33 alone).  Its own buffer,
+            # the spherical j2c_10v, is held back as well
             if _env('FASTDFHESSIP_PACKROWS', '1') != '0':
-                plan, plan_f, do_fuse, carve = make_plan(word_avail, True)
+                plan, plan_f, do_fuse, carve = make_plan(
+                    word_avail - 3*naux*metric_size, True)
                 aux_batch_size, aux_blksize, blksize2 = plan
                 pack34 = not do_fuse
                 rows34 = True
+            else:
+                plan, plan_f, do_fuse, carve = make_plan(
+                    word_avail - 3*naux*metric_size, False)
+                aux_batch_size, aux_blksize, blksize2 = plan
+            if pack34:
+                # item 34: from the first pass on, dm_oo and (1|00) as their
+                # weighted pairs -- the first pass writes them so, the h_aux
+                # block's products run on them in place, and D5 unpacks a
+                # block of rows at a time; half of both, which is what does
+                # not fit beside the h_aux block on a 40 GB card
+                j3c_oo1 = None
+                dmp = _SymRows(naux, 1, nocc)
+                dmp.put(0, dm_oo.reshape(naux, 1, nocc, nocc))
+                dm_oo = dm_oo_full = None
+                dm_oo = dmp
+                j3c_oo1 = _SymRows(3*naux, 1, nocc, xstride=naux)
         st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
                 plan_fused=plan_f[0])
         st.note(chol=chol is not None, nao=nao, nocc=nocc, naux=naux, metric_size=metric_size,
@@ -860,21 +878,15 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             if crow is not None:
                 crow.set_j2c_10v(j2c_10v)
                 for x in range(3):
-                    sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
+                    if pack34:
+                        rx = j3c_oo1p.p[x*naux:(x+1)*naux]
+                        sa.to_sph(rx, rx)
+                    else:
+                        sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
             if pack34:
-                # item 34: D5's two partners as their i <= j pairs, and the
-                # second pass planned on what that frees
-                # dm_oo first: its packed copy fits beside both, and
-                # freeing it makes room for the larger one
-                nsph_ = sa.nsph
-                dmp = _SymRows(naux, 1, nocc)
-                dmp.put(0, dm_oo.reshape(naux, 1, nocc, nocc))
-                dm_oo = dm_oo_full = None
-                t1p = _SymRows(3*nsph_, 1, nocc)
-                for x in range(3):
-                    t1p.put(x*nsph_, j3c_oo1p[x, :nsph_].reshape(
-                        nsph_, 1, nocc, nocc))
-                j3c_oo1p = j3c_oo1 = None
+                # item 34: the second pass planned on what the packing left
+                t1p = j3c_oo1p
+                j3c_oo1p = j3c_oo1 = dm_oo = None
                 word_avail = _avail() // 8
                 plan = _plan_v(word_avail, naux, nao, nocc, nocc_in_batch,
                                nao_pair, batch_size, nao_on_atom, natm,
@@ -1599,10 +1611,13 @@ def _d1_from_d3(tmp, c, out, trace_out, nspin=0):
 def _ipaux_pass(eval_ipaux, num_aux_batches, blksize, nao, nao_pair,
                 batch_size, nocc_in_batch, pair_addresses, dm_factor_l,
                 nocc0, nocc1, j3c_oo1, auxvec_ipauxp, dm):
-    """Upstream's first pass: ``(1|00)`` and, on batch 0, its trace."""
+    """Upstream's first pass: ``(1|00)`` and, on batch 0, its trace
+    (``j3c_oo1`` a ``_SymRows``: item 34, written packed)."""
     j3c_full = cp.zeros((nao, nao, blksize))
     buf = cp.empty((3, nao_pair, batch_size))
     buf1 = cp.empty((blksize * nocc_in_batch * nao))
+    if isinstance(j3c_oo1, _SymRows):
+        j3c_oo1.tmp = cp.empty((blksize, nocc_in_batch, dm_factor_l.shape[1]))
     aux0 = 0
     for kbatch in range(num_aux_batches):
         compressed = eval_ipaux(kbatch, out=buf)
@@ -1611,6 +1626,8 @@ def _ipaux_pass(eval_ipaux, num_aux_batches, blksize, nao, nao_pair,
                      nao, nocc_in_batch, pair_addresses, dm_factor_l, nocc0,
                      nocc1, j3c_oo1, auxvec_ipauxp, dm)
         aux0 += naux_in_batch
+    if isinstance(j3c_oo1, _SymRows):
+        j3c_oo1.tmp = None
 
 
 def _ipaux_batch(compressed, aux0, naux_in_batch, blksize, j3c_full, work,
@@ -1626,8 +1643,14 @@ def _ipaux_batch(compressed, aux0, naux_in_batch, blksize, j3c_full, work,
                            out=j3c)
             contract('pqr,pi->iqr', j3c, dm_factor_l[:, nocc0:nocc1], out=tmp)
             # d/dX = -d/dr
-            contract('iqr,qj->rij', tmp, dm_factor_l, alpha=-1,
-                     out=j3c_oo1[i, a0:a1])
+            if isinstance(j3c_oo1, _SymRows):
+                t = contract('iqr,qj->rij', tmp, dm_factor_l, alpha=-1,
+                             out=j3c_oo1.tmp[:dk])
+                j3c_oo1.put(i*j3c_oo1.xstride + a0,
+                            t.reshape(dk, 1, *t.shape[1:]))
+            else:
+                contract('iqr,qj->rij', tmp, dm_factor_l, alpha=-1,
+                         out=j3c_oo1[i, a0:a1])
             if auxvec_ipauxp is not None:
                 contract('pqr,pq->r', j3c, dm, -1, out=auxvec_ipauxp[i, a0:a1])
     # the symmetric fill writes the whole of j3c; the (10|0) pass that may
@@ -1843,6 +1866,26 @@ def _h_aux_head_packed(j2c_10, dm_oo, j3c_oo1, nspin, k_factor, h_out,
     return j3c_oo1
 
 
+def _h_aux_head_pin(j2c_10, dmp, j1p, k_factor, h_out, dmaux_out,
+                    dmaux1_out):
+    """Item 34 (W40): ``_h_aux_head_packed`` on inputs held packed
+    (``_SymRows``, rows ``r`` and ``(x, r)``): the same four products on all
+    the pairs at once, with no chunk buffers, and ``j3c_oo1p`` left in
+    ``j1p``, packed."""
+    n, npr = dmp.p.shape
+    n3 = 3 * n
+    alpha = -.5 * k_factor
+    _gemm_rm('N', 'N', n3, npr, n, -1., j2c_10.data.ptr, n, dmp.p.data.ptr,
+             npr, 1., j1p.p.data.ptr, npr)
+    _syrk_acc(j1p.p, n3, npr, npr, alpha, 0., h_out)
+    _syrk_acc(dmp.p, n, npr, npr, alpha, 0., dmaux_out)
+    _gemm_rm('N', 'T', n3, n, npr, alpha, j1p.p.data.ptr, npr,
+             dmp.p.data.ptr, npr, 0., dmaux1_out.data.ptr, n)
+    _mirror(h_out)
+    _mirror(dmaux_out)
+    return j1p
+
+
 def _h_aux_words(naux, metric_size):
     """What ``_h_aux_block``'s temporaries take from ``work``, in words."""
     return 15 * naux**2 + naux * metric_size
@@ -1883,15 +1926,29 @@ def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
     # square (one occupied batch); the layout of the carved temporaries is
     # then dm_aux1 [0, 3n^2), dm_aux [3n^2, 4n^2), the rest after
     nocc = dm_oo.shape[-1]
+    # item 34 (W40): dm_oo and j3c_oo1 arrive already as their weighted
+    # pairs (_SymRows); the head runs on them in place
+    pin = isinstance(dm_oo, _SymRows)
     # Not on the long-range operator: its metric is ill-conditioned enough
     # that reading one triangle of j3c_oo1 for both -- a change at the last
     # bit of each element -- moves a triplet's ip2 term by 6e-10 relative
     # against upstream's (tests/test_dfuhessip.py), as reassociating stage A
     # does by 1e-10; every omega = 0 case agrees to 1e-13
-    packed = (_env('FASTDFHESSIP_PACK', '1') != '0' and omega == 0 and
-              j3c_oo1.shape[-2] == nspin * nocc and
-              dm_oo.shape[-2] == nspin * nocc)
-    if packed:
+    packed = pin or (_env('FASTDFHESSIP_PACK', '1') != '0' and omega == 0 and
+                     j3c_oo1.shape[-2] == nspin * nocc and
+                     dm_oo.shape[-2] == nspin * nocc)
+    if pin:
+        _S['packed'] = _S.get('packed', 0) + 1
+        h_aux = ndarray((3*n, 3*n), buffer=h_buf) if carve else \
+            cp.empty((3*n, 3*n))
+        dm_aux1 = take((3, n, n), 0)
+        dm_aux = take((n, n), 3*n*n)
+        _h_aux_head_pin(j2c_10, dm_oo, j3c_oo1, k_factor, h_aux, dm_aux,
+                        dm_aux1)
+        j3c_oo1p = j3c_oo1
+        h_aux = h_aux.reshape(3, n, 3, n)
+        o0 = 4*n*n
+    elif packed:
         _S['packed'] = _S.get('packed', 0) + 1
         h_aux = ndarray((3*n, 3*n), buffer=h_buf) if carve else \
             cp.empty((3*n, 3*n))
@@ -2316,8 +2373,9 @@ class _CholRows:
             if tpk:
                 tb = ndarray((3, nb, ns, nocc, nocc), buffer=work[off:])
                 off += tb.size
+                xs_ = t1s.xstride or nsph
                 for x in range(3):
-                    t1s.rows(x*nsph + s0, x*nsph + s1, tb[x])
+                    t1s.rows(x*xs_ + s0, x*xs_ + s1, tb[x])
             else:
                 tb = t1s[:, s0:s1]
             st_y, st_s, st_n = (x // 8 for x in tb.strides[:3])
@@ -2407,15 +2465,25 @@ class _CholRows:
 
 class _SymRows:
     """Item 34 (W40): rows of symmetric ``(ns, nocc, nocc)`` blocks held as
-    their ``i <= j`` pairs, unit weights, so that unpacking gives back the
-    array exactly -- item 22 has already written both triangles of these
-    from one.  ``rows(r0, r1, out)`` unpacks rows ``r0:r1`` into ``out``."""
+    their ``i <= j`` pairs, weighted as item 22's ``_Pairs`` weights them
+    (``sqrt 2`` off the diagonal), so that the h_aux block's products run
+    on them as they are and a row dotted with a row is the full dot
+    product.  ``rows(r0, r1, out)`` unpacks rows ``r0:r1`` into ``out``;
+    ``xstride`` is the row offset of each Cartesian direction where the rows
+    are ``(x, r)`` (``3 naux`` of them).  Item 22 has already made both
+    triangles of these from one, so no information is lost."""
 
-    def __init__(self, nrow, ns, nocc):
+    def __init__(self, nrow, ns, nocc, xstride=0):
         self.pr = _Pairs(nocc, ns)
-        self.pr.w = cp.ones(self.pr.n)
         self.p = cp.empty((nrow, self.pr.n))
         self.shape = (nrow, ns, nocc, nocc)
+        self.xstride = xstride
+
+    def diag_sum(self):
+        """``sum_{n,i} a[r, n, i, i]`` for every row."""
+        i, j = np.triu_indices(self.shape[2])
+        d = np.nonzero(np.tile(i == j, self.shape[1]))[0]
+        return self.p[:, cp.asarray(d)].sum(axis=1)
 
     def put(self, r0, a):
         """Pack the rows of ``a`` (``(m, ns, nocc, nocc)``, contiguous) into
