@@ -40,6 +40,9 @@ is W32), `docs/README_fastdfhessip4.md` **W31** (whose finding is W34),
 `docs/README_fastxcfxclocal.md` **W36** (falsified by its count),
 `docs/README_fastdfhessip6.md` **W37** (whose finding is W39),
 `docs/README_fastdfuh1batch.md` **W38** (whose findings are W40 and W41),
+`docs/README_fastdfhessip7.md` **W39** (whose finding is W43),
+`docs/README_fastdfhessip8.md` **W40** (whose findings are W42 and W44),
+`docs/README_fastdfuh1a.md` **W41**,
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -239,6 +242,28 @@ this page and it is what re-ranked §4.
 Ranked by (value × confidence) / cost, **after** §3.3.  Each item gives what
 to change, the evidence it rests on, what would count as success, and what
 would falsify it.
+
+**W39, W40 and W41 are done; W42, W43 and W44 are what they found.**
+W39's tiles were falsified by the count it asked for — the tiles holding a
+stored pair cover 94–100 % of a 113-atom block, the pair fill being a
+shell-level pattern no AO tile addresses (W5's finding, on the Hessian's own
+pairs) — but two of its three products are symmetric, and a triangle is
+half of any block: the pseudo-density and stage A on the lower triangle,
+with W37's two small leads (the h_aux block's `j2c_ip2` sum as `dsyrk`,
+the spherical pattern on the device), take taxol's ip2 call to **1.315x**
+of its pre-W37 time in the call and 1.297x inside a whole Hessian.  W40's
+40 GB call was the walks of a fallback, not arithmetic the card forces:
+the Cholesky factor in chunks of rows of `Y = L^-1 K` — each chunk walking
+only a prefix of the integrals, D5 rewritten so that nothing needs
+`L^-T Y` by rows — with `dm_oo` and `(1|00)` held packed from the first
+pass on, takes taxol⁺'s 40 GB call **227 → 44.9 s** (1.31x of its full
+card, which it takes 51.3 → 34.2 s), taxol's 31.7 → 22.8 s (1.37x) and the
+Co(II) sextet's 167 → 34.6 s (1.33x); and with the CPHF's XC response
+handing its right-hand sides over in groups, a whole 40 GB UKS Hessian of
+taxol⁺ runs, **1760.7 s against 1482.3 s** (1.19x) — all of it the CPHF's
+two atom blocks (W44).  W41's stage A
+runs once and the 40 GB h1 call is **1.04x** of the full card (31.3 against
+30.2 s), a second of it the per-batch `cudaMalloc`s of W38's arrays.
 
 **W37 and W38 are done; W39, W40 and W41 are what they found.**  W37's
 D stages were mostly at rate already (D2 16.3 TF/s, the triangular
@@ -2898,7 +2923,40 @@ The restricted function batches the occupied index when that does not fit
   enough to cost more than the memory-short branch at 54.6 GB — then the
   next thing is keeping `dm_3c` on the host for the batches not in use.
 
-### W39 — The ip2 call's `(nao, nao)` products on the stored pairs only
+### W39 — The ip2 call's `(nao, nao)` products on the stored pairs only — **done: falsified by the count as tiles (94–100 % of a 113-atom block is in tiles that hold a pair), and half of two of the three products as a triangle; the call 1.315x of its pre-W37 time, 1.297x inside a Hessian**
+
+Items 29–32 of `fastdfhessip` (`FASTDFHESSIP_PDLOW=0`, `ALOW=0`,
+`IP2SYM=0`, `SPHHOST=1`, `LOW_TILE=<n>`, `TIME=3`),
+`benchmarks/df_ip2_tile_probe.py`, `benchmarks/df_ip2_stagea_bench.py`;
+write-up in `docs/README_fastdfhessip7.md`.
+
+Counted on the Hessian's Cartesian pair list, tiles of 16–128 AOs holding a
+stored pair cover 94.1–100 % of taxol's block and 97.7–100 % of the Co(II)
+sextet's (pair fill 50 %): the falsification's condition, so no tile is
+left out.  At 284 atoms they cover 61–93 % (71 % at 32 AOs) — W5's numbers
+for the SCF's cderi.  The count also found the stored pairs in both
+triangles (55/44 % on taxol).  Two of the products are symmetric, though:
+the pseudo-density is formed on the lower triangle's row tiles (52.7 % of
+the dense product) and read there, its Coulomb part added on the pairs
+(item 29, 0.50 → 0.30 s); stage A is `G + G^T` with `G = C^T L C` on the
+lower triangle `L` (item 30, the fill and products 0.38 → 0.29 s, inside a
+stage whose integrals vary by ±0.1 s from call to call); and W37's two leads,
+the h_aux block's nine `j2c_ip2` GEMMs as three `dsyrk` and three GEMMs
+(item 31, 0.11 s) and `_SphAux`'s pattern on the device (item 32, 0.17 s).
+Taxol's call **16.66 → 16.13 s**, 1.315x of W37's before (21.21 s):
+**success in the call**; inside a whole Hessian 16.65 → 16.05 s, 1.297x
+against the 1.3x bar, missed by 0.3 %.  The Co(II) sextet 25.71 → 25.36 s.
+D3's `M` has different values in its two triangles and stays dense.  Items
+29 and 30 are off on the long-range operator (reading one triangle of the
+pseudo-density moved water's long-range term by 1.1e-10).  Tests within
+6.6e-13 of GPU4PySCF; whole taxol Hessian 2.3e-11–2.7e-11 Eh/bohr² from
+W37's, whose two runs differ by 3.7e-11.  What is left of the call is
+arithmetic at rate, and `D3 alloc` (0.23 s inside the Hessian, the second
+pass's 36 GB `cudaMalloc` right after stage C frees its buffers).  PfPMT's
+call (284 atoms) was not timed: it batches the occupied index, which turns
+item 8 and everything built on it off (W43).
+
+The original entry, for the record:
 
 *(Found by W37.)*
 
@@ -2920,7 +2978,52 @@ call has the same three with two spins (`docs/README_fastdfhessip6.md`
   the block at a tile size the GEMMs still run well at — then the fill is
   not tile-shaped, and the products stay dense.
 
-### W40 — The unrestricted ip2 term on a 40 GB card
+### W40 — The unrestricted ip2 term on a 40 GB card — **done: the walks of a fallback, not the card's arithmetic; the Cholesky factor in chunks of rows takes taxol⁺'s 40 GB call 227 → 44.9 s (1.31x of the full card), taxol's 1.37x, the Co(II) sextet's 1.33x**
+
+Items 33 and 34 of `fastdfhessip` (`_CholRows`, `_SymRows`,
+`_h_aux_head_pin`; `FASTDFHESSIP_CROWS=0`, `PACKROWS=0`, `D5_ROWS=<n>`,
+`MEMLOG=1`), in both spin cases, `df_hess_anatomy.py --ballast`; write-up in
+`docs/README_fastdfhessip8.md`.
+
+Taxol⁺ at 40 GB ran 32 chunks of 176 metric rows, and 212 s of 227 were
+per chunk: 32 walks over the derivative integrals (35 s), each chunk's
+`(10|0) C` and its GEMM against the metric (71 s), and the eigenbasis D5
+over the whole Cartesian auxiliary index per chunk (107 s) — the fallback
+item 25 leaves when its whole spherical index does not fit, which is also
+what taxol⁺ ran on the **80 GB** card (51.3 s).  The falsification does not
+fire.  Item 33 keeps the Cholesky factor and chunks `Y = L^-1 K` by rows: a
+chunk needs only the Cartesian rows whose shell starts below its last row
+(a prefix of the integral batches; the chunks run last first, so the first
+is the whole walk), D4 is the Gram form on the chunk, and D5 is rewritten —
+its first half as `L^-T[:v1, v0:v1]` times the chunk, its second against
+`C^T j2c_10v` — so that nothing needs `Z = L^-T Y` by rows.  Item 34 sizes
+the pass without upstream's per-atom D5 and, unfused, holds `dm_oo` and
+`(1|00)` as their weighted pairs from the first pass on, the h_aux block's
+head running on them in place: at 40 GB the block's own temporaries did not
+fit beside the unpacked pair.  taxol⁺ at 40 GB **227.1 → 44.9 s** (7
+chunks), on 80 GB **51.3 → 34.2 s**: **1.31x**; taxol RKS at 40 GB 31.7 →
+22.8 s against 16.6 (1.37x); the Co(II) sextet at a 40 GB card's 27.6 GB
+167.3 → 34.6 s against 25.9 (1.33x), at 44.6 GB 48.1 → 29.1 s.  Unchanged
+where item 8 or 25 fits whole.  **Success in the call**, and the whole 40 GB
+UKS Hessian of taxol⁺ is measured — after one more change, outside the ip2
+term: it stopped in its CPHF (`cudaErrorMemoryAllocation` in `fastxcfxc`'s
+W33 buffers, linear in an atom block's right-hand sides), so
+`_get_veff_resp_mo_u` now hands them over in groups when they do not fit
+(`FASTXCFXC_SETS=<n>` for the tests).  **1760.7 s against 1482.3 s** on the
+full card (1.19x); inside it ip2 39.4 s (34.2) and h1 34.7 s (29.0); the
+rest is the CPHF in two atom blocks where the full card takes one (1721.6 s
+with the full card forced to the same blocks, W44).  The 40 and 80 GB
+Hessians differ by 1.5e-4 Eh/bohr², as does the full card's with its CPHF
+in the 40 GB blocks, which agrees with the 40 GB Hessian to 5.2e-10: the
+difference is GPU4PySCF's per-block Krylov tolerance.
+Tests within 5.0e-13 of GPU4PySCF with the chunked pass forced; at 113
+atoms against the whole Cholesky form on the same SCF 5.5e-12 (taxol) and
+4.5e-11 (the Co sextet, whose metric of condition 3.3e10 moves its Cholesky
+form by 4–6e-11 per ulp, W37 §5.1), and against the fallback in the same
+factor 2.0e-12.  What is left at 40 GB is walks: the first pass is a walk of
+its own when unfused (2.7 s) and seven chunks walk four times' worth (W42).
+
+The original entry, for the record:
 
 *(Found by W38.)*
 
@@ -2944,7 +3047,30 @@ the derivative integrals (ten on the Co(II) sextet, 78.6 s;
 * **Falsified if**: the extra time is arithmetic that the smaller card
   forces (the same flops at a lower rate would say it is not).
 
-### W41 — Stage A of the batched unrestricted h1 term, once
+### W41 — Stage A of the batched unrestricted h1 term, once — **done: stage A at its full-card time, and the 40 GB call 1.04x of the full card on taxol⁺ (1.05x on the Co(II) sextet)**
+
+Item 35 of `fastdfhessip` (`FASTDFHESSIP_H1UA1=0`, `H1UB_CHUNK=<n>`);
+write-up in `docs/README_fastdfuh1a.md`.
+
+In item 23's host mode, one integral pass contracts `(00|0)` with every
+occupied orbital and writes `j3c_00` into the host array `dm_3c` will take —
+the same columns, each read back by its batch before its `dm_3c` overwrites
+it — and each batch fetches its columns eight orbitals at a time behind
+stage B's work on the eight before.  Stage A 4.13 → **1.50 s** (full card
+1.50–1.54).  Measured stage by stage, a second of W38's call was not stage A:
+the batch's `dm_3c`, `dm_oo` and B's buffer are over GPU4PySCF's 100 MB pool
+threshold, so each batch was a `cudaFree` and a `cudaMalloc` of the same
+7 GB, and the `cudaMalloc` waited for the driver (0.25 s a batch); they are
+now allocated once.  taxol⁺ at a 40 GB card's memory **34.0 → 31.3 s**
+against 30.2 s on the full card (**1.04x**; W38 read 33.5), the Co(II)
+sextet 26.4 → **24.9 s** against 23.8 (1.05x).  **Success**; the
+falsification does not fire — the read-back is hidden except its first chunk
+per batch (40–50 ms) and B is 0.27 s slower beside it.  Correct to 4.7e-15
+against GPU4PySCF on every forced-batch h1 row, with the fetch in chunks of
+3 and with W38's stage A; 8.3e-14 against the unbatched call on the same
+SCF at 113 atoms.
+
+The original entry, for the record:
 
 *(Found by W38.)*
 
@@ -2959,6 +3085,77 @@ host array, leaving only the metric (B) and `j2c_10` (C) per batch.
 * **Success**: stage A at its full-card time, the 40 GB call within 1.05x.
 * **Falsified if**: B then has to read `j3c_00` back at PCIe rate faster
   than it is hidden (27 GB each way, 1 s at 26 GB/s).
+
+### W42 — The chunked Cholesky second pass's walks on a 40 GB card
+
+*(Found by W40.)*
+
+After items 33 and 34, taxol⁺'s unrestricted ip2 call at 40 GB is 44.9 s
+against 34.2 s on the full card, and the difference is walks
+(`docs/README_fastdfhessip8.md` §3): the first pass is a walk of its own
+(2.7 s; unfused, because the fusion's plan holds `10 naux²` back for an
+h_aux block that item 34's packed head no longer needs), and seven chunks
+of 800 rows walk four times' worth of the integrals (D3 integrals 4.1 s
+against 2.0, D3 `j3c_100` 12.4 against 8.5, D5 13.5 against 11.8).  Two
+more things take rows from the chunks: the packed `(1|00)` keeps all `naux`
+rows per direction where D5 reads the `nsph` spherical ones (1.2 GB), and
+the chunk holds both spins where a pass per spin would give each spin
+twice the rows.
+
+* **Do**: fuse the first pass into the first chunk under item 34 (the
+  packed head needs no chunk buffers), compact the packed `(1|00)` to its
+  spherical rows, and measure whether the first walk's Cartesian
+  `(10|0) C` kept in page-locked host memory (W38's pool) and fed to the
+  later chunks beats walking them again.
+* **Success**: taxol⁺'s 40 GB call within 1.15x of its full-card time.
+* **Falsified if**: the fused first chunk costs the pass a chunk, and the
+  host copies are not hidden behind the chunks' D4 and D5.
+
+### W43 — The restricted ip2 call with its occupied index batched
+
+*(Found by W39.)*
+
+Item 8 and everything built on it since W24 — the Cholesky factor, items
+22, 24–27, 32–34 — requires the occupied index in one batch (`_SphAux` is
+built only when `num_occ_batches == 1`, and item 22's blocks are square
+only then).  At 284 atoms
+(PfPMT, `nocc` 547, `naux` 15,761) `j3c_oo` alone is 38 GB, so the call
+batches the occupied index and falls back to upstream's eigenbasis in
+chunks, per occupied batch; it has never been timed (W39 did not: hours,
+by its sizes), and W39's count says the three `(nao, nao)` products have 29
+% of empty tiles to give there as well.
+
+* **Do**: time PfPMT's ip2 call with a stage table; carry item 8 (with item
+  33's chunks of rows) to a batched occupied index — every term but D4's
+  `Q` is linear in the batch's orbitals — and measure at 284 atoms.
+* **Success**: the 284-atom call at the rate the 113-atom one runs, per
+  flop.
+* **Falsified if**: the per-batch terms that are not linear in the batch
+  (`Q`, and the h_aux block's) cost more than the batching saves.
+
+### W44 — The unrestricted CPHF in one atom block on a 40 GB card
+
+*(Found by W40.)*
+
+A whole 40 GB UKS Hessian of taxol⁺ is 1760.7 s against 1482.3 s on the
+full card, and 1721.6 s of the full card's time is reached by forcing its
+CPHF into the 40 GB run's two atom blocks (64 and 49 atoms;
+`docs/README_fastdfhessip8.md` §3.1): the 1.19x is GPU4PySCF's `solve_mo1`
+blocking, not a slower kernel.  Two blocks take fifteen `_get_jk` calls
+(1357 s) where one takes six (1089 s), each block's Krylov iteration run to
+its own tolerance.  `solve_mo1` sizes the block from 30 % of the free memory
+against `8 nao² x 18` words an atom — AO-basis `vj`, `vk` and densities for
+both spins — which the patched response may not hold: W8's `_get_jk` and
+W33's occupied-side fxc both return what `_ao2mo` needs.
+
+* **Do**: measure what the patched CPHF holds per right-hand side (the
+  densities, W8's `_get_jk` buffers, `_fxc_blocked`'s), size `solve_mo1`'s
+  atom block from that, and see whether taxol⁺'s 339 right-hand sides fit one
+  block at 40 GB.
+* **Success**: the whole 40 GB UKS Hessian within 1.05x of the full card's.
+* **Falsified if**: the response's AO-basis arrays for all 339 right-hand
+  sides do not fit beside the cderi — then the blocks stay, and the next
+  thing is the Krylov iteration across blocks.
 
 ### Not on this list
 
@@ -3270,6 +3467,12 @@ FASTDFHESSIP_TIME=1 FASTDFHESSIP_NVTX=1 nsys profile ... --nvtx
 python benchmarks/df_ip2_stage_profile.py $SCRATCH/p.sqlite  # W37: kernels per stage
 python benchmarks/df_hess_metric_sens.py --xyz ... --spin 1  # the twin's metric
 python benchmarks/df_hess_anatomy.py --xyz ... --patch all --rounds 2
+python benchmarks/df_ip2_tile_probe.py --cases taxol,PfPMT:0:-1   # W39's count
+python benchmarks/df_ip2_stagea_bench.py --xyz ...   # W39: stage A's pieces
+FASTDFHESSIP_TIME=3 python benchmarks/df_hess_terms_probe.py ...  # stage A split
+FASTDFHESSIP_MEMLOG=1 python benchmarks/df_hess_terms_probe.py --ballast 40 ...
+python benchmarks/df_hess_anatomy.py --xyz ... --patch all --rounds 1 \
+    --ballast 40                                     # W40: a 40 GB Hessian
 FASTDFHESSIP_OFF=1 FASTXCFXC_MO=0 python benchmarks/df_hess_anatomy.py ...
 ```
 

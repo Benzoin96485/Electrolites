@@ -43,7 +43,12 @@ beside them at all.
 **The call is within the entry's 1.5x at 113 atoms in both spin cases**:
 taxol⁺ 1.31x of its full-card time (which this round also takes from 51.3
 to 34.2 s), taxol 1.37x, the Co(II) sextet 1.33x at a 40 GB card's memory.
-The falsification does not fire (§1).  WHOLE_HESSIAN_TBD
+The falsification does not fire (§1).  **And a whole 40 GB UKS Hessian
+of taxol⁺ is measured** (§3.1): **1760.7 s against 1482.3 s** on the full
+card (1.19x), once the CPHF's XC response hands its right-hand sides over
+in groups (§2.3) — before that, the ip2 and h1 terms ran and the Hessian
+stopped in its CPHF.  Inside it the ip2 term is 39.4 s (34.2 s on the full
+card) and h1 34.7 s (29.0 s); the difference is the CPHF (W44).
 
 ---
 
@@ -146,6 +151,22 @@ the first half's GEMM.  `FASTDFHESSIP_CROWS=0` is the fallback.
 prints the second pass's memory (it found the two OOMs of the first
 versions); `FASTDFHESSIP_D5_ROWS=<n>` caps D5's row blocks (test-only).
 
+### 2.3 What stopped the whole Hessian next: the CPHF's fxc
+
+With the ip2 and h1 terms running, the first 40 GB UKS Hessian of taxol⁺
+stopped in its CPHF: `cudaErrorMemoryAllocation` in `fastxcfxc`'s
+`_fxc_blocked`, allocating the AO route's per-block product (`aow`) for all
+of an atom block's right-hand sides at once — GPU4PySCF's `solve_mo1` sizes
+its atom block (three sets an atom, both spins in each) from 30 % of the
+free memory for its own arrays, and W33's buffers, linear in the sets (a
+bound of 0.3 GB a set at 113 atoms), are not in that estimate.  The sets are independent, so
+`fastxcfxc._get_veff_resp_mo_u` now hands them to `_fxc_blocked` in as many
+groups as half the free memory holds (`_set_groups`, a bound with every grid
+block's AO count at `nao`); on a card where they fit it is one group and the
+call as before.  `FASTXCFXC_SETS=<n>` caps a group (test-only;
+`tests/test_fxc_occ.py` runs it at 2 on five open-shell systems, within
+4.6e-15 of GPU4PySCF).
+
 ---
 
 ## 3. Measurements
@@ -196,6 +217,32 @@ a triangular multiply over all rows, where item 25 runs two.  At 40 GB the
 first pass is a walk of its own (`D1 ipaux pass`, 2.1–2.7 s) and the
 chunks are smaller.
 
+### 3.1 The whole Hessian
+
+`benchmarks/df_hess_anatomy.py --patch all --rounds 1` (with `--ballast 40`
+for the 40 GB card), taxol⁺ UKS B3LYP, one process each in one job
+(`el_w3941ph`, the preempt queue: the 40 GB Hessian does not fit a 30-minute
+debug job), s:
+
+| | 40 GB card | 80 GB card |
+|---|---|---|
+| **whole Hessian** | **1760.7** | **1482.3** |
+| partial_hess_elec (.. ip2) | 48.9 (39.4) | 43.4 (34.2) |
+| make_h1 (.. h1 `_get_veff`) | 55.1 (34.7) | 49.3 (29.0) |
+| solve_mo1 (CPHF) | 1655.0 | 1387.8 |
+| .. `_get_jk` (W8) | 1357.2 (15 calls) | 1089.0 (6 calls) |
+| .. `nr_uks_fxc` | 155.1 (70 calls: §2.3's groups) | 120.1 (19) |
+| trace | 108.9223988 | 108.9229005 |
+
+The CPHF is 94 % of both, and on the 40 GB card GPU4PySCF's `solve_mo1`
+solves it in two atom blocks (64 and 49 atoms, six and seven Krylov cycles)
+where the full card takes one: fifteen `_get_jk` calls of up to 192
+right-hand sides against six of up to 339 — the same 339 right-hand sides
+in more, smaller calls, and 1.25x the time.  It is the blocking, not the
+card: the full card with its CPHF forced to the same two blocks
+(`get_avail_mem` in `hessian/uhf.py` read as 42 GB, job `el_w3941hb`) takes
+**1721.6 s** — the 40 GB Hessian is 1.02x of that.  That is W44.
+
 ---
 
 ## 4. Correctness
@@ -217,6 +264,21 @@ metric (W37 §5.1), and item 33 applies the same factor in another order.
 Against `CROWS=0` (the same factor through the fallback's order) the Co
 sextet agrees to **2.0e-12**; two runs of the same code differ by 4e-12 on
 taxol (the ip2 kernel's atomics, W39).
+
+### 4.1 The whole Hessian
+
+The 40 GB and 80 GB Hessians of taxol⁺ (§3.1) differ by **1.5e-4**
+Eh/bohr² — and so does the full card's Hessian with the CPHF forced to the
+40 GB run's two atom blocks (1.49e-4), while that Hessian and the 40 GB one
+agree to **5.2e-10**.  The difference is GPU4PySCF's CPHF solved in other
+blocks, each to its own Krylov tolerance (`conv_tol_cpscf` times the
+block's atoms, 1e-6 here), not anything this round changes; the 40 GB
+Hessian's own code paths are where 5.2e-10 puts them.  On ethanol⁺, the
+whole UKS Hessian with every 40 GB path forced at once — item 33's chunks
+(`FASTDFHESSIP_VCHUNK=40`, unfused, so item 34 packs), item 23/35's host
+batches (`OCC_BATCH=5`) and §2.3's groups (`FASTXCFXC_SETS=2`) — is
+**4.1e-12** Eh/bohr² from the unpatched Hessian (the default paths 4.3e-12;
+two runs of the same code differ by 5e-12).
 
 ---
 
