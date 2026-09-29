@@ -33,7 +33,15 @@ ap.add_argument('--auxbasis', default=None)
 ap.add_argument('--rounds', type=int, default=2)
 ap.add_argument('--conv-tol-cpscf', type=float, default=1e-6)
 ap.add_argument('--save', default='', help='write the last Hessian here (.npy)')
+ap.add_argument('--ballast', type=float, default=0,
+                help='GB held on the device for the whole run, before the '
+                     'SCF: 40 on an 80 GB card is the memory of a 40 GB one '
+                     '(W40)')
 a = ap.parse_args()
+if a.ballast:
+    _ballast = cp.empty(int(a.ballast * 1e9) // 8)
+    print(f'# ballast {a.ballast} GB, '
+          f'{cp.cuda.runtime.memGetInfo()[0] / 1e9:.1f} GB free', flush=True)
 patched = apply_patch(a.patch)
 
 from gpu4pyscf import dft                                    # noqa: E402

@@ -269,15 +269,30 @@ for mem, term, fuse in [(m, t, f) for m in 4e7 * 0.85 ** np.arange(16)
         reached[term].add('v fused' if fused else 'v')
 # a multi-chunk second pass with the first pass fused into it, forced: the
 # fusion's own memory margin keeps it off at every cap above
-for vchunk in (160, 64):
+# W40's item 33 is the Cholesky factor in chunks of rows (the default
+# wherever item 8's whole index does not fit); CROWS=0 is the chunked
+# eigen-style arithmetic it replaces, D5_GROUP=8 and D5_ROWS=7 its D5 in
+# many groups and row blocks; unfused, item 34 packs D5's partners
+# (PACKROWS=0 does not)
+CROWS = [('', {}), (' [CROWS=0]', {'CROWS': 0}),
+         (' [D5_GROUP=8]', {'D5_GROUP': 8}),
+         (' [D5_ROWS=7]', {'D5_ROWS': 7}),
+         (' [PACKROWS=0]', {'PACKROWS': 0})]
+for vchunk in (160, 64, 40):
     for fuse in (1, 0):
+      for lbl, sw in (CROWS if fuse else CROWS[:2] + CROWS[3:]):
         fused0 = fastdfhessip.stats()['fused']
-        with env(VCHUNK=vchunk, FUSE=fuse):
+        rows0 = fastdfhessip.stats().get('chol_rows', 0)
+        with env(VCHUNK=vchunk, FUSE=fuse, **sw):
             got = fastdfhessip._jk_energy_per_atom(intopt, dm0, 1., 0.2)
         st = fastdfhessip.stats()
         fused = st['fused'] > fused0
+        rows = st.get('chol_rows', 0) > rows0
+        if rows:
+            reached['ip2'].add('chol rows')
         check(f'ethanol ip2 chunk {vchunk} (vchunks={st["vchunks"]}'
-              f'{" fused" if fused else ""})', got, ref['ip2'])
+              f'{" fused" if fused else ""}{" rows" if rows else ""}){lbl}',
+              got, ref['ip2'])
         if st['vchunks'] > 1:
             reached['ip2'].add('v fused' if fused else 'v')
 # and the occupied batching, forced: ethanol's 13 occupied orbitals never
@@ -325,7 +340,7 @@ for lbl, sw in (('', {}), (' [H1C=atom]', {'H1C': 'atom'}),
     if fastdfhessip.stats()['h1_kocc']:
         reached['h1'].add('k occ')
     check(f'ethanol h1, exchange on the occupied side{lbl}', got, ref['h1'])
-ok = (reached['ip2'] == {'occ', 'v', 'v fused'} and
+ok = (reached['ip2'] == {'occ', 'v', 'v fused', 'chol rows'} and
       reached['h1'] == {'occ', 'k occ', 'rebalanced'})
 if not ok:
     fails.append(f'memory cap did not reach the batched paths: {reached}')

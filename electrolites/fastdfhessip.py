@@ -278,6 +278,30 @@ both spin cases, ``omega = 0`` only:
     the ``ncart x nsph`` pattern that ran on the host in stage B (W37's
     other §4 lead).  ``FASTDFHESSIP_SPHHOST=1``.
 
+``docs/DF_WORK_LIST.md`` **W40** (``docs/README_fastdfhessip8.md``) gave item
+8 the cards and molecules where its whole spherical index does not fit (a
+40 GB card at 113 atoms in both spin cases, and taxol's unrestricted call on
+an 80 GB one), which had fallen back to upstream's chunked arithmetic:
+
+33. **The Cholesky factor in chunks of rows of ``Y = L^-1 K``**
+    (``_CholRows``): a chunk ``[v0, v1)`` is the factor's columns applied to
+    ``(10|0) C`` as upstream's chunk is, but reaches only the Cartesian rows
+    whose shell starts below ``v1``, so it walks only their integral
+    batches, and the chunks run last first; D4 is the Gram form on the
+    chunk; D5's first half is ``L^-T[:v1, v0:v1]`` times the chunk, a GEMM
+    per atom group, and its second half the chunk against ``(C^T
+    j2c_10v)[:, :, v0:v1]`` -- no ``Z = L^-T Y`` by rows, which nothing
+    needs.  ``FASTDFHESSIP_CROWS=0`` is the chunked eigen-style arithmetic.
+34. **Item 33's memory**: the second pass sized without upstream's per-atom
+    D5 temporaries, and, unfused, ``dm_oo`` and ``(1|00)`` held from the
+    first pass on as their weighted ``i <= j`` pairs (``_SymRows``): the
+    first pass writes them so, the h_aux block's head runs on them in place
+    (``_h_aux_head_pin``), D5 unpacks a block of rows at a time, and the
+    second pass is planned on what the h_aux block leaves -- which on a
+    40 GB card is what lets that block run at all.
+    ``FASTDFHESSIP_PACKROWS=0`` is item 33 alone;
+    ``FASTDFHESSIP_D5_ROWS=<n>`` caps D5's row blocks (test-only).
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -340,8 +364,14 @@ as item 25 (W37).
     FASTDFHESSIP_SPHHOST=1, FASTDFHESSIP_LOW_TILE=<n>
                              W39's items 29-32 off, or the triangle's tile
                              (64 AOs)
+    FASTDFHESSIP_CROWS=0, FASTDFHESSIP_PACKROWS=0
+                             W40's items 33 and 34 off
+    FASTDFHESSIP_MEMLOG=1    print the unrestricted second pass's memory
+                             as it is planned and allocated, and item 33's
+                             D5 blocks (W40)
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
-                             also times the ip2 kernel per auxiliary l;
+                             also times the ip2 kernel per auxiliary l, =3
+                             splits the ip2 call's stage A (W39);
                              with FASTDFHESSIP_NVTX=1 each stage's end is
                              an NVTX mark (``df_ip2_stage_profile.py``)
     FASTDFHESSIP_RCHUNK=<n>  W17's 1.2e8-element bound on the Gram form's
@@ -553,6 +583,17 @@ def _avail():
     takes when memory is short.
     """
     mem = get_avail_mem(exclude_memory_pool=True)
+    cap = _env('FASTDFHESSIP_MEM', '')
+    return min(mem, int(float(cap))) if cap else mem
+
+
+def _avail_less(nbytes):
+    """``_avail()`` as it will read once ``nbytes`` more are allocated (a
+    buffer over GPU4PySCF's pool threshold is its own ``cudaMalloc``): item
+    34 decides the form of ``(1|00)`` after the plan, and allocating the
+    unpacked one first only to free it costs the ``cudaMalloc`` beside that
+    ``cudaFree`` its wait (0.55 s on taxol+, W34's effect)."""
+    mem = get_avail_mem(exclude_memory_pool=True) - nbytes
     cap = _env('FASTDFHESSIP_MEM', '')
     return min(mem, int(float(cap))) if cap else mem
 
@@ -794,7 +835,8 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         nocc_in_batch = nocc1 - nocc0
 
         dm_oo = cp.asarray(dm_oo_full[:, nocc0:nocc1])
-        j3c_oo1 = cp.empty((3, naux, nocc_in_batch, nocc))  # = (1|00)
+        # (1|00), allocated once item 34 has said in which form
+        j1_shape = (3, naux, nocc_in_batch, nocc)
 
         # The sizes the second pass is going to use, worked out before the
         # first so that item 3 can tell whether there will be one chunk.
@@ -802,17 +844,19 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         # and the h_aux block; the arithmetic below is upstream's, applied to
         # the same `word_avail` those steps leave (they free what they
         # allocate), so the chunking is the same as upstream's.
-        mem_avail = _avail()
+        mem_avail = _avail_less(8 * int(np.prod(j1_shape)))
         word_avail = mem_avail // 8
         blksize1 = min(naux, word_avail // (nao**2*8) * 8)
         assert blksize1 > 0, 'Insufficient GPU memory'
         blksize1 = min(blksize1, batch_size)
 
-        plan = _plan_v(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair,
-                       batch_size, nao_on_atom, natm, metric_size, batch_id)
-        do_fuse = False
-        plan_f = (None,)
-        if fuse:
+        def make_plan(word_avail, rows):
+          plan = _plan_v(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair,
+                         batch_size, nao_on_atom, natm, metric_size, batch_id,
+                         rows)
+          do_fuse = carve = False
+          plan_f = (None,)
+          if fuse:
             # Fused, the first pass rides on the second pass's *first*
             # chunk and the h_aux block runs after that chunk's integrals,
             # while its buffers are held rather than before they are
@@ -834,12 +878,15 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             try:
                 plan_f = _plan_v(word_avail - margin, naux, nao, nocc,
                                  nocc_in_batch, nao_pair, batch_size,
-                                 nao_on_atom, natm, metric_size, batch_id)
+                                 nao_on_atom, natm, metric_size, batch_id,
+                                 rows)
             except AssertionError:
                 plan_f = (0,)
             if plan_f[0] > 0 and (-(-metric_size // plan_f[0]) <=
                                   -(-metric_size // plan[0])):
                 plan, do_fuse = plan_f, True
+          return plan, plan_f, do_fuse, carve
+        plan, plan_f, do_fuse, carve = make_plan(word_avail, False)
         aux_batch_size, aux_blksize, blksize2 = plan
         # item 8's structured second pass needs the whole auxiliary index in
         # its one chunk; otherwise the factor goes through upstream's chunked
@@ -848,6 +895,50 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             else None
         if sa is not None and chol is None:
             _S['chol_chunked'] = _S.get('chol_chunked', 0) + 1
+        # item 33 (W40): where it does not, the factor in chunks of rows of
+        # Y = L^-1 K, the last chunk first, each walking only the integral
+        # batches its rows reach
+        crow = None
+        pack34 = rows34 = False
+        if (sa is not None and chol is None and metric == 'chol' and
+                _env('FASTDFHESSIP_CROWS', '1') != '0'):
+            crow = _CholRows(sa)
+            _S['chol_rows'] = _S.get('chol_rows', 0) + 1
+            # item 34: sized without upstream's per-atom D5, and unfused,
+            # its partners packed and the pass re-planned after the h_aux
+            # block (fused, that block runs inside the first chunk, whose
+            # buffers are already sized)
+            # (FASTDFHESSIP_PACKROWS=0: item 33 alone).  Its own buffer,
+            # the spherical j2c_10v, is held back as well
+            if _env('FASTDFHESSIP_PACKROWS', '1') != '0':
+                try:
+                    plan, plan_f, do_fuse, carve = make_plan(
+                        word_avail - 3*naux*metric_size, True)
+                except AssertionError:
+                    # not a row before the packing: unfused, and planned
+                    # after it
+                    plan, plan_f, do_fuse, carve = ((metric_size, 0, 0),
+                                                    (0,), False, False)
+                aux_batch_size, aux_blksize, blksize2 = plan
+                pack34 = not do_fuse
+                rows34 = True
+            else:
+                plan, plan_f, do_fuse, carve = make_plan(
+                    word_avail - 3*naux*metric_size, False)
+                aux_batch_size, aux_blksize, blksize2 = plan
+            if pack34:
+                # item 34: from the first pass on, dm_oo and (1|00) as their
+                # weighted pairs -- the first pass writes them so, the h_aux
+                # block's products run on them in place, and D5 unpacks a
+                # block of rows at a time; half of both, which is what does
+                # not fit beside the h_aux block on a 40 GB card
+                j3c_oo1 = _SymRows(3*naux, 1, nocc, xstride=naux)
+                dmp = _SymRows(naux, 1, nocc)
+                dmp.put(0, dm_oo.reshape(naux, 1, nocc, nocc))
+                dm_oo = dm_oo_full = None
+                dm_oo = dmp
+        if not pack34:
+            j3c_oo1 = cp.empty(j1_shape)  # = (1|00)
         st.note(free_gb=round(word_avail * 8e-9, 1), plan=plan[0],
                 plan_fused=plan_f[0])
         st.note(chol=chol is not None, nao=nao, nocc=nocc, naux=naux, metric_size=metric_size,
@@ -882,6 +973,27 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             h_aux_parts = None
             if chol is not None:
                 j2c_10v = None
+            if crow is not None:
+                crow.set_j2c_10v(j2c_10v)
+                for x in range(3):
+                    if pack34:
+                        rx = j3c_oo1p.p[x*naux:(x+1)*naux]
+                        sa.to_sph(rx, rx)
+                    else:
+                        sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
+            if pack34:
+                # item 34: the second pass planned on what the packing left
+                t1p = j3c_oo1p
+                j3c_oo1p = j3c_oo1 = dm_oo = None
+                word_avail = _avail() // 8
+                plan = _plan_v(word_avail, naux, nao, nocc, nocc_in_batch,
+                               nao_pair, batch_size, nao_on_atom, natm,
+                               metric_size, batch_id, True, True)
+                aux_batch_size, aux_blksize, blksize2 = plan
+                _S['vchunks'] = int(-(-metric_size // aux_batch_size))
+                _S['packrows'] = _S.get('packrows', 0) + 1
+                st.note(free_gb_packed=round(word_avail * 8e-9, 1),
+                        vchunk_packed=aux_batch_size)
             st('D2 h_aux')
         else:
             j3c_oo1p = j3c_oo1
@@ -894,7 +1006,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         nw = _work_words(
             aux_unit2*aux_blksize, nao, nocc, nocc_in_batch, naux, nao_pair,
             batch_size, blksize2, nao_on_atom, aux_batch_size, metric_size,
-            chol, batch_id == 0 and oosum == 'gram')
+            chol, batch_id == 0 and oosum == 'gram', rows34)
         if d3probe == 'hold':
             # measurement only (W34): the two buffers kept across calls
             j3c_buf = _held('j3c_buf', nj)
@@ -903,8 +1015,16 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             j3c_buf = cp.empty(nj)
             work = cp.empty(nw)
         st('D3 alloc')
-        for v0, v1 in lib.prange(0, metric_size, aux_batch_size):
+        vchunks = list(lib.prange(0, metric_size, aux_batch_size))
+        if crow is not None:
+            # item 33: the last rows first -- theirs is the whole walk, which
+            # the fused first pass and the h_aux block ride on
+            vchunks = vchunks[::-1]
+            h_raw = cp.zeros((natm, sa.nsph, 3, 3))
+        for ci, (v0, v1) in enumerate(vchunks):
             dv = v1 - v0
+            vfirst = ci == 0
+            ncp = crow.ncart(v1) if crow is not None else naux
             if batch_id == 0:
                 j3c_100 = ndarray((3, dv, nao, nocc), buffer=j3c_buf)
             else:
@@ -919,11 +1039,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             st('D3 buffers')
             aux0 = aux1 = 0
             for kbatch in range(num_aux_batches):
+                if aux1 >= ncp:
+                    # item 33: no row past here reaches this chunk
+                    break
                 compressed_di = eval_ip1(kbatch, out=buf0)
                 compressed_dk = eval_ipaux(kbatch, out=buf1)
                 naux_in_batch = compressed_di.shape[-1]
                 st('D3 integrals')
-                if do_fuse and v0 == 0 and not d1d3:
+                if do_fuse and vfirst and not d1d3:
                     # item 3: upstream's first pass, on this batch's
                     # ipaux integrals before they are folded into dj
                     _ipaux_batch(compressed_dk, aux1, naux_in_batch,
@@ -955,7 +1078,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                             j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
                         if batch_id == 0:
                             contract('pqr,qi->pir', j3c, _dm_factor_l, out=tmp)
-                            if d1d3 and v0 == 0:
+                            if d1d3 and vfirst:
                                 _d1_from_d3(tmp, _dm_factor_l,
                                             j3c_oo1[x, aux0:aux1],
                                             auxvec_ipauxp[x, aux0:aux1]
@@ -977,7 +1100,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             j3c_full = buf0 = buf1 = None
             compressed_di = compressed_dj = compressed_dk = None
 
-            if do_fuse and v0 == 0:
+            if do_fuse and vfirst:
                 # the h_aux block that upstream runs between the passes, in
                 # the integral buffers the walk has finished with
                 j3c_oo1p, h_aux_parts = _h_aux_block(
@@ -992,6 +1115,10 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 h_aux_parts = None
                 if chol is not None:
                     j2c_10v = None
+                if crow is not None:
+                    crow.set_j2c_10v(j2c_10v)
+                    for x in range(3):
+                        sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
                 st('D2 h_aux')
 
             if chol is not None:
@@ -1020,6 +1147,17 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                                   naux, oosum)
                 st('D4 oo_atm')
 
+            if crow is not None:
+                nsph_ = sa.nsph
+                crow.d5(j3c_100.reshape(3, dv, 1, nao, nocc), v0, v1,
+                        t1p if pack34 else
+                        j3c_oo1p[:, :nsph_].reshape(3, nsph_, 1, nocc, nocc),
+                        dmp if pack34 else
+                        dm_oo.reshape(dm_oo.shape[0], 1, nocc, nocc),
+                        _dm_factor_l.reshape(1, nao, nocc), aoslices,
+                        -k_factor, k_factor, h_raw, work)
+                st('D5 per-atom')
+                continue
             if batch_id == 0:
                 j3c_100 = j3c_100[:, :, :, nocc0:nocc1]
             for i, (p0, p1) in enumerate(zip(aoslices[:-1], aoslices[1:])):
@@ -1043,6 +1181,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         j3c_buf = work = work1 = tmp0 = tmp1 = None
         j3c = j3c_100 = None
         j2c_10v = j2c_10c = j3c_oo1p = j3c_oo1 = None
+        if crow is not None:
+            h_sph = _aggregate_to_atoms(h_raw, natm, sa.atm, axis=1)
+            h_raw = crow = t1p = dmp = None
 
     ejk_ao_aux = _aggregate_to_atoms(h_ao_aux, natm, aux_atm_labels, axis=1)
     if h_sph is not None:
@@ -1377,6 +1518,16 @@ class _SphAux:
             o2[c0:c1] = self.mp[a0:a1, c0:c1].T.dot(x2[a0:a1])
         return out[:self.nsph]
 
+    def pinv_blocks(self):
+        """``mp = C (C^T C)^-1`` shell block by shell block (``to_sph_pinv``'s
+        coefficients), built once."""
+        if not hasattr(self, 'mp'):
+            self.mp = cp.zeros_like(self.ms)
+            for a0, a1, c0, c1 in self.blocks:
+                b = self.ms[a0:a1, c0:c1]
+                self.mp[a0:a1, c0:c1] = b.dot(cp.linalg.inv(b.T.dot(b)))
+        return self.mp
+
     def factor(self):
         """``C L^-T``, Cartesian rows in the integrals' order: with unit
         weights, what ``_factorize_j2c``'s ``V`` is to its ``w``."""
@@ -1388,16 +1539,30 @@ class _SphAux:
 
 
 def _plan_v(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair, batch_size,
-            nao_on_atom, natm, metric_size, batch_id):
-    """Upstream's sizing of the second pass, unchanged."""
-    word_avail -= 4 * naux**2  # j2c_10v
+            nao_on_atom, natm, metric_size, batch_id, rows=False,
+            after_h_aux=False):
+    """Upstream's sizing of the second pass, unchanged -- except with
+    ``rows`` (item 34, W40): item 33's D5 has no ``naux``-sized per-atom
+    temporaries, so the ``6 naux nao_A nocc`` words held back for them are
+    not; ``after_h_aux``:
+    planned on what is free after the h_aux block, which already holds its
+    j2c_10v."""
+    if not after_h_aux:
+        word_avail -= 4 * naux**2  # j2c_10v
     word_avail -= 3 * batch_size * nao_pair * 2  # eval_ip1, eval_ipaux
+    # (the 3 naux words per auxiliary function are _oo_gram's Coulomb
+    # temporary as well as upstream's per-atom D5's, so rows keeps them)
+    per_aux = 3*naux
     if batch_id == 0:
-        aux_unit1 = 3*nao*nocc + 3*naux
+        aux_unit1 = 3*nao*nocc + per_aux
     else:
-        aux_unit1 = 3*nao*nocc_in_batch + 3*naux
+        aux_unit1 = 3*nao*nocc_in_batch + per_aux
+    # (rows: and D4's few (3, 3, nao, nao) results and temporaries, which
+    # the chunks' Gram form allocates beside the two buffers)
+    held = (_D5_ROWS_WORDS + 64*nao*nao if rows else
+            6*naux*nao_on_atom*nocc)
     aux_batch_size = min(int(word_avail*.85),
-                         word_avail-6*naux*nao_on_atom*nocc) // aux_unit1
+                         word_avail-held) // aux_unit1
     assert aux_batch_size > 0, 'Insufficient GPU memory'
     # FASTDFHESSIP_VCHUNK=<n> caps the chunk, for the tests: a multi-chunk
     # second pass is otherwise only reached when memory is short
@@ -1422,6 +1587,8 @@ def _plan_v(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair, batch_size,
 
 
 _HELD = {}
+#: what item 33's D5 is left at least, in words (it sizes its blocks to it)
+_D5_ROWS_WORDS = int(2.5e8)
 
 
 def _held(key, n):
@@ -1436,7 +1603,7 @@ def _held(key, n):
 
 def _work_words(atm_words, nao, nocc, nocc_in_batch, naux, nao_pair,
                 batch_size, blksize2, nao_on_atom, aux_batch_size,
-                metric_size, chol, gram):
+                metric_size, chol, gram, rows=False):
     """Words of the second pass's ``work`` buffer (item 19, W34).
 
     Upstream sizes it as the largest of four uses, one of which is
@@ -1458,6 +1625,9 @@ def _work_words(atm_words, nao, nocc, nocc_in_batch, naux, nao_pair,
     uses = [3*nao_pair*batch_size * 2 + (nocc+nao)*nao * blksize2,
             3*naux*nao_on_atom*nocc_in_batch * 2,
             3*naux*nao_on_atom*nocc_in_batch + 3*aux_batch_size*naux]
+    if rows:
+        # item 34: item 33's D5 in place of upstream's per-atom one
+        uses[1:] = [_D5_ROWS_WORDS]
     if _env('FASTDFHESSIP_WORK', '') == 'upstream':
         return max([atm_words] + uses)
     if chol is not None:
@@ -1551,10 +1721,13 @@ def _d1_from_d3(tmp, c, out, trace_out, nspin=0):
 def _ipaux_pass(eval_ipaux, num_aux_batches, blksize, nao, nao_pair,
                 batch_size, nocc_in_batch, pair_addresses, dm_factor_l,
                 nocc0, nocc1, j3c_oo1, auxvec_ipauxp, dm):
-    """Upstream's first pass: ``(1|00)`` and, on batch 0, its trace."""
+    """Upstream's first pass: ``(1|00)`` and, on batch 0, its trace
+    (``j3c_oo1`` a ``_SymRows``: item 34, written packed)."""
     j3c_full = cp.zeros((nao, nao, blksize))
     buf = cp.empty((3, nao_pair, batch_size))
     buf1 = cp.empty((blksize * nocc_in_batch * nao))
+    if isinstance(j3c_oo1, _SymRows):
+        j3c_oo1.tmp = cp.empty((blksize, nocc_in_batch, dm_factor_l.shape[1]))
     aux0 = 0
     for kbatch in range(num_aux_batches):
         compressed = eval_ipaux(kbatch, out=buf)
@@ -1563,6 +1736,8 @@ def _ipaux_pass(eval_ipaux, num_aux_batches, blksize, nao, nao_pair,
                      nao, nocc_in_batch, pair_addresses, dm_factor_l, nocc0,
                      nocc1, j3c_oo1, auxvec_ipauxp, dm)
         aux0 += naux_in_batch
+    if isinstance(j3c_oo1, _SymRows):
+        j3c_oo1.tmp = None
 
 
 def _ipaux_batch(compressed, aux0, naux_in_batch, blksize, j3c_full, work,
@@ -1578,8 +1753,14 @@ def _ipaux_batch(compressed, aux0, naux_in_batch, blksize, j3c_full, work,
                            out=j3c)
             contract('pqr,pi->iqr', j3c, dm_factor_l[:, nocc0:nocc1], out=tmp)
             # d/dX = -d/dr
-            contract('iqr,qj->rij', tmp, dm_factor_l, alpha=-1,
-                     out=j3c_oo1[i, a0:a1])
+            if isinstance(j3c_oo1, _SymRows):
+                t = contract('iqr,qj->rij', tmp, dm_factor_l, alpha=-1,
+                             out=j3c_oo1.tmp[:dk])
+                j3c_oo1.put(i*j3c_oo1.xstride + a0,
+                            t.reshape(dk, 1, *t.shape[1:]))
+            else:
+                contract('iqr,qj->rij', tmp, dm_factor_l, alpha=-1,
+                         out=j3c_oo1[i, a0:a1])
             if auxvec_ipauxp is not None:
                 contract('pqr,pq->r', j3c, dm, -1, out=auxvec_ipauxp[i, a0:a1])
     # the symmetric fill writes the whole of j3c; the (10|0) pass that may
@@ -1795,6 +1976,26 @@ def _h_aux_head_packed(j2c_10, dm_oo, j3c_oo1, nspin, k_factor, h_out,
     return j3c_oo1
 
 
+def _h_aux_head_pin(j2c_10, dmp, j1p, k_factor, h_out, dmaux_out,
+                    dmaux1_out):
+    """Item 34 (W40): ``_h_aux_head_packed`` on inputs held packed
+    (``_SymRows``, rows ``r`` and ``(x, r)``): the same four products on all
+    the pairs at once, with no chunk buffers, and ``j3c_oo1p`` left in
+    ``j1p``, packed."""
+    n, npr = dmp.p.shape
+    n3 = 3 * n
+    alpha = -.5 * k_factor
+    _gemm_rm('N', 'N', n3, npr, n, -1., j2c_10.data.ptr, n, dmp.p.data.ptr,
+             npr, 1., j1p.p.data.ptr, npr)
+    _syrk_acc(j1p.p, n3, npr, npr, alpha, 0., h_out)
+    _syrk_acc(dmp.p, n, npr, npr, alpha, 0., dmaux_out)
+    _gemm_rm('N', 'T', n3, n, npr, alpha, j1p.p.data.ptr, npr,
+             dmp.p.data.ptr, npr, 0., dmaux1_out.data.ptr, n)
+    _mirror(h_out)
+    _mirror(dmaux_out)
+    return j1p
+
+
 def _h_aux_words(naux, metric_size):
     """What ``_h_aux_block``'s temporaries take from ``work``, in words."""
     return 15 * naux**2 + naux * metric_size
@@ -1835,15 +2036,29 @@ def _h_aux_block(auxmol, omega, _aux_sorting, _metric_v, _metric_w, dm_oo,
     # square (one occupied batch); the layout of the carved temporaries is
     # then dm_aux1 [0, 3n^2), dm_aux [3n^2, 4n^2), the rest after
     nocc = dm_oo.shape[-1]
+    # item 34 (W40): dm_oo and j3c_oo1 arrive already as their weighted
+    # pairs (_SymRows); the head runs on them in place
+    pin = isinstance(dm_oo, _SymRows)
     # Not on the long-range operator: its metric is ill-conditioned enough
     # that reading one triangle of j3c_oo1 for both -- a change at the last
     # bit of each element -- moves a triplet's ip2 term by 6e-10 relative
     # against upstream's (tests/test_dfuhessip.py), as reassociating stage A
     # does by 1e-10; every omega = 0 case agrees to 1e-13
-    packed = (_env('FASTDFHESSIP_PACK', '1') != '0' and omega == 0 and
-              j3c_oo1.shape[-2] == nspin * nocc and
-              dm_oo.shape[-2] == nspin * nocc)
-    if packed:
+    packed = pin or (_env('FASTDFHESSIP_PACK', '1') != '0' and omega == 0 and
+                     j3c_oo1.shape[-2] == nspin * nocc and
+                     dm_oo.shape[-2] == nspin * nocc)
+    if pin:
+        _S['packed'] = _S.get('packed', 0) + 1
+        h_aux = ndarray((3*n, 3*n), buffer=h_buf) if carve else \
+            cp.empty((3*n, 3*n))
+        dm_aux1 = take((3, n, n), 0)
+        dm_aux = take((n, n), 3*n*n)
+        _h_aux_head_pin(j2c_10, dm_oo, j3c_oo1, k_factor, h_aux, dm_aux,
+                        dm_aux1)
+        j3c_oo1p = j3c_oo1
+        h_aux = h_aux.reshape(3, n, 3, n)
+        o0 = 4*n*n
+    elif packed:
         _S['packed'] = _S.get('packed', 0) + 1
         h_aux = ndarray((3*n, 3*n), buffer=h_buf) if carve else \
             cp.empty((3*n, 3*n))
@@ -2136,6 +2351,290 @@ def _d5_chol(sa, z, t1s, dm_oo, c, aoslices, f1, f2, j10s, h_sph, work):
                                      np.int64(j10s.strides[0] // 8),
                                      np.float64(f2)))
         ps = pa = None
+
+
+_D5_H2R = cp.RawKernel(r"""
+extern "C" __global__
+void d5_h2r(const double* __restrict__ m, const double* __restrict__ j,
+            double* __restrict__ h, const int dv, const long long ss,
+            const int ld, const double f)
+{
+    // h[s][x][y] += f sum_{t<dv} m[s][x][t] j[y][s][t], j's y stride ss
+    // and row stride ld (a column block of a wider array)
+    const int s = blockIdx.x;
+    const double* mp = m + (long long)s*3*dv;
+    const double* jp = j + (long long)s*ld;
+    double acc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (int t = threadIdx.x; t < dv; t += blockDim.x) {
+        const double m0 = mp[t], m1 = mp[dv + t], m2 = mp[2*dv + t];
+        const double j0 = jp[t], j1 = jp[ss + t], j2 = jp[2*ss + t];
+        acc[0] += m0*j0; acc[1] += m0*j1; acc[2] += m0*j2;
+        acc[3] += m1*j0; acc[4] += m1*j1; acc[5] += m1*j2;
+        acc[6] += m2*j0; acc[7] += m2*j1; acc[8] += m2*j2;
+    }
+    __shared__ double red[9][32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int c = 0; c < 9; c++) {
+        double v = acc[c];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o);
+        if (lane == 0) red[c][warp] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 9) {
+        double v = 0;
+        for (int w = 0; w < (blockDim.x >> 5); w++) v += red[threadIdx.x][w];
+        h[(long long)s*9 + threadIdx.x] += f * v;
+    }
+}
+""", 'd5_h2r')
+
+
+class _CholRows:
+    """Item 30 (W40): item 8 on a card too short for the whole spherical index.
+
+    Item 8 holds ``K``, the spherical ``(10|0) C``, for every auxiliary
+    function at once, because D4 needs ``Y = L^-1 K`` by rows and D5 needs
+    ``Z = L^-T Y`` by columns; where that does not fit (at 113 atoms on a
+    40 GB card, and taxol's unrestricted call on an 80 GB one) the factor
+    went through upstream's chunked arithmetic, whose every chunk is a walk
+    over the integrals and whose D5 is the eigenbasis's three
+    ``naux_cart x naux_sph`` contractions.  But nothing here needs ``Z`` by
+    rows: with ``Y`` in chunks of rows ``[v0, v1)``,
+
+    * ``Y`` for the chunk is ``V[:, v0:v1]^T`` applied to ``(10|0) C``,
+      ``V = C L^-T`` the factor as upstream's ``metric_v`` -- the chunked
+      second pass as it stands, except that ``V[r, v0:v1]`` is zero for every
+      Cartesian row whose shell's first spherical column is ``>= v1``: a
+      chunk needs only the integral batches of a prefix of the rows
+      (``ncart(v1)``), and the chunks run last first, so that the first one
+      is the whole walk the fused first pass rides on;
+    * D4 sums over ``r`` and is W17's Gram form on the chunk, unchanged;
+    * D5's first half is ``sum_{s in B} <Z[s], T1[s]>``, and ``Z`` restricted
+      to one chunk's rows of ``Y`` is ``L^-T[:v1, v0:v1] Y_c``: nonzero on
+      the rows ``s < v1`` only, one GEMM per atom group;
+    * D5's second half sums ``Z`` over its index against ``j10s``, so it is
+      ``sum_{t in chunk} (j10s L^-T)[y,s,t] (P . Y)[s,x,t]`` -- the same
+      per-atom product on the chunk's rows of ``Y``, and ``j10s L^-T`` is
+      ``C^T j2c_10v``, the spherical rows of what the h_aux block already
+      forms;
+    * the Coulomb terms are upstream's in the factor's basis (``_oo_gram``'s
+      own), which is exact for any ``V`` with ``V V^T = C J^-1 C^T``.
+
+    ``FASTDFHESSIP_CROWS=0`` is the chunked eigen-style arithmetic of before.
+    """
+
+    def __init__(self, sa):
+        self.sa = sa
+        # the first spherical column of every row from r on: within a shell
+        # the rows' first columns are not in order (a Cartesian d row can
+        # reach only its last spherical one), across shells they are
+        self.lo = np.minimum.accumulate(np.asarray(sa.lo)[::-1])[::-1]
+        self.j10l = None
+
+    def ncart(self, v1):
+        """Cartesian rows with a nonzero ``V[r, :v1]``: a prefix."""
+        return int(np.searchsorted(self.lo, v1, side='left'))
+
+    def set_j2c_10v(self, j2c_10v):
+        """``(C^T j2c_10v)[y, s, t] = (j10s L^-T)[y, s, t]``, spherical."""
+        sa = self.sa
+        out = cp.empty((3, sa.ncart, sa.nsph))
+        for y in range(3):
+            sa.to_sph(j2c_10v[y], out[y])
+        self.j10l = out[:, :sa.nsph]
+
+    def d5(self, y, v0, v1, t1s, dm_oo, c, aoslices, f1, f2, h_sph, work):
+        """D5 on the chunk ``y = Y[:, v0:v1]`` (``(3, dv, ns, nao, nocc)``).
+
+        ``t1s`` is the spherical partner ``(3, nsph, ns, nocc, nocc)`` and
+        ``dm_oo`` ``(ncart, ns, nocc, nocc)`` -- arrays, or item 34's
+        ``_SymRows`` of them (``3 nsph`` and ``ncart`` rows); ``c`` is
+        ``(ns, nao, nocc)``.  The first half runs over blocks of the
+        spherical rows ``s < v1``, the second over blocks of the Cartesian
+        rows of whole shells, each block's partner rows unpacked once for
+        every atom group; both are sized to ``work``.
+        """
+        sa = self.sa
+        nsph, ncart = sa.nsph, sa.ncart
+        dv = v1 - v0
+        ns, nao, nocc = y.shape[2], y.shape[3], y.shape[4]
+        natm = len(aoslices) - 1
+        na = np.diff(aoslices)
+        nam = int(na.max())
+        tpk = isinstance(t1s, _SymRows)
+        dpk = isinstance(dm_oo, _SymRows)
+        size = work.size
+        # the groups: as many AOs as the buffer holds beside a block of at
+        # least 256 spherical rows (first half) and the largest shell block
+        # of Cartesian rows (second half), at least the largest atom
+        per_s1 = natm*9 + (3*ns*nocc*nocc if tpk else 0)
+        per_su = 6*ns*nocc
+        per_r1 = (ns*nocc*nocc if dpk else 0) + 3*dv
+        blk2 = max(b[1] - b[0] for b in sa.blocks)
+        cap = min((size // min(v1, 256) - per_s1) // per_su,
+                  (size // blk2 - per_r1) // (2*ns*nocc))
+        cap = max(nam, min(nao, cap))
+        cap = min(cap, int(_env('FASTDFHESSIP_D5_GROUP', '0')) or cap)
+        groups = []
+        a0 = 0
+        for a in range(1, natm + 1):
+            if a == natm or aoslices[a+1] - aoslices[a0] > cap:
+                groups.append((a0, a))
+                a0 = a
+        ngm = max(int(aoslices[b] - aoslices[a]) for a, b in groups)
+        sb = max(1, min(v1, size // (per_s1 + per_su*ngm)))
+        sb = min(sb, int(_env('FASTDFHESSIP_D5_ROWS', '0')) or sb)
+        need = sb * (per_s1 + per_su*ngm)
+        if _env('FASTDFHESSIP_MEMLOG', '') == '1':
+            print(f'[memlog d5] v {v0}:{v1} work {size*8e-9:.2f} GB, first '
+                  f'half need {need*8e-9:.2f}, sb {sb}, cap {cap}, free '
+                  f'{_avail()*1e-9:.2f}', flush=True)
+        if size < need:
+            work = cp.empty(need)
+        linv = sa.linv
+        ys_x, ys_r, ys_n = (x // 8 for x in y.strides[:3])
+        ginfo = []
+        for a0, a1 in groups:
+            q0 = int(aoslices[a0])
+            ginfo.append((a0, a1, q0, int(aoslices[a1]) - q0,
+                          cp.asarray(aoslices[a0:a1] - q0, dtype=np.int32),
+                          cp.asarray(na[a0:a1], dtype=np.int32),
+                          cp.arange(a0, a1, dtype=np.int32)))
+        # the first half: rows s < v1 of this chunk's Z
+        for s0, s1 in lib.prange(0, v1, sb):
+            nb = s1 - s0
+            hb = ndarray((natm, nb, 3, 3), buffer=work)
+            hb[:] = 0.
+            off = natm*nb*9
+            if tpk:
+                tb = ndarray((3, nb, ns, nocc, nocc), buffer=work[off:])
+                off += tb.size
+                xs_ = t1s.xstride or nsph
+                for x in range(3):
+                    t1s.rows(x*xs_ + s0, x*xs_ + s1, tb[x])
+            else:
+                tb = t1s[:, s0:s1]
+            st_y, st_s, st_n = (x // 8 for x in tb.strides[:3])
+            for a0, a1, q0, ng, au0, anu, aid in ginfo:
+                w = ndarray((3, nb, ns, ng, nocc), buffer=work[off:])
+                t1 = ndarray((3, nb, ns, ng, nocc),
+                             buffer=work[off + w.size:])
+                # w[x,s,n,u,j] = sum_{t in chunk} linv[t, s] y[x,t,n,u,j]
+                for x in range(3):
+                    for n in range(ns):
+                        _gemm_rm('T', 'N', nb, ng*nocc, dv, 1.,
+                                 linv.data.ptr + 8*(v0*nsph + s0), nsph,
+                                 y.data.ptr + 8*(x*ys_x + n*ys_n + q0*nocc),
+                                 ys_r, 0.,
+                                 w.data.ptr + 8*(x*nb*ns + n)*ng*nocc,
+                                 ns*ng*nocc)
+                for yy in range(3):
+                    for n in range(ns):
+                        _batched_occ(tb, c[n, q0:q0+ng], t1, nb, st_s,
+                                     yy*st_y + n*st_n, ns*ng*nocc,
+                                     (yy*nb*ns + n)*ng*nocc, nocc, ng)
+                _D5_H1((a1 - a0, nb), (256,),
+                       (w, t1, hb, au0, anu, aid, np.int32(nb),
+                        np.int32(ns), np.int32(ng), np.int32(nocc),
+                        np.int32(ng), np.int32(0), np.float64(f1)))
+            h_sph[:, s0:s1] += hb
+        hb = tb = w = t1 = None
+        # the second half: Cartesian rows of whole shells, their spherical
+        # rows of P, and every atom's product against the chunk
+        mp = sa.pinv_blocks()
+        per_r = per_r1 + 2*ns*ngm*nocc
+        rb = max(1, size // per_r)
+        rb = min(rb, int(_env('FASTDFHESSIP_D5_ROWS', '0')) or rb)
+        sup = []
+        cur = []
+        for blk in sa.blocks:
+            if cur and blk[1] - cur[0][0] > rb:
+                sup.append(cur)
+                cur = []
+            cur.append(blk)
+        sup.append(cur)
+        need = max(b[-1][1] - b[0][0] for b in sup) * per_r
+        if work.size < need:
+            work = cp.empty(need)
+        for blks in sup:
+            A0, A1 = blks[0][0], blks[-1][1]
+            C0 = min(b[2] for b in blks)
+            C1 = max(b[3] for b in blks)
+            nr, nc = A1 - A0, C1 - C0
+            off = 0
+            if dpk:
+                db = ndarray((nr, ns, nocc, nocc), buffer=work)
+                off = db.size
+                dm_oo.rows(A0, A1, db)
+            else:
+                db = dm_oo[A0:A1]
+            m = ndarray((nc, 3, dv), buffer=work[off:])
+            off += m.size
+            dm_s, dm_n = (x // 8 for x in db.strides[:2])
+            for a0, a1, q0, ng, au0, anu, aid in ginfo:
+                pa = ndarray((nr, ns, ng, nocc), buffer=work[off:])
+                ps = ndarray((nc, ns, ng, nocc), buffer=work[off + pa.size:])
+                for n in range(ns):
+                    _batched_occ(db, c[n, q0:q0+ng], pa, nr, dm_s, n*dm_n,
+                                 ns*ng*nocc, n*ng*nocc, nocc, ng)
+                p2 = pa.reshape(nr, -1)
+                s2 = ps.reshape(nc, -1)
+                for b0, b1, c0, c1 in blks:
+                    cp.dot(mp[b0:b1, c0:c1].T, p2[b0-A0:b1-A0],
+                           out=s2[c0-C0:c1-C0])
+                for a in range(a0, a1):
+                    u0 = int(aoslices[a]) - q0
+                    nu = int(na[a])
+                    for n in range(ns):
+                        # m[s,x,t] = sum_{u in A, j} P[s,n,u,j] y[x,t,n,u,j]
+                        contract('suj,xtuj->sxt', ps[:, n, u0:u0+nu],
+                                 y[:, :, n, q0+u0:q0+u0+nu],
+                                 beta=0. if n == 0 else 1., out=m)
+                    _D5_H2R((nc,), (256,),
+                            (m, self.j10l[:, C0:C1, v0:v1], h_sph[a, C0:C1],
+                             np.int32(dv),
+                             np.int64(self.j10l.strides[0] // 8),
+                             np.int32(self.j10l.strides[1] // 8),
+                             np.float64(f2)))
+        pa = ps = m = db = None
+
+
+class _SymRows:
+    """Item 34 (W40): rows of symmetric ``(ns, nocc, nocc)`` blocks held as
+    their ``i <= j`` pairs, weighted as item 22's ``_Pairs`` weights them
+    (``sqrt 2`` off the diagonal), so that the h_aux block's products run
+    on them as they are and a row dotted with a row is the full dot
+    product.  ``rows(r0, r1, out)`` unpacks rows ``r0:r1`` into ``out``;
+    ``xstride`` is the row offset of each Cartesian direction where the rows
+    are ``(x, r)`` (``3 naux`` of them).  Item 22 has already made both
+    triangles of these from one, so no information is lost."""
+
+    def __init__(self, nrow, ns, nocc, xstride=0, buf=None):
+        self.pr = _Pairs(nocc, ns)
+        # `buf`: carved from a buffer that is done with (item 34 puts both
+        # packed arrays in the unpacked (1|00)'s own, which saves the
+        # cudaMalloc beside its cudaFree)
+        self.p = (cp.empty((nrow, self.pr.n)) if buf is None else
+                  ndarray((nrow, self.pr.n), buffer=buf))
+        self.shape = (nrow, ns, nocc, nocc)
+        self.xstride = xstride
+
+    def diag_sum(self):
+        """``sum_{n,i} a[r, n, i, i]`` for every row."""
+        i, j = np.triu_indices(self.shape[2])
+        d = np.nonzero(np.tile(i == j, self.shape[1]))[0]
+        return self.p[:, cp.asarray(d)].sum(axis=1)
+
+    def put(self, r0, a):
+        """Pack the rows of ``a`` (``(m, ns, nocc, nocc)``, contiguous) into
+        rows ``r0:r0+m``."""
+        m = a.shape[0]
+        self.pr.pack(a.reshape(m, -1), 0, self.pr.n, self.p[r0:r0+m])
+
+    def rows(self, r0, r1, out):
+        self.pr.unpack(self.p[r0:r1], out.reshape(r1 - r0, -1), 0,
+                       self.pr.n)
+        return out
 
 
 def _trmm(sa, x, trans=False):
