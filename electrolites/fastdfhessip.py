@@ -243,6 +243,31 @@ unless a line says otherwise:
     come, instead of two batch-wide elementwise passes and two indexed
     assignments.  ``FASTDFHESSIP_D3SCATTER=0``.
 
+``docs/DF_WORK_LIST.md`` **W39** (``docs/README_fastdfhessip7.md``) asked for
+the ``(nao, nao)`` products to run on the tiles that hold stored pairs; a
+tile holding one covers 94-100 % of a 113-atom block
+(``benchmarks/df_ip2_tile_probe.py``), so no tile is left out -- but two of
+the three products are symmetric, and a triangle is half of any block.  In
+both spin cases, ``omega = 0`` only:
+
+29. **The pseudo-density on the lower triangle** (``_LowTri.c_t``): ``C X
+    C^T`` is symmetric and read only at the stored pairs, each of which is
+    read at ``(max(i,j), min(i,j))``; one GEMM per row tile of AOs over the
+    columns up to that tile's last pair, 53 % of the dense product on taxol,
+    and the Coulomb part added on the pairs after the read.
+    ``FASTDFHESSIP_PDLOW=0``.
+30. **Stage A's ``C^T J C`` as ``G + G^T``**, ``G = C^T L C`` with ``L`` the
+    lower triangle of ``J`` and half its diagonal (``_LowTri.lt_c``,
+    ``scatter``): the first product reads the rows ``p >= q`` only, by
+    column tiles.  ``FASTDFHESSIP_ALOW=0``.
+31. **The h_aux block's nine ``j2c_ip2`` GEMMs as three ``dsyrk`` and three
+    GEMMs** (W37's §4 lead): the block is symmetrised at its end, so its
+    ``(y, x)`` term is the ``(x, y)`` one transposed.
+    ``FASTDFHESSIP_IP2SYM=0``.
+32. **``_SphAux``'s pattern on the device**: the four ``argmax`` passes over
+    the ``ncart x nsph`` pattern that ran on the host in stage B (W37's
+    other §4 lead).  ``FASTDFHESSIP_SPHHOST=1``.
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -300,6 +325,10 @@ as item 25 (W37).
     FASTDFHESSIP_TRMM_BLK=<n>, FASTDFHESSIP_D3SCATTER=0
                              W37's items 22 and 24-28 off, or their
                              shapes (above)
+    FASTDFHESSIP_PDLOW=0, FASTDFHESSIP_ALOW=0, FASTDFHESSIP_IP2SYM=0,
+    FASTDFHESSIP_SPHHOST=1, FASTDFHESSIP_LOW_TILE=<n>
+                             W39's items 29-32 off, or the triangle's tile
+                             (64 AOs)
     FASTDFHESSIP_TIME=1      print a synchronised stage table per call; =2
                              also times the ip2 kernel per auxiliary l;
                              with FASTDFHESSIP_NVTX=1 each stage's end is
