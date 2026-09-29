@@ -118,6 +118,16 @@ against one); an unrestricted Hessian takes both halves for every
 functional, through ``hessian/uks.py:get_veff_resp_mo`` -- the method that
 calls ``nr_uks_fxc`` and then ``_ao2mo`` -- which this module now replaces.
 ``FASTXCFXC_OCC=0`` is the ablation.
+
+**The right-hand sides in groups when they do not fit (W40).**  Every
+buffer of ``_fxc_blocked`` is linear in the number of right-hand sides, and
+an unrestricted Hessian's CPHF hands it all of an atom block's at once --
+96 on taxol⁺, about 0.3 GB each for the AO route's per-block products at
+113 atoms: on a 40 GB card that did not fit beside the cderi, and the whole
+Hessian stopped in its CPHF.  The sets are independent, so
+``_get_veff_resp_mo_u`` now hands them over in as many groups as the free
+memory needs, and on a card where they fit it is one group, the call as it
+was.  ``FASTXCFXC_SETS=<n>`` caps a group (test-only).
 """
 import functools
 import os
@@ -132,7 +142,7 @@ from gpu4pyscf.dft.numint import (
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import (
     add_sparse, contract, grouped_dot, grouped_gemm, ndarray, take_last2d,
-    transpose_sum)
+    transpose_sum, tag_array, get_avail_mem)
 from gpu4pyscf.__config__ import num_devices
 
 from ._paths import KERNEL_DIR as HERE
@@ -1067,6 +1077,44 @@ _nr_rks_fxc_mo_orig = None
 _get_veff_resp_mo_u_orig = None
 
 
+def _set_groups(nset, nao, nspin):
+    """The right-hand sides a call of ``_fxc_blocked`` can take at once:
+    its buffers per set, bounded with every grid block's AO count at
+    ``nao`` -- the potential (``nao^2``), the AO route's masked density and
+    potential (``2 nao^2``) and its three per-block products
+    (``3 nao MIN_BLK_SIZE``) -- per spin, against half of what is free."""
+    per_set = nspin * (3 * nao * nao + 3 * nao * NI.MIN_BLK_SIZE)
+    cap = int(get_avail_mem() * .5 / 8 // per_set)
+    cap = min(nset, max(1, cap))
+    forced = int(os.environ.get('FASTXCFXC_SETS', '0'))
+    if forced > 0:
+        cap = min(cap, forced)
+    return [(s0, min(nset, s0 + cap)) for s0 in range(0, nset, cap)]
+
+
+def _fxc_u_groups(ni, mol, grids, xc_code, dms, hermi, rho0, vxc, fxc, nao,
+                  nset):
+    """``_nr_uks_fxc_blocked(..., occ=True)`` on ``dms`` a group of sets at a
+    time (W40), the results concatenated along the set index."""
+    groups = _set_groups(nset, nao, 2)
+    if len(groups) == 1:
+        return _nr_uks_fxc_blocked(ni, mol, grids, xc_code, None, dms, 0,
+                                   hermi, rho0, vxc, fxc, None, None,
+                                   occ=True)
+    _S['u_set_groups'] = _S.get('u_set_groups', 0) + 1
+    parts = []
+    for s0, s1 in groups:
+        dg = tag_array(dms[:, s0:s1], mo1=[m[s0:s1] for m in dms.mo1],
+                       occ_coeff=dms.occ_coeff)
+        parts.append(_nr_uks_fxc_blocked(ni, mol, grids, xc_code, None, dg,
+                                         0, hermi, rho0, vxc, fxc, None,
+                                         None, occ=True))
+        dg = None
+    if isinstance(parts[0], list):
+        return [cupy.concatenate([p[k] for p in parts]) for k in range(2)]
+    return cupy.concatenate(parts, axis=1)
+
+
 def _get_veff_resp_mo_u(hessobj, mol, dms, mo_coeff, mo_occ, hermi=1):
     """``hessian/uks.py:get_veff_resp_mo`` -- an unrestricted Hessian's CPHF.
 
@@ -1121,8 +1169,8 @@ def _get_veff_resp_mo_u(hessobj, mol, dms, mo_coeff, mo_occ, hermi=1):
         vc = None
     else:
         _S['ours_u_mo'] += 1
-        v1 = _nr_uks_fxc_blocked(ni, mol, grids, mf.xc, None, dms, 0, hermi,
-                                 rho0, vxc, fxc, None, None, occ=True)
+        v1 = _fxc_u_groups(ni, mol, grids, mf.xc, dms, hermi, rho0, vxc,
+                           fxc, nao, nset)
         # `occ_coeff` is padded to nocca columns for both spins
         vc = v1 if isinstance(v1, list) else None
     if vc is not None:
