@@ -1455,7 +1455,10 @@ def _plan_v(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair, batch_size,
         aux_unit1 = 3*nao*nocc + per_aux
     else:
         aux_unit1 = 3*nao*nocc_in_batch + per_aux
-    held = _D5_ROWS_WORDS if rows else 6*naux*nao_on_atom*nocc
+    # (rows: and D4's few (3, 3, nao, nao) results and temporaries, which
+    # the chunks' Gram form allocates beside the two buffers)
+    held = (_D5_ROWS_WORDS + 64*nao*nao if rows else
+            6*naux*nao_on_atom*nocc)
     aux_batch_size = min(int(word_avail*.85),
                          word_avail-held) // aux_unit1
     assert aux_batch_size > 0, 'Insufficient GPU memory'
@@ -2358,6 +2361,10 @@ class _CholRows:
         sb = max(1, min(v1, size // (per_s1 + per_su*ngm)))
         sb = min(sb, int(_env('FASTDFHESSIP_D5_ROWS', '0')) or sb)
         need = sb * (per_s1 + per_su*ngm)
+        if _env('FASTDFHESSIP_MEMLOG', '') == '1':
+            print(f'[memlog d5] v {v0}:{v1} work {size*8e-9:.2f} GB, first '
+                  f'half need {need*8e-9:.2f}, sb {sb}, cap {cap}, free '
+                  f'{_avail()*1e-9:.2f}', flush=True)
         if size < need:
             work = cp.empty(need)
         linv = sa.linv

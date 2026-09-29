@@ -394,6 +394,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             _S['packrows'] = _S.get('packrows', 0) + 1
             st.note(free_gb_packed=round(word_avail * 8e-9, 1),
                     vchunk_packed=aux_batch_size)
+            if _env('FASTDFHESSIP_MEMLOG', '') == '1':
+                print(f'[memlog ip2 U] packed: free {word_avail*8e-9:.2f} GB,'
+                      f' plan {plan}', flush=True)
         st('D2 h_aux')
 
     j3c_buf = cp.empty((3, aux_batch_size, nsp, nao, nocc))
@@ -410,6 +413,11 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                  3*ns_*nsp*nao_on_atom*nocc + nc_*nsp*nao_on_atom*nocc +
                  3*ns_*ns_]
     work = cp.empty(max(wuse))
+    if _env('FASTDFHESSIP_MEMLOG', '') == '1':
+        print(f'[memlog ip2 U] after D3 alloc: free {_avail()*1e-9:.2f} GB, '
+              f'j3c_buf {j3c_buf.nbytes*1e-9:.2f}, work {work.nbytes*1e-9:.2f}'
+              f', plan {plan}, wuse {[round(w*8e-9, 2) for w in wuse]}',
+              flush=True)
     st('D3 alloc')
     # the spin groups of the second pass: both at once, or with item 8 on a
     # short card one at a time, the integrals walked once per group
@@ -693,7 +701,10 @@ def _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size, nao_on_atom,
     # `rows` (item 34, W40) item 33's D5, which has none of upstream's
     # naux-sized per-atom temporaries
     aux_unit1 = 3*nsp*nao*nocc + 3*naux
-    held = H._D5_ROWS_WORDS if rows else 12*naux*nao_on_atom*nocc
+    # (rows: and D4's few (3, 3, nao, nao) results and temporaries per
+    # spin, which the Gram form allocates beside the two buffers)
+    held = (H._D5_ROWS_WORDS + 64*nao*nao if rows else
+            12*naux*nao_on_atom*nocc)
     aux_batch_size = (min(int(word_avail*.85), word_avail-held)
                       // (aux_unit1 * 8) * 8)
     assert aux_batch_size > 0, 'Insufficient GPU memory'
