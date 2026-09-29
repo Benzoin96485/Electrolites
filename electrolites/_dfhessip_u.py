@@ -1471,6 +1471,14 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         inv_aux_sorting[aux_sorting] = cp.arange(naux)
         return j2c_10[:, inv_aux_sorting[aux_idx, None], inv_aux_sorting]
 
+    if host:
+        # item 35: every batch's device arrays in the same buffers.  Each is
+        # over GPU4PySCF's 100 MB pool threshold, so allocated per batch it
+        # is a cudaFree and a cudaMalloc of the same 7 GB (taxol+), and the
+        # malloc waits for the driver to take the free back: 0.25 s a batch
+        bbuf = cp.empty(naux*2*nb*nao)
+        obuf = cp.empty(naux*2*nb*nocc)
+        wbuf = cp.empty(nw*2*bchunk*nao)
     for it in range(num_occ_batches):
         nocc0 = it * nb
         nocc1 = min(nocc, nocc0 + nb)
@@ -1481,7 +1489,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
 
         aux0 = aux1 = 0
         if a_once:
-            j3c_00 = cp.empty((naux, 2, nob, nao))
+            j3c_00 = ndarray((naux, 2, nob, nao), buffer=bbuf)
             # item 35: the batch's columns of j3c_00 back from the host,
             # eight orbitals at a time, each chunk's fetch behind stage B's
             # work on the chunk before it
@@ -1509,7 +1517,8 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         else:
             j3c_full = cp.zeros((nao, nao, blksize))
             buf = cp.empty((batch_size, nao_pair))
-            j3c_00 = cp.empty((naux, 2, nob, nao))
+            j3c_00 = (ndarray((naux, 2, nob, nao), buffer=bbuf) if host else
+                      cp.empty((naux, 2, nob, nao)))
         for kbatch in range(0 if a_once else num_aux_batches):
             compressed = eval_j3c(aux_batch_id=kbatch, out=buf)
             naux_in_batch = compressed.shape[1]
@@ -1525,7 +1534,8 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         j3c_full = j3c = buf = compressed = None
         st('A j3c_00')
 
-        work = cp.empty((nw, 2, bchunk, nao))
+        work = (ndarray((nw, 2, bchunk, nao), buffer=wbuf) if host else
+                cp.empty((nw, 2, bchunk, nao)))
         for c, (i0, i1) in enumerate(lib.prange(0, nob, bchunk)):
             if a_once:
                 if hasync:
@@ -1540,7 +1550,9 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
         j3c_00 = tmp = work = None
 
         fdone = None
-        dm_oo = contract('rniq,nqj->rnij', dm_3c, orbo)
+        dm_oo = contract('rniq,nqj->rnij', dm_3c, orbo,
+                         out=ndarray((naux, 2, nob, nocc), buffer=obuf)
+                         if host else None)
         if j_factor != 0 and it == 0:
             if batched:
                 auxvec = metric_v.dot(auxvec.dot(metric_v) / metric_w)
@@ -1637,6 +1649,7 @@ def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
             _stage_de(nocc0, nocc1, dm_3c, dm_oo, it == 0)
         dm_oo = dm_3c = None
     if host:
+        bbuf = obuf = wbuf = None
         stage_bufs = [cp.empty((batch_size, 2, nocc, nao))
                       for _ in range(2 if hasync else 1)]
         ready = [None, None]
