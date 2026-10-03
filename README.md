@@ -46,6 +46,7 @@ One A100-SXM4-40GB unless a row says otherwise, GPU4PySCF 1.8.1, level-3 grids.
 | ↳ DF-PBE | 25.6 s | **8.37 s** | **3.06x** |
 | 42-atom DF Hessian, def2-TZVPP | **cannot be run** | **46.6 s** | — |
 | 113-atom DF Hessian | **cannot be run** | **701 s** | — |
+| 113-atom open-shell (UKS) DF Hessian, taxol⁺, 80 GB / 40 GB card | **cannot be run** | **1324.5 s / 1348.6 s** | — |
 
 The last two rows are capacity results, not ratios: GPU4PySCF sizes one
 cuTENSOR contraction in the CPHF build from free memory alone and

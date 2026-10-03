@@ -43,6 +43,8 @@ is W32), `docs/README_fastdfhessip4.md` **W31** (whose finding is W34),
 `docs/README_fastdfhessip7.md` **W39** (whose finding is W43),
 `docs/README_fastdfhessip8.md` **W40** (whose findings are W42 and W44),
 `docs/README_fastdfuh1a.md` **W41**,
+`docs/README_fastdfhessip9.md` **W42** and **W43** (whose finding is W47),
+`docs/README_fastcphf.md` **W44** (whose findings are W45 and W46),
 and **W6** took two rounds --
 `docs/README_dflocal.md` is the two measurements it asked for first and
 `docs/README_dflocal_k.md` the implementation and the cost estimate;
@@ -242,6 +244,21 @@ this page and it is what re-ranked §4.
 Ranked by (value × confidence) / cost, **after** §3.3.  Each item gives what
 to change, the evidence it rests on, what would count as success, and what
 would falsify it.
+
+**W42, W43 and W44 are done (W43 at 113 atoms, not PfPMT); W45, W46
+and W47 are what they found.**  W44's solve of the CPHF in one atom block
+takes the whole 40 GB UKS Hessian of taxol⁺ from 1760.7 to **1348.6 s, 1.018x
+of the full card's** (which goes 1482.3 → 1324.5 s), the two now agreeing to
+5.2e-10 instead of 1.5e-4 -- and it found that GPU4PySCF's own Krylov
+solver was **174 s** of the full card's 1389 s CPHF, projecting its
+subspace a row at a time (27.5 s as blocks of GEMMs, W45).  The exchange is
+now 82 % of that Hessian (W46).  W42 found its own baseline was the probe's:
+a Hessian releases the SCF's cderi before the ip2 term, and with it released
+taxol⁺'s 40 GB call was already 37.9 s, 1.21x -- which fusing after the
+packing does not change, because there it costs a chunk (W47); where it does
+not, it pays (taxol RKS 21.4 → 19.5 s).  W43's item 38 carries item 8 to a
+batched occupied index: 1.29x–1.41x on taxol where memory batches it (the
+284-atom PfPMT, the entry's own case, was not run: multi-hour jobs).
 
 **W39, W40 and W41 are done; W42, W43 and W44 are what they found.**
 W39's tiles were falsified by the count it asked for — the tiles holding a
@@ -3086,7 +3103,34 @@ host array, leaving only the metric (B) and `j2c_10` (C) per batch.
 * **Falsified if**: B then has to read `j3c_00` back at PCIe rate faster
   than it is hidden (27 GB each way, 1 s at 26 GB/s).
 
-### W42 — The chunked Cholesky second pass's walks on a 40 GB card
+### W42 — The chunked Cholesky second pass's walks on a 40 GB card — **done, and not a success on taxol⁺: inside a Hessian its call was already 37.9 s (1.21x), the 44.9 s was the probe holding the SCF's cderi; fused where it costs no chunk (taxol RKS 21.4 → 19.5 s), and the rest is the chunk count**
+
+Items 36 and 37 of `fastdfhessip` (`_plan36`, `_sph_rows`;
+`FASTDFHESSIP_PACKFUSE=0`, `SPHROWS=0`), both spin cases, and
+`df_hess_terms_probe.py --keep-cderi`; write-up in
+`docs/README_fastdfhessip9.md` §1-§2.
+
+`df_hess_terms_probe.py` kept the SCF's 14.3 GB cderi on the device while
+it timed the term, which a Hessian does not (`partial_hess_elec` and
+`make_h1` call `with_df.reset()`, §5.18): with it released, taxol⁺'s 40 GB
+call was 37.9 s against 31.2 s on the full card, and the probe now
+reproduces the Hessian's call to 0.1 s.  Item 36 plans the fused and
+unfused pass on what item 34's packing leaves (it had planned before packing,
+and held item 3's `10 naux^2` for an h_aux block that item 11 now mostly
+carves) and fuses iff that costs no chunk, with item 24's first pass written
+into the packed `(1|00)`; item 37 cuts that packed array to its spherical
+rows (1.2 GB at taxol⁺).  **taxol RKS 21.4 → 19.5 s** at 40 GB (fused; 1.18x
+of the full card, was 1.37x in W40), the Co(II) sextet at 27.6 GB 34.0 →
+32.6 s, taxol⁺ with the cderi kept 44.3 → 42.7 s (7 → 6 chunks) -- and
+**taxol⁺ as a Hessian runs it unchanged at 37.9 s**: fused, its chunk is
+1120 rows against 1408, five chunks against four, so the falsification's
+first half fires and item 36 does not fuse.  The host copy of `(10|0) C`
+was priced, not built: 85 GB of page-locked memory to save at most 2 s.
+Tests within 5.5e-13 of GPU4PySCF with the packed fused pass reached; at
+113 atoms 4e-14–1.2e-12 against item 34's code.  What is left at 40 GB is the
+number of chunks, i.e. memory (W47).
+
+The original entry, for the record:
 
 *(Found by W40.)*
 
@@ -3111,7 +3155,35 @@ twice the rows.
 * **Falsified if**: the fused first chunk costs the pass a chunk, and the
   host copies are not hidden behind the chunks' D4 and D5.
 
-### W43 — The restricted ip2 call with its occupied index batched
+### W43 — The restricted ip2 call with its occupied index batched — **done at 113 atoms: 1.29x–1.41x where memory batches taxol's occupied index, 1.06x–1.37x forced on other classes; PfPMT itself not measured**
+
+Item 38 of `fastdfhessip` (`FASTDFHESSIP_OCCROWS=0`); write-up in
+`docs/README_fastdfhessip9.md` §3.
+
+With the occupied index batched the call now runs the Cholesky factor in
+item 33's chunks of rows per batch -- a prefix walk per chunk, item 33's D5
+on the batch's columns (`_batched_occ` contracts every orbital against the
+batch's), D4 in batch 0 on every orbital as upstream's, whose columns are
+then moved in place for D5 (`_cols_in_place`) -- where it fell back to
+upstream's eigenbasis, a whole walk per chunk per batch.  Measured where
+memory makes the batching (taxol RKS, the card's memory withheld after the
+SCF: two batches, two or three chunks): **24 GB 47.2 → 33.9 s, 20 GB 54.6 →
+38.6 s, 18 GB 56.7 → 44.1 s**; forced into batches, the neutral Ni
+dithiolene 1.06x and penicillin V (5 chunks) 1.37x.  Item 38 holds the
+factor's coefficients beside upstream's arrays, and its first version ran
+out of memory at 16 GB where the eigenbasis runs: it is now taken only
+where a bound on its peak fits with 2 GB spare, and a call that runs out of
+memory in it anyway is retried without it (outside the `except`: the
+traceback held the failed attempt's arrays).  At 16 GB it declines, 67.2 s
+against 67.3.  Correct to 1.4e-13–4.7e-13 against GPU4PySCF on ethanol in
+forced batches, 9e-12–1.1e-11 against the eigenbasis at 113 atoms.
+**PfPMT (284 atoms) was not measured**: its calls need multi-hour jobs, two
+were queued about a day without starting, and they were dropped for the
+113-atom measurements above, which reach the same paths; whether the
+284-atom call runs at the 113-atom rate per flop -- the entry's success --
+is still open.
+
+The original entry, for the record:
 
 *(Found by W39.)*
 
@@ -3133,7 +3205,38 @@ by its sizes), and W39's count says the three `(nao, nao)` products have 29
 * **Falsified if**: the per-batch terms that are not linear in the batch
   (`Q`, and the h_aux block's) cost more than the batching saves.
 
-### W44 — The unrestricted CPHF in one atom block on a 40 GB card
+### W44 — The unrestricted CPHF in one atom block on a 40 GB card — **done: the whole 40 GB UKS Hessian of taxol⁺ 1760.7 → 1348.6 s, 1.018x of the full card's; and GPU4PySCF's own Krylov solver was 174 s of the full card's CPHF**
+
+`electrolites/fastcphf.py` (in `patch_all()`: both spin cases' `solve_mo1`),
+`tests/test_cphf.py`, `benchmarks/df_cphf_probe.py`; write-up in
+`docs/README_fastcphf.md`.
+
+Measured piece by piece, the upstream CPHF of taxol⁺ on the full card is
+1389 s: `_get_jk` 1092, the XC response 120, and **173.7 s of `krylov`'s
+own work** -- it keeps its subspace as lists of rows and projects each new
+block against them one row at a time, a GEMV and a 1.4 GB update per row,
+then stacks both lists (the call's +47.8 GB peak).  Nothing had timed the
+solver.  Upstream's per-set budget for the response's AO arrays (0.3 of the
+free memory over `6 nao^2` words) is kept but applied per *response call*:
+the call runs in groups of sets, and the Krylov iteration carries every atom
+in one block, whose own arrays are MO-sized -- so a 40 GB card solves the
+same equations to the same tolerance as an 80 GB one.  The solver is
+GPU4PySCF's algorithm with its subspace as blocks (two GEMMs per block,
+twice; `h` accumulated per cycle; the solution a GEMM per block), on the
+host when the device is short.  CPHF alone: full card 1389.4 → 1246.6 s
+(1.115x), 40 GB 1255.9 s in one block and six calls (was two blocks and
+fifteen); taxol RKS 624.2 → 555.3 s (1.124x).  Whole Hessians: **40 GB
+1760.7 → 1348.6 s, full card 1482.3 → 1324.5 s**, 1.018x apart (the bar was
+1.05x), and the two now agree to 5.2e-10 Eh/bohr² where the old ones
+differed by 1.5e-4.  **Success**; the falsification does not fire -- the AO
+arrays of all 339 sets never have to be held at once.  Correct to
+1e-13–1.4e-11 against upstream's `solve_mo1` density-fitted (ethanol,
+ethanol⁺, CuCl₂), whole Hessians 1.9e-12–2.8e-12; the direct path with its
+response grouped 5e-10–3.4e-9, because direct K screens on the largest
+density of the call.  What is left of the CPHF is `_get_jk` itself: 82 % of
+the whole Hessian (W46).
+
+The original entry, for the record:
 
 *(Found by W40.)*
 
@@ -3156,6 +3259,66 @@ W33's occupied-side fxc both return what `_ao2mo` needs.
 * **Falsified if**: the response's AO-basis arrays for all 339 right-hand
   sides do not fit beside the cderi — then the blocks stay, and the next
   thing is the Krylov iteration across blocks.
+
+### W45 — What is left of the CPHF solver's own time
+
+*(Found by W44.)*
+
+After W44 the solver's own work in taxol⁺'s full-card CPHF is 27.5 s of
+1246.6 (was 173.7): upstream's per-set budget for the response (0.3 of the
+free memory over `6 nao^2` words) splits even the full card's calls into two
+groups of ~170 sets, and the same rule then puts six of the ten subspace
+blocks on the host, which each cycle reads back; `_stable_qr` is still
+upstream's (a host synchronisation per vector).  The budget was measured to
+be generous: the response's peak is 115 MB a set at 339 sets, and upstream's
+budget is 200 MB a set of free memory.
+
+* **Do**: size the group from the response's own measured peak per set
+  (`benchmarks/df_cphf_probe.py` prints it) rather than upstream's
+  constant, keep the subspace on the device whenever the next call fits, and
+  time `_stable_qr` per cycle.
+* **Success**: the solver's own work under 1 % of the CPHF on both cards.
+* **Falsified if**: the per-set peak is not stable across systems (it moves
+  with `_get_jk`'s self-sized batch buffer), so a measured budget cannot be
+  trusted.
+
+### W46 — The CPHF's exchange is now 82 % of a 113-atom UKS Hessian
+
+*(Found by W44.)*
+
+With W44 the whole taxol⁺ UKS Hessian is 1324.5 s on the full card, and
+`_get_jk` (W8) is 1083.2 s of it, at 0.745 s a right-hand side on every call
+-- W8's rate, 78 % of the card's fp64 peak.  W8 showed the call cannot be
+rearranged into less arithmetic (`naux nao^2 nocc` per set is the floor of
+an exchange build with a rank-`nocc` density); what is not fixed is how many
+set-calls the Krylov iteration asks for (339 + 336 + 336 + 201 + 80 + 339
+here) and at what precision.  The Krylov tolerance is `1e-6` per atom, so
+the early cycles' images are needed to far less than fp64.
+
+* **Do**: measure the CPHF's result against the number of set-calls with
+  the early cycles' exchange in single precision (W7's cderi, or an
+  emulated fp64 GEMM), and with a better initial guess or preconditioner;
+  price each by the Hessian's change against its tolerance.
+* **Success**: 1.3x on the CPHF at 113 atoms with the Hessian within
+  `conv_tol_cpscf` of the fp64 one.
+* **Falsified if**: the iteration needs fp64 images from the first cycle to
+  converge in the same number of cycles.
+
+### W47 — The chunk count of item 33's pass on a 40 GB card
+
+*(Found by W42.)*
+
+Inside a 40 GB Hessian taxol⁺'s ip2 call is 37.9 s against 31.3 s on the
+full card and the difference is four chunks of 1408 rows against the full
+card's one: every chunk row is `3 x 2 x nao x nocc` words (12.9 MB), both
+spins, Cartesian AO index.  Fusing would cost a fifth chunk (W42).
+
+* **Do**: count what the pass holds beside the chunk at 40 GB
+  (`FASTDFHESSIP_MEMLOG=1`), and price holding the chunk on the spherical AO
+  index (5 % fewer words) or the packed partners in the host pool W38 built.
+* **Success**: three chunks, and the call within 1.15x of the full card.
+* **Falsified if**: what the pass holds beside the chunk is all needed at
+  the chunk's peak.
 
 ### Not on this list
 
@@ -3310,6 +3473,22 @@ four are cheap to avoid and none is detectable from the number itself.
    Before a stage-table row becomes an item, check it inside a whole
    Hessian with `FASTDFHESSIP_TIME=1` (`benchmarks/df_hess_anatomy.py`);
    `docs/README_fastdfhessip5.md` has the sleep ladder that shows it.
+
+18. **A term timed on its own must be given the memory a Hessian gives it.**
+   Upstream's `partial_hess_elec` and `make_h1` call `with_df.reset()` before
+   the ip2 and h1 terms, and `df_hess_terms_probe.py` did not: W40's 40 GB
+   rows were taken with the SCF's 14.3 GB cderi still on the device, which
+   is seven chunks where a Hessian runs four (44.9 s against 37.9).  The
+   probe now releases it; `--keep-cderi` is the old setting.
+19. **Do not measure memory by replacing GPU4PySCF's allocator.**  GPU4PySCF
+   sends every allocation over 100 MB straight to `cudaMalloc`
+   (`set_conditional_mempool_malloc`), past CuPy's pool, whose counters
+   therefore miss every array that matters.  `set_allocator(pool.malloc)`
+   to count them replaces that allocator: the large arrays then stay in a
+   pool that has a limit, and W44's first probe ran out of memory in
+   `make_h1` where the Hessian does not, and timed everything on an
+   allocator no Hessian uses.  Wrap `cp.cuda.get_allocator()` and read
+   `cudaMemGetInfo` (`benchmarks/df_cphf_probe.py`).
 
 And one that is not about timing: **a patch target is not a code path.**
 Three rounds in this repository have now shipped a module that was loaded,
@@ -3474,7 +3653,16 @@ FASTDFHESSIP_MEMLOG=1 python benchmarks/df_hess_terms_probe.py --ballast 40 ...
 python benchmarks/df_hess_anatomy.py --xyz ... --patch all --rounds 1 \
     --ballast 40                                     # W40: a 40 GB Hessian
 FASTDFHESSIP_OFF=1 FASTXCFXC_MO=0 python benchmarks/df_hess_anatomy.py ...
+python benchmarks/df_hess_terms_probe.py ... --keep-cderi       # W40's setting
+python benchmarks/df_cphf_probe.py --xyz ... --cache $SCRATCH/cphf \
+    --variants stock,ours [--ballast 40]                        # W44
+python tests/test_cphf.py [--no-hessian]                       # W44's bar
 ```
+
+`fastcphf`'s switches (`FASTCPHF_OFF`, `FASTCPHF_BLOCK=upstream`,
+`FASTCPHF_KRYLOV=upstream`, `FASTCPHF_STORE=auto|device|host`,
+`FASTCPHF_REORTH=0`, `FASTCPHF_FXSETS=<n>`) are listed at the top of
+`electrolites/fastcphf.py`.
 
 `fastdfhessip`'s switches are listed at the top of
 `electrolites/fastdfhessip.py`; `FASTXCFXC_MO=0` is W16's.
