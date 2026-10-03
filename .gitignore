@@ -29,3 +29,5 @@ electrolites/kernels/fastkhigh_generated.cu
 electrolites/kernels/fastjkhigh_generated.cu
 electrolites/kernels/fastejk_generated.cu
 electrolites/kernels/fastjmdm_generated.cu
+
+figures/
