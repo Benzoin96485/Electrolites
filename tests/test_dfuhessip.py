@@ -230,12 +230,18 @@ reached = set()
 CROWS = [('', {}), (' [CROWS=0]', {'CROWS': 0}),
          (' [D5_GROUP=8]', {'D5_GROUP': 8}),
          (' [D5_ROWS=7]', {'D5_ROWS': 7}),
-         (' [PACKROWS=0]', {'PACKROWS': 0})]
+         (' [PACKROWS=0]', {'PACKROWS': 0}),
+         # W42: item 36 fuses after item 34's packing (PACKFUSE=0 is item
+         # 34's decision), its first pass without item 24 (D1D3=0), and
+         # item 37's spherical rows off (SPHROWS=0)
+         (' [PACKFUSE=0]', {'PACKFUSE': 0}), (' [D1D3=0]', {'D1D3': 0}),
+         (' [SPHROWS=0]', {'SPHROWS': 0})]
 for vchunk in (160, 64, 40):
     for fuse in (1, 0):
       for lbl, sw in (CROWS if fuse else CROWS[:2] + CROWS[3:]):
         fused0 = fastdfhessip.stats()['fused']
         rows0 = fastdfhessip.stats().get('chol_rows', 0)
+        pf0 = fastdfhessip.stats().get('packfused', 0)
         with env(VCHUNK=vchunk, FUSE=fuse, **sw):
             got = U._jk_energy_per_atom(intopt, dm0, 1., 0.2)
         st = fastdfhessip.stats()
@@ -243,6 +249,8 @@ for vchunk in (160, 64, 40):
         rows = st.get('chol_rows', 0) > rows0
         if rows:
             reached.add('chol rows')
+        if st.get('packfused', 0) > pf0:
+            reached.add('packed fused')
         check(f'ethanol+ ip2 chunk {vchunk} (vchunks={st["vchunks"]}'
               f'{" fused" if fused else ""}{" rows" if rows else ""}){lbl}',
               got, ref['ip2'])
@@ -373,7 +381,8 @@ with env(OCC_BATCH=5, H1UBATCH=0):
 check('ethanol+ h1 [H1UBATCH=0]', got, ref['h1'])
 if not ok:
     fails.append('H1UBATCH=0 batched the occupied index')
-ok = {'v', 'v fused', 'chol rows', 'h1 mem_insufficient', 'h1 rebalanced',
+ok = {'v', 'v fused', 'chol rows', 'packed fused', 'h1 mem_insufficient',
+      'h1 rebalanced',
       'h1 occ batches host', 'h1 occ batches occ'} <= reached
 if not ok:
     fails.append(f'memory caps did not reach the batched paths: {reached}')

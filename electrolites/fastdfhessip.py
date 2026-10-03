@@ -302,6 +302,39 @@ an 80 GB one), which had fallen back to upstream's chunked arithmetic:
     ``FASTDFHESSIP_PACKROWS=0`` is item 33 alone;
     ``FASTDFHESSIP_D5_ROWS=<n>`` caps D5's row blocks (test-only).
 
+``docs/DF_WORK_LIST.md`` **W42** (``docs/README_fastdfhessip9.md``) took one
+walk out of item 33's pass on a short card, in both spin cases:
+
+36. **Fused after item 34's packing** (``_plan36``): item 34 chose between
+    the fused and unfused second pass on plans made before it packed, and a
+    fused plan also held item 3's ``10 naux^2`` back for the h_aux block, so
+    on a 40 GB card the pass never fused and the first pass was a walk of
+    its own.  Now ``dm_oo`` and ``(1|00)`` are packed first, both plans are
+    made on what that leaves, the fused one holding what the h_aux block
+    allocates beside the pass's buffers, and the pass fuses iff that costs
+    no chunk -- with item 24's first pass from the second's ``M C``,
+    written into the packed ``(1|00)``.  ``FASTDFHESSIP_PACKFUSE=0`` is
+    item 34's decision.
+37. **Item 34's packed ``(1|00)`` cut to its spherical rows** before an
+    unfused second pass is planned (``_sph_rows``).
+    ``FASTDFHESSIP_SPHROWS=0``.
+
+``docs/DF_WORK_LIST.md`` **W43** (``docs/README_fastdfhessip9.md``) carried item
+8 to a batched occupied index (PfPMT at 284 atoms, whose ``j3c_oo`` alone is
+38 GB), which had fallen back to upstream's eigenbasis in chunks per batch:
+
+38. **Item 33 per occupied batch**: every term of the second pass but D4 is
+    linear in the batch's orbitals, so each batch runs item 33's chunks of
+    rows -- a prefix walk per chunk and item 33's D5 on the batch's columns
+    (``nocc`` there is the batch's ``j``, ``_batched_occ``'s ``nk`` every
+    ``i``) -- and batch 0 also D4, on every orbital, as upstream's does,
+    after which its columns are moved in place (``_cols_in_place``).
+    Unpacked: a batch's blocks are not symmetric.  It holds the factor's
+    coefficients beside upstream's arrays, so it is taken only where a
+    bound on its peak fits, and a call that runs out of memory in it is run
+    again without it (``stats()['occ_rows_retried']``).
+    ``FASTDFHESSIP_OCCROWS=0`` is the eigenbasis.
+
 What falls through to GPU4PySCF: more than one device, and ``FASTDFHESSIP_OFF``.
 The unrestricted twins in ``df/hessian/uhf.py`` are ``electrolites/_dfhessip_u.py``
 (``docs/DF_WORK_LIST.md`` **W25**), which this module loads and patches, under
@@ -366,6 +399,9 @@ as item 25 (W37).
                              (64 AOs)
     FASTDFHESSIP_CROWS=0, FASTDFHESSIP_PACKROWS=0
                              W40's items 33 and 34 off
+    FASTDFHESSIP_PACKFUSE=0, FASTDFHESSIP_SPHROWS=0
+                             W42's items 36 and 37 off
+    FASTDFHESSIP_OCCROWS=0   W43's item 38 off
     FASTDFHESSIP_MEMLOG=1    print the unrestricted second pass's memory
                              as it is planned and allocated, and item 33's
                              D5 blocks (W40)
@@ -639,6 +675,42 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     if k_factor == 0:
         # upstream's own branch for this: a pure functional's ip2 term
         return _j_energy_per_atom(int3c2e_opt, dm, verbose) * j_factor
+    r0 = _S.get('occ_rows', 0)
+    retry = False
+    try:
+        return _jk_energy_per_atom_k(int3c2e_opt, dm, j_factor, k_factor,
+                                     omega, verbose)
+    except (cp.cuda.memory.OutOfMemoryError, AssertionError,
+            cp.cuda.runtime.CUDARuntimeError) as exc:
+        # item 38 holds more than the eigenbasis it replaces, and its
+        # up-front estimate (below) is a bound, not a plan: a call that
+        # runs out of memory inside it is run again without it, as it would
+        # have run before W43 (taxol at 16 GB free).  The retry is made
+        # outside this block: the exception's traceback holds the failed
+        # attempt's frames, and with them its arrays
+        if (_S.get('occ_rows', 0) == r0 or
+                _env('FASTDFHESSIP_OCCROWS', '1') == '0' or
+                ('memory' not in str(exc).lower() and
+                 not isinstance(exc, cp.cuda.memory.OutOfMemoryError))):
+            raise
+        retry = True
+    if retry:
+        _S['occ_rows_retried'] = _S.get('occ_rows_retried', 0) + 1
+        cp.get_default_memory_pool().free_all_blocks()
+        saved = os.environ.get('FASTDFHESSIP_OCCROWS')
+        os.environ['FASTDFHESSIP_OCCROWS'] = '0'
+        try:
+            return _jk_energy_per_atom_k(int3c2e_opt, dm, j_factor, k_factor,
+                                         omega, verbose)
+        finally:
+            if saved is None:
+                os.environ.pop('FASTDFHESSIP_OCCROWS', None)
+            else:
+                os.environ['FASTDFHESSIP_OCCROWS'] = saved
+
+
+def _jk_energy_per_atom_k(int3c2e_opt, dm, j_factor, k_factor, omega,
+                          verbose):
     _S['ip2'] += 1
     spmult = int(_env('FASTDFHESSIP_SPMULT', '1'))
     oosum = _env('FASTDFHESSIP_OOSUM', 'gram')
@@ -754,7 +826,36 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
     # measured: the factor in D3-D5 and upstream's eigenbasis everywhere
     # else -- `benchmarks/df_hess_metric_sens.py`.)
     sa = None
-    if (metric in ('chol', 'mixed') and omega == 0 and num_occ_batches == 1
+    # item 38 (W43): with the occupied index in batches, the factor in item
+    # 33's chunks of rows
+    occrows = (metric == 'chol' and _env('FASTDFHESSIP_CROWS', '1') != '0'
+               and _env('FASTDFHESSIP_OCCROWS', '1') != '0')
+    if occrows and num_occ_batches > 1:
+        # item 38 holds the factor's coefficients beside upstream's arrays
+        # (`ms`, its pseudo-inverse blocks and `L^-1`: 2 naux nsph + nsph^2
+        # words); taken only if a batch's (1|00) and dm_oo and the unfused
+        # h_aux block's temporaries still fit beside them once stage B has
+        # moved dm_oo to the host -- otherwise upstream's eigenbasis, which
+        # runs where this would not (taxol at 16 GB free)
+        # (the larger of the unfused h_aux block -- its temporaries, j2c_10
+        # and its sorted copy, j2c_10v -- and, beside what outlives it, the
+        # second pass's floor: item 33's D5 buffer, D4's temporaries and the
+        # two integral batches; with 2 GB for what this does not count.
+        # An estimate, so the call is retried without item 38 if it runs
+        # out of memory anyway -- see `_jk_energy_per_atom`)
+        nsph_ = auxmol.mol.nao
+        peak = max(_h_aux_words(naux, nsph_) + 6*naux**2 + 3*naux*nsph_,
+                   6*naux*nsph_ + _D5_ROWS_WORDS + 64*nao*nao +
+                   6*batch_size*nao_pair)
+        need = 8 * (4*naux*nocc_per_batch*nocc + 2*naux*nsph_ + nsph_**2 +
+                    peak) + (2 << 30)
+        if _env('FASTDFHESSIP_MEMLOG', '') == '1':
+            print(f'[memlog ip2] item 38: free {_avail()*1e-9:.2f} GB + j3c_oo {j3c_oo.nbytes*1e-9:.2f}, need {need*1e-9:.2f}', flush=True)
+        if _avail() + j3c_oo.nbytes < need:
+            occrows = False
+            _S['occ_rows_declined'] = _S.get('occ_rows_declined', 0) + 1
+    if (metric in ('chol', 'mixed') and omega == 0 and
+            (num_occ_batches == 1 or occrows)
             and oosum == 'gram' and not auxmol.mol.cart):
         try:
             sa = _SphAux(auxmol, aux_sorting, omega,
@@ -845,6 +946,8 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         # the same `word_avail` those steps leave (they free what they
         # allocate), so the chunking is the same as upstream's.
         mem_avail = _avail_less(8 * int(np.prod(j1_shape)))
+        if _env("FASTDFHESSIP_MEMLOG", "") == "1":
+            print(f"[memlog ip2] batch {batch_id}: free {_avail()*1e-9:.2f} GB, less (1|00) {mem_avail*1e-9:.2f}, dm_oo {dm_oo.nbytes*1e-9:.2f}", flush=True)
         word_avail = mem_avail // 8
         blksize1 = min(naux, word_avail // (nao**2*8) * 8)
         assert blksize1 > 0, 'Insufficient GPU memory'
@@ -891,15 +994,15 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         # item 8's structured second pass needs the whole auxiliary index in
         # its one chunk; otherwise the factor goes through upstream's chunked
         # arithmetic like an eigenbasis would
-        chol = sa if (sa is not None and aux_batch_size >= metric_size) \
-            else None
+        chol = sa if (sa is not None and num_occ_batches == 1 and
+                      aux_batch_size >= metric_size) else None
         if sa is not None and chol is None:
             _S['chol_chunked'] = _S.get('chol_chunked', 0) + 1
         # item 33 (W40): where it does not, the factor in chunks of rows of
         # Y = L^-1 K, the last chunk first, each walking only the integral
         # batches its rows reach
         crow = None
-        pack34 = rows34 = False
+        pack34 = rows34 = packf = False
         if (sa is not None and chol is None and metric == 'chol' and
                 _env('FASTDFHESSIP_CROWS', '1') != '0'):
             crow = _CholRows(sa)
@@ -910,7 +1013,28 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             # buffers are already sized)
             # (FASTDFHESSIP_PACKROWS=0: item 33 alone).  Its own buffer,
             # the spherical j2c_10v, is held back as well
-            if _env('FASTDFHESSIP_PACKROWS', '1') != '0':
+            # items 34 and 36 pack symmetric blocks; a batch of the
+            # occupied index is not one (item 38)
+            one_batch = num_occ_batches == 1
+            packf = (one_batch and fuse and
+                     _env('FASTDFHESSIP_PACKROWS', '1') != '0' and
+                     _env('FASTDFHESSIP_PACKFUSE', '1') != '0')
+            if packf:
+                # item 36 (W42): packed first, then fused or not by plans
+                # made on what the packing leaves
+                j3c_oo1 = _SymRows(3*naux, 1, nocc, xstride=naux)
+                dmp = _SymRows(naux, 1, nocc)
+                dmp.put(0, dm_oo.reshape(naux, 1, nocc, nocc))
+                dm_oo = dm_oo_full = None
+                dm_oo = dmp
+                plan, plan_f, do_fuse, carve = _plan36(
+                    _avail() // 8, naux, nao, nocc, nocc_in_batch, nao_pair,
+                    batch_size, nao_on_atom, natm, metric_size, batch_id)
+                aux_batch_size, aux_blksize, blksize2 = plan
+                pack34 = rows34 = True
+                if do_fuse:
+                    _S['packfused'] = _S.get('packfused', 0) + 1
+            elif one_batch and _env('FASTDFHESSIP_PACKROWS', '1') != '0':
                 try:
                     plan, plan_f, do_fuse, carve = make_plan(
                         word_avail - 3*naux*metric_size, True)
@@ -923,10 +1047,14 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 pack34 = not do_fuse
                 rows34 = True
             else:
+                # (item 38: batched, D5 is item 33's, sized to `work`)
                 plan, plan_f, do_fuse, carve = make_plan(
-                    word_avail - 3*naux*metric_size, False)
+                    word_avail - 3*naux*metric_size, not one_batch)
                 aux_batch_size, aux_blksize, blksize2 = plan
-            if pack34:
+                rows34 = not one_batch
+                if not one_batch:
+                    _S['occ_rows'] = _S.get('occ_rows', 0) + 1
+            if pack34 and not packf:
                 # item 34: from the first pass on, dm_oo and (1|00) as their
                 # weighted pairs -- the first pass writes them so, the h_aux
                 # block's products run on them in place, and D5 unpacks a
@@ -983,7 +1111,8 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                         sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
             if pack34:
                 # item 34: the second pass planned on what the packing left
-                t1p = j3c_oo1p
+                # (item 37, W42: with the spherical rows of (1|00) only)
+                t1p = _sph_rows(j3c_oo1p, sa.nsph)
                 j3c_oo1p = j3c_oo1 = dm_oo = None
                 word_avail = _avail() // 8
                 plan = _plan_v(word_avail, naux, nao, nocc, nocc_in_batch,
@@ -1021,6 +1150,10 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             # the fused first pass and the h_aux block ride on
             vchunks = vchunks[::-1]
             h_raw = cp.zeros((natm, sa.nsph, 3, 3))
+        d1buf = (cp.empty(blksize2 * nocc * nocc)
+                 if d1d3 and pack34 else None)
+        if do_fuse and pack34 and not d1d3:
+            j3c_oo1.tmp = cp.empty((blksize2, nocc_in_batch, nocc))
         for ci, (v0, v1) in enumerate(vchunks):
             dv = v1 - v0
             vfirst = ci == 0
@@ -1078,7 +1211,16 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                             j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
                         if batch_id == 0:
                             contract('pqr,qi->pir', j3c, _dm_factor_l, out=tmp)
-                            if d1d3 and vfirst:
+                            if d1d3 and vfirst and pack34:
+                                # item 36: into the packed (1|00)
+                                o1 = ndarray((dk, 1, nocc, nocc),
+                                             buffer=d1buf)
+                                _d1_from_d3(tmp, _dm_factor_l,
+                                            o1.reshape(dk, nocc, nocc),
+                                            auxvec_ipauxp[x, aux0:aux1]
+                                            if j_factor != 0 else None)
+                                j3c_oo1.put(x*naux + aux0, o1)
+                            elif d1d3 and vfirst:
                                 _d1_from_d3(tmp, _dm_factor_l,
                                             j3c_oo1[x, aux0:aux1],
                                             auxvec_ipauxp[x, aux0:aux1]
@@ -1118,7 +1260,16 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                 if crow is not None:
                     crow.set_j2c_10v(j2c_10v)
                     for x in range(3):
-                        sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
+                        if pack34:
+                            rx = j3c_oo1p.p[x*naux:(x+1)*naux]
+                            sa.to_sph(rx, rx)
+                        else:
+                            sa.to_sph(j3c_oo1p[x], j3c_oo1p[x])
+                if pack34:
+                    # item 36: D5's partners, packed as item 34 has them
+                    t1p = j3c_oo1p
+                    j3c_oo1p = j3c_oo1 = None
+                d1buf = None
                 st('D2 h_aux')
 
             if chol is not None:
@@ -1149,13 +1300,20 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
 
             if crow is not None:
                 nsph_ = sa.nsph
-                crow.d5(j3c_100.reshape(3, dv, 1, nao, nocc), v0, v1,
+                yb = j3c_100
+                if num_occ_batches > 1 and batch_id == 0:
+                    # item 38: D4 is done with every orbital; D5 wants the
+                    # batch's, contiguous -- moved down in place
+                    yb = _cols_in_place(j3c_100, nocc0, nocc1, work)
+                nb_ = nocc_in_batch
+                crow.d5(yb.reshape(3, dv, 1, nao, nb_), v0, v1,
                         t1p if pack34 else
-                        j3c_oo1p[:, :nsph_].reshape(3, nsph_, 1, nocc, nocc),
+                        j3c_oo1p[:, :nsph_].reshape(3, nsph_, 1, nb_, nocc),
                         dmp if pack34 else
-                        dm_oo.reshape(dm_oo.shape[0], 1, nocc, nocc),
+                        dm_oo.reshape(dm_oo.shape[0], 1, nb_, nocc),
                         _dm_factor_l.reshape(1, nao, nocc), aoslices,
                         -k_factor, k_factor, h_raw, work)
+                yb = None
                 st('D5 per-atom')
                 continue
             if batch_id == 0:
@@ -1182,8 +1340,10 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         j3c = j3c_100 = None
         j2c_10v = j2c_10c = j3c_oo1p = j3c_oo1 = None
         if crow is not None:
-            h_sph = _aggregate_to_atoms(h_raw, natm, sa.atm, axis=1)
-            h_raw = crow = t1p = dmp = None
+            # (item 38: summed over the occupied batches)
+            hb = _aggregate_to_atoms(h_raw, natm, sa.atm, axis=1)
+            h_sph = hb if h_sph is None else h_sph + hb
+            h_raw = crow = t1p = dmp = hb = None
 
     ejk_ao_aux = _aggregate_to_atoms(h_ao_aux, natm, aux_atm_labels, axis=1)
     if h_sph is not None:
@@ -2256,17 +2416,20 @@ void d5_h2(const double* __restrict__ m, const double* __restrict__ j10s,
 
 
 def _batched_occ(src, c, out, nb, sa_stride, off_a, sc_stride, off_c, nocc,
-                 ng):
+                 ng, nk=None):
     """``out_b[u, j] = sum_i src_b[j, i] c[u, i]`` for ``nb`` batches:
-    ``src_b`` the ``nocc x nocc`` block at ``off_a + b sa_stride``,
-    ``out_b`` the ``ng x nocc`` block at ``off_c + b sc_stride`` (words)."""
+    ``src_b`` the ``nocc x nk`` block at ``off_a + b sa_stride``,
+    ``out_b`` the ``ng x nocc`` block at ``off_c + b sc_stride`` (words);
+    ``nk`` (``c``'s columns) is ``nocc`` unless a batch of ``j`` is given
+    (item 38)."""
     from cupy.cuda import cublas
+    nk = nocc if nk is None else nk
     one = np.ones(1)
     zero = np.zeros(1)
     cublas.dgemmStridedBatched(
         cp.cuda.device.get_cublas_handle(), cublas.CUBLAS_OP_T,
-        cublas.CUBLAS_OP_N, nocc, ng, nocc, one.ctypes.data,
-        src.data.ptr + 8*off_a, nocc, sa_stride, c.data.ptr, nocc, 0,
+        cublas.CUBLAS_OP_N, nocc, ng, nk, one.ctypes.data,
+        src.data.ptr + 8*off_a, nk, sa_stride, c.data.ptr, nk, 0,
         zero.ctypes.data, out.data.ptr + 8*off_c, nocc, sc_stride, nb)
 
 
@@ -2458,6 +2621,12 @@ class _CholRows:
         nsph, ncart = sa.nsph, sa.ncart
         dv = v1 - v0
         ns, nao, nocc = y.shape[2], y.shape[3], y.shape[4]
+        # item 38 (W43): with the occupied index in batches, ``nocc`` here
+        # is the batch's ``j`` (y's last axis, the partners' second last)
+        # and ``nk`` every orbital (c's last axis); y must be contiguous in
+        # (u, j)
+        nk = c.shape[2]
+        assert y.strides[3] == 8 * nocc and y.strides[4] == 8
         natm = len(aoslices) - 1
         na = np.diff(aoslices)
         nam = int(na.max())
@@ -2532,7 +2701,7 @@ class _CholRows:
                     for n in range(ns):
                         _batched_occ(tb, c[n, q0:q0+ng], t1, nb, st_s,
                                      yy*st_y + n*st_n, ns*ng*nocc,
-                                     (yy*nb*ns + n)*ng*nocc, nocc, ng)
+                                     (yy*nb*ns + n)*ng*nocc, nocc, ng, nk)
                 _D5_H1((a1 - a0, nb), (256,),
                        (w, t1, hb, au0, anu, aid, np.int32(nb),
                         np.int32(ns), np.int32(ng), np.int32(nocc),
@@ -2576,7 +2745,7 @@ class _CholRows:
                 ps = ndarray((nc, ns, ng, nocc), buffer=work[off + pa.size:])
                 for n in range(ns):
                     _batched_occ(db, c[n, q0:q0+ng], pa, nr, dm_s, n*dm_n,
-                                 ns*ng*nocc, n*ng*nocc, nocc, ng)
+                                 ns*ng*nocc, n*ng*nocc, nocc, ng, nk)
                 p2 = pa.reshape(nr, -1)
                 s2 = ps.reshape(nc, -1)
                 for b0, b1, c0, c1 in blks:
@@ -2635,6 +2804,90 @@ class _SymRows:
         self.pr.unpack(self.p[r0:r1], out.reshape(r1 - r0, -1), 0,
                        self.pr.n)
         return out
+
+
+def _cols_in_place(a, c0, c1, work):
+    """Item 38 (W43): ``a[..., c0:c1]`` of a C-contiguous array, moved to the
+    front of its own buffer and returned as a contiguous array there.  Row
+    ``r``'s block goes from ``r n + c0`` to ``r (c1 - c0)``, never later, so
+    the rows are moved in increasing order through ``work``, a block of rows
+    at a time."""
+    n = a.shape[-1]
+    m = c1 - c0
+    rows = a.size // n
+    flat = a.reshape(-1)
+    r_blk = max(1, min(rows, work.size // m))
+    for r0 in range(0, rows, r_blk):
+        r1 = min(rows, r0 + r_blk)
+        t = ndarray((r1 - r0, m), buffer=work)
+        t[:] = flat[r0*n:r1*n].reshape(r1 - r0, n)[:, c0:c1]
+        flat[r0*m:r1*m].reshape(r1 - r0, m)[:] = t
+    return flat[:rows*m].reshape(a.shape[:-1] + (m,))
+
+
+def _sph_rows(t1p, nsph):
+    """Item 37 (W42): item 34's packed ``(1|00)`` cut to the spherical rows
+    D5 reads.  After the h_aux block each direction's first ``nsph`` rows
+    are spherical and the rest are not read again, but they are
+    ``naux - nsph`` rows a direction of the buffer the second pass is
+    planned beside (1.2 GB at 113 atoms unrestricted).  A copy, made before
+    the second pass allocates anything.  ``FASTDFHESSIP_SPHROWS=0`` keeps
+    them."""
+    if not isinstance(t1p, _SymRows) or _env('FASTDFHESSIP_SPHROWS', '1') == '0':
+        return t1p
+    naux = t1p.xstride
+    if not naux or naux == nsph:
+        return t1p
+    ns, nocc = t1p.shape[1], t1p.shape[2]
+    out = _SymRows(3*nsph, ns, nocc, xstride=nsph)
+    for x in range(3):
+        out.p[x*nsph:(x+1)*nsph] = t1p.p[x*naux:x*naux+nsph]
+    _S['sph_rows'] = _S.get('sph_rows', 0) + 1
+    return out
+
+
+def _plan36(word_avail, naux, nao, nocc, nocc_in_batch, nao_pair, batch_size,
+            nao_on_atom, natm, metric_size, batch_id, nspin=1):
+    """Item 36 (W42): fused or not, planned after item 34's packing.
+
+    Item 34 decided on a plan made before its own packing, against the
+    unpacked ``(1|00)`` and ``dm_oo``, and a fused pass also held item 3's
+    ``10 naux^2`` back for the h_aux block -- so at 113 atoms on a 40 GB card
+    the fused chunk was a third of the unfused one and the call ran the
+    first pass as a walk of its own.  Planned on what the packing leaves
+    (``word_avail``), both forms hold what outlives the h_aux block (its
+    ``j2c_10v`` and item 33's spherical copy, ``6 naux nsph`` words) and the
+    fused one also what the block allocates while the pass's buffers are
+    held: ``j2c_10`` and its sorted copy (``6 naux^2``) where item 11 puts
+    the rest in the integral buffers, all of it where it cannot.  Fused iff
+    that costs no chunk; ``plan_u`` is only an estimate of what the unfused
+    pass re-plans after the block.  ``FASTDFHESSIP_PACKFUSE=0`` is item 34's
+    decision."""
+    persist = 6 * naux * metric_size
+    carve = (_env('FASTDFHESSIP_CARVE', '1') != '0' and
+             6 * batch_size * nao_pair >= _h_aux_words(naux, metric_size))
+    margin = 6 * naux**2 + (0 if carve else _h_aux_words(naux, metric_size))
+    unit = nocc_in_batch if nspin == 1 else nocc
+
+    def plan(w):
+        try:
+            if nspin == 1:
+                return _plan_v(w, naux, nao, nocc, unit, nao_pair,
+                               batch_size, nao_on_atom, natm, metric_size,
+                               batch_id, True, True)
+            from electrolites import _dfhessip_u as U
+            return U._plan_v(w, naux, nao, nocc, nao_pair, batch_size,
+                             nao_on_atom, natm, metric_size, True, 2, True,
+                             True)
+        except AssertionError:
+            return None
+    pu = plan(word_avail - persist)
+    pf = plan(word_avail - persist - margin)
+    nch = lambda p: -(-metric_size // p[0])                   # noqa: E731
+    fused = pf is not None and (pu is None or nch(pf) <= nch(pu))
+    if fused:
+        return pf, pf, True, carve
+    return (pu or (metric_size, 0, 0)), (pf or (0,)), False, False
 
 
 def _trmm(sa, x, trans=False):

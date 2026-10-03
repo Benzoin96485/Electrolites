@@ -326,14 +326,30 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         _S['chol_chunked'] = _S.get('chol_chunked', 0) + 1
     # item 33 (W40): fastdfhessip's chunks of rows of Y, both spins in each
     crow = None
-    pack34 = rows34 = False
+    pack34 = rows34 = packf = False
     if (sa is not None and chol is None and
             _env('FASTDFHESSIP_CROWS', '1') != '0'):
         crow = H._CholRows(sa)
         _S['chol_rows'] = _S.get('chol_rows', 0) + 1
         # item 34, as in fastdfhessip (FASTDFHESSIP_PACKROWS=0: item 33
         # alone); either holds its spherical j2c_10v back
-        if _env('FASTDFHESSIP_PACKROWS', '1') != '0':
+        packf = (fuse and _env('FASTDFHESSIP_PACKROWS', '1') != '0' and
+                 _env('FASTDFHESSIP_PACKFUSE', '1') != '0')
+        if packf:
+            # item 36 (W42), as in fastdfhessip: packed first, then fused
+            # or not by plans made on what the packing leaves
+            j3c_oo1 = H._SymRows(3*naux, 2, nocc, xstride=naux)
+            dmp = H._SymRows(naux, 2, nocc)
+            dmp.put(0, dm_oo)
+            dm_oo = dmp
+            plan, plan_f, do_fuse, carve = H._plan36(
+                _avail() // 8, naux, nao, nocc, nocc, nao_pair, batch_size,
+                nao_on_atom, natm, metric_size, 0, nspin=2)
+            aux_batch_size, aux_blksize, blksize2 = plan
+            pack34 = rows34 = True
+            if do_fuse:
+                _S['packfused'] = _S.get('packfused', 0) + 1
+        elif _env('FASTDFHESSIP_PACKROWS', '1') != '0':
             try:
                 plan, plan_f, do_fuse, carve = make_plan(
                     word_avail - 3*naux*metric_size, True)
@@ -349,7 +365,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             plan, plan_f, do_fuse, carve = make_plan(
                 word_avail - 3*naux*metric_size, False)
             aux_batch_size, aux_blksize, blksize2 = plan
-        if pack34:
+        if pack34 and not packf:
             # item 34: dm_oo and (1|00) as their weighted pairs from the
             # first pass on (fastdfhessip's note)
             j3c_oo1 = H._SymRows(3*naux, 2, nocc, xstride=naux)
@@ -410,7 +426,8 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         j2c_10 = None
         if pack34:
             # item 34: the second pass planned on what the packing left
-            t1p = j3c_oo1p
+            # (item 37, W42: with the spherical rows of (1|00) only)
+            t1p = H._sph_rows(j3c_oo1p, sa.nsph)
             j3c_oo1p = j3c_oo1 = dm_oo = None
             word_avail = _avail() // 8
             plan = _plan_v(word_avail, naux, nao, nocc, nao_pair, batch_size,
@@ -459,6 +476,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
         # item 33: the last rows first, whose walk is the whole one
         vchunks = vchunks[::-1]
         h_raw = cp.zeros((natm, sa.nsph, 3, 3))
+    d1buf = cp.empty(blksize2 * 2 * nocc * nocc) if d1d3 and pack34 else None
+    if do_fuse and pack34 and not d1d3:
+        j3c_oo1.tmp = cp.empty((blksize2, 2, nocc, nocc))
     for ci, ((n0, n1), (v0, v1)) in enumerate(
             (g, v) for g in groups for v in vchunks):
         dv = v1 - v0
@@ -509,7 +529,12 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
                         j3c[i_addr, j_addr] = compressed_di[x, :, k0:k1]
                     tmp = contract('pqr,nqi->npir', j3c, dm_factor_l[n0:n1],
                                    out=tmp)
-                    if d1d3 and vfirst:
+                    if d1d3 and vfirst and pack34:
+                        # item 36: into the packed (1|00)
+                        o1 = ndarray((dk, 2, nocc, nocc), buffer=d1buf)
+                        H._d1_from_d3(tmp, dm_factor_l, o1, None, nspin=2)
+                        j3c_oo1.put(x*naux + aux0, o1)
+                    elif d1d3 and vfirst:
                         H._d1_from_d3(tmp, dm_factor_l, j3c_oo1[x, aux0:aux1],
                                       None, nspin=2)
                     if chol is None:
@@ -530,6 +555,11 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
             ejk_ao += e_aux
             j2c_10c = H._j2c_10c(chol, j2c_10)
             j2c_10 = None
+            if pack34:
+                # item 36: D5's partners, packed as item 34 has them
+                t1p = j3c_oo1p
+                j3c_oo1p = j3c_oo1 = None
+            d1buf = None
             st('D2 h_aux')
 
         if chol is not None:

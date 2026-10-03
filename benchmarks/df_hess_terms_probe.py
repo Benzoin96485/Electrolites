@@ -62,6 +62,12 @@ ap.add_argument('--free-after', type=float, default=0,
                 help='GB left free after the SCF, by a ballast allocated '
                      'then: the terms at a 40 GB card\'s memory (44.6) for '
                      'a molecule whose SCF does not fit one (W38)')
+ap.add_argument('--keep-cderi', action='store_true',
+                help="keep the SCF's cderi on the device while the ip2 and h1 "
+                     "terms run.  Upstream's `partial_hess_elec` and "
+                     "`make_h1` call `with_df.reset()` before them, so a "
+                     "Hessian does not; W40's 40 GB rows were taken with "
+                     "it kept (14.3 GB at 113 atoms, W42)")
 ap.add_argument('--save-out', default='',
                 help='save each term\'s first-variant result to <path>.<term>.npy')
 ap.add_argument('--ref-out', default='',
@@ -144,6 +150,13 @@ def _free_after():
     _ballast2[:] = 0
     print(f'# ballast after the SCF {_ballast2.nbytes / 1e9:.1f} GB, '
           f'{cp.cuda.runtime.memGetInfo()[0] / 1e9:.1f} GB free', flush=True)
+
+if not a.keep_cderi:
+    # as `df/hessian/{rhf,uhf}.py:partial_hess_elec` and `make_h1` do
+    # before the terms (`# Release GPU memory`); the terms build their own
+    # integral optimiser without a cderi
+    mf.with_df.reset()
+    cp.get_default_memory_pool().free_all_blocks()
 
 mo_coeff = cp.asarray(mf.mo_coeff)
 mo_occ = cp.asarray(mf.mo_occ)
