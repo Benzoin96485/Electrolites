@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -180,6 +180,13 @@ _TARGETS = {
     # goes through, looked up at call time, wrapped so that a contraction
     # cuTENSOR refuses is cut into pieces it plans (docs/DF_WORK_LIST.md W27)
     'planguard': ('gpu4pyscf.lib.cutensor', 'contraction'),
+    # the Hessian's CPHF solve (docs/DF_WORK_LIST.md W44): both spin cases'
+    # `solve_mo1`, which the Hessian classes' methods look up on their
+    # modules at call time, and the Krylov solver and QR it reuses
+    'fastcphf': (('gpu4pyscf.hessian.rhf', 'solve_mo1'),
+                 ('gpu4pyscf.hessian.uhf', 'solve_mo1'),
+                 ('gpu4pyscf.lib.cupy_helper', 'krylov'),
+                 ('gpu4pyscf.lib.cupy_helper', '_stable_qr')),
 }
 
 _patched = []

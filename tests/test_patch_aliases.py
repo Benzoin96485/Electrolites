@@ -139,6 +139,11 @@ ORIGINALS = [
     ('fastdfhessip', 'gpu4pyscf.df.hessian.rhf', '_get_veff_orig'),
     ('fastdfhessip', 'gpu4pyscf.df.hessian.uhf', '_jk_energy_per_atom_orig'),
     ('fastdfhessip', 'gpu4pyscf.df.hessian.uhf', '_get_veff_orig'),
+    # W44: both spin cases' CPHF solve, which the Hessian methods, the IR
+    # and Raman drivers and `hessian/uks.py`'s class all reach through the
+    # module global
+    ('fastcphf', 'gpu4pyscf.hessian.rhf', '_solve_mo1_orig'),
+    ('fastcphf', 'gpu4pyscf.hessian.uhf', '_solve_mo1_orig'),
 ]
 
 #: aliases that are known and deliberate: (holder, attribute) -> why
