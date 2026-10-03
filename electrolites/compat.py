@@ -28,6 +28,8 @@ What actually changed, and what this module hides:
 import functools
 import inspect
 
+import os
+
 import numpy as np
 import cupy as cp
 
@@ -76,17 +78,77 @@ def dense_q_cond(opt):
     return q
 
 
+_TRIL_GEOM = {}
+
+
+def _tril_geometry(l_ctr_bas_loc, nbas, tile):
+    """The candidate ``ish*nbas + jsh`` of every ``(i,j)`` group before the
+    screen, concatenated in the order the groups are listed, with each
+    candidate's group index.  They depend on the shell layout only, so they
+    are built once per layout: building them per call was ~40 boolean-mask
+    indexings per group, each a device-host synchronisation, and 97 % of
+    ``fastk._prep``'s time with the device idle (docs/DIRECT_SURVEY.md)."""
+    key = (tuple(int(x) for x in l_ctr_bas_loc), int(nbas), int(tile))
+    hit = _TRIL_GEOM.get(key)
+    if hit is not None:
+        return hit
+    if len(_TRIL_GEOM) > 8:
+        _TRIL_GEOM.clear()
+    n_groups = len(l_ctr_bas_loc) - 1
+    keys, lists = [], []
+    for i in range(n_groups):
+        for j in range(i + 1):
+            ish0, ish1 = int(l_ctr_bas_loc[i]), int(l_ctr_bas_loc[i + 1])
+            jsh0, jsh1 = int(l_ctr_bas_loc[j]), int(l_ctr_bas_loc[j + 1])
+            ntiles_i = (ish1 - ish0 + tile - 1) // tile
+            ntiles_j = (jsh1 - jsh0 + tile - 1) // tile
+            ish = cp.arange(ish0, ish0 + ntiles_i * tile,
+                            dtype=np.int32).reshape(ntiles_i, tile)
+            jsh = cp.arange(jsh0, jsh0 + ntiles_j * tile,
+                            dtype=np.int32).reshape(ntiles_j, tile)
+            ish = ish[:, None, :, None]
+            jsh = jsh[None, :, None, :]
+            pair_ij = ish * nbas + jsh
+            if i == j:
+                pair_ij = pair_ij[(ish >= jsh) & (ish < ish1) & (jsh < jsh1)]
+            else:
+                pair_ij = pair_ij[(ish < ish1) & (jsh < jsh1)]
+            keys.append((i, j))
+            lists.append(pair_ij.ravel())
+    allp = cp.concatenate(lists)
+    gid = cp.concatenate([cp.full(len(x), g, dtype=np.int32)
+                          for g, x in enumerate(lists)])
+    hit = _TRIL_GEOM[key] = (keys, allp, gid)
+    return hit
+
+
 def tril_pair_mappings(l_ctr_bas_loc, q_cond, cutoff, tile=6):
     """Density-screened ``ish*nbas + jsh`` lists, one per ``(i,j)`` group.
 
     Vendored from GPU4PySCF 1.7.0's ``jk._make_tril_pair_mappings``
     (Apache-2.0), which 1.8.1 removed.  Our kernels consume its output, so it
-    has to keep producing identical lists on both releases.
+    has to keep producing identical lists on both releases -- and it does:
+    the unscreened lists are cached per shell layout (``_tril_geometry``) and
+    screened here in one pass, with two synchronisations per call instead of
+    one per group.  ``ELECTROLITES_TRIL=pergroup`` is the vendored loop.
     """
     if not NEW_JK_ABI:
         return JK._make_tril_pair_mappings(l_ctr_bas_loc, q_cond, cutoff, tile)
     nbas = q_cond.shape[0]
     q_flat = q_cond.ravel()
+    if os.environ.get('ELECTROLITES_TRIL', '') == 'pergroup':
+        return _tril_pair_mappings_pergroup(l_ctr_bas_loc, q_flat, nbas,
+                                            cutoff, tile)
+    keys, allp, gid = _tril_geometry(l_ctr_bas_loc, nbas, tile)
+    idx = cp.nonzero(q_flat[allp] > cutoff)[0]
+    sel = allp[idx]
+    counts = cp.bincount(gid[idx], minlength=len(keys)).get()
+    offs = np.append(0, np.cumsum(counts))
+    return {k: sel[offs[g]:offs[g + 1]] for g, k in enumerate(keys)}
+
+
+def _tril_pair_mappings_pergroup(l_ctr_bas_loc, q_flat, nbas, cutoff, tile):
+    """The vendored loop, one screened list per group as it is built."""
     n_groups = len(l_ctr_bas_loc) - 1
     pair_mappings = {}
     for i in range(n_groups):
