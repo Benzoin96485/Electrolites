@@ -27,6 +27,12 @@ ap.add_argument('--xc', default='pbe0')
 ap.add_argument('--basis', default='gth-dzvp')
 ap.add_argument('--conv-tol', type=float, default=1e-8)
 ap.add_argument('--patch', default='none')
+ap.add_argument('--grad', action='store_true',
+                help='nuclear gradient after the SCF (J7: the per-atom hcore)')
+ap.add_argument('--stress', action='store_true',
+                help='stress tensor after the SCF (J4 with --multigrid, J5)')
+ap.add_argument('--multigrid', action='store_true',
+                help='multigrid_v2 numerical integration (pure functionals)')
 ap.add_argument('--cprofile', default='')
 a = ap.parse_args()
 
@@ -45,14 +51,14 @@ N = OrderedDict()
 
 def wrap(path, label):
     mod, attr = path.split(':')
-    holder = importlib.import_module(mod)
     parts = attr.split('.')
-    for p in parts[:-1]:
-        holder = getattr(holder, p)
     name = parts[-1]
     try:
+        holder = importlib.import_module(mod)
+        for p in parts[:-1]:
+            holder = getattr(holder, p)
         orig = getattr(holder, name)
-    except AttributeError as err:
+    except (AttributeError, ImportError) as err:
         print(f'# cannot wrap {path}: {err}')
         return
     T.setdefault(label, 0.0)
@@ -82,8 +88,46 @@ PLAN = [
     ('gpu4pyscf.pbc.dft.numint:KNumInt.nr_rks', '..KNumInt.nr_rks (XC)'),
     ('gpu4pyscf.pbc.scf.khf:KSCF.eig', '..eig (J8)'),
 ]
+PLAN += [
+    ('gpu4pyscf.pbc.grad.krhf:grad_elec', 'gradient grad_elec'),
+    ('gpu4pyscf.pbc.grad.krks:Gradients.get_veff', '..grad get_veff'),
+    ('gpu4pyscf.pbc.grad.krhf:get_hcore', '..grad get_hcore'),
+    ('gpu4pyscf.pbc.grad.krks_stress:kernel', 'stress kernel'),
+    ('gpu4pyscf.pbc.grad.krks_stress:get_vxc', '..stress get_vxc'),
+    ('gpu4pyscf.pbc.grad.krks_stress:_rks_exc_strain_deriv',
+     '....multigrid strain FD (J4)'),
+    ('gpu4pyscf.pbc.dft.multigrid_v2:evaluate_density_on_g_mesh',
+     '......evaluate_density_on_g_mesh'),
+    ('gpu4pyscf.pbc.grad.krks_stress:_get_pp_nonloc_strain_derivatives',
+     '..pp non-local strain (J5)'),
+    ('gpu4pyscf.pbc.grad.krks_stress:ewald', '..ewald strain'),
+]
 for path, label in PLAN:
     wrap(path, label)
+
+# J7: `grad_elec` asks `hcore_generator` for a closure and calls it once per
+# atom, so the closure is what has to be timed
+import gpu4pyscf.pbc.grad.krhf as _pkrhf                    # noqa: E402
+_gen = _pkrhf.Gradients.hcore_generator
+T.setdefault('..hcore_deriv per atom (J7)', 0.0)
+N.setdefault('..hcore_deriv per atom (J7)', 0)
+
+
+def _timed_gen(self, *args, **kwargs):
+    fn = _gen(self, *args, **kwargs)
+
+    def per_atom(*a2, **k2):
+        _sync()
+        t = time.perf_counter()
+        out = fn(*a2, **k2)
+        _sync()
+        T['..hcore_deriv per atom (J7)'] += time.perf_counter() - t
+        N['..hcore_deriv per atom (J7)'] += 1
+        return out
+    return per_atom
+
+
+_pkrhf.Gradients.hcore_generator = _timed_gen
 
 if a.cell == 'diamond':
     atom = 'C 0 0 0; C 0.8917 0.8917 0.8917'
@@ -103,10 +147,13 @@ from gpu4pyscf.pbc import dft as pdft                       # noqa: E402
 mf = pdft.KRKS(cell, kpts=kpts, xc=a.xc)
 if a.df == 'gdf':
     mf = mf.density_fit()
+if a.multigrid:
+    mf = mf.multigrid_numint()
 mf.conv_tol = a.conv_tol
 mf.verbose = 0
 
-tag = (f'kpt/{a.cell}/{a.kpts}/{a.df}/{a.basis}/{a.xc}/patch={a.patch}')
+tag = (f'kpt/{a.cell}/{a.kpts}/{a.df}{"+mg" if a.multigrid else ""}/'
+       f'{a.basis}/{a.xc}/patch={a.patch}')
 print(f'[{tag}] natm={cell.natm} nao={cell.nao} nk={len(kpts)} '
       f'gpu={cp.cuda.runtime.getDeviceProperties(0)["name"].decode()}',
       flush=True)
@@ -120,6 +167,24 @@ t0 = time.perf_counter()
 e = mf.kernel()
 _sync()
 wall = time.perf_counter() - t0
+if a.grad:
+    g = mf.nuc_grad_method()
+    g.verbose = 0
+    _sync()
+    t = time.perf_counter()
+    g.kernel()
+    _sync()
+    T['gradient total'] = time.perf_counter() - t
+    N['gradient total'] = 1
+if a.stress:
+    g = mf.nuc_grad_method()
+    g.verbose = 0
+    _sync()
+    t = time.perf_counter()
+    g.get_stress()
+    _sync()
+    T['stress total'] = time.perf_counter() - t
+    N['stress total'] = 1
 if a.cprofile:
     prof.disable()
     prof.dump_stats(a.cprofile)
