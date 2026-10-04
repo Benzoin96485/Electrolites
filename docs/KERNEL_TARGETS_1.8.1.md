@@ -22,10 +22,13 @@ the **molecular-dynamics** (`md/`) and **geometry-optimization**
 (`geomopt/`) engines, which drive the methods above rather than being
 methods; the energies and derivatives they call are in scope.
 
-**What this document is not**: no optimization was performed and no new
-measurement was taken for it.  Every number quoted is one already measured in
-this repository's `docs/` (with the pointer), or one in 06 (marked as such).
-Everything else is a reading of the source and carries no share.
+**What this document is not**: no optimization was performed.  The survey
+itself (§1–§4, §6–§9) took no measurement: every number there is one already
+measured in this repository's `docs/` (with the pointer), or one in 06
+(marked as such), and everything else is a reading of the source.  The
+eleven profiles §8 said were owed were then taken (2026-10-03) and are in
+**§10**; **§5 is ranked on them**, and §3.4, §7 and §8 say which of their
+items those profiles closed.
 
 ---
 
@@ -176,6 +179,11 @@ gradients, **ECP**-bearing systems, the restricted **meta-GGA SCF** (06 Q13),
 X2C**, **DF-MP2**, **CCSD**, **FCI**, **PM6**, and every **PBC** path.  §8
 lists the profiles owed, in the order they would change the ranking.
 
+**Since profiled (§10)**: TDDFT gradients and NACs (not spin-flip, not the
+FSSH batch), NMR, IR, the PCM Hessian, the restricted meta-GGA SCF, HSE06
+after Electrolites, the UKS range-separated gradient, DF-MP2, CCSD, and the
+k-point hybrid SCF.  The rest of the list is still unprofiled (§5.2).
+
 ---
 
 ## 3. 06 against 1.8.1 and against Electrolites
@@ -260,9 +268,9 @@ two of them could cost time on the patched path.
 
 | # | finding | evidence | consequence |
 |---|---|---|---|
-| R1 | **`fastgradh` may be a regression on 1.8.1** `[X]` | 1.8.1's own `grad/rhf.py:199-215 get_hcore` builds `int1e_ipkin` on the GPU (`pbc.gto.int1e`) and `int1e_ipnuc` through the int3c2e ip1 path (`:217-240`) `[V]`; `electrolites/fastgradh.py:45` replaces it with CPU `mol.intor('int1e_ipkin', comp=3)` `[V]`.  The module was written against 1.7.0, where both were CPU | the patched Hessian's `make_h1` (reached via `get_grad_hcore`, `grad/rhf.py:396-398`; twice for UHF) pays CPU libcint that stock does not.  Not measured: A/B it, then retire or narrow the module |
-| R2 | **`get_hcore` is not "CPU" on 1.8.1** `[X]` | `scf/hf.py:150-167`: nuclear attraction via `contract_int3c2e_auxvec`, kinetic via `pbc.gto.int1e.int1e_kin`, ECP via `get_ecp` — all GPU `[V]` | `docs/DF_WORK_LIST.md` §3.1 and `docs/README_fastdf.md` §3.1 label a 21.8 % / 13.9 % `get_hcore` row "on the CPU".  The *number* was measured; the *label* is not what the code does.  Same stage is 0.77 s of a 284-atom direct SCF (`ROUND2_1.8.1.md` §2).  Unexplained until profiled (first-call JIT/module load is the obvious suspect `[?]`) — §8 item 9 |
-| R3 | `ROUND2_1.8.1.md` §6's "unpatched nuclear-attraction derivative on the CPU" vs the 1.8.1 source | `grad/rhf.py:242-293 _grad_nuc_without_ecp` and `:217-240` are GPU `[V]`, yet §6 *measured* the stock PfPMT gradient depending on `OMP_NUM_THREADS` | a measurement and a source reading disagree; something on the stock gradient path is CPU and is not the term §6 names.  Profile (§8 item 9) — do not explain it by inspection |
+| R1 | **`fastgradh` may be a regression on 1.8.1** `[X]` | 1.8.1's own `grad/rhf.py:199-215 get_hcore` builds `int1e_ipkin` on the GPU (`pbc.gto.int1e`) and `int1e_ipnuc` through the int3c2e ip1 path (`:217-240`) `[V]`; `electrolites/fastgradh.py:45` replaces it with CPU `mol.intor('int1e_ipkin', comp=3)` `[V]`.  The module was written against 1.7.0, where both were CPU | the patched Hessian's `make_h1` (reached via `get_grad_hcore`, `grad/rhf.py:396-398`; twice for UHF) pays CPU libcint that stock does not.  Not measured: A/B it, then retire or narrow the module.  **Measured (§10.7): not a regression — 0.06 s against stock's 0.14 s, 0.1–0.3 % of a Hessian; keep the module** |
+| R2 | **`get_hcore` is not "CPU" on 1.8.1** `[X]` | `scf/hf.py:150-167`: nuclear attraction via `contract_int3c2e_auxvec`, kinetic via `pbc.gto.int1e.int1e_kin`, ECP via `get_ecp` — all GPU `[V]` | `docs/DF_WORK_LIST.md` §3.1 and `docs/README_fastdf.md` §3.1 label a 21.8 % / 13.9 % `get_hcore` row "on the CPU".  The *number* was measured; the *label* is not what the code does.  Same stage is 0.77 s of a 284-atom direct SCF (`ROUND2_1.8.1.md` §2).  Unexplained until profiled (first-call JIT/module load is the obvious suspect `[?]`) — §8 item 9.  **Profiled (§10.9): first-call initialisation, 0.46–0.52 s cold against 0.10 s warm, independent of thread count** |
+| R3 | `ROUND2_1.8.1.md` §6's "unpatched nuclear-attraction derivative on the CPU" vs the 1.8.1 source | `grad/rhf.py:242-293 _grad_nuc_without_ecp` and `:217-240` are GPU `[V]`, yet §6 *measured* the stock PfPMT gradient depending on `OMP_NUM_THREADS` | a measurement and a source reading disagree; something on the stock gradient path is CPU and is not the term §6 names.  Profile (§8 item 9) — do not explain it by inspection.  **Profiled (§10.9): does not reproduce on 1.8.1 — the stock PfPMT gradient is 19.79 s at 1 and at 16 threads, with no CPU integral in its profile** |
 | R4 | `CATALOGUE_06_STATUS.md` rows stale | D3 and D7 closed upstream (§3.1); B4d's Hessian half done by W16; "`_get_vnlc_deriv1` is 23.1 % of `make_h1`" — the underlying numbers (31.31 s of 39.07 s, `README_fastfnlc.md` §4b) make it **80 %** of `make_h1`; 23.1 % is its ratio to the 135.56 s CPHF | read §2.2 here instead |
 | R5 | **UKS TDDFT ignores `exclude_nlc`** `[V lines; consequence ?]` | `tdscf/uhf.py:752-754` `gen_response(mo_coeff=None, mo_occ=None, hermi=hermi)` drops `with_nlc`; the restricted `tdscf/rhf.py:393,408-415` honours it; `grad/tduks.py:395` runs without NLC | an open-shell VV10 TDDFT energy includes the VV10 response while its gradient does not, and every Davidson iteration pays the VV10 term (`fastfnlc` covers it, 1.47–1.63x).  A semantics fix to report upstream, not a speedup |
 | R6 | CCSD skips shell pairs with `l > LMAX_ON_GPU = 4` (`cc/ccsd_incore.py:281,396,472`; `scf/int4c2e.py:27`) `[V]` | atomic bases are limited to g (`l = 4`) in 1.8.1's README, so this cannot fire on a supported basis | not a bug today; it becomes one the day h shells are allowed |
@@ -430,48 +438,80 @@ absent (greenfield).
 
 ## 5. Ranked
 
-Two orderings, as 06 §5 requires, because they barely overlap.
+Two orderings, as 06 §5 requires, because they barely overlap.  **This
+section was re-ranked on 2026-10-03 on the §8 measurements**, which are in
+§10; every share below that cites §10 was measured after that date and every
+other one is quoted from the document named.
 
 ### 5.1 By measured value (throughput)
 
 Ranking = measured share **after Electrolites** × how much of an existing,
-measured treatment transfers × how clean the oracle is.  **Only entries with a
-measured or directly derived share are ranked**; the rest are in §5.3.
+measured treatment transfers × how clean the oracle is × how cheap the change
+is.  **Only entries with a measured or directly derived share are ranked**;
+the rest are in §5.2 and §5.3.  "Share" is of the whole run of the feature
+named, after `patch_all()`, unless the cell says otherwise.
 
 | Rank | Entry | Features it reaches | Share it acts on (measured) | Why this rank |
 |---|---|---|---|---|
 | 1 | **B13** VV10 pair kernel `f_t` (+ **B14**) | every VV10 functional's polarizability, Hessian, frequencies, IR | `nr_rks_fnlc_mo` **83.3 %** of a wB97M-V CPHF; VV10 response 80.6 % of a stock wB97M-V polarizability, the largest term left after `fastfnlc` | the largest single share anywhere in this repository's profiles; three of `fastnlc`'s measured techniques (MUFU, P10, P11 — 3.92x together on the ground-state sum) transfer; the source is now in the tree; the redundant `ntrial/6` re-evaluation is structural, not tuning |
-| 2 | **C10** IR's duplicate CPHF | IR intensities (and every workflow that asks for them with frequencies) | the duplicate is ~44–48 % of an IR run, *derived* from measured Hessian stages `[?]` | easy, exact (same equations, solved once), and upstream already marks it TODO.  Confirm the derivation with one profile (§8 item 2) before quoting it |
-| 3 | **B12** the CPHF exchange contraction `C` | every direct Hessian, frequencies, IR | `get_k` **37–55 %** of a patched Hessian, 94 % of it `C` | the largest direct-Hessian share and it grows with size; but no treatment transfers — the atomic half is unmeasured and inexact-Krylov is a hypothesis, so it ranks below two cheaper certainties |
-| 4 | **B15** `jk_ip1` (step a first) | every direct Hessian | **26.8 %** of a patched UKS TMC Hessian; 7.0 % / 2.5 % RKS | step (a) is a host-overhead fix measured elsewhere at 3.3 ms per query; (c) is `fastejk`'s P1–P5, measured 1.70x on the sibling kernel |
-| 5 | **B3** `ejk_ip2`'s general kernel | every direct Hessian, esp. transition metals | 63 % of `ejk_ip2`; `ejk_ip2` **29.1 %** of a patched UKS TMC Hessian, 13.7 % of a 42-atom RKS one | P6's "write, don't lift" measured 2.48x on K's general classes; a generator project |
-| 6 | **A5** the AO kernel (+ **A15**) | every DFT SCF, gradient, response | XC 10.2 % of a patched SCF, 34–38 % of it device-idle; `eval_ao` 26 % of the patched XC gradient | the A15 half is easy and bounded at 4.5–7 % of an SCF; the kernel half is mod |
-| 7 | **A20** cheaper direct K | every hybrid SCF | **66.8 %** of a patched SCF | the largest share in the SCF, but nothing measured transfers and it changes the answer; ranked by confidence, not size |
-| 8 | **B17** DF CPHF RHS count/precision (W46) | DF Hessians | 82 % of a 113-atom UKS DF Hessian | already specified in `DF_WORK_LIST.md` with a falsification criterion |
-| 9 | **B16** short-range half of RSH derivatives | UKS RSH gradients; all RSH Hessians | RKS analogue 1.77x on the 2e derivative | an existing identity, ported; the share on UKS is unmeasured |
-| 10 | **C12** fused RSH response J+K | RSH polarizability, TDDFT | J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K in SCF | as `fastrsh`, on `fastjk`'s kernels |
-| 11 | **A18** under-filled K classes | SCF, esp. TMCs | 1.056x on PfPMT `get_k` (login node) | small but measured; owes a compute-node re-run |
-| 12 | **A7** RSH fusion, high-`l` classes | RSH SCF | ~9 % of K (06's estimate) | easy |
+| 2 | **C10** IR's duplicate CPHF | IR intensities (and every workflow that asks for them with frequencies) | the duplicate `make_h1` + `solve_mo1` is **41.8 %** of a 42-atom IR run and 31.6 % of a 22-atom one, growing with size (§10.2); removing it is worth **1.72x / 1.46x** on the whole run | easy, and exact (bitwise: the same equations, solved once); upstream marks it TODO.  Q2's derived 44–48 % was the right size, slightly high |
+| 3 | **A14** restricted meta-GGA XC in the SCF | every restricted TPSS, r2SCAN, SCAN, M06-2X, MN15 SCF (and everything after it) | `nr_rks` is **53–62 %** of a patched pure-mGGA SCF and **34–41 %** of a patched M06-2X one, 42 and 113 atoms, and `fastxc` hands **every** call back to stock (§10.3); per call it is 2.6x the patched GGA build of the same molecule | the code exists for UKS; bounded by Amdahl at **1.3–1.45x** of a pure-mGGA SCF if the GGA treatment's 2.06x transfers.  Broad reach, easy, an element-wise oracle |
+| 4 | **C7** NMR: GIAO AOs evaluated on the CPU per grid block | every NMR shielding | **72–78 %** of a patched NMR run at 22 and 42 atoms (126 s of 171 s at 42 atoms), B3LYP and PBE alike (§10.4) | easy–mod: ig/ipig are `eval_ao` deriv 1–2 times `(R_μ × r)`, no new integrals.  NMR is otherwise untouched by Electrolites (1.02–1.16x).  Was ranked below C6 by guess; measured, it is 3–6x C6 at these sizes |
+| 5 | **A17** native short-range K for HSE06 | every HSE06 (and any `erfc`-only RSH) SCF and its derivatives | patched `get_k` is **66 % / 72 %** of a patched HSE06 SCF at 113 / 284 atoms, and the decomposition gives it **1.01x / 1.05x** over stock where B3LYP's K gets 2.54x (§10.5) | not a regression (Q5 refuted) but the locality of `erfc` is thrown away from ~100 atoms on.  If a native kernel reached B3LYP's 2.5x, the 284-atom SCF gains ~1.7x.  mod |
+| 6 | **I1** DF-MP2 pair-energy loop | every DF-MP2 | **73 % / 81 %** of the DF-MP2 step at 42 / 113 atoms, 46–49 % of SCF + MP2 at 113 atoms; grows with size (§10.10) | easy (batch the pairs into GEMMs, drop the two host syncs per pair), exact to round-off |
+| 7 | **B12** the per-density exchange contraction `C` | every direct Hessian, frequencies, IR — **and TDDFT** | `get_k` **37–55 %** of a patched Hessian, 94 % of it `C`; the multi-density response `get_jk` is **71 %** of a patched 113-atom TDDFT + gradient + NAC run, where `fastjk` falls from 3.2x at 42 atoms to **1.33x** (§10.1) | the largest share in both the Hessian and the TDDFT paths and it grows with size; but no treatment transfers (inexact-Krylov is a hypothesis), so it ranks below the certainties |
+| 8 | **B16** short-range half of RSH derivatives, UKS | UKS range-separated gradients (and both Hessians' ip2) | the 2e derivative is **88 % / 96 %** of a patched UKS ωB97X gradient (penicillin V⁺ / Ni dithiolene⁻), 18–28 % of SCF + gradient; exactly half its class blocks are stock — the ω < 0 pass (§10.8) | easy: `fastgrad`'s RKS identity, measured there at 1.99x on the same term, ported to `grad.uks` |
+| 9 | **D9 + D10** TDDFT gradient / NAC XC kernel and 2e derivative | TDDFT and TDA gradients, NACs, the FSSH inner loop | together **28–33 %** of a patched pure-functional TDDFT gradient + NAC run (42 and 113 atoms) and 13–25 % of a hybrid one; untouched by every module (patched = stock time) (§10.1) | the two structures `fastxcfxc` (3–4x) and `fastejk` (1.7x) already beat on neighbouring paths; bounded at ~1.14x of the run for B3LYP, more for pure functionals.  mod |
+| 10 | **J3** FFTDF k-point exchange | every k-point hybrid on the default `KRKS` back end | `fft_jk.get_k_kpts` is **94–97 %** of a k-point PBE0 SCF; ~nk^2.2 from nk = 8 to 27 (§10.11) | the largest share on the periodic path and on its default back end; no measured treatment transfers (time-reversal symmetry, batched FFTs).  mod–hard |
+| 11 | **B15** `jk_ip1` (step a first) | every direct Hessian | **26.8 %** of a patched UKS TMC Hessian; 7.7 % of a patched 42-atom RKS one on an otherwise idle node (§10.7) | step (a) is a host-overhead fix measured elsewhere at 3.3 ms per query — and this stage doubled when the node's CPUs were shared (§10.7), the signature of a host-bound stage; (c) is `fastejk`'s P1–P5, measured 1.70x on the sibling kernel |
+| 12 | **B3** `ejk_ip2`'s general kernel | every direct Hessian, esp. transition metals | 63 % of `ejk_ip2`; `ejk_ip2` **29.1 %** of a patched UKS TMC Hessian, 13.7 % of a 42-atom RKS one | P6's "write, don't lift" measured 2.48x on K's general classes; a generator project |
+| 13 | **F9 / F11** PCM response and `h1` | PCM Hessians, TDDFT-PCM, PCM polarizabilities | PCM-specific terms **28–30 %** of a patched 42-atom PCM Hessian: `_B_dot_x` in the CPHF **12.6–14.8 %**, the solvent second derivative 10–11 %, the 3·natm `int1e_grids` loop only **1.2–1.5 %**, `get_dqsym_dx` ×3 1–2 % (§10.6) | the multi-RHS batching F9 proposed belongs on `_B_dot_x`, not on the `h1` loop the catalogue named; F11's caching is easy and small |
+| 14 | **A5** the AO kernel (+ **A15**) | every DFT SCF, gradient, response | XC 10.2 % of a patched SCF, 34–38 % of it device-idle; `eval_ao` 26 % of the patched XC gradient | the A15 half is easy and bounded at 4.5–7 % of an SCF; the kernel half is mod |
+| 15 | **A20** cheaper direct K | every hybrid SCF | **66.8 %** of a patched SCF | the largest share in the SCF, but nothing measured transfers and it changes the answer; ranked by confidence, not size |
+| 16 | **B17** DF CPHF RHS count/precision (W46) | DF Hessians | 82 % of a 113-atom UKS DF Hessian | already specified in `DF_WORK_LIST.md` with a falsification criterion |
+| 17 | **I5 / I4** CCSD AO-direct vvvv and host amplitude update | CCSD | AO-direct `ovvv`/`vvvv` **48–53 %** of a 22-atom CCSD; host-side einsum/reshape/DIIS ≈ 22 % and `cudaMalloc` ≈ 16 % (2931 real allocations) by cProfile (§10.10) | the allocator half is this repository's recurring cheap fix (`DF_WORK_LIST.md` §5.8); the rest is hard |
+| 18 | **C12** fused RSH response J+K | RSH polarizability, TDDFT | J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K in SCF | as `fastrsh`, on `fastjk`'s kernels |
+| 19 | **J1** GDF k-point exchange | k-point hybrids with `density_fit()` | `df_jk.get_k_kpts` **50–54 %**; the one-time cderi 39–43 % (§10.11) | J2 (metric `eigh` per k) is 2–8 % and is a tail |
+| 20 | **A18** under-filled K classes | SCF, esp. TMCs | 1.056x on PfPMT `get_k` (login node) | small but measured; owes a compute-node re-run |
+| 21 | **A7** RSH fusion, high-`l` classes | RSH SCF | ~9 % of K (06's estimate) | easy |
+
+**Not a target any more** (closed by §10): R1 `fastgradh` (it is 2–3x
+*faster* than stock on its row, and the row is 0.1–0.3 % of a Hessian,
+§10.7); R2 the DF `get_hcore` row (a first-call initialisation, 0.46–0.52 s
+cold, 0.10 s warm, §10.9); R3 the OMP-dependent stock gradient (not
+reproduced on 1.8.1: PfPMT 19.79 s at 1 and at 16 threads, §10.9); F10 as a
+*time* entry (0.3 % of a PCM Hessian) — it stays as a **memory** wall, below.
+
+**Runnability walls measured by §10** (not throughput, but they decide
+which systems a user can run at all):
+
+* **F10**: at taxol (113 atoms, 11 274 cavity points) `get_d2F_d2A` holds
+  **22.0 GB** and `get_d2D_d2S` **18.3 GB** of device memory, and an IEF-PCM
+  Hessian needs both — beyond a 40 GB card; at 284 atoms the PCM build itself
+  is out of memory on 40 GB (§10.6).
+* **TDDFT**: `_lr_eig` sizes a dense `(2·max_space)²` device matrix from the
+  *host* budget `max_memory`; at 80 GB it is 31 GB for penicillin V and OOMs a
+  40 GB card in stock and patched alike (§10.1).  And the default
+  `cphf_max_cycle = 50` does not converge taxol/PBE's Z-vector (200 does).
 
 ### 5.2 Measure first — probably large, never profiled
 
-In the order a single profile would most likely change §5.1:
+§8's eleven measurements moved ten entries into §5.1.  What is still
+unprofiled, in the order a single profile would most likely change §5.1:
 
-1. **D9 + D10 (+ D11, D12)** — the whole TDDFT-gradient / NAC / FSSH path.
-   No module here is on it (`grep` finds no reference to `grad/tdrks.py` or
-   `_jk_energies_per_atom` in `electrolites/`), and it is the same two
-   structures (per-set grid GEMMs, ip1 derivative integrals) this repository
-   already beat by 3–4x and 1.7x on neighbouring paths.
-2. **A14** restricted meta-GGA SCF — 06 Q13.  Easy if it pays: the
-   open-shell code already exists.
-3. **C6–C9** NMR — the two-electron GIAO term on single-node libcint (C6) is
-   probably the property's whole cost at size; C7 and C8 are near one-line.
-4. **F9–F11** the PCM Hessian — 3·natm full-cavity passes, plus a memory wall
-   arithmetic puts at an OOM for 168 atoms on 80 GB.
-5. **A17** HSE06 after Electrolites — possibly a *regression*, which makes it
-   urgent rather than valuable.
-6. **I1** DF-MP2 pair loop — easy; likely dominant at mid size.
-7. **J1, J3, J7** — the PBC paths most likely to carry a hybrid k-point run.
+1. **D12** `force_and_nacv` — one Z-vector CPHF per state pair; §10.1 puts
+   the Z-vector at 23–40 % of a single pair, so `n_pairs` of them is the FSSH
+   inner loop.  Easy–mod.
+2. **B14 against B13** — the split of `_get_vnlc_deriv1`'s 31 s between the
+   host atom loop and the pair kernel.
+3. **D13** spin-flip multicollinear XC, and whether `fastxcfxc` is on the
+   spin-flip response path at all.
+4. **F12** SMD (the CDS Hessian by 6·natm finite differences) and **F8** ECP
+   (needs a heavy-element system; the Pt complex of `OPENSHELL_TMC.md`).
+5. **B9** grid-response Hessian, including the `:2010` int32 assert (Q4).
+6. **J4, J5, J7** — the periodic gradient and stress paths.
+7. **A19, A21, K1/K2, C4, C5, D6** — g-shell classes, GKS, PM6, EDA, C6
+   coefficients, TDDFT-ris.
 
 ### 5.3 By benchmark cleanliness (low contamination)
 
@@ -480,19 +520,21 @@ to them.  Low contamination means essentially no public GPU source to recall:
 
 | Entry | Why it is clean | Oracle |
 |---|---|---|
-| **C6** GIAO `(ig1)` two-electron integrals | no public GPU implementation `[?]` | PySCF `prop.nmr` CPU, element-wise |
+| **C7** GIAO AOs on the GPU (new, §10.4) | no public GPU GIAO AO evaluation `[?]`; and it is now also the largest NMR share | PySCF `eval_gto('GTOval_ig')` element-wise; shielding tensors |
+| **C6** GIAO `(ig1)` two-electron integrals | no public GPU implementation `[?]`; 20–22 % of a 42-atom NMR run and growing as ~nao^2.7 (§10.4) | PySCF `prop.nmr` CPU, element-wise |
 | **F8** ECP screening (06 A12) | carries its own TODO; no public GPU ECP screen | exact: unscreened result to 1e-14 |
-| **F9/F10** PCM Hessian multi-RHS and sparse d2F | PCM Hessians on GPU are GPU4PySCF-only and recent | upstream's dense path; finite differences |
+| **F9/F10** PCM response batching and sparse d2F | PCM Hessians on GPU are GPU4PySCF-only and recent | upstream's dense path; finite differences |
 | **B13** VV10 response kernel | public only since 1.8.0 (06 tier C1, "the best discriminating tier") | the stock `.so` element-wise |
 | **K1/K2** PM6 pair integrals and analytic derivatives | PM6 on GPU is new in 1.7.1/1.8.0 | MOPAC; the current FD gradient |
 | **J4** analytic multigrid stress | new in 1.8.0; FD upstream | the FD stress |
 | **E3** real-space properties | greenfield, no incumbent — never pooled into speedup statistics | PySCF `tools.cubegen` |
 | **F1** D3/D4 on GPU | no public GPU port located `[?]` | simple-dftd3 / dftd4 to 1e-12 |
 
-**The one-sentence version** (06's, still true): the most valuable throughput
-targets (§5.1) and the cleanest benchmark targets (§5.3) barely overlap —
-with one exception, **B13**, which is both the largest measured share left and
-a C1-tier kernel.
+**The one-sentence version** (06's, still true, now with a second
+exception): the most valuable throughput targets (§5.1) and the cleanest
+benchmark targets (§5.3) barely overlap — except **B13**, which is both the
+largest measured share left and a C1-tier kernel, and **C7**, which is both
+three quarters of an NMR run and essentially uncontaminated.
 
 ---
 
@@ -522,12 +564,12 @@ systems).  Additions for the classes 06 did not cover:
 | # | Claim | Status |
 |---|---|---|
 | Q1 | Every "not measured" entry in §4 | `[?]` by definition.  §5.2's order is a judgment, not a measurement |
-| Q2 | C10's 44–48 % | **derived**, not measured: `make_h1 + solve_mo1` shares of a Hessian (`HESSIAN_1.8.1.md` §2–3) applied to a run that is a Hessian plus the duplicate.  IR's `make_h1` may differ (no XC deriv2 there) |
-| Q3 | F9's 26–38 s and F10's 10 GB / 70 GB | arithmetic from shapes and from `fast1e`'s per-call times, never run |
+| Q2 | C10's 44–48 % | **closed, §10.2**: measured 41.8 % at 42 atoms (31.6 % at 22) — the right size, slightly high |
+| Q3 | F9's 26–38 s and F10's 10 GB / 70 GB | **closed, §10.6**: F10's tensors measured at 22.0 GB (d2F + d2A) and 18.3 GB (d2D + d2S) at taxol, i.e. the shape arithmetic holds; F9's `h1` loop is 1.1 s at 42 atoms, so 26–38 s at taxol was an over-estimate (~6–8 s by scaling `[?]`) |
 | Q4 | B9's "fails above ~240 atoms" | arithmetic on the `:2010` assert, never run |
-| Q5 | A17: HSE06 patched may be slower than stock | inferred from the decomposition; the direction of the effect is not established |
-| Q6 | R1: `fastgradh` is a regression on 1.8.1 | the code reading is `[V]` on both sides; the *cost* is not measured |
-| Q7 | R2/R3: the `get_hcore` "CPU" row and the OMP-dependent stock gradient | a measurement and a source reading disagree.  **Do not explain either by inspection** — profile it (§8 item 9) |
+| Q5 | A17: HSE06 patched may be slower than stock | **refuted, §10.5**: never slower; but K gains only 1.01–1.05x from 113 atoms on |
+| Q6 | R1: `fastgradh` is a regression on 1.8.1 | **refuted, §10.7**: its row is 2–3x faster than stock, and 0.1–0.3 % of a Hessian |
+| Q7 | R2/R3: the `get_hcore` "CPU" row and the OMP-dependent stock gradient | **closed, §10.9**: R2 is first-call initialisation (0.46–0.52 s cold, 0.10 s warm); R3 does not reproduce on 1.8.1 (PfPMT 19.79 s at 1 and 16 threads) |
 | Q8 | B13's `ceil(ntrial/6)` re-evaluation | read from the launch geometry (`vv10.cu:760-764`, `blockIdx.y` over trial groups); whether the compiler or the cache hides any of it is not measured |
 | Q9 | contamination tiers | `[?]` exactly as 06 §0 says: no recall probe was run |
 | Q10 | 06's §2 shares quoted here (18–21 % AO evaluation; PCM 5.3 % of a gradient) | stock **1.7.0** numbers; 1.8.1's `eval_ao` is several times faster (`RESPONSE_1.8.1.md` §3.4) |
@@ -535,6 +577,9 @@ systems).  Additions for the classes 06 did not cover:
 ---
 
 ## 8. Measurements owed, in the order they would change §5
+
+**All eleven were taken on 2026-10-03; the results are §10.1–§10.11, in the
+same order, and §5 is ranked on them.**  The list is kept as it was written.
 
 All on a compute node (the login node's shared card overstated host-bound
 stretches 2x, `DIRECT_SURVEY.md`), stock against `patch_all()` back to back
@@ -567,3 +612,248 @@ tree (the line numbers are 1.8.1's and will move in 1.8.2), and read the
 Electrolites gating line it names.  Every quoted number has its `docs/` file
 and section beside it; the commands that produced those numbers are in that
 file.
+
+§10's measurements are reproduced with (from `benchmarks/`, one GPU, the
+`barw-dev` environment; `--patch none` and `--patch all` back to back):
+
+    python path_anatomy.py --feature tdgrad --xyz molecules/penicillinV.xyz --basis def2-svp --xc b3lyp --patch all
+    python path_anatomy.py --feature ir     --xyz molecules/penicillinV.xyz --basis def2-svp --xc b3lyp --patch all
+    python path_anatomy.py --feature scf --no-grad --xyz molecules/taxol.xyz --basis def2-svp --xc tpss --patch all
+    python path_anatomy.py --feature nmr    --xyz molecules/penicillinV.xyz --basis def2-svp --xc b3lyp --patch all
+    python path_anatomy.py --feature scf --no-grad --xyz molecules/PfPMT.xyz --charge -1 --basis '6-31g*' --xc hse06 --patch all
+    python path_anatomy.py --feature pcmhess --solvent IEF-PCM --xyz molecules/penicillinV.xyz --basis def2-svp --xc b3lyp --patch all
+    python pcm_d2_probe.py --xyz molecules/taxol.xyz
+    python path_anatomy.py --feature hess   --xyz molecules/penicillinV.xyz --basis def2-svp --xc b3lyp --patch <all, or all but fastgradh>
+    python path_anatomy.py --feature grad   --xyz molecules/tmc_ni_dithiolene.xyz --charge -1 --spin 1 --basis def2-svp --xc wb97x --patch all
+    OMP_NUM_THREADS=1 python path_anatomy.py --feature grad --xyz molecules/PfPMT.xyz --charge -1 --basis '6-31g*' --xc b3lyp --patch none --cprofile grad.prof
+    python path_anatomy.py --feature scf --no-grad --first-call --density-fit --xyz molecules/penicillinV.xyz --basis def2-svp --xc b3lyp --patch none
+    python path_anatomy.py --feature dfmp2  --xyz molecules/taxol.xyz --basis def2-svp --patch all
+    python path_anatomy.py --feature ccsd   --xyz molecules/alanine_dipeptide.xyz --basis def2-svp --patch all --cprofile ccsd.prof
+    python kpt_anatomy.py --cell diamond8 --kpts 2,2,2 --df fftdf
+
+with the other molecules, functionals and flags as §10's tables name them.
+The raw logs are under `/pscratch/sd/w/weiliang/kt181/logs/` (purge-eligible).
+
+---
+
+## 10. The §8 measurements (2026-10-03)
+
+Everything in this section was measured for §8 and nothing else in the
+document was re-measured.  **Hardware and method**: one Perlmutter GPU node
+(`nid001077`), A100-SXM4-**40GB**, GPU4PySCF 1.8.1 in `barw-dev` against
+`cudatoolkit/12.9`, `OMP_NUM_THREADS=16` unless a row says otherwise,
+`direct_scf_tol = 1e-13`, `conv_tol = 1e-9`, level-3 grids, def2-SVP unless
+named.  Stock (`--patch none`) and `patch_all()` are separate processes run
+back to back on the same card.  The four cards ran four different
+measurements at once; §10.7 found that this inflates **host-bound** stages
+(one stage doubled), so the two results that rest on a host-bound stage were
+re-run on an otherwise idle node and agree (§10.4, §10.7).  Each number is one
+run, not a minimum of several.
+
+The harness is `benchmarks/path_anatomy.py` (one script for every molecular
+feature: each stage wrapped with a device synchronisation on both sides, and
+a **coverage** count of every Electrolites entry point reached, of every call
+a module handed back to its saved stock original, and of the class blocks
+taken by our kernels against GPU4PySCF's), `benchmarks/kpt_anatomy.py` for
+the periodic path and `benchmarks/pcm_d2_probe.py` for the PCM memory wall.
+Rows prefixed `↳` are sub-intervals of their parent; shares are of the whole
+run (SCF included) unless a row says otherwise.
+
+### 10.1 TDDFT gradient + NAC (§8 item 1; D9, D10, Z-vector)
+
+TDDFT (RPA), 5 roots, gradient of state 1 and the NAC between states 1 and 2.
+
+| system / functional | stock → patched | TDDFT eigen | Z-vector CPHF ×2 | **D9** `_contract_xc_kernel` ×5 | **D10** `jk_energies_per_atom` (grad + NAC) | response J/K |
+|---|---|---|---|---|---|---|
+| penicillin V / B3LYP | 89.0 → 36.4 s | 30.0 % | 25.1 % | 3.17 s = **8.7 %** | 6.08 s = **16.7 %** | `get_jk` 45.7 % |
+| penicillin V / PBE | 42.8 → 27.9 s | 20.9 % | 28.1 % | 3.34 s = **12.0 %** | 5.78 s = **20.7 %** | `get_j` 34.7 % |
+| taxol / B3LYP | 335.6 → 254.3 s | 52.8 % | 22.8 % | 10.42 s = 4.1 % | 22.40 s = 8.8 % | `get_jk` **71.2 %** |
+| taxol / PBE ‡ | 147.7 → 103.2 s | 19.8 % | 39.9 % | 9.47 s = **9.2 %** | 18.87 s = **18.3 %** | `get_j` 40.6 % |
+
+(patched shares.)  **D9 and D10 take the same time patched and stock**
+(3.50 / 3.17 s and 3.06 / 3.06 s at penicillin V) — no module is on either,
+as the source reading said.  `fastjk` and `fastxcfxc` are on the Davidson and
+the Z-vector; `fastjk`'s response build goes 52.95 → 16.60 s (3.2x) at 42
+atoms but only 241.2 → 181.2 s (**1.33x**) at 113, where it is 71 % of the
+run.  With PBE, `fastj`'s multi-density J hands 315 of 588 (42 atoms) and
+252 of 462 (113 atoms) class blocks to stock `_run_ref`.
+
+‡ taxol/PBE's Z-vector does **not converge in 50 iterations** (GPU4PySCF's
+default `cphf_max_cycle`), stock or patched; the row is with 200.  And
+`_lr_eig` sizes a dense `(2·max_space)²` **device** matrix from `max_memory`,
+a host budget: at the 80 GB `_common.build_mol` sets, penicillin V asks for
+31 GB and OOMs a 40 GB card in both builds.  The harness sets
+`td.max_memory = 4000` (PySCF's default).
+
+### 10.2 IR (§8 item 2; C10, Q2)
+
+B3LYP.  "Duplicate" = `eval_ir_freq_intensity` minus the `hessian.kernel()`
+inside it: the second `make_h1` + `solve_mo1` + the dipole derivative
+(`make_h1` and `solve_mo1` each count **2** calls).
+
+| system | stock: run / duplicate | patched: run / duplicate | duplicate share, patched | gain from removing it |
+|---|---|---|---|---|
+| alanine dipeptide (22) | 47.6 s / 17.7 s | 18.65 s / 5.89 s | 31.6 % | 1.46x |
+| penicillin V (42) | 167.7 s / 68.4 s | 87.63 s / 36.63 s | **41.8 %** (44.4 % of the IR driver) | **1.72x** |
+
+Q2's derived 44–48 % is confirmed in size and slightly high.
+
+### 10.3 Restricted meta-GGA SCF (§8 item 3; A14, 06 Q13)
+
+| system / functional | SCF stock → patched | `nr_rks` patched | its share, patched | stock fall-backs |
+|---|---|---|---|---|
+| penicillin V / TPSS | 6.63 → 5.53 s | 3.10 s | **56.1 %** | 16 of 16 |
+| penicillin V / r2SCAN | 6.85 → 6.33 s | 3.34 s | **52.8 %** | 16 of 16 |
+| penicillin V / M06-2X | 14.40 → 7.57 s | 3.09 s | 40.9 % | 14 of 14 |
+| taxol / TPSS | 18.32 → 14.20 s | 8.80 s | **62.0 %** | 18 of 18 |
+| taxol / r2SCAN | 17.12 → 13.43 s | 8.16 s | **60.8 %** | 17 of 17 |
+| taxol / M06-2X | 30.37 → 19.74 s | 6.67 s | 33.8 % | 14 of 14 |
+
+`fastxc`'s `nr_rks` is reached on every cycle and hands **every** call to
+`_nr_rks_orig`: the whole speedup is J and K.  For scale, the patched taxol
+PBE `nr_rks` is 0.19 s per cycle against 0.49 s (TPSS) and 0.48 s (r2SCAN).
+
+### 10.4 NMR (§8 item 4; C6 against C7–C9)
+
+| system / functional | run stock → patched | **C7** `shielding.nr_rks` (GIAO AOs on the CPU) | **C6** `int2e_ig1` (libcint) | C8 `jk.get_jk` | CPHF |
+|---|---|---|---|---|---|
+| alanine dipeptide / B3LYP | 46.4 → 39.9 s | 30.2 s = **75.8 %** | 5.2 s = 13.0 % | 2.5 % | 1.7 % |
+| alanine dipeptide / PBE | 37.8 → 37.8 s | 29.5 s = **78.1 %** | 4.6 s = 12.2 % | 2.6 % | 0.4 % |
+| penicillin V / B3LYP | 190.6 → 177.6 s | 128.6 s = **72.4 %** | 38.3 s = 21.6 % | 2.0 % | 1.6 % |
+| penicillin V / PBE | 173.4 → 169.2 s | 126.3 s = **74.6 %** | 36.7 s = 21.7 % | 0.9 % | 0.3 % |
+| penicillin V / B3LYP, idle node | — → 170.7 s | 126.3 s = 74.0 % | 34.1 s = 20.0 % | 2.1 % | 1.7 % |
+
+From 200 to 430 AOs C7 grows ~nao^1.9 and C6 ~nao^2.7, so C6 would overtake
+C7 near 2000 AOs by extrapolation `[?]`.  C9's per-atom integrals are inside
+the < 1 % the wrapped rows leave over.
+
+### 10.5 HSE06 patched against stock (§8 item 5; A17, Q5)
+
+| system | `get_k` stock → patched | SCF stock → patched | patched `get_k` share |
+|---|---|---|---|
+| penicillin V (42), def2-SVP | 11.04 → 3.29 s (3.36x) | 16.29 → 6.59 s | 49.9 % |
+| taxol (113), def2-SVP | 15.22 → 15.10 s (**1.01x**) | 27.69 → 22.85 s | **66.1 %** |
+| PfPMT (284), 6-31G\*, charge −1 | 60.93 → 58.19 s (**1.05x**) | 100.43 → 80.79 s | **72.0 %** |
+| PfPMT, B3LYP, same card, for scale | 81.44 → 32.12 s (2.54x) | 120.49 → 54.97 s | 58.4 % |
+
+Patched is never slower (Q5 refuted; energies agree to 1e-8 Eh).  Stock's
+short-range screen makes stock HSE06's K 25 % cheaper than stock B3LYP's at
+284 atoms; the decomposition makes patched HSE06's K **1.81x** dearer than
+patched B3LYP's.
+
+### 10.6 PCM Hessian (§8 item 6; F9–F11, Q3)
+
+B3LYP, Lebedev order 29, ε = 78.36.
+
+| penicillin V (42, 4834 cavity points), patched | IEF-PCM | C-PCM |
+|---|---|---|
+| whole run, stock → patched | 166.2 → 90.7 s | 157.5 → 73.9 s |
+| `PCM._B_dot_x` inside the CPHF (F9, response half) | 11.43 s = **12.6 %** | 10.94 s = **14.8 %** |
+| solvent second derivative `PCM.hess` | 10.16 s = 11.2 % | 7.24 s = 9.8 % |
+| ↳ `analytical_hess_qv` | 5.97 s | 5.44 s |
+| `analytical_grad_vmat` in `make_h1` | 4.14 s = 4.6 % | 3.95 s = 5.4 % |
+| ↳ 3·natm `int1e_grids` (F9, `h1` half; 126 calls) | 1.13 s = **1.2 %** | 1.14 s = 1.5 % |
+| ↳ `get_dqsym_dx`, called 3 times (F11) | 1.83 s = 2.0 % | 0.87 s = 1.2 % |
+| `get_d2F_d2A` + `get_d2D_d2S` (F10) | 0.24 s | 0.26 s |
+| PCM-specific total | **28 %** | **30 %** |
+
+Alanine dipeptide (2729 points): 25 % (IEF-PCM).  `fast1e` is on the path
+(622 calls).  **Q3, time**: the 3·natm `h1` loop is 1.1 s at 42 atoms, so the
+arithmetic's 26–38 s at taxol is an over-estimate; scaling by calls × points
+gives ~6–8 s `[?]`.  **Q3, memory** (`pcm_d2_probe.py`, read from the
+device's free memory because GPU4PySCF's own allocator bypasses CuPy's pool
+counters):
+
+| system | cavity points | `get_d2F_d2A` holds | `get_d2D_d2S` holds |
+|---|---|---|---|
+| alanine dipeptide | 2 729 | 0.33 GB | 1.07 GB |
+| penicillin V | 4 834 | 1.63 GB | 3.37 GB |
+| taxol | 11 274 | **21.97 GB** | **18.30 GB** |
+| PfPMT (284) | — | the PCM build itself is out of memory on 40 GB | |
+
+A whole taxol IEF-PCM Hessian on the 40 GB card ran out of memory earlier,
+in the vacuum `make_h1`'s `_get_jk_ip1`, so the d2 wall could not be reached
+end to end on this card.
+
+### 10.7 `fastgradh` on and off in a 42-atom Hessian (§8 item 7; R1, Q6)
+
+Penicillin V B3LYP Hessian, three processes: stock, `patch_all()`, and
+`patch_all()` without `fastgradh`.  `grad.get_hcore` (via
+`get_grad_hcore` in `make_h1`): **0.14 s stock, 0.06 s with `fastgradh`,
+0.18 s without**; Hessian 52.68 s with, 53.27 s without; traces agree to
+1e-10.  `fastgradh` is not a regression, and its row is 0.1–0.3 % of the
+Hessian either way.  On an idle node: Hessian 83.34 → 45.80 s (1.82x), the row
+0.14 → 0.05 s.
+
+Measurement hazard: in the concurrent run `jk_ip1` — patched by nothing —
+read 3.75 s (stock), **8.12 s** (all) and 6.49 s (all but `fastgradh`); on
+the idle node it is 3.96 / 3.93 s.  It is host-bound enough (B15's
+per-launch device queries) to double under CPU contention.
+
+### 10.8 UKS range-separated gradient (§8 item 8; B16)
+
+ωB97X; penicillin V⁺ (doublet, 42 atoms) and the Ni dithiolene anion
+(doublet, 21 atoms), with neutral penicillin V RKS for comparison.
+
+| system | 2e derivative stock → patched | its share of the patched gradient | of SCF + gradient | fastejk class blocks ours / stock |
+|---|---|---|---|---|
+| penicillin V⁺ UKS | 3.75 → 3.32 s (1.13x) | **88 %** | 18.4 % | 462 / 462 |
+| Ni dithiolene⁻ UKS | 18.29 → 12.97 s (1.41x) | **96 %** | 27.7 % | 1649 / 1649 |
+| penicillin V RKS | 3.74 → 1.88 s (1.99x) | 84 % | 21.5 % | 924 / 0 |
+
+The UKS gradient calls `_jk_energy_per_atom` twice and exactly the ω < 0
+(short-range) pass goes to stock — the split the source reading predicted.
+
+### 10.9 The stock gradient's thread dependence and the DF `get_hcore` row (§8 item 9; R2, R3, Q7)
+
+Profiled with cProfile (host self time per function) rather than `nsys`,
+because the question was what runs on the host.
+
+* **R3**: stock B3LYP/6-31G\* gradient at `OMP_NUM_THREADS` 16 and 1 —
+  penicillin V **1.74 / 1.70 s**, PfPMT **19.79 / 19.79 s** (`_jk_energy_per_atom`
+  86 % of it).  The top host self-time entries are GPU launches and
+  synchronisations (`scf/jk.py:730 proc`, `grad/rhf.py:96 proc`, `.get()`);
+  there is no CPU integral on the path.  `ROUND2_1.8.1.md` §6's
+  thread-dependent stock gradient does **not** reproduce on 1.8.1.
+* **R2**: DF-B3LYP penicillin V, stock: the **first** `get_hcore` in a fresh
+  process takes 0.46–0.52 s and the second **0.10 s**, at either thread
+  count; the difference is module import and CUDA module loading.  The
+  `DF_WORK_LIST.md` §3.1 row is a first-call cost (13 % of a 3.8 s DF SCF),
+  not a CPU integral.
+
+### 10.10 DF-MP2 and CCSD (§8 item 10; I1, I4, I5)
+
+| DF-MP2 (RHF reference, default RI basis) | MP2 step | pair-energy loop (I1) | 3c2e + transform | I1 share of SCF + MP2 |
+|---|---|---|---|---|
+| penicillin V (42) | 1.29 s | 0.94 s = **73 %** of the step | 0.11 s | 19–29 % |
+| taxol (113) | 17.23 s | 13.99 s = **81 %** of the step | 2.28 s | 46–49 % |
+
+| CCSD (`ccsd_incore`, RHF/def2-SVP) | CCSD | `update_amps` | ↳ AO-direct `ovvv`/`vvvv` (I5) | `run_diis` |
+|---|---|---|---|---|
+| glycine (10, 95 AO), patched | 7.70 s | 6.48 s | 4.63 s = 43.5 % | 2.7 % |
+| alanine dipeptide (22, 200 AO), stock | 163.2 s | 139.9 s | 85.8 s = **47.8 %** | 7.1 % |
+| alanine dipeptide, patched | 175.8 s | 151.8 s | 94.2 s = **52.5 %** | 6.9 % |
+
+cProfile of the 22-atom run: host numpy/PySCF einsum, reshapes and the
+h5py-backed DIIS ≈ 39 s (**≈ 22 %**, I4), `cudaMalloc` 28.5 s over 2931
+real allocations (**≈ 16 %**), `.get()` 25 s.  Electrolites touches only the
+SCF in both (CCSD 1.00x).
+
+### 10.11 k-point hybrid (§8 item 11; J1, J2, J3)
+
+Diamond, PBE0/gth-dzvp/gth-pade; the 2-atom primitive cell (26 AO) and the
+8-atom cubic cell (104 AO).
+
+| cell, k mesh, back end | SCF | exchange | one-time cderi | metric `eigh` per k (J2) | XC |
+|---|---|---|---|---|---|
+| 2-atom, 2×2×2, FFTDF | 8.28 s | **J3** 5.36 s = 64.7 % | — | — | 10.1 % |
+| 2-atom, 3×3×3, FFTDF | 71.64 s | **J3** 67.35 s = **94.0 %** | — | — | 2.6 % |
+| 8-atom, 2×2×2, FFTDF | 276.69 s | **J3** 267.84 s = **96.8 %** | — | — | 1.8 % |
+| 2-atom, 3×3×3, GDF | 7.18 s | **J1** 3.62 s = 50.4 % | 38.7 % | 8.2 % | 22.8 % |
+| 8-atom, 2×2×2, GDF | 15.59 s | **J1** 8.21 s = 52.7 % | 41.8 % | 1.7 % | 30.4 % |
+
+FFTDF exchange grows ~nk^2.2 from 8 to 27 k-points (the k1×k2 loops), and
+GDF is 10–18x faster than the default FFTDF on the same cell.  The first run
+in the batch (2-atom GDF, stock) carried 12 s of first-call initialisation in
+`get_hcore` and is not quoted.  Electrolites is inert on the periodic path
+(same times, same energies, no entry point reached).
