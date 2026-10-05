@@ -470,7 +470,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 2 **done** | **C10** IR's duplicate CPHF — `fastir` (§13.2) | IR intensities (and every workflow that asks for them with frequencies) | was: the duplicate `make_h1` + `solve_mo1` **41.8 %** of a 42-atom IR run, 31.6 % at 22 (§10.2) | **built and measured.**  The Hessian's own CPHF solution is kept and reused for the dipole derivative: IR driver **1.66x / 1.82x / 1.96x** at 22 / 42 / 113 atoms (B3LYP), 1.86x for wB97M-V at 42; results equal to stock within stock's own run-to-run scatter.  **Left**: nothing in this row — what remains of an IR run is the Hessian |
 | 3 **done** | **D12** `force_and_nacv` through the batched NAC solver — `fastnacms` (§13.3) | FSSH and every multi-pair NAC workflow | was: routing the 15 pairs through `NAC_multistates` 2.1x / 2.0x / 1.86x (§11.1) | **built and measured.**  `force_and_nacv` takes the batched solver for a restricted singlet reference requesting all pairs among its states: **2.08x / 2.01x / 1.73x** (penicillin V B3LYP / PBE, taxol B3LYP); results equal to the serial path within the serial path's own run-to-run scatter.  **Left**: open-shell and triplet NACs still go serial; the batched run is now 58–69 % D10 (rank 6) |
 | 4 **done** | **A14** restricted meta-GGA XC in the SCF — `fastxc` (§13.4) | every restricted TPSS, r2SCAN, SCAN, M06-2X, MN15 SCF (and everything after it) | was: `nr_rks` 53–62 % of a patched pure-mGGA SCF, 34–41 % of an M06-2X one, every call handed to stock (§10.3) | **built and measured.**  The grouped pass now takes meta-GGA: the four orbital products per block in one grouped launch, rho/∇rho/tau in one kernel per block, the four potential products in one grouped launch.  `nr_rks` **2.0x** at 42 atoms and **1.5x** at 113; SCF 1.14–1.46x (42) and 1.15–1.29x (113), inside §5.1's 1.3–1.45x bound; energies to 4e-12 Eh.  **Left**: the potential's four products per block, flop-bound |
-| 5 | **C7** NMR: GIAO AOs evaluated on the CPU per grid block | every NMR shielding | **72–78 %** of a patched NMR run at 22 and 42 atoms (§10.4) | easy–mod: ig/ipig are `eval_ao` deriv 1–2 times `(R_μ × r)`, no new integrals; up to ~3.6x on the run |
+| 5 **done** | **C7** NMR: GIAO AOs on the GPU — `fastnmr` (§13.5) | every NMR shielding | was: **72–78 %** of a patched NMR run (§10.4) | **built and measured.**  `GTOval_ig`/`_ipig` are ½(R_μ × r)φ and its derivative, formed on the GPU from the block's own AOs, one GEMM per block for all three field directions: the term 30.3 → < 0.1 s, 131.7 → < 1 s, 916.9 → 1.6 s at 22 / 42 / 113 atoms; NMR **4.2x / 4.5x / 1.62x**, shieldings to 3e-12 ppm.  **Left**: C6 (`int2e_ig1` on the CPU) is now 87–97 % of an NMR run — a §5.3 entry, greenfield |
 | 6 | **D10** TDDFT gradient / NAC two-electron derivative (with **D9**) | TDDFT gradients, NACs, FSSH | D10 is **54–72 %** of the batched force + all-NAC run once D12 is taken (§11.1), and its one multi-density call is as slow as the fifteen single-pair calls it replaces; D9 + D10 are 28–33 % of a single pure-functional gradient + NAC and 13–25 % of a hybrid one (§10.1); no module on either | the ip1 structure `fastejk` already beat 1.7x, extended to density pairs; the batched path makes it the FSSH bottleneck.  mod |
 | 7 | **A17** native short-range K for HSE06 | every HSE06 (and any `erfc`-only RSH) SCF and its derivatives | patched `get_k` is **66 % / 72 %** of a patched HSE06 SCF at 113 / 284 atoms; the decomposition gives it **1.01x / 1.05x** (§10.5) | not a regression (Q5 refuted) but the locality of `erfc` is lost from ~100 atoms on; ~1.7x on the 284-atom SCF if B3LYP's 2.5x transferred.  mod |
 | 8 | **I1** DF-MP2 pair-energy loop | every DF-MP2 and DF-UMP2 | **73 % / 81 %** of the DF-MP2 step at 42 / 113 atoms (§10.10); the UMP2 pair loops are **92–94 %** of DF-UMP2 (§12.4) | easy, exact to round-off |
@@ -1288,3 +1288,27 @@ Correctness: the matrix to 2e-14 relative and SCF energies to 4e-12 Eh on
 eight cases including the Pt (ECP) and Ni complexes (`tests/test_rxc_mgga.py`).
 The row's residue: at 113 atoms half of the remaining call is the potential's
 four GEMMs per block, flop-bound; the SCF of a hybrid meta-GGA is K-bound.
+
+### 13.5 Rank 5 — C7: the NMR GIAO XC term on the GPU (`docs/README_fastnmr.md`)
+
+Built: `fastnmr` replaces `properties.shielding.nr_rks`.  The GIAO factors
+are `GTOval_ig[d] = ½ (R_μ × r)_d φ_μ` and
+`GTOval_ipig[x,d] = ½ [(R_μ × r)_d ∂_x φ_μ + ε_dax R_μ,a φ_μ]` (checked
+against libcint to 1e-16), so they are formed on the GPU from the block's
+own AOs instead of by libcint on the host over all `nao` AOs, and the
+contraction is regrouped into one GEMM per block for all three field
+directions.
+
+| NMR, `--patch all`, with and without `FASTNMR_OFF=1` | before | after | | GIAO XC term |
+|---|---|---|---|---|
+| alanine dipeptide (22) / B3LYP | 36.1 s | 8.6 s | 4.2x | 30.3 s → < 0.1 s |
+| penicillin V (42) / B3LYP | 201.2 s | 44.3 s | 4.5x | 131.7 s → < 1 s |
+| penicillin V (42) / PBE | 200.3 s | 66.4 s | 3.0x | 134.3 s → < 1 s |
+| taxol (113) / PBE | 1954.2 s | 1207.5 s | 1.62x | 916.9 s → 1.6 s |
+
+Correctness: the GIAO XC matrix to 5e-15 relative and the shielding tensors
+to 3e-12 ppm (`tests/test_nmr.py`; LDA, GGA, hybrid; a third-row atom;
+def2-TZVPP).  The row's share is now zero; **C6**, the GIAO two-electron
+term on the CPU, is 87–97 % of what is left (it was 13–22 %), and it is not a
+§5.1 row (§5.3 lists it as a clean benchmark target; a GPU `(ig1)` Rys kernel
+is greenfield).

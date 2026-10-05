@@ -238,6 +238,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastvnlch` | `hessian.rks._get_vnlc_deriv1` (and its `uks`/DF bindings) — the VV10 Fock derivative's atom loops as one GEMM per block | `docs/README_fastvv10ft.md` §6 |
 | `fastir` | `properties.ir.eval_ir_freq_intensity` — the Hessian's CPHF solution reused for the dipole derivative | `docs/README_fastir.md` |
 | `fastnacms` | `tdscf.rhf.TDBase.force_and_nacv` — the force and all NACs through the batched multi-state solver (restricted singlets) | `docs/README_fastnacms.md` |
+| `fastnmr` | `properties.shielding.nr_rks` — the NMR shielding's GIAO XC term with the GIAO AOs formed on the GPU | `docs/README_fastnmr.md` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |

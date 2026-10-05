@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -201,6 +201,9 @@ _TARGETS = {
     # TDA/TDDFT classes of both references inherit the method
     'fastnacms': (('gpu4pyscf.tdscf.rhf', 'TDBase.force_and_nacv'),
                   ('gpu4pyscf.tdscf.rhf', 'TDA.NACGradients')),
+    # the NMR shielding's XC term with the GIAO AOs on the GPU (C7);
+    # `get_vxc` calls the module-level name
+    'fastnmr': ('gpu4pyscf.properties.shielding', 'nr_rks'),
     # the Hessian's CPHF solve (docs/DF_WORK_LIST.md W44): both spin cases'
     # `solve_mo1`, which the Hessian classes' methods look up on their
     # modules at call time, and the Krylov solver and QR it reuses
