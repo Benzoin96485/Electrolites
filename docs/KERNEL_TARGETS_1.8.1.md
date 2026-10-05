@@ -468,7 +468,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 |---|---|---|---|---|
 | 1 **done** | **B13** VV10 pair kernel `f_t` (+ **B14**) — `fastvv10ft`, `fastvnlch` (§13.1) | every VV10 functional's polarizability, Hessian, frequencies, IR | was: `f_t` **58 % / 71 %** of a patched wB97M-V Hessian at 22 / 42 atoms (§11.2) | **built and measured.**  `f_t` as an fp64 tensor-core GEMM with the pair kernel built in the A fragments: **5.9x** on the kernel at a Hessian's `3 natm` trials (89.0 → 15.0 s, 42 atoms; same ratio at 113), 1.7–2.2x at a polarizability's 3; its grid-weight twin `EUW_with_weight1` likewise (50.1 → 14.5 s); B14's atom loops as one GEMM per block; `fastfnlc`'s per-density loops batched.  wB97M-V Hessian **141.5 → 45.4 s (3.12x)** at 22 atoms, **932.6 → 237.3 s (3.93x)** at 42, UKS Ni dithiolene⁻ 406.2 → 218.3 s (1.86x); polarizability CPKS 1.80x / 1.94x at 42 / 113 atoms; frequencies within 0.0001 cm⁻¹.  **Left**: `f_t` is still 48 % of the 42-atom Hessian, MMA-bound at 13.7 of 19.5 TF, and 79 % of a taxol polarizability, evaluation-bound — a 3xTF32 far field is the next step |
 | 2 **done** | **C10** IR's duplicate CPHF — `fastir` (§13.2) | IR intensities (and every workflow that asks for them with frequencies) | was: the duplicate `make_h1` + `solve_mo1` **41.8 %** of a 42-atom IR run, 31.6 % at 22 (§10.2) | **built and measured.**  The Hessian's own CPHF solution is kept and reused for the dipole derivative: IR driver **1.66x / 1.82x / 1.96x** at 22 / 42 / 113 atoms (B3LYP), 1.86x for wB97M-V at 42; results equal to stock within stock's own run-to-run scatter.  **Left**: nothing in this row — what remains of an IR run is the Hessian |
-| 3 | **D12** `force_and_nacv` through the batched NAC solver | FSSH and every multi-pair NAC workflow | routing the 15 pairs through upstream's existing `NAC_multistates` is **2.1x / 2.0x / 1.86x** on the patched force + all-NAC run (penicillin V B3LYP / PBE, taxol B3LYP), agreeing to the Z-vector tolerance (§11.1) | easy — the batched solver exists upstream; extending it past singlets is the work.  Not bitwise (one CPHF instead of fifteen), so the oracle is the serial path at tolerance |
+| 3 **done** | **D12** `force_and_nacv` through the batched NAC solver — `fastnacms` (§13.3) | FSSH and every multi-pair NAC workflow | was: routing the 15 pairs through `NAC_multistates` 2.1x / 2.0x / 1.86x (§11.1) | **built and measured.**  `force_and_nacv` takes the batched solver for a restricted singlet reference requesting all pairs among its states: **2.08x / 2.01x / 1.73x** (penicillin V B3LYP / PBE, taxol B3LYP); results equal to the serial path within the serial path's own run-to-run scatter.  **Left**: open-shell and triplet NACs still go serial; the batched run is now 58–69 % D10 (rank 6) |
 | 4 | **A14** restricted meta-GGA XC in the SCF | every restricted TPSS, r2SCAN, SCAN, M06-2X, MN15 SCF (and everything after it) | `nr_rks` is **53–62 %** of a patched pure-mGGA SCF and **34–41 %** of a patched M06-2X one, 42 and 113 atoms, and `fastxc` hands **every** call back to stock (§10.3) | the code exists for UKS; bounded at **1.3–1.45x** of a pure-mGGA SCF if the GGA treatment's 2.06x transfers.  Broad reach, easy |
 | 5 | **C7** NMR: GIAO AOs evaluated on the CPU per grid block | every NMR shielding | **72–78 %** of a patched NMR run at 22 and 42 atoms (§10.4) | easy–mod: ig/ipig are `eval_ao` deriv 1–2 times `(R_μ × r)`, no new integrals; up to ~3.6x on the run |
 | 6 | **D10** TDDFT gradient / NAC two-electron derivative (with **D9**) | TDDFT gradients, NACs, FSSH | D10 is **54–72 %** of the batched force + all-NAC run once D12 is taken (§11.1), and its one multi-density call is as slow as the fifteen single-pair calls it replaces; D9 + D10 are 28–33 % of a single pure-functional gradient + NAC and 13–25 % of a hybrid one (§10.1); no module on either | the ip1 structure `fastejk` already beat 1.7x, extended to density pairs; the batched path makes it the FSSH bottleneck.  mod |
@@ -1245,3 +1245,24 @@ on the driver it is 1.82x.  Correctness: frequencies within 1.3e-8 cm⁻¹ and
 intensities within 4.2e-9 km/mol of stock, which is the size of two stock runs'
 own difference (`tests/test_ir.py`).  The row's share is now zero: an IR run
 is its Hessian.
+
+### 13.3 Rank 3 — D12: the force and all NACs batched (`docs/README_fastnacms.md`)
+
+Built: `fastnacms` replaces `TDBase.force_and_nacv`; for a restricted
+singlet reference with no solvent, asking for all pairs among a set of states
+(the method's default and FSSH's request), it calls upstream's batched
+`NAC_multistates` instead of looping over pairs.
+
+| force on state 1 + all 15 NACVs, 5 roots | serial | batched | |
+|---|---|---|---|
+| penicillin V (42) / B3LYP | 147.8 s | 71.1 s | 2.08x |
+| penicillin V (42) / PBE | 127.6 s | 63.4 s | 2.01x |
+| taxol (113) / B3LYP | 738.5 s | 425.9 s | 1.73x |
+
+Two properties of the reference were found and are recorded in the module's
+document: GPU4PySCF's Krylov solver stops at a residual of ~3e-7 whatever
+`tol` says (`DSOLVE_LINDEP = 1e-13`), and its ground-to-excited NACVs differ
+by up to 1e-4 between two identical serial calls.  The batched results agree
+with the serial ones within that scatter; with the solver floor lowered the
+excited–excited NACVs agree to 1e-8.  The row's residue is D10 (58–69 % of the
+batched run, rank 6) and the open-shell/triplet cases.
