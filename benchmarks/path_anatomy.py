@@ -39,7 +39,9 @@ ap = parser(__doc__.splitlines()[0])
 ap.add_argument('--feature', required=True,
                 choices=('tdgrad', 'ir', 'scf', 'nmr', 'pcmhess', 'hess',
                          'grad', 'dfmp2', 'ccsd', 'forcenac', 'sftda',
-                         'smdhess', 'ecp', 'gks', 'eda', 'c6', 'ris', 'pm6'))
+                         'smdhess', 'ecp', 'gks', 'eda', 'c6', 'ris', 'pm6',
+                         'raman', 'dftdgrad', 'qmmm', 'x2c', 'fci', 'mp2',
+                         'disphess', 'analysis'))
 ap.add_argument('--nstates', type=int, default=5)
 ap.add_argument('--tda', action='store_true')
 ap.add_argument('--state', type=int, default=1,
@@ -66,6 +68,13 @@ ap.add_argument('--multistate', action='store_true',
 ap.add_argument('--frag2', default='',
                 help='eda: the second fragment (the first is --xyz)')
 ap.add_argument('--collinear', default='mcol')
+ap.add_argument('--nmm', type=int, default=10000,
+                help='qmmm: the number of MM point charges')
+ap.add_argument('--cas', default='12,12', help="fci: 'norb,nelec'")
+ap.add_argument('--memsample', action='store_true',
+                help='sample the device free memory every 20 ms and report '
+                     'the peak in use (GPU4PySCF allocates outside the CuPy '
+                     "pool, so the pool's counters do not see it)")
 ap.add_argument('--cprofile', default='',
                 help='write a cProfile of the feature to this file and print '
                      'the 40 functions with the most self time')
@@ -431,6 +440,58 @@ PLANS = {
         ('gpu4pyscf.sem.grad.rhf:Gradients._grad_elec_nuc_batched',
          '..FD pair gradient (K2)', None),
     ],
+    'raman': [
+        ('gpu4pyscf.hessian.rhf:HessianBase.kernel', 'hessian.kernel', None),
+        ('gpu4pyscf.properties.raman:polarizability_derivative_numerical_dEdE',
+         'polarizability derivative by field FD (C11)', None),
+        ('gpu4pyscf.scf.hf:SCF.scf', '..SCF (each)', None),
+        ('gpu4pyscf.grad.rhf:GradientsBase.kernel', '..gradient (each)', None),
+        ('gpu4pyscf.properties.polarizability:eval_polarizability', '..polarizability', None),
+        ('gpu4pyscf.hessian.rhf:HessianBase.solve_mo1', '..solve_mo1', None),
+    ] + JK,
+    'dftdgrad': [
+        ('gpu4pyscf.tdscf.rhf:TDHF.kernel', 'td.kernel (TDDFT)', None),
+        ('gpu4pyscf.tdscf.rhf:TDA.kernel', 'td.kernel (TDA)', None),
+        ('gpu4pyscf.scf.cphf:solve', '..cphf.solve (Z-vector)', None),
+        ('gpu4pyscf.grad.tdrks:_contract_xc_kernel', '..contract_xc_kernel (D9)', None),
+        ('gpu4pyscf.df.grad.tdrhf:_jk_energies_per_atom', '..DF jk_energies_per_atom (D11)', None),
+        ('gpu4pyscf.df.grad.tdrhf:_jk_energies_by_dm_factors', '....by_dm_factors', None),
+        ('gpu4pyscf.df.grad.tdrhf:_j_energies_per_atom', '..DF j_energies_per_atom', None),
+    ],
+    'qmmm': [
+        ('gpu4pyscf.qmmm.itrf:QMMMSCF.get_hcore', '..SCF get_hcore (+MM)', None),
+        ('gpu4pyscf.qmmm.itrf:QMMMSCF.energy_nuc', '..energy_nuc (+MM)', None),
+        ('gpu4pyscf.qmmm.itrf:_mm_charge_integrals', '....MM charge integrals', None),
+        ('gpu4pyscf.qmmm.itrf:QMMMGrad.get_hcore', '..grad get_hcore (+MM)', None),
+        ('gpu4pyscf.qmmm.itrf:QMMMGrad.grad_hcore_mm', '..grad_hcore_mm (MM-atom forces, ip2)', None),
+        ('gpu4pyscf.qmmm.itrf:QMMMGrad.grad_nuc', '..grad_nuc (+MM, host numpy)', None),
+        ('gpu4pyscf.qmmm.itrf:QMMMGrad.grad_nuc_mm', '..grad_nuc_mm (host numpy)', None),
+        ('gpu4pyscf.qmmm.itrf:QMMMGrad.extra_force', '..extra_force', None),
+        ('gpu4pyscf.grad.rhf:GradientsBase.kernel', 'gradient', None),
+    ] + JK,
+    'x2c': [
+        ('gpu4pyscf.x2c.sfx2c1e:SFX2C1E_SCF.get_hcore', '..get_hcore (sfX2C)', None),
+        ('gpu4pyscf.x2c.sfx2c1e:SpinFreeX2CHelper.get_hcore', '....X2C helper get_hcore (K3)', None),
+        ('gpu4pyscf.x2c.sfx2c1e:_atomic_1e_x', '......atomic 1e X', None),
+    ] + JK,
+    'fci': [],
+    'mp2': [
+        ('gpu4pyscf.mp.mp2:_make_eris', '..conventional MP2 _make_eris (I3)', None),
+        ('gpu4pyscf.scf.int4c2e:get_int4c2e_ovov', '....get_int4c2e_ovov', None),
+        ('gpu4pyscf.mp.mp2:kernel', '..conventional MP2 kernel', None),
+        ('gpu4pyscf.mp.dfmp2_drivers:dfump2_kernel_one_gpu', '..DF-UMP2 one-GPU driver', None),
+        ('gpu4pyscf.mp.dfmp2_addons:get_dfump2_energy_pair_intra', '....UMP2 pair-energy loop', None),
+        ('gpu4pyscf.mp.dfmp2_addons:get_dfmp2_energy_pair_intra', '....RMP2 pair-energy loop', None),
+    ],
+    'disphess': [
+        ('gpu4pyscf.hessian.rhf:HessianBase.kernel', 'hessian.kernel', None),
+        ('gpu4pyscf.hessian.rks:Hessian.get_dispersion', '..Hessian.get_dispersion (F1)', None),
+        ('gpu4pyscf.hessian.dispersion:get_dispersion', '..dispersion.get_dispersion (F1)', None),
+        ('pyscf.dispersion.dftd3:DFTD3Dispersion.get_dispersion', '....one D3 evaluation (CPU)', None),
+        ('pyscf.dispersion.dftd3:DFTD3Dispersion.__init__', '....D3 model rebuild', None),
+        ('gpu4pyscf.hessian.rhf:HessianBase.solve_mo1', '..solve_mo1', None),
+    ],
+    'analysis': [],
     'dfmp2': [
         ('gpu4pyscf.mp.dfmp2_drivers:dfmp2_kernel_one_gpu', 'dfmp2_kernel_one_gpu', None),
         ('gpu4pyscf.df.int3c2e_bdiv:Int3c2eOpt.build', '..Int3c2eOpt.build', None),
@@ -776,6 +837,187 @@ def feature_pm6(mol):
         g.kernel()
 
 
+def feature_raman(mol):
+    """C11: Raman intensities (a Hessian plus field finite differences)."""
+    from gpu4pyscf.properties import raman
+    mf = build_mf(mol)
+    run_scf(mf)
+    with stage('raman total'):
+        out = raman.eval_raman_intensity(mf)
+    INFO['n_out'] = len(out) if isinstance(out, (tuple, list)) else 1
+
+
+def feature_dftdgrad(mol):
+    """D11: a density-fitted TDDFT gradient, with its memory."""
+    mf = build_mf(mol)          # --density-fit makes it DF
+    run_scf(mf)
+    td = mf.TDA() if a.tda else mf.TDDFT()
+    td.nstates = a.nstates
+    td.verbose = 0
+    td.max_memory = 4000
+    with stage('td total'):
+        td.kernel()
+    g = td.nuc_grad_method()
+    g.verbose = 0
+    with stage('td gradient'):
+        de = g.kernel(state=a.state)
+    INFO['grad_norm'] = float(np.linalg.norm(cp.asnumpy(cp.asarray(de))))
+
+
+def feature_qmmm(mol):
+    """F13: QM/MM SCF and gradient with many point charges."""
+    from gpu4pyscf.qmmm import itrf
+    # neutral point dipoles (+0.4 / -0.4 e, 1 A apart) scattered no closer
+    # than 4 A to any QM atom, in a box 25 A beyond the molecule: an
+    # electrostatic environment the SCF converges in, like a solvent shell
+    rng = np.random.default_rng(20261004)
+    c = mol.atom_coords() * 0.52917721      # Angstrom
+    lo, hi = c.min(0) - 25.0, c.max(0) + 25.0
+    npair = a.nmm // 2
+    pts = []
+    while sum(len(p) for p in pts) < npair:
+        q = rng.uniform(lo, hi, size=(npair, 3))
+        d = np.linalg.norm(q[:, None, :] - c[None, :, :], axis=2).min(1)
+        pts.append(q[d > 4.0])
+    centres = np.concatenate(pts)[:npair]
+    u = rng.normal(size=(npair, 3))
+    u /= np.linalg.norm(u, axis=1)[:, None]
+    coords = np.concatenate([centres + 0.5 * u, centres - 0.5 * u])
+    charges = np.concatenate([np.full(npair, 0.4), np.full(npair, -0.4)])
+    mf = itrf.add_mm_charges(build_mf(mol), coords, charges, unit='Angstrom')
+    run_scf(mf)
+    g = mf.nuc_grad_method()
+    g.verbose = 0
+    with stage('qmmm gradient'):
+        de = g.kernel()
+    INFO['nmm'] = a.nmm
+    INFO['grad_norm'] = float(np.linalg.norm(cp.asnumpy(cp.asarray(de))))
+    if hasattr(g, 'grad_nuc_mm'):
+        with stage('MM-atom forces: grad_hcore_mm + grad_nuc_mm'):
+            dm = mf.make_rdm1()
+            g.grad_hcore_mm(dm)
+            g.grad_nuc_mm()
+
+
+def feature_x2c(mol):
+    """K3: spin-free X2C SCF and gradient."""
+    mf = build_mf(mol).x2c()
+    run_scf(mf)
+
+
+def feature_fci(mol):
+    """I6: GPU4PySCF's FCI sigma build against PySCF's, on a CAS of --cas.
+
+    1.8.1's `FCI` class swaps in a GPU `contract_2e` that wants a 2-D CI
+    vector, while PySCF's Davidson hands it a 1-D one, so the solver is tried
+    end to end first and the sigma build is then timed on its own."""
+    from pyscf import scf as cscf, mcscf, ao2mo
+    from pyscf.fci import direct_spin1 as cfci, cistring
+    from gpu4pyscf.fci import direct_spin1 as gfci
+    norb, nelec = (int(x) for x in a.cas.split(','))
+    m = mol.copy()
+    m.verbose = 0
+    mfc = cscf.RHF(m).run()
+    mc = mcscf.CASCI(mfc, norb, nelec)
+    mc.fcisolver = gfci.FCI(m)
+    mc.verbose = 0
+    try:
+        with stage(f'CASCI({nelec},{norb}) with the GPU FCI solver'):
+            INFO['e_gpu'] = float(mc.kernel()[0])
+    except Exception as err:                             # noqa: BLE001
+        INFO['gpu_solver_error'] = f'{type(err).__name__}: {str(err)[:120]}'
+    mc = mcscf.CASCI(mfc, norb, nelec)
+    mc.verbose = 0
+    with stage(f'CASCI({nelec},{norb}) with the PySCF CPU solver'):
+        INFO['e_cpu'] = float(mc.kernel()[0])
+    h1, ecore = mc.get_h1eff()
+    h2 = ao2mo.restore(1, mc.get_h2eff(), norb)
+    eri = cfci.absorb_h1e(h1, h2, norb, nelec, .5)
+    link = cistring.gen_linkstr_index(range(norb), nelec // 2, tril=True)
+    na = link.shape[0]
+    rng = np.random.default_rng(1)
+    ci = rng.random((na, na))
+    ci /= np.linalg.norm(ci)
+    eri_g = ao2mo.restore(4, eri, norb)
+    # the GPU sigma build returns a host array (`direct_spin1.py:187`), so
+    # both of its rows include the device-to-host copy of the result
+    for name, fn in (('GPU contract_2e from a host CI vector',
+                      lambda: gfci.contract_2e(eri_g, cp.asarray(ci), norb, nelec,
+                                               (link, link))),
+                     ('GPU contract_2e from a device CI vector',
+                      lambda: gfci.contract_2e(eri_g, ci_d, norb, nelec, (link, link))),
+                     ('CPU contract_2e (PySCF)',
+                      lambda: cfci.contract_2e(eri, ci, norb, nelec, (link, link)))):
+        ci_d = cp.asarray(ci)
+        fn()
+        _sync()
+        with stage(f'sigma: {name}'):
+            for _ in range(3):
+                fn()
+        N[f'sigma: {name}'] = 3
+    INFO['na'] = int(na)
+
+
+def feature_mp2(mol):
+    """I2/I3: conventional RMP2, and DF-UMP2 on an open shell."""
+    from gpu4pyscf import scf
+    if mol.spin:
+        from gpu4pyscf.mp import dfump2
+        mf = scf.UHF(mol).density_fit()
+        mf.conv_tol = a.conv_tol
+        mf.max_cycle = a.max_cycle
+        mf.verbose = 0
+        run_scf(mf)
+        pt = dfump2.DFUMP2(mf)
+        pt.verbose = 0
+        with stage('DF-UMP2 total'):
+            pt.kernel()
+    else:
+        from gpu4pyscf.mp import mp2
+        mf = scf.RHF(mol)
+        mf.conv_tol = a.conv_tol
+        mf.verbose = 0
+        run_scf(mf)
+        pt = mp2.MP2(mf)
+        pt.verbose = 0
+        with stage('conventional RMP2 total'):
+            pt.kernel()
+    INFO['e_corr'] = float(pt.e_corr)
+
+
+def feature_disphess(mol):
+    """F1: a -D3(BJ) Hessian; the dispersion part by CPU finite differences.
+
+    With --no-grad only the dispersion Hessian is evaluated (it needs no SCF),
+    which is how it is sized at 284 and 545 atoms."""
+    if not a.no_grad:
+        feature_hess(mol)
+        return
+    mf = build_mf(mol)
+    h = mf.Hessian()
+    with stage('dispersion Hessian alone'):
+        h.get_dispersion()
+
+
+def feature_analysis(mol):
+    """E1, E2, E4, E5: population analysis, multipoles, ESP/RESP, CHELPG."""
+    from gpu4pyscf.pop import esp
+    from gpu4pyscf.qmmm import chelpg
+    mf = build_mf(mol)
+    run_scf(mf)
+    dm = mf.make_rdm1()
+    with stage('E2 dip_moment'):
+        mf.dip_moment(verbose=0)
+    with stage('E1 analyze (to_cpu + meta-Lowdin)'):
+        mf.analyze(verbose=0)
+    with stage('E4 esp_solve'):
+        esp.esp_solve(mol, dm)
+    with stage('E4 resp_solve'):
+        esp.resp_solve(mol, dm)
+    with stage('E5 CHELPG'):
+        chelpg.eval_chelpg_layer_gpu(mf)
+
+
 def feature_dfmp2(mol):
     from gpu4pyscf import scf
     from gpu4pyscf.mp import dfmp2
@@ -814,6 +1056,21 @@ print(f'[{tag}] natm={mol.natm} nao={mol.nao} nelec={mol.nelectron} '
       f'OMP={os.environ.get("OMP_NUM_THREADS")} '
       f'gpu={cp.cuda.runtime.getDeviceProperties(0)["name"].decode()}',
       flush=True)
+if a.memsample:
+    import threading
+    _free0, _total = cp.cuda.runtime.memGetInfo()
+    _mem = {'min_free': _free0, 'stop': False}
+    _dev = cp.cuda.Device().id
+
+    def _sampler():
+        with cp.cuda.Device(_dev):
+            while not _mem['stop']:
+                f = cp.cuda.runtime.memGetInfo()[0]
+                if f < _mem['min_free']:
+                    _mem['min_free'] = f
+                time.sleep(0.02)
+    _th = threading.Thread(target=_sampler, daemon=True)
+    _th.start()
 t0 = time.perf_counter()
 if a.cprofile:
     import cProfile
@@ -829,6 +1086,12 @@ if a.cprofile:
     print('\n# cProfile, by self time')
     pstats.Stats(prof).sort_stats('tottime').print_stats(40)
 peak = cp.get_default_memory_pool().total_bytes() / 1e9
+if a.memsample:
+    _mem['stop'] = True
+    INFO['device_peak_in_use_GB'] = round((_total - _mem['min_free']) / 1e9, 2)
+    INFO['device_total_GB'] = round(_total / 1e9, 2)
+    print(f"# device memory: peak in use {INFO['device_peak_in_use_GB']} GB "
+          f"of {INFO['device_total_GB']} GB")
 
 print(f'\n[{tag}] wall {wall:.2f} s   pool now {peak:.1f} GB')
 print(f'{"stage":44s} {"s":>9s} {"%wall":>7s} {"calls":>6s}  ndm')
