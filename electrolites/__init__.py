@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -194,6 +194,9 @@ _TARGETS = {
     # goes through, looked up at call time, wrapped so that a contraction
     # cuTENSOR refuses is cut into pieces it plans (docs/DF_WORK_LIST.md W27)
     'planguard': ('gpu4pyscf.lib.cutensor', 'contraction'),
+    # the IR driver: the Hessian's CPHF solution reused for the dipole
+    # derivative (catalogue C10); callers reach it as `ir.eval_ir_...`
+    'fastir': ('gpu4pyscf.properties.ir', 'eval_ir_freq_intensity'),
     # the Hessian's CPHF solve (docs/DF_WORK_LIST.md W44): both spin cases'
     # `solve_mo1`, which the Hessian classes' methods look up on their
     # modules at call time, and the Krylov solver and QR it reuses
