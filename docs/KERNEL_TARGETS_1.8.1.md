@@ -471,7 +471,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 3 **done** | **D12** `force_and_nacv` through the batched NAC solver — `fastnacms` (§13.3) | FSSH and every multi-pair NAC workflow | was: routing the 15 pairs through `NAC_multistates` 2.1x / 2.0x / 1.86x (§11.1) | **built and measured.**  `force_and_nacv` takes the batched solver for a restricted singlet reference requesting all pairs among its states: **2.08x / 2.01x / 1.73x** (penicillin V B3LYP / PBE, taxol B3LYP); results equal to the serial path within the serial path's own run-to-run scatter.  **Left**: open-shell and triplet NACs still go serial; the batched run is now 58–69 % D10 (rank 6) |
 | 4 **done** | **A14** restricted meta-GGA XC in the SCF — `fastxc` (§13.4) | every restricted TPSS, r2SCAN, SCAN, M06-2X, MN15 SCF (and everything after it) | was: `nr_rks` 53–62 % of a patched pure-mGGA SCF, 34–41 % of an M06-2X one, every call handed to stock (§10.3) | **built and measured.**  The grouped pass now takes meta-GGA: the four orbital products per block in one grouped launch, rho/∇rho/tau in one kernel per block, the four potential products in one grouped launch.  `nr_rks` **2.0x** at 42 atoms and **1.5x** at 113; SCF 1.14–1.46x (42) and 1.15–1.29x (113), inside §5.1's 1.3–1.45x bound; energies to 4e-12 Eh.  **Left**: the potential's four products per block, flop-bound |
 | 5 **done** | **C7** NMR: GIAO AOs on the GPU — `fastnmr` (§13.5) | every NMR shielding | was: **72–78 %** of a patched NMR run (§10.4) | **built and measured.**  `GTOval_ig`/`_ipig` are ½(R_μ × r)φ and its derivative, formed on the GPU from the block's own AOs, one GEMM per block for all three field directions: the term 30.3 → < 0.1 s, 131.7 → < 1 s, 916.9 → 1.6 s at 22 / 42 / 113 atoms; NMR **4.2x / 4.5x / 1.62x**, shieldings to 3e-12 ppm.  **Left**: C6 (`int2e_ig1` on the CPU) is now 87–97 % of an NMR run — a §5.3 entry, greenfield |
-| 6 | **D10** TDDFT gradient / NAC two-electron derivative (with **D9**) | TDDFT gradients, NACs, FSSH | D10 is **54–72 %** of the batched force + all-NAC run once D12 is taken (§11.1), and its one multi-density call is as slow as the fifteen single-pair calls it replaces; D9 + D10 are 28–33 % of a single pure-functional gradient + NAC and 13–25 % of a hybrid one (§10.1); no module on either | the ip1 structure `fastejk` already beat 1.7x, extended to density pairs; the batched path makes it the FSSH bottleneck.  mod |
+| 6 **done** | **D10** TDDFT gradient / NAC two-electron derivative — `fasttdejk` (§13.6) | TDDFT gradients, NACs, FSSH | was: **54–72 %** of the batched force + all-NAC run once D12 is taken (§11.1) | **built and measured.**  A pair family generated from `fastejk`'s kernels: `EJK_NT` outputs per launch, density products in registers, all 63 classes through f.  D10 **2.73x / 2.74x / 2.33x** (penicillin V B3LYP / PBE, taxol B3LYP); the batched force + all NACs **1.77x / 1.88x / 1.50x** on top of rank 3 (147.8 → 40.0 s with both, penicillin V B3LYP).  Found: GPU4PySCF's kernels miss finite differences by 2–6e-2 on a general density pair and are not reproducible — the source of its NACV scatter.  **Left**: the Z-vector CPHF and D9 |
 | 7 | **A17** native short-range K for HSE06 | every HSE06 (and any `erfc`-only RSH) SCF and its derivatives | patched `get_k` is **66 % / 72 %** of a patched HSE06 SCF at 113 / 284 atoms; the decomposition gives it **1.01x / 1.05x** (§10.5) | not a regression (Q5 refuted) but the locality of `erfc` is lost from ~100 atoms on; ~1.7x on the 284-atom SCF if B3LYP's 2.5x transferred.  mod |
 | 8 | **I1** DF-MP2 pair-energy loop | every DF-MP2 and DF-UMP2 | **73 % / 81 %** of the DF-MP2 step at 42 / 113 atoms (§10.10); the UMP2 pair loops are **92–94 %** of DF-UMP2 (§12.4) | easy, exact to round-off |
 | 9 | **C5** C6 coefficients: full A/B and a host eigensolve | `properties.c6` | `_solve_full_spectrum` is **95 %** of a patched 22-atom run: `get_ab` (D4, CPU `int2e` + O(N⁵) transforms) 41 %, the host Cholesky/`eigh` on `2·nov` 54 %; 53 % at 10 atoms, so it climbs as nov³ (§11.9) | the GPU ovov builder exists for D4; the eigensolve wants an imaginary-frequency CPKS on the response path Electrolites already accelerates.  mod |
@@ -1312,3 +1312,30 @@ def2-TZVPP).  The row's share is now zero; **C6**, the GIAO two-electron
 term on the CPU, is 87–97 % of what is left (it was 13–22 %), and it is not a
 §5.1 row (§5.3 lists it as a clean benchmark target; a GPU `(ig1)` Rys kernel
 is greenfield).
+
+### 13.6 Rank 6 — D10: the TDDFT gradient / NAC two-electron derivative (`docs/README_fasttdejk.md`)
+
+Built: `fasttdejk` replaces `grad.tdrhf._jk_energies_per_atom`, with a kernel
+family `codegen/gen_ejkpair.py` writes from `fastejk`'s generator: `EJK_NT = 2`
+density pairs per launch, their density products in registers, the force terms
+of each cartesian function formed once for both; all 63 classes through f.
+
+| | D10 before → after | run before → after |
+|---|---|---|
+| force + 15 NACVs (batched), penicillin V / B3LYP | 48.8 → 17.9 s (2.73x) | 70.8 → 40.0 s (1.77x) |
+| same, penicillin V / PBE | 46.1 → 16.8 s (2.74x) | 64.0 → 34.1 s (1.88x) |
+| same, taxol / B3LYP | 247.8 → 106.2 s (2.33x) | 425.0 → 283.1 s (1.50x) |
+| TDDFT gradient + one NAC, penicillin V / B3LYP | 6.0 → 4.1 s | 20.3 → 17.8 s |
+| TDDFT gradient + one NAC, taxol / PBE | 18.8 → 10.4 s | 72.9 → 64.9 s |
+
+GPU4PySCF's kernel spends most of a pass on the contraction (a pass over six
+pairs costs 2.5x one over a single pair), which is what the register-resident
+products remove.  Correctness is checked against **finite differences** of
+`get_jk` energies (≤ 1.1e-8), because GPU4PySCF itself is not a usable
+reference here: on a general density pair on glycine/def2-SVP it misses the
+finite difference by 2–6e-2 relative and two calls differ by up to 2e-3 (its
+multi-density kernel also faults at exactly six pairs).  On the physical
+densities of a TDDFT gradient, NAC and batched solve it agrees with this
+module to 5e-12.  That non-reproducibility is the source of the NACV scatter
+§13.3 recorded.  The row's residue: at 113 atoms the batched run is now the
+Z-vector CPHF (115 s), D10 (106 s) and D9 (30 s).

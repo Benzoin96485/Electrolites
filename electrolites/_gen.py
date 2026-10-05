@@ -64,6 +64,8 @@ _SPECS = {
                                  'fastjkhigh_launch.json')),
     'fastejk_generated.cu': ('electrolites.codegen.gen_ejk',
                              ('--table', 'fastejk_launch.json')),
+    # the density-pair family (catalogue D10): TDDFT gradients and NACs
+    'fastejkpair_generated.cu': ('electrolites.codegen.gen_ejkpair', ()),
 }
 
 

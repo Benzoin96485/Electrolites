@@ -68,7 +68,10 @@ GPU4PySCF's own code set what "agree" can mean:
    case, with the same sign; the force agrees to 1e-8–1e-13.
 
 Neither is introduced here, and both affect the serial path equally; they are
-recorded because a tighter test is not possible against this reference.
+recorded because a tighter test is not possible against this reference.  The
+second was traced in rank 6 (`README_fasttdejk.md`): GPU4PySCF's
+`_jk_energies_per_atom` kernels are not reproducible, and not correct on
+general density pairs; with `fasttdejk` in place the NACVs repeat.
 
 ## What is left
 
