@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -211,6 +211,10 @@ _TARGETS = {
     # on `dfmp2_addons` at call time
     'fastdfmp2': (('gpu4pyscf.mp.dfmp2_addons', 'get_dfmp2_energy_pair_intra'),
                   ('gpu4pyscf.mp.dfmp2_addons', 'get_dfump2_energy_pair_intra')),
+    # C6 coefficients: the full-spectrum solve on the device (C5)
+    'fastc6': (('gpu4pyscf.properties.c6', '_solve_full_spectrum'),
+               ('gpu4pyscf.properties.c6', 'calc_c6'),
+               ('gpu4pyscf.tdscf.rhf', 'get_ab')),
     # the Hessian's CPHF solve (docs/DF_WORK_LIST.md W44): both spin cases'
     # `solve_mo1`, which the Hessian classes' methods look up on their
     # modules at call time, and the Krylov solver and QR it reuses
