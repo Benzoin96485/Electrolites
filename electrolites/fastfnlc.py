@@ -48,7 +48,15 @@ contraction -- and change 2 reassociates one grid sum, which agrees to
    ``V = S + G + G^T = (M + M^T)/2`` with ``M = (ao_0 f_rho + 2 nabla_dot) . ao_0^T``,
    which is exact because ``S`` is symmetric.
 
-**What is left, and it is the larger half.**
+3. **The perturbed densities on the grid, for the whole batch at once**, and
+4. **the ``return_in_mo`` path's MO projection, batched** (2026-10-05,
+   ``docs/README_fastvv10ft.md`` 5): with ``S = D + D^T`` the densities are
+   one GEMM per block instead of two per density, and the Hessian's CPHF
+   path now takes change 2 followed by two contractions for the projection.
+   Both reassociate sums; ``FASTFNLC_RHO_BATCH=0 FASTFNLC_MO_BATCH=0``
+   restores bit-identity on the ``mo`` path.
+
+**What is left, and it is the larger half** (now ``fastvv10ft``'s).
 ``VXC_vv10nlc_hess_eval_f_t`` is **64.7 %** of a call and depends on the
 perturbed densities, so it cannot be cached.  It is an ``O(ngrids^2)`` fp64
 double sum over 519 680 points -- 2.7e11 pairs in 4.61 s -- and the three
@@ -116,6 +124,11 @@ libgdft = numint.libgdft
 #: potential loop back, which is the ablation for change 2.
 CACHE = os.environ.get('FASTFNLC_CACHE', '1') != '0'
 BATCH = os.environ.get('FASTFNLC_BATCH', '1') != '0'
+#: FASTFNLC_RHO_BATCH=0 evaluates the perturbed densities one at a time, as
+#: GPU4PySCF does (the ablation for change 3); FASTFNLC_MO_BATCH=0 keeps
+#: GPU4PySCF's per-density loop on the ``return_in_mo`` path (change 4)
+RHO_BATCH = os.environ.get('FASTFNLC_RHO_BATCH', '1') != '0'
+MO_BATCH = os.environ.get('FASTFNLC_MO_BATCH', '1') != '0'
 
 #: Budget, in the same units as ``rho*weight``, for the grid points left out
 #: of the two ``O(ngrids^2)`` pair sums -- ``fastnlc``'s ``FASTNLC_BUDGET``
@@ -381,19 +394,42 @@ def _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
     nsub_max = max(len(x[1]) for x in grids.get_non0ao_idx(opt))
     blk = numint.MIN_BLK_SIZE
     aow_buf = wv_buf = v_buf = None
+    s_buf = c_buf = None
 
     for i_dm1_batch in range(0, n_dm1, ndm1_per_batch):
         n_dm1_batch = min(ndm1_per_batch, n_dm1 - i_dm1_batch)
-        if BATCH and not return_in_mo and aow_buf is None:
+        batched = BATCH and (MO_BATCH or not return_in_mo)
+        if batched and aow_buf is None:
             aow_buf = cupy.empty(n_dm1_batch * nsub_max * blk)
             wv_buf = cupy.empty(n_dm1_batch * 4 * blk)
             v_buf = cupy.empty(n_dm1_batch * nsub_max * nsub_max)
 
         rho_drho_t = cupy.empty([n_dm1_batch, 4, ngrids_full])
         g1 = 0
+        dmb = dm1s_sorted[i_dm1_batch:i_dm1_batch + n_dm1_batch]
         for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv=1,
                                                 strict_grid_order=True):
             g0, g1 = g1, g1 + weight.shape[0]
+            if RHO_BATCH:
+                # every density of the batch at once: with S = D + D^T,
+                # rho = 1/2 ao0.(S ao0) and nabla rho = nabla ao.(S ao0),
+                # which is `eval_rho(..., hermi=0)` with one GEMM for the
+                # batch instead of two per density
+                nsub, ngb = len(idx), weight.shape[0]
+                if s_buf is None:
+                    s_buf = cupy.empty(n_dm1_batch * nsub_max * nsub_max)
+                    c_buf = cupy.empty(n_dm1_batch * nsub_max * blk)
+                sm = ndarray((n_dm1_batch, nsub, nsub), buffer=s_buf)
+                sm[:] = dmb[:, idx[:, None], idx]
+                transpose_sum(sm)
+                c0 = ndarray((n_dm1_batch * nsub, ngb), buffer=c_buf)
+                cupy.dot(sm.reshape(-1, nsub), ao[0], out=c0)
+                c0 = c0.reshape(n_dm1_batch, nsub, ngb)
+                rho_drho_t[:, 0, g0:g1] = contract('pg,npg->ng', ao[0], c0,
+                                                   alpha=.5)
+                rho_drho_t[:, 1:4, g0:g1] = contract('xpg,npg->nxg', ao[1:4],
+                                                     c0)
+                continue
             for i_dm in range(n_dm1_batch):
                 dm1_masked = take_last2d(dm1s_sorted[i_dm + i_dm1_batch],
                                          idx, out=dm_mask_buf)
@@ -463,7 +499,7 @@ def _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
             f_rho = fxc_rho[:, g0_nonzero:g1_nonzero]
             f_gam = fxc_gamma[:, :, g0_nonzero:g1_nonzero]
 
-            if BATCH and not return_in_mo:
+            if batched:
                 # V = S + G + G^T with S = ao0 . (ao0 f_rho)^T symmetric and
                 # G = ao0 . nabla_dot^T, so V = (M + M^T)/2 for
                 # M = (ao0 f_rho + 2 nabla_dot) . ao0^T -- one weighted-AO
@@ -484,8 +520,17 @@ def _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
                 vblk = vblk.reshape(n_dm1_batch, nsub, nsub)
                 transpose_sum(vblk)
                 vblk *= .5
-                add_sparse(vmat[i_dm1_batch:i_dm1_batch + n_dm1_batch],
-                           vblk, idx)
+                if return_in_mo:
+                    # the projection GPU4PySCF does per density, for the
+                    # batch: (C^T V Cocc) as two contractions
+                    for m, mo, vm in zip(mos, moccs, vmats):
+                        tmp = contract('npq,qj->npj', vblk, mo[idx, :])
+                        vm[i_dm1_batch:i_dm1_batch + n_dm1_batch] += \
+                            contract('pi,npj->nij', m[idx, :], tmp)
+                        del tmp
+                else:
+                    add_sparse(vmat[i_dm1_batch:i_dm1_batch + n_dm1_batch],
+                               vblk, idx)
             else:
                 for i_dm in range(n_dm1_batch):
                     V_munu = contract('ig,jg->ij', ao[0],

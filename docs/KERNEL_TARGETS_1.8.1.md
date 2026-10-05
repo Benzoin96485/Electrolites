@@ -450,6 +450,12 @@ measurements (§10), then on the measurements that emptied the "measure first"
 lists (§11, §12).  Every share below that cites §10–§12 was measured then;
 every other one is quoted from the document named.
 
+**From 2026-10-05 the §5.1 proposals are being built, in rank order** (§13).
+A row whose proposal has been built and measured says **done** in its first
+column and gives the measured result and what is left in place of the
+justification; the ranks of the other rows are unchanged so that the order of
+work stays readable.
+
 ### 5.1 By measured value (throughput)
 
 Ranking = measured share **after Electrolites** × how much of an existing,
@@ -460,7 +466,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 
 | Rank | Entry | Features it reaches | Share it acts on (measured) | Why this rank |
 |---|---|---|---|---|
-| 1 | **B13** VV10 pair kernel `f_t` (+ **B14**) | every VV10 functional's polarizability, Hessian, frequencies, IR | the `f_t` kernel alone is **58 % / 71 %** of a patched wB97M-V Hessian at 22 / 42 atoms, and Electrolites takes that Hessian only 1.12x (§11.2); VV10 response 80.6 % of a stock wB97M-V polarizability | the largest single kernel share anywhere in this repository's profiles, growing with size; three of `fastnlc`'s measured techniques (MUFU, P10, P11 — 3.92x together on the ground-state sum) transfer; the redundant `ntrial/6` re-evaluation is structural.  B14 (the host side of `_get_vnlc_deriv1`) is 8–9 % (§11.2) and rides along |
+| 1 **done** | **B13** VV10 pair kernel `f_t` (+ **B14**) — `fastvv10ft`, `fastvnlch` (§13.1) | every VV10 functional's polarizability, Hessian, frequencies, IR | was: `f_t` **58 % / 71 %** of a patched wB97M-V Hessian at 22 / 42 atoms (§11.2) | **built and measured.**  `f_t` as an fp64 tensor-core GEMM with the pair kernel built in the A fragments: **5.9x** on the kernel at a Hessian's `3 natm` trials (89.0 → 15.0 s, 42 atoms; same ratio at 113), 1.7–2.2x at a polarizability's 3; its grid-weight twin `EUW_with_weight1` likewise (50.1 → 14.5 s); B14's atom loops as one GEMM per block; `fastfnlc`'s per-density loops batched.  wB97M-V Hessian **141.5 → 45.4 s (3.12x)** at 22 atoms, **932.6 → 237.3 s (3.93x)** at 42, UKS Ni dithiolene⁻ 406.2 → 218.3 s (1.86x); polarizability CPKS 1.80x / 1.94x at 42 / 113 atoms; frequencies within 0.0001 cm⁻¹.  **Left**: `f_t` is still 48 % of the 42-atom Hessian, MMA-bound at 13.7 of 19.5 TF, and 79 % of a taxol polarizability, evaluation-bound — a 3xTF32 far field is the next step |
 | 2 | **C10** IR's duplicate CPHF | IR intensities (and every workflow that asks for them with frequencies) | the duplicate `make_h1` + `solve_mo1` is **41.8 %** of a 42-atom IR run and 31.6 % of a 22-atom one (§10.2); removing it is worth **1.72x / 1.46x** | easy, and exact (bitwise); upstream marks it TODO |
 | 3 | **D12** `force_and_nacv` through the batched NAC solver | FSSH and every multi-pair NAC workflow | routing the 15 pairs through upstream's existing `NAC_multistates` is **2.1x / 2.0x / 1.86x** on the patched force + all-NAC run (penicillin V B3LYP / PBE, taxol B3LYP), agreeing to the Z-vector tolerance (§11.1) | easy — the batched solver exists upstream; extending it past singlets is the work.  Not bitwise (one CPHF instead of fifteen), so the oracle is the serial path at tolerance |
 | 4 | **A14** restricted meta-GGA XC in the SCF | every restricted TPSS, r2SCAN, SCAN, M06-2X, MN15 SCF (and everything after it) | `nr_rks` is **53–62 %** of a patched pure-mGGA SCF and **34–41 %** of a patched M06-2X one, 42 and 113 atoms, and `fastxc` hands **every** call back to stock (§10.3) | the code exists for UKS; bounded at **1.3–1.45x** of a pure-mGGA SCF if the GGA treatment's 2.06x transfers.  Broad reach, easy |
@@ -539,9 +545,10 @@ systems a user can run at all):
 ### 5.2 Measure first — nothing left
 
 §10, §11 and §12 profiled every feature §2.5 listed.  What is unmeasured now
-is not a feature but a treatment: no entry in §5.1 has had its proposed
-change built and timed, so every "would be worth" there is an Amdahl bound
-from a measured share, not a speedup.  Two shares are worth re-taking on an
+is not a feature but a treatment: apart from the rows marked **done** (§13),
+no entry in §5.1 has had its proposed change built and timed, so every
+"would be worth" there is an Amdahl bound from a measured share, not a
+speedup.  Two shares are worth re-taking on an
 otherwise idle node before they are quoted as precisely as the rest: B15's
 `jk_ip1` (host-bound, doubled under contention, §10.7) and A21's `mcfun` (read
 1.2–1.5x slower patched than stock under contention, §11.8).
@@ -603,7 +610,7 @@ systems).  Additions for the classes 06 did not cover:
 | Q5 | A17: HSE06 patched may be slower than stock | **refuted, §10.5**: never slower; but K gains only 1.01–1.05x from 113 atoms on |
 | Q6 | R1: `fastgradh` is a regression on 1.8.1 | **refuted, §10.7**: its row is 2–3x faster than stock, and 0.1–0.3 % of a Hessian |
 | Q7 | R2/R3: the `get_hcore` "CPU" row and the OMP-dependent stock gradient | **closed, §10.9**: R2 is first-call initialisation (0.46–0.52 s cold, 0.10 s warm); R3 does not reproduce on 1.8.1 (PfPMT 19.79 s at 1 and 16 threads) |
-| Q8 | B13's `ceil(ntrial/6)` re-evaluation | read from the launch geometry (`vv10.cu:760-764`, `blockIdx.y` over trial groups); whether the compiler or the cache hides any of it is not measured |
+| Q8 | B13's `ceil(ntrial/6)` re-evaluation | **closed, §13.1**: nothing hides it — the stock kernel runs at the fp64 SIMT peak, and evaluating each pair once per 64 trials with the contraction on the tensor cores is 5.9x at 126 trials |
 | Q9 | contamination tiers | `[?]` exactly as 06 §0 says: no recall probe was run |
 | Q10 | 06's §2 shares quoted here (18–21 % AO evaluation; PCM 5.3 % of a gradient) | stock **1.7.0** numbers; 1.8.1's `eval_ao` is several times faster (`RESPONSE_1.8.1.md` §3.4) |
 
@@ -1170,3 +1177,51 @@ point dipoles, 1 Å long, no closer than 4 Å to a QM atom; random monopoles at
 * **Analysis** (patched): `dip_moment` ≤ 0.07 s; `analyze` (whole object to the
   host, meta-Löwdin) 1.0–3.7 s; ESP/RESP ≤ 0.7 s; CHELPG 0.3 / 1.2 / **8.2 s**
   at 42 / 113 / 284 atoms (12 % of SCF + analysis at PfPMT).
+
+---
+
+## 13. The §5.1 proposals, built (from 2026-10-05)
+
+Each subsection is one §5.1 row, in rank order: what was built, the measured
+result on the feature the row names, at two sizes and on a second class of
+system where one exists, and what the row's share is afterwards.  The
+module's own document has the derivation, the ablations and the tests.
+
+### 13.1 Rank 1 — B13 (+ B14): the VV10 response kernels (`docs/README_fastvv10ft.md`)
+
+Built: `fastvv10ft` replaces the `libgdft` symbols
+`VXC_vv10nlc_hess_eval_f_t` and `VXC_vv10nlc_hess_eval_EUW_with_weight1`
+(all their callers look them up at call time) with fp64 tensor-core kernels:
+the lane that evaluates a pair holds that pair's `mma.m8n8k4` A-fragment
+element, so the pair kernel is evaluated once per 8–64 trial densities instead
+of once per 6, and the contraction is an MMA; fp32 kernel values beyond
+10 Bohr (P10, the MMA stays fp64).  `fastvnlch` replaces
+`_get_vnlc_deriv1` with its per-atom loops (B14) as one GEMM per grid block.
+`fastfnlc` now batches the perturbed densities and the MO projection over the
+densities, which the Hessian's `return_in_mo` path had not had.
+
+All on one A100-SXM4-80GB, before and after back to back, wB97M-V/def2-SVP:
+
+| | before (Electrolites) | after | |
+|---|---|---|---|
+| `f_t` kernel, 42 atoms, 126 trials | 89.0 s (stock) | 15.0 s | **5.9x** |
+| `f_t` kernel, 113 atoms, 32 trials | 160.7 s | 29.8 s | 5.4x |
+| `f_t` kernel, 42 atoms, 3 trials | 4.03 s | 1.84 s | 2.2x |
+| **Hessian, 22 atoms** | 141.5 s (stock 165.5) | **45.4 s** | **3.12x** |
+| **Hessian, 42 atoms** | 932.6 s | **237.3 s** | **3.93x** |
+| Hessian, Ni dithiolene⁻ UKS, 21 atoms | 406.2 s | 218.3 s | 1.86x |
+| polarizability (CPKS), 42 atoms | 93.3 s (stock 150.1) | 51.7 s | 1.80x |
+| polarizability (CPKS), 113 atoms | 698.0 s | 359.3 s | 1.94x |
+
+Correctness: kernels element-wise against GPU4PySCF (≤ 1e-15 all fp64,
+≤ 1.1e-10 with the default fp32 far field); Hessians against stock within
+GPU4PySCF's own run-to-run scatter (two stock Hessians in one process differ
+by up to 5.6e-7), harmonic frequencies of alanine dipeptide within
+0.0001 cm⁻¹; polarizabilities 4e-16.
+
+What the row's share is now: at 42 atoms `f_t` is 115 s of the 237 s Hessian
+(**48 %**, was 71 %), the rest of the VV10 terms ~15 %, J/K 23 %; the open-shell
+Hessian is now J/K-bound (`get_k` 73.6 s, `jk_ip1` 44.4 s of 218 s, VV10 31 s).
+In a polarizability the VV10 response is still 79 % at 113 atoms and is bound
+by the pair *evaluation* at 3 trials, not the MMA.  Both residues have the same
+next step, a 3xTF32 far field, which is not in this round.

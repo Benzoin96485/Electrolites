@@ -234,6 +234,8 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastxchess` | `hessian.{rks,uks}._get_vxc_deriv{1,2}` (GGA and meta-GGA), and `hessian.rks`'s in-place `contract` calls | `docs/README_fastxchess.md`, `docs/README_mgga_repro.md`, `docs/README_fastxchessmgga.md` |
 | `fastxcfxc` | `dft.numint.nr_{rks,uks}_fxc` — the grid half of every response property — and `hessian.rks.nr_rks_fxc_mo`, a restricted Hessian's | `docs/README_fastxcfxc.md`, `docs/README_fastdfhessip.md` |
 | `fastfnlc` | `hessian.{rks,uks}.nr_rks_fnlc_mo` — the VV10 response term | `docs/README_fastfnlc.md` |
+| `fastvv10ft` | `libgdft` `VXC_vv10nlc_hess_eval_f_t`, `..._EUW_with_weight1` — the VV10 response and grid-weight pair kernels on the fp64 tensor cores | `docs/README_fastvv10ft.md` |
+| `fastvnlch` | `hessian.rks._get_vnlc_deriv1` (and its `uks`/DF bindings) — the VV10 Fock derivative's atom loops as one GEMM per block | `docs/README_fastvv10ft.md` §6 |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |

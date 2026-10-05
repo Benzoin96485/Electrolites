@@ -36,7 +36,7 @@ TESTED_GPU4PYSCF = ('1.7.0', '1.8.1')
 MODULES = (
     'fastk', 'fastj', 'fastxc', 'fastrsh', 'fastxcnlc', 'fastnlc', 'fast1e',
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
-    'fastxcfxc', 'fastfnlc', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
+    'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
     'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf',
 )
@@ -86,6 +86,20 @@ _TARGETS = {
                   ('gpu4pyscf.hessian.rks', 'nr_rks_fxc_mo')),
     'fastfnlc': (('gpu4pyscf.hessian.rks', 'nr_rks_fnlc_mo'),
                  ('gpu4pyscf.hessian.uks', 'nr_rks_fnlc_mo')),
+    # CUDA symbols, not Python entry points: every caller of the VV10
+    # response pair sum (`hessian/rks.py`, three functions, and `fastfnlc`)
+    # and of its grid-weight-derivative twin looks them up on this ctypes
+    # library at call time
+    'fastvv10ft': (('gpu4pyscf.dft.numint',
+                    'libgdft.VXC_vv10nlc_hess_eval_f_t'),
+                   ('gpu4pyscf.dft.numint',
+                    'libgdft.VXC_vv10nlc_hess_eval_EUW_with_weight1')),
+    # the VV10 term of every Hessian's `make_h1`; `hessian/uks.py` and the
+    # density-fitted Hessians bind the name at import (B14)
+    'fastvnlch': (('gpu4pyscf.hessian.rks', '_get_vnlc_deriv1'),
+                  ('gpu4pyscf.hessian.uks', '_get_vnlc_deriv1'),
+                  ('gpu4pyscf.df.hessian.rks', '_get_vnlc_deriv1'),
+                  ('gpu4pyscf.df.hessian.uks', '_get_vnlc_deriv1')),
     'fastjk': ('gpu4pyscf.scf.jk', '_VHFOpt.get_jk'),
     # this one replaces two CUDA symbols rather than a Python entry point, so
     # the target check only confirms the driver that looks them up still exists

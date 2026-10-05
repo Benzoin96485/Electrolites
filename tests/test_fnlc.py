@@ -5,9 +5,11 @@ iteration of a CPKS or CPHF solve, so every case here calls it **twice** and
 checks the second call as well: the first fills the ground-state cache, the
 second uses it, and both must agree with GPU4PySCF.
 
-The `mo` column is the `return_in_mo=True` path, which keeps GPU4PySCF's own
-potential contraction and therefore has to be **bit-identical** -- that is the
-test of the cache on its own.  The `ao` column is `return_in_mo=False`, whose
+The `mo` column is the `return_in_mo=True` path.  With
+`FASTFNLC_RHO_BATCH=0 FASTFNLC_MO_BATCH=0` it keeps GPU4PySCF's own density
+evaluation and potential contraction and therefore has to be
+**bit-identical** -- that is the test of the cache on its own; by default
+both are batched over the densities and it is checked to round-off.  The `ao` column is `return_in_mo=False`, whose
 potential contraction is batched over the perturbed densities and reassociates
 one grid sum, so it is checked to round-off instead.
 
@@ -109,7 +111,12 @@ for atom, basis, xc, level, nset in cases:
           f'{d_pol:10.2e}', flush=True)
     # `mo` is exact, `ao` and the polarizability are round-off -- the last
     # one only because the SCF is shared; see `tests/test_fxc.py`.
-    if not (exact and errs[False] <= 1e-12 and errs[(False, 2)] <= 1e-12
+    # The `mo` path is bit-identical only with the batched density and
+    # MO-projection changes switched off (FASTFNLC_RHO_BATCH=0
+    # FASTFNLC_MO_BATCH=0); with them on it reassociates the same sums.
+    mo_ok = exact if not (fastfnlc.RHO_BATCH or fastfnlc.MO_BATCH) else \
+        (errs[True] <= 1e-12 and errs[(True, 2)] <= 1e-12)
+    if not (mo_ok and errs[False] <= 1e-12 and errs[(False, 2)] <= 1e-12
             and d_pol <= 1e-9):
         fails += 1
         print('  ^ FAIL', flush=True)

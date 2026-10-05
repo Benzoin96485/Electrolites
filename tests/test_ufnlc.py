@@ -10,8 +10,10 @@ none of it.
 
 Each case calls the term twice, as a CPKS or CPHF solve does, so the second
 call exercises the ground-state cache.  `mo` is `return_in_mo=True`, which
-keeps GPU4PySCF's own contraction and therefore has to be **bit-identical**
-(and, for an unrestricted reference, has to come back as a two-element tuple);
+has to be **bit-identical** with `FASTFNLC_RHO_BATCH=0 FASTFNLC_MO_BATCH=0`
+(GPU4PySCF's own density evaluation and contraction) and round-off with them
+on (and, for an unrestricted reference, has to come back as a two-element
+tuple);
 `ao` is `return_in_mo=False`, whose contraction is batched over the perturbed
 densities and is checked to round-off.
 
@@ -145,7 +147,11 @@ for name, atom, basis, xc, level, charge, spin, nset in cases:
         if in_mo:
             exact = bool(cp.all(got == ref)) and bool(cp.all(got2 == ref))
 
-    ok = (exact and errs[False] <= 1e-12 and errs[(False, 2)] <= 1e-12)
+    # bit-identical only with FASTFNLC_RHO_BATCH=0 FASTFNLC_MO_BATCH=0;
+    # the batched density and projection reassociate the same sums
+    mo_ok = exact if not (fastfnlc.RHO_BATCH or fastfnlc.MO_BATCH) else \
+        (errs[True] <= 1e-12 and errs[(True, 2)] <= 1e-12)
+    ok = (mo_ok and errs[False] <= 1e-12 and errs[(False, 2)] <= 1e-12)
     fails += not ok
     print(f'{name+"/"+basis:34s} {xc:9s} {nset:4d} {errs[True]:9.2e} '
           f'{str(exact):>3s} {errs[False]:10.2e} '
