@@ -266,6 +266,7 @@ Each is a measurement, kept so that it is not rediscovered.  Full table:
 | PCM D/S matrix-free (06 F3), SCF path | off the default path; 0.026 s of 141 s | `README_fast1e.md` |
 | eigensolver, DIIS (06 H1/H2) | 1.9 % together with grids | `ROUND2_1.8.1.md` §2 |
 | seminumerical exchange (COSX) | greenfield; `sem/` is semi-empirical, not seminumerical | `DF_WORK_LIST.md` "Not on this list" |
+| short-range (erfc) screening for HSE06 K (A17) | 0.97–1.00x at 42 / 113 / 284 atoms: the exchange's density-matrix screen already removes the distant quartets; the erfc cost is its doubled Rys roots | §13.7 |
 
 ### 3.4 Corrections and coverage defects found by this survey
 
@@ -472,7 +473,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 4 **done** | **A14** restricted meta-GGA XC in the SCF — `fastxc` (§13.4) | every restricted TPSS, r2SCAN, SCAN, M06-2X, MN15 SCF (and everything after it) | was: `nr_rks` 53–62 % of a patched pure-mGGA SCF, 34–41 % of an M06-2X one, every call handed to stock (§10.3) | **built and measured.**  The grouped pass now takes meta-GGA: the four orbital products per block in one grouped launch, rho/∇rho/tau in one kernel per block, the four potential products in one grouped launch.  `nr_rks` **2.0x** at 42 atoms and **1.5x** at 113; SCF 1.14–1.46x (42) and 1.15–1.29x (113), inside §5.1's 1.3–1.45x bound; energies to 4e-12 Eh.  **Left**: the potential's four products per block, flop-bound |
 | 5 **done** | **C7** NMR: GIAO AOs on the GPU — `fastnmr` (§13.5) | every NMR shielding | was: **72–78 %** of a patched NMR run (§10.4) | **built and measured.**  `GTOval_ig`/`_ipig` are ½(R_μ × r)φ and its derivative, formed on the GPU from the block's own AOs, one GEMM per block for all three field directions: the term 30.3 → < 0.1 s, 131.7 → < 1 s, 916.9 → 1.6 s at 22 / 42 / 113 atoms; NMR **4.2x / 4.5x / 1.62x**, shieldings to 3e-12 ppm.  **Left**: C6 (`int2e_ig1` on the CPU) is now 87–97 % of an NMR run — a §5.3 entry, greenfield |
 | 6 **done** | **D10** TDDFT gradient / NAC two-electron derivative — `fasttdejk` (§13.6) | TDDFT gradients, NACs, FSSH | was: **54–72 %** of the batched force + all-NAC run once D12 is taken (§11.1) | **built and measured.**  A pair family generated from `fastejk`'s kernels: `EJK_NT` outputs per launch, density products in registers, all 63 classes through f.  D10 **2.73x / 2.74x / 2.33x** (penicillin V B3LYP / PBE, taxol B3LYP); the batched force + all NACs **1.77x / 1.88x / 1.50x** on top of rank 3 (147.8 → 40.0 s with both, penicillin V B3LYP).  Found: GPU4PySCF's kernels miss finite differences by 2–6e-2 on a general density pair and are not reproducible — the source of its NACV scatter.  **Left**: the Z-vector CPHF and D9 |
-| 7 | **A17** native short-range K for HSE06 | every HSE06 (and any `erfc`-only RSH) SCF and its derivatives | patched `get_k` is **66 % / 72 %** of a patched HSE06 SCF at 113 / 284 atoms; the decomposition gives it **1.01x / 1.05x** (§10.5) | not a regression (Q5 refuted) but the locality of `erfc` is lost from ~100 atoms on; ~1.7x on the 284-atom SCF if B3LYP's 2.5x transferred.  mod |
+| 7 **rejected** | **A17** native short-range K for HSE06 (§13.7) | every HSE06 (and any `erfc`-only RSH) SCF and its derivatives | was: patched `get_k` **66 % / 72 %** of a patched HSE06 SCF at 113 / 284 atoms; 1.01x / 1.05x over stock (§10.5) | **built, measured, rejected.**  GPU4PySCF's short-range screen (Schwarz on the erfc operator, plus its distance estimate from the most diffuse exponents) put into the fused kernels' task filler: `get_k` **3.49 / 15.83 / 58.20 s against 3.33 / 15.17 / 58.27 s** without it (42 / 113 / 284 atoms), energies equal.  The premise was wrong: the exchange's density screen already removes the quartets erfc would, and what makes HSE06's K dearer than B3LYP's is the doubled Rys roots erfc needs (full − long range), which a native kernel needs too.  Code not kept |
 | 8 | **I1** DF-MP2 pair-energy loop | every DF-MP2 and DF-UMP2 | **73 % / 81 %** of the DF-MP2 step at 42 / 113 atoms (§10.10); the UMP2 pair loops are **92–94 %** of DF-UMP2 (§12.4) | easy, exact to round-off |
 | 9 | **C5** C6 coefficients: full A/B and a host eigensolve | `properties.c6` | `_solve_full_spectrum` is **95 %** of a patched 22-atom run: `get_ab` (D4, CPU `int2e` + O(N⁵) transforms) 41 %, the host Cholesky/`eigh` on `2·nov` 54 %; 53 % at 10 atoms, so it climbs as nov³ (§11.9) | the GPU ovov builder exists for D4; the eigensolve wants an imaginary-frequency CPKS on the response path Electrolites already accelerates.  mod |
 | 10 | **C11** Raman's field finite differences | Raman intensities | the polarizability derivative by 7 field points is **51–61 %** of a patched Raman run, 1.3–2.2 Hessians' worth (§12.1) | greenfield analytic derivative, but it can reuse C10's single CPHF `mo1`; Electrolites already takes Raman 2.4–4.8x |
@@ -1339,3 +1340,32 @@ densities of a TDDFT gradient, NAC and batched solve it agrees with this
 module to 5e-12.  That non-reproducibility is the source of the NACV scatter
 §13.3 recorded.  The row's residue: at 113 atoms the batched run is now the
 Z-vector CPHF (115 s), D10 (106 s) and D9 (30 s).
+
+### 13.7 Rank 7 — A17: short-range screening for HSE06's K — measured, rejected
+
+Built (then removed): for a pure short-range request (`lr = 0`), the fused
+`fastk` kernels' task filler screened on a short-range sibling `_VHFOpt`'s
+Schwarz bound (`q_cond` of the erfc operator) and on GPU4PySCF's own
+distance estimate (`_fill_sr_vk_tasks`: per-pair `s_cond` plus
+`log(r² + 1) + θ r²` from the most diffuse exponents), compiled as a separate
+`-DSR_SCREEN` module whose screening data are module globals.  The K matrix
+agreed with GPU4PySCF's to ≤ 2.7e-14 on four systems (water, glycine/def2-TZVP,
+alanine dipeptide, Ni dithiolene²⁻).
+
+| HSE06 SCF, `get_k` over the SCF (def2-SVP; PfPMT 6-31G\*) | stock | fused, full-range screen | fused, short-range screen |
+|---|---|---|---|
+| penicillin V (42) | 9.67 s | 3.33 s | 3.49 s |
+| taxol (113) | 15.42 s | 15.17 s | 15.83 s |
+| PfPMT (284) | 60.9 s | 58.27 s | 58.20 s |
+
+A per-call probe on taxol densities from the first, sixth, ninth and twelfth
+cycle gives the same answer (1.54 / 1.05 / 0.79 / 0.61 s with the screen
+against 1.49 / 1.01 / 0.76 / 0.58 s without).  The exchange contraction is
+already screened on `D_ik D_jl`, and a converged density is local on the
+scale on which erfc(0.11 r) decays, so the quartets the erfc estimate would
+drop are already gone.  What makes HSE06's K 1.81x dearer than B3LYP's at 284
+atoms (§10.5) is that an erfc integral needs twice the Rys roots (full minus
+long range), on every path including GPU4PySCF's.  Q5 stays refuted; the row
+is moved to §3.3.  Reducing the root count for erfc (a quadrature for the
+truncated weight) would be the next idea, and it is research rather than a
+kernel change.
