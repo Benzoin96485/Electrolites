@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -207,6 +207,10 @@ _TARGETS = {
     # the TDDFT gradient / NAC two-electron derivative for density pairs
     # (D10); `Gradients.jk_energies_per_atom` looks the name up at call time
     'fasttdejk': ('gpu4pyscf.grad.tdrhf', '_jk_energies_per_atom'),
+    # the DF-MP2 / DF-UMP2 pair-energy loops (I1); the drivers look them up
+    # on `dfmp2_addons` at call time
+    'fastdfmp2': (('gpu4pyscf.mp.dfmp2_addons', 'get_dfmp2_energy_pair_intra'),
+                  ('gpu4pyscf.mp.dfmp2_addons', 'get_dfump2_energy_pair_intra')),
     # the Hessian's CPHF solve (docs/DF_WORK_LIST.md W44): both spin cases'
     # `solve_mo1`, which the Hessian classes' methods look up on their
     # modules at call time, and the Krylov solver and QR it reuses

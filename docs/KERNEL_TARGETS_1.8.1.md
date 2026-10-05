@@ -474,7 +474,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 5 **done** | **C7** NMR: GIAO AOs on the GPU — `fastnmr` (§13.5) | every NMR shielding | was: **72–78 %** of a patched NMR run (§10.4) | **built and measured.**  `GTOval_ig`/`_ipig` are ½(R_μ × r)φ and its derivative, formed on the GPU from the block's own AOs, one GEMM per block for all three field directions: the term 30.3 → < 0.1 s, 131.7 → < 1 s, 916.9 → 1.6 s at 22 / 42 / 113 atoms; NMR **4.2x / 4.5x / 1.62x**, shieldings to 3e-12 ppm.  **Left**: C6 (`int2e_ig1` on the CPU) is now 87–97 % of an NMR run — a §5.3 entry, greenfield |
 | 6 **done** | **D10** TDDFT gradient / NAC two-electron derivative — `fasttdejk` (§13.6) | TDDFT gradients, NACs, FSSH | was: **54–72 %** of the batched force + all-NAC run once D12 is taken (§11.1) | **built and measured.**  A pair family generated from `fastejk`'s kernels: `EJK_NT` outputs per launch, density products in registers, all 63 classes through f.  D10 **2.73x / 2.74x / 2.33x** (penicillin V B3LYP / PBE, taxol B3LYP); the batched force + all NACs **1.77x / 1.88x / 1.50x** on top of rank 3 (147.8 → 40.0 s with both, penicillin V B3LYP).  Found: GPU4PySCF's kernels miss finite differences by 2–6e-2 on a general density pair and are not reproducible — the source of its NACV scatter.  **Left**: the Z-vector CPHF and D9 |
 | 7 **rejected** | **A17** native short-range K for HSE06 (§13.7) | every HSE06 (and any `erfc`-only RSH) SCF and its derivatives | was: patched `get_k` **66 % / 72 %** of a patched HSE06 SCF at 113 / 284 atoms; 1.01x / 1.05x over stock (§10.5) | **built, measured, rejected.**  GPU4PySCF's short-range screen (Schwarz on the erfc operator, plus its distance estimate from the most diffuse exponents) put into the fused kernels' task filler: `get_k` **3.49 / 15.83 / 58.20 s against 3.33 / 15.17 / 58.27 s** without it (42 / 113 / 284 atoms), energies equal.  The premise was wrong: the exchange's density screen already removes the quartets erfc would, and what makes HSE06's K dearer than B3LYP's is the doubled Rys roots erfc needs (full − long range), which a native kernel needs too.  Code not kept |
-| 8 | **I1** DF-MP2 pair-energy loop | every DF-MP2 and DF-UMP2 | **73 % / 81 %** of the DF-MP2 step at 42 / 113 atoms (§10.10); the UMP2 pair loops are **92–94 %** of DF-UMP2 (§12.4) | easy, exact to round-off |
+| 8 **done** | **I1** DF-MP2 pair-energy loop — `fastdfmp2` (§13.8) | every DF-MP2 and DF-UMP2 | was: **73 % / 81 %** of the DF-MP2 step at 42 / 113 atoms; UMP2 pair loops 92–94 % (§10.10, §12.4) | **built and measured.**  Block-pair GEMMs and one reduction kernel per block, no host sync until the end: DF-MP2 step **2.2x / 1.28x**, DF-UMP2 **3.7x / 1.33x** at 42 / 113 atoms.  **Left**: at 113 atoms the fp32 GEMM itself (~15 TF) |
 | 9 | **C5** C6 coefficients: full A/B and a host eigensolve | `properties.c6` | `_solve_full_spectrum` is **95 %** of a patched 22-atom run: `get_ab` (D4, CPU `int2e` + O(N⁵) transforms) 41 %, the host Cholesky/`eigh` on `2·nov` 54 %; 53 % at 10 atoms, so it climbs as nov³ (§11.9) | the GPU ovov builder exists for D4; the eigensolve wants an imaginary-frequency CPKS on the response path Electrolites already accelerates.  mod |
 | 10 | **C11** Raman's field finite differences | Raman intensities | the polarizability derivative by 7 field points is **51–61 %** of a patched Raman run, 1.3–2.2 Hessians' worth (§12.1) | greenfield analytic derivative, but it can reuse C10's single CPHF `mo1`; Electrolites already takes Raman 2.4–4.8x |
 | 11 | **B12** the per-density exchange contraction `C` | every direct Hessian, frequencies, IR — and TDDFT | `get_k` **37–55 %** of a patched Hessian, 94 % of it `C`; the response `get_jk` is **71 %** of a patched 113-atom TDDFT + gradient + NAC run, where `fastjk` falls to 1.33x (§10.1) | the largest share in both paths and it grows; no treatment transfers |
@@ -1369,3 +1369,22 @@ long range), on every path including GPU4PySCF's.  Q5 stays refuted; the row
 is moved to §3.3.  Reducing the root count for erfc (a quadrature for the
 truncated weight) would be the next idea, and it is research rather than a
 kernel change.
+
+### 13.8 Rank 8 — I1: the DF-MP2 pair-energy loops (`docs/README_fastdfmp2.md`)
+
+Built: `fastdfmp2` replaces `get_dfmp2_energy_pair_intra` and
+`get_dfump2_energy_pair_intra`: pairs in blocks of 16 occupied orbitals, one
+GEMM per block pair, one kernel reducing each `(i, j)` slice to its pair
+energies (amplitudes written from the same GEMM output when asked for), pair
+sums in double precision, one host synchronisation per call.
+
+| def2-SVP, `--patch all` | before | after |
+|---|---|---|
+| DF-MP2 step, penicillin V | 1.29 s | 0.59 s (2.2x) |
+| DF-MP2 step, taxol | 17.06 s | 13.36 s (1.28x) |
+| DF-UMP2 step, penicillin V⁺ | 3.37 s | 0.92 s (3.7x) |
+| DF-UMP2 step, taxol⁺ | 55.58 s | 41.88 s (1.33x) |
+
+Correlation energies equal to 3e-14 (RMP2) and 7e-11 Eh (UMP2, float32
+integrals).  The share is gone at 42 atoms; at 113 atoms the loop is the fp32
+GEMM at ~15 TF, i.e. arithmetic.
