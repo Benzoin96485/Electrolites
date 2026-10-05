@@ -86,6 +86,53 @@ AOs) because the batching has more blocks to work with and the per-launch
 overhead it removes is a larger share of a bigger problem — the opposite of the
 usual worry, but worth stating: the mechanism is not a small-system artefact.
 
+## Restricted meta-GGA (catalogue A14, 2026-10-05)
+
+Until this round `nr_rks` handed every restricted meta-GGA call (TPSS,
+r2SCAN, SCAN, M06-2X, MN15) back to GPU4PySCF, although the unrestricted
+build covered meta-GGA; `docs/KERNEL_TARGETS_1.8.1.md` §10.3 measured that
+call at 53–62 % of a patched pure-mGGA SCF.  Now the grouped pass handles it:
+
+* **density**: tau needs all four AO components contracted.  Through the
+  occupied orbitals (scaled by `sqrt(occ)`) that is four `nocc x nsub x ng`
+  products — one grouped launch for every block of a group — and rho, its
+  gradient and tau are then sums of squares, formed for a block in **one**
+  kernel (`mgga_rho_mo`): the seven `_contract_rho` reductions per block it
+  replaces were ~9000 launches a call on a 1e6-point grid and cost more than
+  the GEMMs.  When `nocc` exceeds the block's AO count the density-matrix
+  route (four `nsub x nsub x ng` products) is used instead, the same rule as
+  for GGA.
+* **potential**: the GGA product and the three tau products
+  `nabla_m phi (w_tau nabla_m phi)^T` of every block go into one grouped
+  launch and are summed per block before the scatter — the unrestricted
+  build's `_vmat_pairs`, reused.
+
+Measured (`benchmarks/path_anatomy.py --feature scf --no-grad --patch all`,
+def2-SVP, level 3, with and without `FASTXC_RKS_MGGA=0`, best of two, one
+A100-SXM4-80GB; the node was running CPU-heavy NMR jobs at the same time,
+which is why the stock column reads slower than §10.3):
+
+| | `nr_rks`, before | after | | SCF, before | after | |
+|---|---|---|---|---|---|---|
+| penicillin V / TPSS | 4.38 s | 2.15 s | **2.04x** | 7.70 s | 5.27 s | **1.46x** |
+| penicillin V / r2SCAN | 3.73 s | 2.26 s | 1.65x | 6.81 s | 5.95 s | 1.14x |
+| penicillin V / M06-2X | 3.94 s | 1.90 s | 2.07x | 9.01 s | 7.14 s | 1.26x |
+| taxol / TPSS | 11.86 s | 8.08 s | 1.47x | 18.19 s | 14.38 s | 1.26x |
+| taxol / r2SCAN | 11.38 s | 7.66 s | 1.49x | 17.47 s | 13.53 s | 1.29x |
+| taxol / M06-2X | 9.43 s | 6.46 s | 1.46x | 23.72 s | 20.58 s | 1.15x |
+
+At 113 atoms what is left of the call is the potential (the four products per
+block, ~0.21 s of 0.42 s a call on taxol/TPSS, flop-bound at ~8 TF) and the AO
+evaluation; the gain is 1.5x rather than the GGA path's 2x because a
+meta-GGA call does four times the GEMM work of a GGA one and the batching only
+removes launch overhead.
+
+`tests/test_rxc_mgga.py`: eight cases (TPSS, r2SCAN, M06-2X, SCAN, MN15,
+TPSSh; water, glycine, the Pt amine complex with its ECP, Ni dithiolene²⁻;
+def2-TZVPP; grid levels 1–3), the matrix to ≤ 2.0e-14 relative and the SCF
+energy to ≤ 4.1e-12 Eh against GPU4PySCF.  `FASTXC_RKS_MGGA=0` is the
+ablation.
+
 ## Files
 
 | file | role |

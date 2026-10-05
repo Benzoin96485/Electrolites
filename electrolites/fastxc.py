@@ -59,6 +59,39 @@ from gpu4pyscf.__config__ import num_devices
 # density-matrix and orbital routes per block.
 MODE = os.environ.get('FASTXC_MODE', 'grouped')
 RHO = os.environ.get('FASTXC_RHO', 'auto')
+# FASTXC_RKS_MGGA=0 hands restricted meta-GGA back to GPU4PySCF, as before
+# catalogue A14 was taken (docs/README_fastxc.md, the A14 section)
+RKS_MGGA = os.environ.get('FASTXC_RKS_MGGA', '1') != '0'
+
+
+_MGGA_RHO_SRC = r'''
+extern "C" __global__ void
+mgga_rho_mo(const double *c0, const double *c1, const double *c2,
+            const double *c3, double *rho, int nocc, int ng)
+{
+    // rho, nabla rho and tau of one grid block from the orbital products
+    // c_m[i, g] = sum_mu C_mu,i d_m phi_mu(g), C scaled by sqrt(occ):
+    // rho = sum c0^2, d_m rho = 2 sum c0 c_m, tau = 1/2 sum_m sum c_m^2
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= ng) return;
+    double r = 0, x = 0, y = 0, z = 0, t = 0;
+    for (int i = 0; i < nocc; ++i) {
+        const size_t k = (size_t)i * ng + g;
+        const double a = c0[k], bx = c1[k], by = c2[k], bz = c3[k];
+        r += a * a; x += a * bx; y += a * by; z += a * bz;
+        t += bx * bx + by * by + bz * bz;
+    }
+    rho[g] = r; rho[ng + g] = 2 * x; rho[2 * ng + g] = 2 * y;
+    rho[3 * ng + g] = 2 * z; rho[4 * ng + g] = .5 * t;
+}
+'''
+_MGGA_K = []
+
+
+def _mgga_rho_kernel():
+    if not _MGGA_K:
+        _MGGA_K.append(cupy.RawKernel(_MGGA_RHO_SRC, 'mgga_rho_mo'))
+    return _MGGA_K[0]
 
 
 def _prep(ni, mol, grids, dms):
@@ -171,7 +204,40 @@ def _nr_rks_grouped(ni, mol, grids, xc_code, dms, hermi, verbose):
         ao0 = [a if ao_deriv == 0 else a[0] for a in ao_group]
         route = _rho_route(max(len(i) for i in idx_group), nocc, nvar, dm, mo)
         rho_group = []
-        if route == 'dm':
+        if xctype == 'MGGA' and mo is not None and (
+                RHO == 'mo' or (RHO == 'auto' and
+                                nocc < max(len(i) for i in idx_group))):
+            # tau needs all four AO components contracted; through the
+            # occupied orbitals that is four (nocc x nsub x ng) products
+            # instead of four (nsub x nsub x ng) ones, and rho, its
+            # gradient and tau are sums of squares of the results
+            cpos = [cupy.take(mo, idx, axis=0) for idx in idx_group]
+            c_all = grouped_gemm([c for c in cpos for _ in range(4)],
+                                 [ao[m] for ao in ao_group for m in range(4)])
+            cpos = None
+            for b in range(len(ao_group)):
+                c = c_all[4*b:4*b+4]
+                ngb = c[0].shape[1]
+                rho = cupy.empty((5, ngb))
+                _mgga_rho_kernel()(((ngb + 127) // 128,), (128,),
+                                   (c[0], c[1], c[2], c[3], rho,
+                                    np.int32(c[0].shape[0]), np.int32(ngb)))
+                rho_group.append(rho)
+            c_all = None
+        elif xctype == 'MGGA':
+            # tau needs D . nabla_m ao for m = 1..3 as well; all four
+            # products of every block go into one grouped launch, exactly as
+            # the unrestricted build does for each spin (catalogue A14)
+            masks = [take_last2d(dm, idx) for idx in idx_group]
+            c_group = [cupy.empty((4,) + a.shape) for a in ao0]
+            grouped_gemm([m_ for m_ in masks for _ in range(4)],
+                         [ao[m] for ao in ao_group for m in range(4)],
+                         Cs=[c[m] for c in c_group for m in range(4)])
+            masks = None
+            for ao, c, a0 in zip(ao_group, c_group, ao0):
+                rho_group.append(_rho_from_c(ao, c, xctype, a0.shape[1]))
+            c_group = None
+        elif route == 'dm':
             # dm_mask is symmetric, so grouped_gemm's A^T.B is dm_mask . ao0
             masks = [take_last2d(dm, idx) for idx in idx_group]
             c0_group = grouped_gemm(masks, ao0)
@@ -214,6 +280,29 @@ def _nr_rks_grouped(ni, mol, grids, xc_code, dms, hermi, verbose):
         rho_cat = None
 
         # ---- potential matrix, batched over the same blocks ---------------
+        if xctype == 'MGGA':
+            # the GGA product and the three tau products of every block in
+            # one grouped launch, summed per block before the scatter
+            pairs, owner = [], []
+            p0 = 0
+            for b, (ao, w) in enumerate(zip(ao_group, w_group)):
+                p1 = p0 + w.size
+                for A, B in _vmat_pairs(ao, wv[:, p0:p1], xctype):
+                    pairs.append((A, B))
+                    owner.append(b)
+                p0 = p1
+            res = grouped_dot([A for A, _ in pairs], [B for _, B in pairs])
+            pairs = None
+            vb = [None] * len(ao_group)
+            for r, b in zip(res, owner):
+                if vb[b] is None:
+                    vb[b] = r
+                else:
+                    vb[b] += r
+            for r, idx in zip(vb, idx_group):
+                add_sparse(vmat, r, idx)
+            res = vb = ao0 = None
+            continue
         aow_group = []
         p0 = 0
         for ao_mask, w in zip(ao_group, w_group):
@@ -502,10 +591,10 @@ def _nr_rks_dispatch(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
                      max_memory=2000, verbose=None):
     xctype = ni._xc_type(xc_code)
     ok = (num_devices == 1 and hermi == 1 and getattr(dms, 'ndim', 3) == 2
-          and xctype in ('LDA', 'GGA'))
-    if ok and MODE == 'grouped':
+          and xctype in ('LDA', 'GGA', 'MGGA'))
+    if ok and MODE == 'grouped' and (xctype != 'MGGA' or RKS_MGGA):
         return _nr_rks_grouped(ni, mol, grids, xc_code, dms, hermi, verbose)
-    if ok and MODE == 'perblock':
+    if ok and MODE == 'perblock' and xctype != 'MGGA':
         return _nr_rks_perblock(ni, mol, grids, xc_code, dms, hermi, verbose)
     return NI._nr_rks_orig(ni, mol, grids, xc_code, dms, relativity, hermi,
                            max_memory, verbose)
