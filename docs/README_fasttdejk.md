@@ -56,6 +56,11 @@ same node:
 | one TDDFT gradient + one NAC, penicillin V / B3LYP | 6.0 s | 4.1 s | 1.46x | 20.3 s | 17.8 s | 1.14x |
 | one TDDFT gradient + one NAC, taxol / PBE | 18.8 s | 10.4 s | 1.81x | 72.9 s | 64.9 s | 1.12x |
 
+A closed-shell transition-metal complex (Ni dithiolene²⁻, 21 atoms, def2-SVP,
+B3LYP; the Ni s shells form bra pairs of more than 36 primitives, so 6 of
+3298 class groups go to GPU4PySCF's kernel): TDDFT gradient + one NAC
+50.0 → 41.7 s (1.20x), gradient and NAC equal to 5e-11.
+
 With rank 3, a penicillin V B3LYP force + all-NACs step goes 147.8 → 40.0 s
 (3.7x).  What is left of the batched run at 113 atoms: the Z-vector CPHF
 (115 s), D10 (106 s) and the batched XC kernel (30 s, D9).
