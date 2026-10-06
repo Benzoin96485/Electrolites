@@ -476,7 +476,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 7 **rejected** | **A17** native short-range K for HSE06 (§13.7) | every HSE06 (and any `erfc`-only RSH) SCF and its derivatives | was: patched `get_k` **66 % / 72 %** of a patched HSE06 SCF at 113 / 284 atoms; 1.01x / 1.05x over stock (§10.5) | **built, measured, rejected.**  GPU4PySCF's short-range screen (Schwarz on the erfc operator, plus its distance estimate from the most diffuse exponents) put into the fused kernels' task filler: `get_k` **3.49 / 15.83 / 58.20 s against 3.33 / 15.17 / 58.27 s** without it (42 / 113 / 284 atoms), energies equal.  The premise was wrong: the exchange's density screen already removes the quartets erfc would, and what makes HSE06's K dearer than B3LYP's is the doubled Rys roots erfc needs (full − long range), which a native kernel needs too.  Code not kept |
 | 8 **done** | **I1** DF-MP2 pair-energy loop — `fastdfmp2` (§13.8) | every DF-MP2 and DF-UMP2 | was: **73 % / 81 %** of the DF-MP2 step at 42 / 113 atoms; UMP2 pair loops 92–94 % (§10.10, §12.4) | **built and measured.**  Block-pair GEMMs and one reduction kernel per block, no host sync until the end: DF-MP2 step **2.2x / 1.28x**, DF-UMP2 **3.7x / 1.33x** at 42 / 113 atoms.  **Left**: at 113 atoms the fp32 GEMM itself (~15 TF) |
 | 9 **done** | **C5** C6 coefficients — `fastc6` (§13.9) | `properties.c6` | was: `_solve_full_spectrum` **95 %** of a patched 22-atom run: `get_ab` 41 %, host Cholesky/`eigh` 54 % (§11.9) | **built and measured.**  The AO ERI from GPU4PySCF's GPU fill into `get_ab`'s unchanged transformation, the Casida linear algebra in CuPy, and the second spectrum of `calc_c6(td, td)` not solved: **6.5x / 6.7x** (alanine dipeptide B3LYP / PBE), 2.7x at glycine; C6 to 1e-12.  The imaginary-frequency CPKS route was not needed.  **Left**: the method's own O(nov³) and `nao⁴` |
-| 10 | **C11** Raman's field finite differences | Raman intensities | the polarizability derivative by 7 field points is **51–61 %** of a patched Raman run, 1.3–2.2 Hessians' worth (§12.1) | greenfield analytic derivative, but it can reuse C10's single CPHF `mo1`; Electrolites already takes Raman 2.4–4.8x |
+| 10 **open (cheap variant rejected)** | **C11** Raman's field finite differences (§13.10) | Raman intensities | the polarizability derivative by 7 field points is **51–61 %** of a patched Raman run (§12.1) | **the cheap variant was built and rejected; the analytic derivative is not attempted.**  Each of the 19 field SCFs started from the field-free density instead of `minao`: the field FD 21.16 → 20.74 s (alanine dipeptide), 58.75 → 57.59 s (penicillin V) — 2 %, and a warm start failed to converge on glycine/PBE at `conv_tol` 1e-12.  A field of 2.5e-3 au moves the energy by ~4e-3 Eh, so a warm SCF still takes 7–8 cycles, and per-field set-up dominates.  What is left is the greenfield analytic derivative (Amos 1986; 2n+1 with the Hessian's `mo1` and the polarizability's U^F, plus third XC derivatives) |
 | 11 | **B12** the per-density exchange contraction `C` | every direct Hessian, frequencies, IR — and TDDFT | `get_k` **37–55 %** of a patched Hessian, 94 % of it `C`; the response `get_jk` is **71 %** of a patched 113-atom TDDFT + gradient + NAC run, where `fastjk` falls to 1.33x (§10.1) | the largest share in both paths and it grows; no treatment transfers |
 | 12 | **B16** short-range half of RSH derivatives, UKS | UKS range-separated gradients (and both Hessians' ip2) | **88 % / 96 %** of a patched UKS ωB97X gradient (§10.8) | easy: `fastgrad`'s RKS identity (1.99x on the same term) ported to `grad.uks` |
 | 13 | **F13 (+F6)** QM/MM's MM terms | QM/MM SCF and gradients | MM-specific terms **15 % / 34 %** of a patched QM/MM SCF + gradient at 10⁴ / 10⁵ charges; the largest, the QM-nucleus–MM energy recomputed on the host every SCF cycle, is 17 % at 10⁵ (§12.3) | F6's caching is easy and bitwise; the far-field collapse of `fast1e` for the `_ip` kernels is mod |
@@ -1408,3 +1408,26 @@ C6 to ≤ 1.3e-12 relative, excitation energies to 1.2e-10 Eh over six cases
 (`tests/test_c6.py`).  The proposed imaginary-frequency CPKS was not needed to
 remove the host: the matrices fit on the device for every system the
 full-spectrum method is used on.
+
+### 13.10 Rank 10 — C11: Raman's field finite differences — cheap variant rejected, analytic open
+
+Built (then removed): `raman.polarizability_derivative_numerical_dEdE`
+re-executed with each of its 19 field SCFs starting from the converged
+field-free density (and a cold retry if the warm one does not converge).
+
+| B3LYP/def2-SVP, `--patch all` | field FD, cold starts | warm starts | Raman total |
+|---|---|---|---|
+| alanine dipeptide | 21.16 s | 20.74 s | 29.67 → 29.23 s |
+| penicillin V | 58.75 s | 57.59 s | 104.56 → 103.68 s |
+
+Two percent.  A field of 2.5e-3 au changes the water energy by 3.6e-3 Eh, so a
+warm-started field SCF still needs 7–8 cycles at `conv_tol` 1e-12 against
+~9 cold, and the per-field set-up (a new gradient object, the response
+caches) is what is left; on glycine/PBE at 1e-12 one warm SCF did not converge
+at all.  Not kept.  The row stays open for the change the catalogue actually
+proposes, the analytic polarizability derivative (Amos, *Chem. Phys. Lett.*
+**124**, 376 (1986)): with the Hessian's `mo1` (rank 2 already keeps it) and
+the polarizability's field response it is a 2n+1 expression, but it needs the
+third functional derivative of the XC energy contracted with two response
+densities and derivative integrals the package does not yet assemble — a
+greenfield implementation, not attempted in this round.
