@@ -228,7 +228,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastrsh` | `dft.rks.RKS.get_veff` — range-separated hybrids on 1.7.x only | `docs/README_fastrsh.md` |
 | `fast1e` | `gto.int3c1e.get_int3c1e*` — PCM, QM/MM, ESP, CHELPG | `docs/README_fast1e.md` |
 | `fastejk` | `grad.rhf._jk_energy_per_atom` | `docs/README_fastejk.md` |
-| `fastgrad` | `grad.rks.Gradients.energy_ee` | — |
+| `fastgrad` | `grad.rks.Gradients.energy_ee`, `grad.uks.Gradients.energy_ee`, `hessian.{rks,uks}.partial_hess_elec` | — |
 | `fastxcgrad` | `grad.{rks,uks}.get_exc`, `get_nlc_exc` | `docs/README_fastxcgrad.md` |
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | — |
 | `fastxchess` | `hessian.{rks,uks}._get_vxc_deriv{1,2}` (GGA and meta-GGA), and `hessian.rks`'s in-place `contract` calls | `docs/README_fastxchess.md`, `docs/README_mgga_repro.md`, `docs/README_fastxchessmgga.md` |

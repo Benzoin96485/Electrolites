@@ -478,7 +478,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 9 **done** | **C5** C6 coefficients — `fastc6` (§13.9) | `properties.c6` | was: `_solve_full_spectrum` **95 %** of a patched 22-atom run: `get_ab` 41 %, host Cholesky/`eigh` 54 % (§11.9) | **built and measured.**  The AO ERI from GPU4PySCF's GPU fill into `get_ab`'s unchanged transformation, the Casida linear algebra in CuPy, and the second spectrum of `calc_c6(td, td)` not solved: **6.5x / 6.7x** (alanine dipeptide B3LYP / PBE), 2.7x at glycine; C6 to 1e-12.  The imaginary-frequency CPKS route was not needed.  **Left**: the method's own O(nov³) and `nao⁴` |
 | 10 **open (cheap variant rejected)** | **C11** Raman's field finite differences (§13.10) | Raman intensities | the polarizability derivative by 7 field points is **51–61 %** of a patched Raman run (§12.1) | **the cheap variant was built and rejected; the analytic derivative is not attempted.**  Each of the 19 field SCFs started from the field-free density instead of `minao`: the field FD 21.16 → 20.74 s (alanine dipeptide), 58.75 → 57.59 s (penicillin V) — 2 %, and a warm start failed to converge on glycine/PBE at `conv_tol` 1e-12.  A field of 2.5e-3 au moves the energy by ~4e-3 Eh, so a warm SCF still takes 7–8 cycles, and per-field set-up dominates.  What is left is the greenfield analytic derivative (Amos 1986; 2n+1 with the Hessian's `mo1` and the polarizability's U^F, plus third XC derivatives) |
 | 11 **done** | **B12** the per-density exchange contraction `C` (§13.11) | every direct Hessian, frequencies, IR — and TDDFT | `get_k` **37–55 %** of a patched Hessian, 94 % of it `C`; the response `get_jk` is **71 %** of a patched 113-atom TDDFT + gradient + NAC run, where `fastjk` falls to 1.33x (§10.1) | **both halves built.**  (a) measured by ablation: the `atomicAdd`s are **72 %** of `C`, and the writes into a ket column, which lanes of one warp share, most of that; a segmented warp reduction of those writes is `C` 1.13x (42 atoms) and `get_k` in the CPHF **1.47x** (113 atoms).  (b) the response builds inside `solve_mo1` screen at `1e-3·conv_tol_cpscf` (≤ 1e-9) instead of 1e-13.  Whole Hessian **45.71 → 34.85 s (1.31x)** penicillin V, **1175.4 → 525.8 s (2.24x)** taxol, 84.0 → 79.1 s (1.06x) a Ni(II) UKS complex; the Hessian moves 5.9e-8 Eh/bohr² on taxol, against 4.7e-5–3.2e-4 that the solve's own tolerance moves it |
-| 12 | **B16** short-range half of RSH derivatives, UKS | UKS range-separated gradients (and both Hessians' ip2) | **88 % / 96 %** of a patched UKS ωB97X gradient (§10.8) | easy: `fastgrad`'s RKS identity (1.99x on the same term) ported to `grad.uks` |
+| 12 **done** | **B16** short-range half of RSH derivatives, UKS (§13.12) | UKS range-separated gradients (and both Hessians' ip2) | **88 % / 96 %** of a patched UKS ωB97X gradient (§10.8) | **done in all three remaining places**: `grad/uks.py:energy_ee` and both Hessians' `partial_hess_elec` build `K(erf)` with `alpha-hyb` instead of `K(erfc)`.  UKS ωB97X gradient **2.87 → 2.17 s (1.32x)** penicillin V⁺, **13.12 → 4.82 s (2.72x)** Ni(II) dithiolene⁻; Hessian `partial_hess_elec` 1.31x (RKS, 42 atoms) / 1.46x (UKS Ni); agreement ≤ 1e-9 over five functionals |
 | 13 | **F13 (+F6)** QM/MM's MM terms | QM/MM SCF and gradients | MM-specific terms **15 % / 34 %** of a patched QM/MM SCF + gradient at 10⁴ / 10⁵ charges; the largest, the QM-nucleus–MM energy recomputed on the host every SCF cycle, is 17 % at 10⁵ (§12.3) | F6's caching is easy and bitwise; the far-field collapse of `fast1e` for the `_ip` kernels is mod |
 | 14 | **J5 / J7** periodic PP strain and per-atom `hcore` | k-point stress and gradients | J5 (GTH non-local PP strain) is **45–59 %** of a stress tensor, which costs 1.3–3.4 SCFs; J7 is **20–56 %** of a k-point FFTDF gradient (§11.6) | easy–mod: J7 has its G-space twin in the multigrid branch; J5 is Python loops over strains × k × atoms with CPU `eval_gto` |
 | 15 | **A21** GKS multi-collinear XC | GKS / spin–orbit DFT on small heavy-element systems | `mcfun.eval_xc_eff` is **90–94 %** of a patched GKS SCF (§11.8) | mod; narrow reach.  FeCl₄⁻'s GKS also does not converge in 50 cycles — a robustness note for upstream |
@@ -1524,3 +1524,38 @@ the ket-column writes of those families, and the other column's in all, are
 still one atomic per lane.  Found on the way: `fastjk2_generated.cu` offset
 `vj` by `i_dm * nao * nao` in `int` (overflow past ~1700 densities at 1123
 AOs); now `size_t`, in the generator too.
+
+### 13.12 Rank 12 — B16: the short-range half of RSH derivatives (`docs/README_fastejk.md`, last addendum)
+
+GPU4PySCF chooses `alpha*K(1/r) + (hyb-alpha)*K(erfc)` ("prefer computing
+the SR part") in four places; `fastgrad` had rewritten only `grad/rks.py`.
+The other three — `grad/uks.py:energy_ee` and the ip2 term of
+`hessian/{rks,uks}.py:partial_hess_elec` — now build
+`hyb*K(1/r) + (alpha-hyb)*K(erf)` as well, by editing GPU4PySCF's source of
+each and binding it to the live module namespace.  The short-range operator
+doubles the Rys roots (and, in the ip2 scheme, the shared memory per
+quartet); the long-range one costs what the full-range one does, and in the
+gradient it runs on `fastejk`'s kernels, which decline `omega < 0`.
+
+| ωB97X/def2-SVP, `--patch all` | before | after |
+|---|---|---|
+| penicillin V⁺ UKS gradient | 2.87 s | **2.17 s (1.32x)** |
+| ↳ 2e derivative | 2.45 s | 1.81 s |
+| Ni(II) dithiolene⁻ UKS gradient | 13.12 s | **4.82 s (2.72x)** |
+| ↳ 2e derivative | 12.56 s | 4.39 s |
+| penicillin V RKS Hessian | 59.30 s | 55.17 s (1.07x) |
+| ↳ `partial_hess_elec` | 17.67 s | 13.52 s (1.31x) |
+| Ni(II) dithiolene⁻ UKS Hessian | 166.19 s | 143.47 s (1.16x) |
+| ↳ `partial_hess_elec` | 73.70 s | 50.44 s (1.46x) |
+
+Against GPU4PySCF's functions on the same SCF, for B3LYP, ωB97X,
+CAM-B3LYP, HSE06 (SR only) and LC-ωPBE (LR only), on ethanol / ethanol⁺ and
+CuCl₂: `energy_ee` ≤ 4.1e-10 Eh/bohr, `partial_hess_elec` ≤ 9.9e-10
+(`tests/test_rsh_deriv.py`) — the two operators screen different
+integrals.  Gradient norms agree to 1e-12, Hessian traces to 1e-8.
+
+Found on the way: the first version built the UKS `energy_ee` in a *copy*
+of `grad/uks.py`'s namespace, so `fastxcgrad`'s `get_exc` (patched later)
+was silently bypassed; binding to the module's own dictionary fixed it.
+`fastc6` builds its `get_ab` the copying way too; nothing patches the
+names it calls today.

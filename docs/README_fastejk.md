@@ -19,7 +19,7 @@ g = mf.nuc_grad_method().kernel()
 | module | replaces | what it covers |
 |---|---|---|
 | `fastejk` | `grad.rhf._jk_energy_per_atom` | the per-atom derivative of `j*J - k*K`, every `(li lj\|lk ll)` class an spdf basis reaches, for the full-range and the long-range (erf) operator |
-| `fastgrad` | `grad.rks.Gradients.energy_ee` | range-separated hybrids: the long-range operator in place of GPU4PySCF's short-range one |
+| `fastgrad` | `grad.rks.Gradients.energy_ee`, `grad.uks.Gradients.energy_ee`, `hessian.{rks,uks}.partial_hess_elec` | range-separated hybrids: the long-range operator in place of GPU4PySCF's short-range one |
 | `fastxcgrad` | `grad.rks.get_exc`, `grad.rks.get_nlc_exc` | the XC (LDA/GGA) and VV10 grid contractions |
 | `fastgradh` | `grad.rhf.GradientsBase.get_hcore` | the nuclear-attraction part of the one-electron derivative, on the GPU |
 
@@ -363,3 +363,26 @@ open('work/pfpmt70.xyz', 'w').write(
     f'{len(sub)}\nfirst 70 atoms of PfPMT_cluster\n' + '\n'.join(sub) + '\n')
 PY
 ```
+
+---
+
+# Addendum: the same swap for UKS gradients and both Hessians (catalogue B16)
+
+GPU4PySCF makes the "prefer computing the SR part" choice in exactly four
+places: `grad/rks.py` (already `fastgrad`'s), `grad/uks.py`, and the ip2 term
+of `hessian/rks.py` and `hessian/uks.py:partial_hess_elec`.  The other three
+now get the same identity, `hyb*K(1/r) + (alpha-hyb)*K(erf)`: their source,
+with the exchange block edited, executed and bound to the live module
+namespace (so `fastxcgrad`'s later patches are still reached).
+`FASTGRAD_UKS_OFF=1` / `FASTGRAD_HESS_OFF=1` keep GPU4PySCF's.
+
+| ωB97X/def2-SVP, `--patch all` | 2e term before → after | whole step before → after |
+|---|---|---|
+| penicillin V⁺ UKS gradient | 2.45 → 1.81 s | 2.87 → 2.17 s (1.32x) |
+| Ni(II) dithiolene⁻ UKS gradient | 12.56 → 4.39 s | 13.12 → 4.82 s (2.72x) |
+| penicillin V RKS Hessian (`partial_hess_elec`) | 17.67 → 13.52 s | 59.30 → 55.17 s |
+| Ni(II) dithiolene⁻ UKS Hessian (`partial_hess_elec`) | 73.70 → 50.44 s | 166.19 → 143.47 s |
+
+`tests/test_rsh_deriv.py`: `energy_ee` and `partial_hess_elec` against
+GPU4PySCF's for B3LYP, ωB97X, CAM-B3LYP, HSE06 and LC-ωPBE, on ethanol(⁺)
+and CuCl₂: ≤ 4e-10 and ≤ 1e-9 (the two operators screen differently).
