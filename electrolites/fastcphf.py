@@ -41,6 +41,20 @@ upstream's budget and moves it to where the AO arrays live:
    one group; otherwise it goes to the host, which the projections read back
    once per cycle.  ``FASTCPHF_STORE=auto|device|host``.
 
+4. **The response builds inside the solve screen at the solve's precision**
+   (catalogue B12, ``docs/KERNEL_TARGETS_1.8.1.md`` §13.11).  The direct J
+   and K builds screen a quartet against ``direct_scf_tol`` (1e-13), the
+   SCF's precision; the CPHF is converged to ``conv_tol_cpscf``.  While
+   ``solve_mo1`` runs, the builds screen against
+   ``max(direct_scf_tol, min(1e-3 conv_tol_cpscf, 1e-9))`` instead -- 1e-9
+   at a 1e-6 solve, 1e-11 at PySCF's default 1e-8.  The Krylov vectors are
+   scaled to their residuals, so an absolute threshold is already a relative
+   one that loosens as the solve converges; the factor keeps it three
+   decades under the tolerance, and the cap at the loosest threshold
+   measured safe (1e-7 at a 1e-6 solve breaks the iteration).
+   ``FASTCPHF_SCREEN=off`` (or ``FASTCPHF_OFF=1``) keeps
+   ``direct_scf_tol``.
+
 Anything else -- a callback, a custom inner product, a matrix operator -- is
 upstream's ``krylov``; ``FASTCPHF_OFF=1`` is upstream's ``solve_mo1``.
 """
@@ -71,7 +85,11 @@ GB = 1024 * 1024 * 1024
 
 _S = {'solve_u': 0, 'solve_r': 0, 'declined': 0, 'blocks': 0,
       'fx_calls': 0, 'fx_groups': 0, 'krylov': 0, 'krylov_upstream': 0,
-      'store_device': 0, 'store_host': 0, 'cycles': 0}
+      'store_device': 0, 'store_host': 0, 'cycles': 0, 'screen': 0.}
+#: item 4: the screening threshold of the response builds is this times
+#: conv_tol_cpscf, but never looser than SCREEN_CAP
+SCREEN_FACTOR = 1e-3
+SCREEN_CAP = 1e-9
 
 
 def _env(name, default):
@@ -376,6 +394,56 @@ def _keeper(budget, nsets_next):
 # --------------------------------------------------------------------------
 # solve_mo1
 # --------------------------------------------------------------------------
+def _screen_tol(mf):
+    """Item 4's threshold for the response builds of this solve."""
+    base = getattr(mf, 'direct_scf_tol', 1e-13)
+    if (_env('FASTCPHF_SCREEN', 'on') == 'off'
+            or _env('FASTCPHF_OFF', '') == '1'):
+        return base
+    tol = getattr(mf, 'conv_tol_cpscf', 1e-8)
+    return max(base, min(SCREEN_FACTOR * tol, SCREEN_CAP))
+
+
+def _screened(solve):
+    """Run ``solve`` with every direct J/K build screening at
+    `_screen_tol`: the options objects the response reaches (one per
+    ``omega``, built lazily by ``_get_jk_mo``) are GPU4PySCF's ``_VHFOpt``
+    of ``scf/jk.py`` and ``scf/j_engine.py``, and each reads its
+    ``direct_scf_tol`` at call time, so the methods are wrapped for the
+    duration of the solve and restored after it."""
+    import functools
+    from gpu4pyscf.scf import jk as JK, j_engine as JE
+
+    def call_with(fn, tol):
+        @functools.wraps(fn)
+        def wrapped(self, *x, **k):
+            keep = self.direct_scf_tol
+            self.direct_scf_tol = max(keep, tol)
+            try:
+                return fn(self, *x, **k)
+            finally:
+                self.direct_scf_tol = keep
+        return wrapped
+
+    @functools.wraps(solve)
+    def run(mf, *x, **k):
+        tol = _screen_tol(mf)
+        if tol <= getattr(mf, 'direct_scf_tol', 1e-13):
+            return solve(mf, *x, **k)
+        _S['screen'] = tol
+        saved = [(JK._VHFOpt, 'get_k'), (JK._VHFOpt, 'get_jk'),
+                 (JE._VHFOpt, 'get_j')]
+        saved = [(c, n, c.__dict__[n]) for c, n in saved if n in c.__dict__]
+        for c, n, fn in saved:
+            setattr(c, n, call_with(fn, tol))
+        try:
+            return solve(mf, *x, **k)
+        finally:
+            for c, n, fn in saved:
+                setattr(c, n, fn)
+    return run
+
+
 def _use_upstream(mf):
     return (_env('FASTCPHF_OFF', '') == '1'
             or _env('FASTCPHF_BLOCK', 'auto') == 'upstream')
@@ -625,5 +693,5 @@ def solve_mo1_r(mf, mo_energy, mo_coeff, mo_occ, h1mo,
     return mo1s, e1s
 
 
-HRHF.solve_mo1 = solve_mo1_r
-HUHF.solve_mo1 = solve_mo1_u
+HRHF.solve_mo1 = _screened(solve_mo1_r)
+HUHF.solve_mo1 = _screened(solve_mo1_u)

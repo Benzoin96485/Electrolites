@@ -47,6 +47,7 @@ from gpu4pyscf.__config__ import props as gpu_specs, num_devices
 from ._paths import KERNEL_DIR as HERE
 from . import _ksplit
 from . import _gen
+from . import fastk
 from .fastk import QUEUE_DEPTH, BLOCKS_PER_SM, MAX_PRIM_PAIR, POOL_STRIDE
 from .fastk import _tables, _classes, _mpp_plan  # noqa: F401
 
@@ -120,8 +121,10 @@ def _module(lmax=None, mpp=MAX_PRIM_PAIR):
     names = None if lmax is None else _ksplit.names_within(files, lmax)
     opts = ('-std=c++17',) if mpp == MAX_PRIM_PAIR else (
         '-std=c++17', f'-DMAX_PRIM_PAIR={int(mpp)}')
-    return cp.RawModule(code=_ksplit.source(files, names),
-                        options=opts, backend='nvrtc')
+    code = _ksplit.source(files, names)
+    if not fastk._NO_KAGG:      # catalogue B12: see fastk._KAGG_SRC
+        code = fastk._kagg(code)
+    return cp.RawModule(code=code, options=opts, backend='nvrtc')
 
 
 @functools.lru_cache(maxsize=256)

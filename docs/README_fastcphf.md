@@ -166,6 +166,30 @@ at their Krylov tolerance.  Whole Hessians, patched against
 Against upstream in the same process on larger systems: 1.1e-12 relative
 (penicillin V⁺, 42 atoms), 1.9e-14 (taxol RKS, 113 atoms).
 
+## 4b. Item 4: the response builds screen at the solve's precision (catalogue B12)
+
+The direct J and K builds screen a shell quartet against `direct_scf_tol`
+(1e-13), the SCF's precision, also inside a CPHF converged to
+`conv_tol_cpscf`.  While `solve_mo1` runs, `fastcphf` now raises the
+threshold of every `_VHFOpt` the response reaches to
+`max(direct_scf_tol, min(1e-3 conv_tol_cpscf, 1e-9))`.
+`benchmarks/cphf_screen_probe.py` measured the rule on two organic
+molecules, taxol and two open-shell transition-metal complexes
+(`docs/KERNEL_TARGETS_1.8.1.md` §13.11): at a 1e-6 solve the threshold 1e-9
+moves the Hessian by 2.5e-8–1.9e-7 Eh/bohr², against 2.4e-5–3.2e-4 that the
+solve's own tolerance moves it, and 1e-7 breaks the iteration.  The Krylov
+vectors are scaled to their residuals, so an absolute threshold is already a
+relative one that loosens as the solve converges.
+
+| `conv_tol_cpscf` 1e-6, `--patch all` | `solve_mo1`, 1e-13 | 1e-9 |
+|---|---|---|
+| penicillin V | 30.09 s | 21.03 s |
+| taxol | 860.9 s | 431.2 s |
+| Ni(II) dithiolene⁻, UKS | 33.52 s | 26.86 s |
+
+`FASTCPHF_SCREEN=off` (and `FASTCPHF_OFF=1`) keep `direct_scf_tol`;
+`tests/test_cphf.py` checks the screened direct Hessians against it.
+
 ## 5. What the probe taught
 
 GPU4PySCF installs an allocator that sends every allocation over 100 MB

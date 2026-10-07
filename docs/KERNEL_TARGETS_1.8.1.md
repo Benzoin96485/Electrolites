@@ -477,7 +477,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 8 **done** | **I1** DF-MP2 pair-energy loop — `fastdfmp2` (§13.8) | every DF-MP2 and DF-UMP2 | was: **73 % / 81 %** of the DF-MP2 step at 42 / 113 atoms; UMP2 pair loops 92–94 % (§10.10, §12.4) | **built and measured.**  Block-pair GEMMs and one reduction kernel per block, no host sync until the end: DF-MP2 step **2.2x / 1.28x**, DF-UMP2 **3.7x / 1.33x** at 42 / 113 atoms.  **Left**: at 113 atoms the fp32 GEMM itself (~15 TF) |
 | 9 **done** | **C5** C6 coefficients — `fastc6` (§13.9) | `properties.c6` | was: `_solve_full_spectrum` **95 %** of a patched 22-atom run: `get_ab` 41 %, host Cholesky/`eigh` 54 % (§11.9) | **built and measured.**  The AO ERI from GPU4PySCF's GPU fill into `get_ab`'s unchanged transformation, the Casida linear algebra in CuPy, and the second spectrum of `calc_c6(td, td)` not solved: **6.5x / 6.7x** (alanine dipeptide B3LYP / PBE), 2.7x at glycine; C6 to 1e-12.  The imaginary-frequency CPKS route was not needed.  **Left**: the method's own O(nov³) and `nao⁴` |
 | 10 **open (cheap variant rejected)** | **C11** Raman's field finite differences (§13.10) | Raman intensities | the polarizability derivative by 7 field points is **51–61 %** of a patched Raman run (§12.1) | **the cheap variant was built and rejected; the analytic derivative is not attempted.**  Each of the 19 field SCFs started from the field-free density instead of `minao`: the field FD 21.16 → 20.74 s (alanine dipeptide), 58.75 → 57.59 s (penicillin V) — 2 %, and a warm start failed to converge on glycine/PBE at `conv_tol` 1e-12.  A field of 2.5e-3 au moves the energy by ~4e-3 Eh, so a warm SCF still takes 7–8 cycles, and per-field set-up dominates.  What is left is the greenfield analytic derivative (Amos 1986; 2n+1 with the Hessian's `mo1` and the polarizability's U^F, plus third XC derivatives) |
-| 11 | **B12** the per-density exchange contraction `C` | every direct Hessian, frequencies, IR — and TDDFT | `get_k` **37–55 %** of a patched Hessian, 94 % of it `C`; the response `get_jk` is **71 %** of a patched 113-atom TDDFT + gradient + NAC run, where `fastjk` falls to 1.33x (§10.1) | the largest share in both paths and it grows; no treatment transfers |
+| 11 **done** | **B12** the per-density exchange contraction `C` (§13.11) | every direct Hessian, frequencies, IR — and TDDFT | `get_k` **37–55 %** of a patched Hessian, 94 % of it `C`; the response `get_jk` is **71 %** of a patched 113-atom TDDFT + gradient + NAC run, where `fastjk` falls to 1.33x (§10.1) | **both halves built.**  (a) measured by ablation: the `atomicAdd`s are **72 %** of `C`, and the writes into a ket column, which lanes of one warp share, most of that; a segmented warp reduction of those writes is `C` 1.13x (42 atoms) and `get_k` in the CPHF **1.47x** (113 atoms).  (b) the response builds inside `solve_mo1` screen at `1e-3·conv_tol_cpscf` (≤ 1e-9) instead of 1e-13.  Whole Hessian **45.71 → 34.85 s (1.31x)** penicillin V, **1175.4 → 525.8 s (2.24x)** taxol, 84.0 → 79.1 s (1.06x) a Ni(II) UKS complex; the Hessian moves 5.9e-8 Eh/bohr² on taxol, against 4.7e-5–3.2e-4 that the solve's own tolerance moves it |
 | 12 | **B16** short-range half of RSH derivatives, UKS | UKS range-separated gradients (and both Hessians' ip2) | **88 % / 96 %** of a patched UKS ωB97X gradient (§10.8) | easy: `fastgrad`'s RKS identity (1.99x on the same term) ported to `grad.uks` |
 | 13 | **F13 (+F6)** QM/MM's MM terms | QM/MM SCF and gradients | MM-specific terms **15 % / 34 %** of a patched QM/MM SCF + gradient at 10⁴ / 10⁵ charges; the largest, the QM-nucleus–MM energy recomputed on the host every SCF cycle, is 17 % at 10⁵ (§12.3) | F6's caching is easy and bitwise; the far-field collapse of `fast1e` for the `_ip` kernels is mod |
 | 14 | **J5 / J7** periodic PP strain and per-atom `hcore` | k-point stress and gradients | J5 (GTH non-local PP strain) is **45–59 %** of a stress tensor, which costs 1.3–3.4 SCFs; J7 is **20–56 %** of a k-point FFTDF gradient (§11.6) | easy–mod: J7 has its G-space twin in the multigrid branch; J5 is Python loops over strains × k × atoms with CPU `eval_gto` |
@@ -1431,3 +1431,96 @@ the polarizability's field response it is a 2n+1 expression, but it needs the
 third functional derivative of the XC energy contracted with two response
 densities and derivative integrals the package does not yet assemble — a
 greenfield implementation, not attempted in this round.
+
+### 13.11 Rank 11 — B12: the per-density exchange contraction (`docs/README_fastk.md`, `docs/README_fastcphf.md` item 4)
+
+The entry's two proposals, both built.
+
+**(a) Where `C` goes, without `ncu`.**  `benchmarks/katomic_probe.py`
+recompiles the `fastk` kernels with the double-precision `atomicAdd`s
+replaced and refits `T = base + n_dm·C` (`benchmarks/ndm_k.py`'s fixed
+density, penicillin V / def2-SVP after one SCF cycle, `hermi = 1`):
+
+| `fastk` kernels with | `C`, s/density |
+|---|---|
+| the shipped atomics | 0.0276 |
+| no writes (every density read and FMA kept) | 0.0077 |
+| a plain racy `*p += v` instead of the atomic | 0.0216 |
+| the writes into a ket column (K[i,k], K[j,k]) dropped | 0.0117 |
+| the writes into a ket column of the one-thread-per-quartet family dropped | 0.0168 |
+| the writes into a bra-ket column (K[i,l], K[j,l]) dropped | 0.0244 |
+
+So the writes are **72 %** of `C` and it is a memory-traffic cost, not the
+atomic itself (the plain read-modify-write is not cheaper); the density
+layout was already ruled out (`ROUND4_B4B.md` §7).  Two thirds of the
+atomics go to a ket column (`nf_k ≥ nf_l`), and since every lane of a block
+has the block's bra pair and the task queue is `ksh`-major, lanes of one warp
+instruction share those addresses: 4.25 lanes per address, against 2.46 for
+the other column.  Scattering the same writes over the matrices is 2.7x
+*slower* — locality is worth keeping — and spreading neighbouring tasks over
+lanes changes nothing, so it is the number of write transactions.
+
+Built: the one-thread-per-quartet kernels (and the `(ss|ss)` one) find the
+runs of equal `ksh` among adjacent lanes once per quartet and sum each
+ket-column value over its run with a segmented shuffle tree before one lane
+writes it (`fastk._KAGG_SRC`, applied as a source transform; 3.4 lanes per
+write).  `fastjk`'s fused kernels get the same, plus their J[i,j] writes,
+where the whole warp is one run.  The families that spread a quartet over
+`threadIdx.y` were tried with the run keyed on `(ksh, threadIdx.y)` and are
+slower (glycine / def2-TZVP `C` 0.0077 → 0.0123), so they are left alone.
+`FASTK_NO_KAGG=1` is the ablation.
+
+| | before | after |
+|---|---|---|
+| `C`, penicillin V, `hermi` 1 / 0 | 0.0276 / 0.0612 | 0.0243 / 0.0535 s/density |
+| fused J+K (`fastjk`), penicillin V, `nset` 10, `hermi` 0 / 1 | 1.166 / 0.628 s | 1.051 / 0.579 s |
+| `get_k` in the CPHF, penicillin V Hessian | 16.88 s | 15.07 s (1.12x) |
+| `get_k` in the CPHF, taxol Hessian | 701.1 s | **477.5 s (1.47x)** |
+| whole Hessian, penicillin V / taxol | 46.98 / 1175.4 s | 43.92 / 950.2 s |
+
+K and fused J/K agree with GPU4PySCF to 1e-14 relative (`tests/test_jk.py`);
+the Hessian traces to 4e-10 (42 atoms) and 1.5e-10 (113).
+
+**(b) The CPHF's screening at the CPHF's precision.**  Every response build
+inside `solve_mo1` screened at `direct_scf_tol` = 1e-13, the SCF's
+precision, for a solve converged to `conv_tol_cpscf`.
+`benchmarks/cphf_screen_probe.py` runs the Hessian with the J and K builds
+inside `solve_mo1` at a looser threshold and measures the change against the
+same `conv_tol_cpscf` at 1e-13, beside what the solve's own tolerance does
+(1e-6 against 1e-9):
+
+| system | solver's own error | 1e-10 | 1e-9 | 1e-8 | 1e-7 | `solve_mo1` at 1e-13 → 1e-9 |
+|---|---|---|---|---|---|---|
+| alanine dipeptide, RKS | 1.3e-4 | 7.5e-9 | 5.0e-8 | 6.1e-7 | 2.2e-4 | 4.32 → 3.87 s |
+| penicillin V, RKS | 4.7e-5 | 2.6e-9 | 9.5e-8 | 6.6e-7 | diverges | 30.09 → 21.03 s |
+| taxol, RKS | — | | 5.9e-8 | | | 860.9 → 431.2 s |
+| Ni(II) dithiolene⁻, UKS | 3.2e-4 | 1.1e-8 | 1.9e-7 | 7.9e-6 | | 33.52 → 26.86 s |
+| Pt(II) amine triplet, UKS | 2.4e-5 | 2.4e-9 | 2.5e-8 | 5.4e-7 | | 30.77 → 27.31 s |
+
+(max |ΔH| in Eh/bohr²; frequencies move by ≤ 2e-4 cm⁻¹ at 1e-9.)  The
+Krylov vectors are scaled to their residuals, so an absolute threshold is
+already a relative one that loosens as the solve converges — the entry's
+"inexact-Krylov relaxation" is what a fixed loose threshold does here — and
+it breaks only when it reaches the vectors' own size (1e-7 at a 1e-6 solve).
+Built as `fastcphf` item 4: `max(direct_scf_tol, min(1e-3·conv_tol_cpscf,
+1e-9))` while `solve_mo1` runs (1e-9 at 1e-6, 1e-11 at PySCF's default
+1e-8); `FASTCPHF_SCREEN=off`.  The gain grows with size because the
+screened-out share does: 1.43x on the CPHF at 42 atoms, 2.0x at 113.
+
+**Together**, `--patch all`, back to back with both off:
+
+| B3LYP/def2-SVP, `conv_tol_cpscf` 1e-6 | before | after |
+|---|---|---|
+| penicillin V (42 atoms) Hessian | 45.71 s | **34.85 s (1.31x)** |
+| ↳ `solve_mo1` | 32.33 s | 21.56 s (1.50x) |
+| taxol (113 atoms) Hessian | 1175.4 s | **525.8 s (2.24x)** |
+| ↳ `solve_mo1` | 1084.2 s | 434.5 s (2.50x) |
+| Ni(II) dithiolene⁻ UKS (21 atoms) Hessian | 84.03 s | 79.08 s (1.06x) |
+
+Left open: at def2-TZVP the `threadIdx.y` families' `C` is *above*
+GPU4PySCF's (glycine, 0.0077 against 0.0050 s/density at `n_dm` ≤ 32), so a
+TZVP Hessian's CPHF exchange is faster than stock only through `base`; and
+the ket-column writes of those families, and the other column's in all, are
+still one atomic per lane.  Found on the way: `fastjk2_generated.cu` offset
+`vj` by `i_dm * nao * nao` in `int` (overflow past ~1700 densities at 1123
+AOs); now `size_t`, in the generator too.

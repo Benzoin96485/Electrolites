@@ -20,7 +20,7 @@ a single pass, which is what ``fastrsh`` uses for omega-B97X.  The short-range
 
 See README_fastk.md and README_fastrsh.md for what the kernels change and why.
 """
-import os, json, math, ctypes, functools, inspect
+import os, re, json, math, ctypes, functools, inspect
 import numpy as np
 import cupy as cp
 from pyscf import lib
@@ -64,6 +64,11 @@ _FUSED_OFF = bool(os.environ.get('FASTK_NO_FUSED'))
 # ablation: hand every multi-density request back, which is what this module
 # did before the B4b round -- the measurement behind docs/ROUND4_B4B.md
 _NO_NDM = bool(os.environ.get('FASTK_NO_NDM'))
+
+# ablation: one atomicAdd per lane for the writes into a ket column, which is
+# what every kernel did before catalogue B12 (docs/KERNEL_TARGETS_1.8.1.md
+# §13.11)
+_NO_KAGG = bool(os.environ.get('FASTK_NO_KAGG'))
 
 # angular-momentum classes handled by our kernels: (li,lj,lk,ll) -> entry point
 with open(os.path.join(HERE, 'fastk_launch.json')) as _f:
@@ -129,6 +134,93 @@ def _sources(wide=False):
 _LMAX = None
 
 
+#: Catalogue B12.  In the one-thread-per-quartet kernels every lane of a
+#: block shares the bra pair (i, j), so the two exchange blocks a quartet
+#: writes into a *ket* column, K[i,k] and K[j,k], have the same addresses on
+#: every lane whose task has the same ``ksh`` -- and the task queue is in
+#: ``pair_kl`` order, ``ksh`` major, so neighbouring lanes usually do.  Those
+#: writes are 2/3 of the build's atomicAdds, ~4 lanes per address per warp
+#: instruction, and the atomics are 72 % of the per-density cost ``C``.
+#: Only that family: in the ones that spread a quartet over
+#: ``threadIdx.y`` (``gen_k2``, ``gen_khigh``) the same treatment, keyed on
+#: ``(ksh, threadIdx.y)``, measured slower -- 1.6x slower ``C`` on a
+#: def2-TZVP build (§13.11).
+#: `krun_init` finds the runs of equal ``ksh`` among adjacent active lanes
+#: once per quartet; `krun_add` sums each value over its run with a
+#: segmented shuffle tree and lets the run's first lane write it.
+_KAGG_SRC = r'''
+struct KRun { unsigned mask, lane, nxt, maxlen; bool head; };
+__device__ __forceinline__ KRun krun_init(int key)
+{
+    KRun r;
+    r.mask = __activemask();
+    asm("mov.u32 %0, %%laneid;" : "=r"(r.lane));
+    int prev = __shfl_up_sync(r.mask, key, 1);
+    bool prev_in = r.lane > 0 && ((r.mask >> (r.lane - 1)) & 1u);
+    r.head = !prev_in || prev != key;
+    unsigned bound = __ballot_sync(r.mask, r.head) | ~r.mask;
+    unsigned after = r.lane == 31 ? 0u : bound & ~((2u << r.lane) - 1u);
+    r.nxt = after ? __ffs(after) - 1 : 32;
+    r.maxlen = __reduce_max_sync(r.mask, r.head ? r.nxt - r.lane : 1u);
+    return r;
+}
+__device__ __forceinline__ void krun_add(const KRun &r, double *p, double v)
+{
+    if (r.maxlen > 1) {
+        for (unsigned off = 1; off < r.maxlen; off <<= 1) {
+            double o = __shfl_down_sync(r.mask, v, off);
+            if (r.lane + off < r.nxt) v += o;
+        }
+        if (!r.head) return;
+    }
+    atomicAdd(p, v);
+}
+'''
+# the density loop of the one-thread-per-quartet family (and of the (ss|ss)
+# kernel in the prologue), which opens right after nao2 is declared
+_KAGG_MARK = re.compile(
+    r'size_t nao2 = \(size_t\)nao \* nao;\n\s*'
+    r'for \(int i_dm = 0; i_dm < n_dm; \+\+i_dm\) \{')
+_KAGG_END = 'pair_ij = atomicAdd(head, 1);'
+# vk+(i0+a)*nao+(k0+c), vk + j0*nao + k0, vk+(jj+b)*nao+(kk+c), ...
+_KAGG_KCOL = re.compile(
+    r'atomicAdd\((vk ?\+ ?\(?(?:[ij]0|ii|jj)(?:\+\d+\))?\*nao ?\+ ?'
+    r'\(?(?:k0|kk)\b)')
+
+
+# fastjk's Coulomb block J[i,j]: the bra pair is the block's, so every lane
+# of a warp writes the same addresses
+_KAGG_JIJ = re.compile(
+    r'atomicAdd\((vj ?\+ ?\(?i0(?:\+\d+\))?\*nao ?\+ ?\(?j0\b)')
+
+
+def _kagg(src):
+    """Route the ket-column writes of the one-thread-per-quartet kernels
+    through `krun_add` (see `_KAGG_SRC`); the other families are untouched.
+    In `fastjk`'s fused kernels the J[i,j] writes go through it too, with
+    every active lane of the warp in one run.
+    """
+    out, pos, n = [], 0, 0
+    for m in _KAGG_MARK.finditer(src):
+        if m.start() < pos:
+            continue
+        end = src.find(_KAGG_END, m.end())
+        end = len(src) if end < 0 else end
+        body, k = _KAGG_KCOL.subn(r'krun_add(kr_, \1', src[m.end():end])
+        body, kj = _KAGG_JIJ.subn(r'krun_add(krj_, \1', body)
+        out.append(src[pos:m.start()])
+        out.append('const KRun kr_ = krun_init(ksh);\n'
+                   + ('const KRun krj_ = krun_init(0);\n' if kj else '')
+                   + m.group(0))
+        out.append(body)
+        n += k + kj
+        pos = end
+    out.append(src[pos:])
+    if not n:
+        return src
+    return _KAGG_SRC + ''.join(out)
+
+
 @functools.lru_cache(maxsize=16)
 def _module(lmax=None, mpp=MAX_PRIM_PAIR):
     """The kernels for this basis' angular momenta, at this bra-pair bound.
@@ -147,8 +239,10 @@ def _module(lmax=None, mpp=MAX_PRIM_PAIR):
     names = None if lmax is None else _ksplit.names_within(files, lmax)
     opts = ('-std=c++17',) if mpp == MAX_PRIM_PAIR else (
         '-std=c++17', f'-DMAX_PRIM_PAIR={int(mpp)}')
-    return cp.RawModule(code=_ksplit.source(files, names),
-                        options=opts, backend='nvrtc')
+    code = _ksplit.source(files, names)
+    if not _NO_KAGG:
+        code = _kagg(code)
+    return cp.RawModule(code=code, options=opts, backend='nvrtc')
 
 
 @functools.lru_cache(maxsize=1)

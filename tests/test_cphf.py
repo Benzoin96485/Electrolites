@@ -17,7 +17,12 @@ molecule and an open-shell transition-metal complex:
   with groups;
 * one Gram-Schmidt pass (``FASTCPHF_REORTH=0``) and upstream's Krylov
   solver under this module's blocks (``FASTCPHF_KRYLOV=upstream``);
-* a whole Hessian, patched against ``FASTCPHF_OFF=1``.
+* a whole Hessian, patched against ``FASTCPHF_OFF=1``;
+* a whole direct Hessian with item 4's screening (catalogue B12) against
+  ``FASTCPHF_SCREEN=off``, at ``conv_tol_cpscf = 1e-6``: the screen must be
+  1e-9 and move the Hessian by less than ``--tol-screen``, a thirtieth of
+  what the solve's own tolerance moves it (1e-6 against 1e-9: 4.7e-5 on
+  penicillin V, 1.3e-4 on alanine dipeptide, 3.2e-4 on a Ni complex).
 
     python tests/test_cphf.py [--no-hessian]
 """
@@ -38,6 +43,8 @@ ap.add_argument('--tol-direct-groups', type=float, default=1e-8,
                      "their Krylov tolerance")
 ap.add_argument('--tol-hessian', type=float, default=1e-8,
                 help='bar on the largest Hessian element, in Eh/bohr^2')
+ap.add_argument('--tol-screen', type=float, default=1e-6,
+                help="bar on the screened Hessian's largest change")
 ap.add_argument('--no-hessian', action='store_true')
 a = ap.parse_args()
 
@@ -184,6 +191,23 @@ if not a.no_hessian:
         if not ok:
             fails.append(f'{tag} Hessian: {err:.3e}')
         print(f'  {"ok  " if ok else "FAIL"} {tag + " whole Hessian":58s} '
+              f'{err:.3e} Eh/bohr^2', flush=True)
+
+    print('\n## whole direct Hessians, screened against FASTCPHF_SCREEN=off')
+    for tag, atom, charge, spin, df in (CASES[2], CASES[3]):
+        mf = scf(atom, charge, spin, df)
+        hs = []
+        for scr in ('on', 'off'):
+            fastcphf._S['screen'] = 0.
+            with env(SCREEN=scr):
+                hs.append(np.asarray(mf.Hessian().kernel()))
+            if scr == 'on' and fastcphf.stats()['screen'] != 1e-9:
+                fails.append(f'{tag}: screen {fastcphf.stats()["screen"]}')
+        err = abs(hs[0] - hs[1]).max()
+        ok = err <= a.tol_screen
+        if not ok:
+            fails.append(f'{tag} screened Hessian: {err:.3e}')
+        print(f'  {"ok  " if ok else "FAIL"} {tag + " screened Hessian":58s} '
               f'{err:.3e} Eh/bohr^2', flush=True)
 
 print('\n# fastcphf', fastcphf.stats())

@@ -424,3 +424,40 @@ Per class, against `gen_kgeneral.py`'s copy of the general kernel, the eleven
 widest classes (`(ff|ff)` and its neighbours, 1800–10000 `gout`) come in at
 **2.22×** together and `(ff|ff)` itself at **5.34×** — the padding they carried
 was the largest.
+
+---
+
+# Addendum: the ket-column writes, warp-aggregated (catalogue B12)
+
+`docs/ROUND4_B4B.md` §4 found the per-density contraction `C` to be 94 % of a
+CPHF exchange build at `n_dm = 126` and the same code in both
+implementations.  `benchmarks/katomic_probe.py` measured where it goes by
+recompiling these kernels with the atomics replaced
+(`docs/KERNEL_TARGETS_1.8.1.md` §13.11 has the table): the writes are 72 % of
+`C`, and the writes into a *ket* column — K[i,k] and K[j,k] — most of that.
+Every lane of a block shares the bra pair, and the task queue is in
+`pair_kl` order, `ksh` major, so neighbouring lanes usually write the same
+ket-column addresses: 4.25 lanes per address per warp instruction.
+
+`_KAGG_SRC` adds two device functions, and `_kagg` routes the ket-column
+`atomicAdd`s of the one-thread-per-quartet family (and of `(ss|ss)`) through
+them as a source transform at module build:
+
+* `krun_init(ksh)`, once per quartet: the runs of equal `ksh` among adjacent
+  active lanes (a shuffle-up, a ballot, the longest run by
+  `__reduce_max_sync`);
+* `krun_add(run, p, v)`, per value: a segmented shuffle-down tree over the run,
+  then one `atomicAdd` by the run's first lane — or the plain `atomicAdd` when
+  no run is longer than one.
+
+`fastjk`'s fused kernels get the same, and their J[i,j] writes too, where the
+whole warp is one run.  The `threadIdx.y` families (`gen_k2`, `gen_khigh`)
+keyed on `(ksh, threadIdx.y)` measured slower and are untouched.
+
+| | `FASTK_NO_KAGG=1` | default |
+|---|---|---|
+| `C`, penicillin V / def2-SVP, `hermi` 1 | 0.0276 | 0.0243 s/density |
+| `get_k` in the CPHF, taxol Hessian | 701.1 s | 477.5 s (1.47x) |
+
+The summation order of a run changes, nothing else: K agrees with
+GPU4PySCF to 1e-14 relative (`tests/test_jk.py`).

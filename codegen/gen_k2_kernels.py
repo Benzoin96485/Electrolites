@@ -133,6 +133,8 @@ def transform(body, tag, nroots, jk=False):
                         'dm_all + i_dm * (size_t)nao * nao')
     body = body.replace('vk_all + i_dm * nao * nao',
                         'vk_all + i_dm * (size_t)nao * nao')
+    body = body.replace('vj_all + i_dm * nao * nao',
+                        'vj_all + i_dm * (size_t)nao * nao')
 
     # ---- one more slot in the ket cache, for 1/akl -------------------------
     body = _sub1(body, 'double *fac_ijkl = shared_memory + nsq_per_block * 8 + sq_id;',
