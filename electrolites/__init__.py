@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -225,6 +225,9 @@ _TARGETS = {
     # the multi-collinear XC on one sample per antipodal pair (A21);
     # `_eval_xc_lebedev` looks the name up at call time
     'fastmcfun': ('gpu4pyscf.dft.mcfun_gpu', '_make_sph_samples'),
+    # FFTDF k-point exchange with time reversal and wide FFT batches (J3);
+    # `FFTDF.get_jk` looks the name up on `fft_jk` at call time
+    'fastfftk': ('gpu4pyscf.pbc.df.fft_jk', 'get_k_kpts'),
     'fastqmmm': (('gpu4pyscf.qmmm.itrf', 'QMMMSCF.energy_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc_mm')),

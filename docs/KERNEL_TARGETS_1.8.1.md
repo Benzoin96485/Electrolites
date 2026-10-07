@@ -482,7 +482,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 13 **F6 done, F13 open** | **F13 (+F6)** QM/MM's MM terms (§13.13) | QM/MM SCF and gradients | MM-specific terms **15 % / 34 %** of a patched QM/MM SCF + gradient at 10⁴ / 10⁵ charges; the largest, the QM-nucleus–MM energy recomputed on the host every SCF cycle, is 17 % at 10⁵ (§12.3) | **F6 built** (`fastqmmm`): the QM-nucleus–MM energy and both pair-force sums on the device, cached across cycles — 10⁵ charges **11.36 → 8.19 s (1.39x)**, 10⁴ 6.80 → 6.60 s; ≤ 9e-15 relative.  **F13's `_ip` far field not built**: the two derivative integrals are what is left (1.44 s = 17.6 % at 10⁵), and `fast1e`'s 1.5x on them is worth ~0.5 s for an NVRTC port of `int3c1e_ip` |
 | 14 **done** | **J5 / J7** periodic PP strain and per-atom `hcore` (§13.14) | k-point stress and gradients | J5 (GTH non-local PP strain) is **45–59 %** of a stress tensor, which costs 1.3–3.4 SCFs; J7 is **20–56 %** of a k-point FFTDF gradient (§11.6) | **both built** (`fastpbcgrad`).  J7: the per-atom `hcore_generator` loop replaced by one density on the grid — 8-atom 2×2×2 gradient **7.12 → 3.56 s (2.0x)**.  J5: projectors once per species, atoms batched on the device, `ft_ao` sorted/allocated once — the term 7.43 → 1.25 s (5.9x), stress **17.30 → 10.93 s (1.58x)**; 1.6x also at 2-atom 3×3×3 and under multigrid_v2.  ≤ 2e-14 (J7), ≤ 3e-11 (J5, a central difference) |
 | 15 **done** | **A21** GKS multi-collinear XC (§13.15) | GKS / spin–orbit DFT on small heavy-element systems | `mcfun.eval_xc_eff` is **90–94 %** of a patched GKS SCF (§11.8) | **built** (`fastmcfun`): the Lebedev set is inversion-symmetric and a collinear functional spin-swap symmetric, so every antipodal pair contributes twice one member's share at every derivative order — half the samples, exactly.  GKS SCF **79.1 → 41.7 s (1.90x)** CuCl₂, **390.2 → 201.5 s (1.94x)** FeCl₄⁻; energies to 1e-12.  Also: GKS with `-d3bj` crashes on stock 1.8.1 |
-| 16 | **J3** FFTDF k-point exchange | every k-point hybrid on the default back end | **94–97 %** of a k-point PBE0 SCF (§10.11) | the largest periodic share; no measured treatment transfers.  mod–hard |
+| 16 **done (time reversal); ACE open** | **J3** FFTDF k-point exchange (§13.16) | every k-point hybrid on the default back end | **94–97 %** of a k-point PBE0 SCF (§10.11) | **time reversal built** (`fastfftk`): `K(-k) = conj(K(k))` when the set and the densities allow — 2-atom 3×3×3 PBE0 SCF **149.5 → 78.8 s (1.90x)**, `get_k` 1.78–2.08x on 3×3×3, 4×4×4, 3×3×1; **1.00x on Gamma-centred 2×2×2** (every point its own partner).  Wider FFT batches measured 1.00x, dropped.  The rest is FFT-bound at `nao·nocc` FFTs per pair; ACE would be `nocc²` but changes the K contract — not built |
 | 17 | **B9** grid-response Hessian | Hessians with `grid_response=True` | **32–40 %** of a patched grid-response Hessian, `get_d2weight_dAdB` 17–20 % of it (§11.5) | opt-in feature; fusing the derivative with its contraction also removes the 241-atom wall (below).  mod |
 | 18 | **B15** `jk_ip1` (step a first) | every direct Hessian | **26.8 %** of a patched UKS TMC Hessian; 7.7 % of a 42-atom RKS one (§10.7) | host-bound (doubled under CPU contention, §10.7); step (a) is a device-query cache |
 | 19 | **D13** spin-flip multi-collinear XC | spin-flip TDA and its gradient | the sampled libxc evaluation is **15–21 %** of a patched SF-TDA + gradient run; the gradient's XC kernel 18–24 %, 6x its collinear cost (§11.3) | mod–hard; the response half is already `fastxcfxc`'s |
@@ -1641,3 +1641,32 @@ non-exact reductions (adaptive or coarser sampling) were not attempted.
 GKS with a `-d3bj` functional raises in `energy_tot` on stock 1.8.1 (the
 dispersion energy is a NumPy array added to a CuPy scalar), so §11.8's and
 these runs use plain B3LYP.
+
+### 13.16 Rank 16 — J3: FFTDF k-point exchange (`docs/README_fastfftk.md`)
+
+The entry names three things: O(nk²) serial launches in `nao/32` FFT
+batches, AOs for every k on the full grid, and no time-reversal symmetry.
+
+* **Time reversal, built.**  `K(-k) = conj(K(k))` for real basis functions
+  when the k-point set is closed under inversion (modulo a reciprocal
+  lattice vector) and `dm(-k) = conj(dm(k))`, both checked per call.
+  `fastfftk` builds one `k1` of each pair.
+
+| `get_k_kpts`, diamond gth-dzvp | GPU4PySCF | `fastfftk` |
+|---|---|---|
+| 2-atom 3×3×3 | 22.84 s | 10.99 s (2.08x) |
+| 2-atom 4×4×4 | 54.84 s | 30.88 s (1.78x) |
+| 8-atom 3×3×1 | 48.55 s | 26.89 s (1.81x) |
+| 2-atom and 8-atom 2×2×2 | — | 1.00x: every point of a Gamma-centred 2×2×2 mesh is time-reversal invariant |
+
+  2-atom 3×3×3 PBE0 SCF: 149.47 → 78.84 s (1.90x), energy to 7e-15 Eh.
+  `tests/test_fftk.py` ≤ 2.7e-15 over seven cases including the fall-backs.
+* **Wider batches, rejected.**  Sizing the AO block from free memory instead
+  of 32: 1.00x on every case — each pair's FFTs already fill the device.
+* **What is left** is arithmetic: `nao·nocc` FFTs of the full mesh per
+  k-point pair (8-atom 2×2×2: 64 pairs × 1664 FFTs of 65³, ~0.3 ms each).
+  The adaptively compressed exchange needs `nocc²` (6.5x fewer here) with the
+  same occupied-space action, energy and SCF fixed point, but different
+  virtual orbital energies and AO-basis K — a change of contract, not a
+  drop-in replacement; not built.  The 2×2×2 benchmarks of §10.11 are
+  therefore unchanged by this round.

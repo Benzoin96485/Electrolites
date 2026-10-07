@@ -245,6 +245,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastqmmm` | `qmmm.itrf.QMMMSCF.energy_nuc`, `QMMMGrad.grad_nuc`, `grad_nuc_mm` — the QM-nucleus–MM-charge terms on the device, cached across SCF cycles | `docs/README_fastqmmm.md` |
 | `fastpbcgrad` | `pbc.grad.{krhf,kuhf}.grad_elec`, `pbc.grad.{rhf,uhf}.Gradients.grad_elec`, `pbc.grad.*_stress._get_pp_nonloc_strain_derivatives` — the periodic gradient's local 1e term from one density pass; the stress tensor's non-local PP term batched on the device | `docs/README_fastpbcgrad.md` |
 | `fastmcfun` | `dft.mcfun_gpu._make_sph_samples` — the multi-collinear GKS functional on one spin sample per antipodal pair | `docs/README_fastmcfun.md` |
+| `fastfftk` | `pbc.df.fft_jk.get_k_kpts` — FFTDF k-point exchange built for one k of each time-reversal pair | `docs/README_fastfftk.md` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |
