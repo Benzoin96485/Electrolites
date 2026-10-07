@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -222,6 +222,9 @@ _TARGETS = {
                     ('gpu4pyscf.pbc.grad.kuhf', 'grad_elec'),
                     ('gpu4pyscf.pbc.grad.rhf', 'Gradients.grad_elec'),
                     ('gpu4pyscf.pbc.grad.uhf', 'Gradients.grad_elec')),
+    # the multi-collinear XC on one sample per antipodal pair (A21);
+    # `_eval_xc_lebedev` looks the name up at call time
+    'fastmcfun': ('gpu4pyscf.dft.mcfun_gpu', '_make_sph_samples'),
     'fastqmmm': (('gpu4pyscf.qmmm.itrf', 'QMMMSCF.energy_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc_mm')),

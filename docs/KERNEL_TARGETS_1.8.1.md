@@ -481,7 +481,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 12 **done** | **B16** short-range half of RSH derivatives, UKS (§13.12) | UKS range-separated gradients (and both Hessians' ip2) | **88 % / 96 %** of a patched UKS ωB97X gradient (§10.8) | **done in all three remaining places**: `grad/uks.py:energy_ee` and both Hessians' `partial_hess_elec` build `K(erf)` with `alpha-hyb` instead of `K(erfc)`.  UKS ωB97X gradient **2.87 → 2.17 s (1.32x)** penicillin V⁺, **13.12 → 4.82 s (2.72x)** Ni(II) dithiolene⁻; Hessian `partial_hess_elec` 1.31x (RKS, 42 atoms) / 1.46x (UKS Ni); agreement ≤ 1e-9 over five functionals |
 | 13 **F6 done, F13 open** | **F13 (+F6)** QM/MM's MM terms (§13.13) | QM/MM SCF and gradients | MM-specific terms **15 % / 34 %** of a patched QM/MM SCF + gradient at 10⁴ / 10⁵ charges; the largest, the QM-nucleus–MM energy recomputed on the host every SCF cycle, is 17 % at 10⁵ (§12.3) | **F6 built** (`fastqmmm`): the QM-nucleus–MM energy and both pair-force sums on the device, cached across cycles — 10⁵ charges **11.36 → 8.19 s (1.39x)**, 10⁴ 6.80 → 6.60 s; ≤ 9e-15 relative.  **F13's `_ip` far field not built**: the two derivative integrals are what is left (1.44 s = 17.6 % at 10⁵), and `fast1e`'s 1.5x on them is worth ~0.5 s for an NVRTC port of `int3c1e_ip` |
 | 14 **done** | **J5 / J7** periodic PP strain and per-atom `hcore` (§13.14) | k-point stress and gradients | J5 (GTH non-local PP strain) is **45–59 %** of a stress tensor, which costs 1.3–3.4 SCFs; J7 is **20–56 %** of a k-point FFTDF gradient (§11.6) | **both built** (`fastpbcgrad`).  J7: the per-atom `hcore_generator` loop replaced by one density on the grid — 8-atom 2×2×2 gradient **7.12 → 3.56 s (2.0x)**.  J5: projectors once per species, atoms batched on the device, `ft_ao` sorted/allocated once — the term 7.43 → 1.25 s (5.9x), stress **17.30 → 10.93 s (1.58x)**; 1.6x also at 2-atom 3×3×3 and under multigrid_v2.  ≤ 2e-14 (J7), ≤ 3e-11 (J5, a central difference) |
-| 15 | **A21** GKS multi-collinear XC | GKS / spin–orbit DFT on small heavy-element systems | `mcfun.eval_xc_eff` is **90–94 %** of a patched GKS SCF (§11.8) | mod; narrow reach.  FeCl₄⁻'s GKS also does not converge in 50 cycles — a robustness note for upstream |
+| 15 **done** | **A21** GKS multi-collinear XC (§13.15) | GKS / spin–orbit DFT on small heavy-element systems | `mcfun.eval_xc_eff` is **90–94 %** of a patched GKS SCF (§11.8) | **built** (`fastmcfun`): the Lebedev set is inversion-symmetric and a collinear functional spin-swap symmetric, so every antipodal pair contributes twice one member's share at every derivative order — half the samples, exactly.  GKS SCF **79.1 → 41.7 s (1.90x)** CuCl₂, **390.2 → 201.5 s (1.94x)** FeCl₄⁻; energies to 1e-12.  Also: GKS with `-d3bj` crashes on stock 1.8.1 |
 | 16 | **J3** FFTDF k-point exchange | every k-point hybrid on the default back end | **94–97 %** of a k-point PBE0 SCF (§10.11) | the largest periodic share; no measured treatment transfers.  mod–hard |
 | 17 | **B9** grid-response Hessian | Hessians with `grid_response=True` | **32–40 %** of a patched grid-response Hessian, `get_d2weight_dAdB` 17–20 % of it (§11.5) | opt-in feature; fusing the derivative with its contraction also removes the 241-atom wall (below).  mod |
 | 18 | **B15** `jk_ip1` (step a first) | every direct Hessian | **26.8 %** of a patched UKS TMC Hessian; 7.7 % of a 42-atom RKS one (§10.7) | host-bound (doubled under CPU contention, §10.7); step (a) is a device-query cache |
@@ -1618,3 +1618,26 @@ with GTH and all-electron cells; the J5 term ≤ 3e-11 on diamond and SiC (one
 and two species, k-points and Gamma).  What remains of a multigrid stress is
 J4's 28 density passes of the strain finite difference (7.95 s of 8.33 s),
 rank 22.
+
+### 13.15 Rank 15 — A21: the multi-collinear GKS functional (`docs/README_fastmcfun.md`)
+
+The entry's "symmetry-reduced sampling", in its exact form.  A Lebedev set
+is inversion-symmetric (same weight at `n` and `-n`) and a collinear
+functional is spin-swap symmetric, so the per-sample term
+`g_n(rho, m) = f(rho, m·n)` is even in `n` as a function of `(rho, m)`, and
+so are all of its derivatives — the quantities `_eval_xc_lebedev`
+accumulates.  `fastmcfun` hands it one sample per antipodal pair at twice
+the weight.
+
+| GKS B3LYP/def2-SVP, `mcol` | `mcfun.eval_xc_eff` | SCF |
+|---|---|---|
+| CuCl₂ | 71.32 → 33.56 s | **79.11 → 41.68 s (1.90x)** |
+| FeCl₄⁻ (50 cycles, unconverged both) | 365.94 → 176.80 s | **390.18 → 201.50 s (1.94x)** |
+
+`exc_eff`/`vxc_eff`/`fxc_eff` against the full set ≤ 4e-15 relative (LDA,
+PBE, B3LYP, TPSS); GKS energies ≤ 6e-14 Eh (O₂), 1e-12 (CuCl₂)
+(`tests/test_mcfun.py`).  `mcfun` is still 80–88 % of the SCF; the
+non-exact reductions (adaptive or coarser sampling) were not attempted.
+GKS with a `-d3bj` functional raises in `energy_tot` on stock 1.8.1 (the
+dispersion energy is a NumPy array added to a CuPy scalar), so §11.8's and
+these runs use plain B3LYP.
