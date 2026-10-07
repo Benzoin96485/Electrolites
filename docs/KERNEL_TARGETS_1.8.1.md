@@ -479,7 +479,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 10 **open (cheap variant rejected)** | **C11** Raman's field finite differences (§13.10) | Raman intensities | the polarizability derivative by 7 field points is **51–61 %** of a patched Raman run (§12.1) | **the cheap variant was built and rejected; the analytic derivative is not attempted.**  Each of the 19 field SCFs started from the field-free density instead of `minao`: the field FD 21.16 → 20.74 s (alanine dipeptide), 58.75 → 57.59 s (penicillin V) — 2 %, and a warm start failed to converge on glycine/PBE at `conv_tol` 1e-12.  A field of 2.5e-3 au moves the energy by ~4e-3 Eh, so a warm SCF still takes 7–8 cycles, and per-field set-up dominates.  What is left is the greenfield analytic derivative (Amos 1986; 2n+1 with the Hessian's `mo1` and the polarizability's U^F, plus third XC derivatives) |
 | 11 **done** | **B12** the per-density exchange contraction `C` (§13.11) | every direct Hessian, frequencies, IR — and TDDFT | `get_k` **37–55 %** of a patched Hessian, 94 % of it `C`; the response `get_jk` is **71 %** of a patched 113-atom TDDFT + gradient + NAC run, where `fastjk` falls to 1.33x (§10.1) | **both halves built.**  (a) measured by ablation: the `atomicAdd`s are **72 %** of `C`, and the writes into a ket column, which lanes of one warp share, most of that; a segmented warp reduction of those writes is `C` 1.13x (42 atoms) and `get_k` in the CPHF **1.47x** (113 atoms).  (b) the response builds inside `solve_mo1` screen at `1e-3·conv_tol_cpscf` (≤ 1e-9) instead of 1e-13.  Whole Hessian **45.71 → 34.85 s (1.31x)** penicillin V, **1175.4 → 525.8 s (2.24x)** taxol, 84.0 → 79.1 s (1.06x) a Ni(II) UKS complex; the Hessian moves 5.9e-8 Eh/bohr² on taxol, against 4.7e-5–3.2e-4 that the solve's own tolerance moves it |
 | 12 **done** | **B16** short-range half of RSH derivatives, UKS (§13.12) | UKS range-separated gradients (and both Hessians' ip2) | **88 % / 96 %** of a patched UKS ωB97X gradient (§10.8) | **done in all three remaining places**: `grad/uks.py:energy_ee` and both Hessians' `partial_hess_elec` build `K(erf)` with `alpha-hyb` instead of `K(erfc)`.  UKS ωB97X gradient **2.87 → 2.17 s (1.32x)** penicillin V⁺, **13.12 → 4.82 s (2.72x)** Ni(II) dithiolene⁻; Hessian `partial_hess_elec` 1.31x (RKS, 42 atoms) / 1.46x (UKS Ni); agreement ≤ 1e-9 over five functionals |
-| 13 | **F13 (+F6)** QM/MM's MM terms | QM/MM SCF and gradients | MM-specific terms **15 % / 34 %** of a patched QM/MM SCF + gradient at 10⁴ / 10⁵ charges; the largest, the QM-nucleus–MM energy recomputed on the host every SCF cycle, is 17 % at 10⁵ (§12.3) | F6's caching is easy and bitwise; the far-field collapse of `fast1e` for the `_ip` kernels is mod |
+| 13 **F6 done, F13 open** | **F13 (+F6)** QM/MM's MM terms (§13.13) | QM/MM SCF and gradients | MM-specific terms **15 % / 34 %** of a patched QM/MM SCF + gradient at 10⁴ / 10⁵ charges; the largest, the QM-nucleus–MM energy recomputed on the host every SCF cycle, is 17 % at 10⁵ (§12.3) | **F6 built** (`fastqmmm`): the QM-nucleus–MM energy and both pair-force sums on the device, cached across cycles — 10⁵ charges **11.36 → 8.19 s (1.39x)**, 10⁴ 6.80 → 6.60 s; ≤ 9e-15 relative.  **F13's `_ip` far field not built**: the two derivative integrals are what is left (1.44 s = 17.6 % at 10⁵), and `fast1e`'s 1.5x on them is worth ~0.5 s for an NVRTC port of `int3c1e_ip` |
 | 14 | **J5 / J7** periodic PP strain and per-atom `hcore` | k-point stress and gradients | J5 (GTH non-local PP strain) is **45–59 %** of a stress tensor, which costs 1.3–3.4 SCFs; J7 is **20–56 %** of a k-point FFTDF gradient (§11.6) | easy–mod: J7 has its G-space twin in the multigrid branch; J5 is Python loops over strains × k × atoms with CPU `eval_gto` |
 | 15 | **A21** GKS multi-collinear XC | GKS / spin–orbit DFT on small heavy-element systems | `mcfun.eval_xc_eff` is **90–94 %** of a patched GKS SCF (§11.8) | mod; narrow reach.  FeCl₄⁻'s GKS also does not converge in 50 cycles — a robustness note for upstream |
 | 16 | **J3** FFTDF k-point exchange | every k-point hybrid on the default back end | **94–97 %** of a k-point PBE0 SCF (§10.11) | the largest periodic share; no measured treatment transfers.  mod–hard |
@@ -1559,3 +1559,31 @@ of `grad/uks.py`'s namespace, so `fastxcgrad`'s `get_exc` (patched later)
 was silently bypassed; binding to the module's own dictionary fixed it.
 `fastc6` builds its `get_ab` the copying way too; nothing patches the
 names it calls today.
+
+### 13.13 Rank 13 — F13 (+F6): QM/MM's MM terms (`docs/README_fastqmmm.md`)
+
+**F6, built.**  `fastqmmm` replaces `QMMMSCF.energy_nuc` and
+`QMMMGrad.grad_nuc` / `grad_nuc_mm`: one CuPy evaluation of
+`Z_A q_C / r` and its pair forces, in blocks of 65 536 charges, cached
+against the QM and MM coordinates and charges (compared on every call).
+
+| penicillin V, B3LYP/def2-SVP, `--patch all` | 10⁴ charges | 10⁵ charges |
+|---|---|---|
+| `energy_nuc`, 14 calls | 0.28 → 0.01 s | 2.42 → 0.05 s |
+| `grad_nuc` + `grad_nuc_mm` | 0.06 → 0.01 s | 0.60 → 0.01 s |
+| SCF + gradient | 6.80 → 6.60 s | **11.36 → 8.19 s (1.39x)** |
+
+≤ 9e-15 relative against the replaced methods at 10³ and 1.5·10⁵ charges,
+also after either set of atoms moves; a whole SCF + gradient agrees with
+`FASTQMMM_OFF=1` to 3.7e-13 Eh and 6.8e-14 Eh/bohr (`tests/test_qmmm.py`).
+
+**F13's derivative integrals, not built.**  After F6 the MM-specific time at
+10⁵ charges is `extra_force`'s `int1e_grids_ip1` (0.89 s) and
+`grad_hcore_mm`'s `int1e_grids_ip2` (0.55 s) — 17.6 % of the run — on
+GPU4PySCF's `int3c1e_ip` kernels.  `fast1e`'s far-field forms were worth
+1.45–1.62x on the non-derivative kernels; carried over (the `ip1` kernels use
+the same `GINT_g1e`, the `ip2` ones a `*_save_u2` variant whose far-field
+`u2` is `R_k/r2`) that is about 0.5 s of the 8.2 s, for porting the
+`int3c1e_ip` translation unit and its host dispatch to NVRTC.  Left open;
+the estimate is an inference from `fast1e`'s ratios, not a measurement on
+these kernels.

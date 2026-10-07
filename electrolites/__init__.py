@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -215,6 +215,11 @@ _TARGETS = {
     'fastc6': (('gpu4pyscf.properties.c6', '_solve_full_spectrum'),
                ('gpu4pyscf.properties.c6', 'calc_c6'),
                ('gpu4pyscf.tdscf.rhf', 'get_ab')),
+    # QM/MM's QM-nucleus--MM-charge energy and forces on the device, cached
+    # (F6 / F13)
+    'fastqmmm': (('gpu4pyscf.qmmm.itrf', 'QMMMSCF.energy_nuc'),
+                 ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc'),
+                 ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc_mm')),
     # the Hessian's CPHF solve (docs/DF_WORK_LIST.md W44): both spin cases'
     # `solve_mo1`, which the Hessian classes' methods look up on their
     # modules at call time, and the Krylov solver and QR it reuses
