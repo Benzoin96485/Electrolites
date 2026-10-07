@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -217,6 +217,11 @@ _TARGETS = {
                ('gpu4pyscf.tdscf.rhf', 'get_ab')),
     # QM/MM's QM-nucleus--MM-charge energy and forces on the device, cached
     # (F6 / F13)
+    # the periodic gradients' local 1e derivative from one density pass (J7)
+    'fastpbcgrad': (('gpu4pyscf.pbc.grad.krhf', 'grad_elec'),
+                    ('gpu4pyscf.pbc.grad.kuhf', 'grad_elec'),
+                    ('gpu4pyscf.pbc.grad.rhf', 'Gradients.grad_elec'),
+                    ('gpu4pyscf.pbc.grad.uhf', 'Gradients.grad_elec')),
     'fastqmmm': (('gpu4pyscf.qmmm.itrf', 'QMMMSCF.energy_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc_mm')),

@@ -480,7 +480,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 11 **done** | **B12** the per-density exchange contraction `C` (§13.11) | every direct Hessian, frequencies, IR — and TDDFT | `get_k` **37–55 %** of a patched Hessian, 94 % of it `C`; the response `get_jk` is **71 %** of a patched 113-atom TDDFT + gradient + NAC run, where `fastjk` falls to 1.33x (§10.1) | **both halves built.**  (a) measured by ablation: the `atomicAdd`s are **72 %** of `C`, and the writes into a ket column, which lanes of one warp share, most of that; a segmented warp reduction of those writes is `C` 1.13x (42 atoms) and `get_k` in the CPHF **1.47x** (113 atoms).  (b) the response builds inside `solve_mo1` screen at `1e-3·conv_tol_cpscf` (≤ 1e-9) instead of 1e-13.  Whole Hessian **45.71 → 34.85 s (1.31x)** penicillin V, **1175.4 → 525.8 s (2.24x)** taxol, 84.0 → 79.1 s (1.06x) a Ni(II) UKS complex; the Hessian moves 5.9e-8 Eh/bohr² on taxol, against 4.7e-5–3.2e-4 that the solve's own tolerance moves it |
 | 12 **done** | **B16** short-range half of RSH derivatives, UKS (§13.12) | UKS range-separated gradients (and both Hessians' ip2) | **88 % / 96 %** of a patched UKS ωB97X gradient (§10.8) | **done in all three remaining places**: `grad/uks.py:energy_ee` and both Hessians' `partial_hess_elec` build `K(erf)` with `alpha-hyb` instead of `K(erfc)`.  UKS ωB97X gradient **2.87 → 2.17 s (1.32x)** penicillin V⁺, **13.12 → 4.82 s (2.72x)** Ni(II) dithiolene⁻; Hessian `partial_hess_elec` 1.31x (RKS, 42 atoms) / 1.46x (UKS Ni); agreement ≤ 1e-9 over five functionals |
 | 13 **F6 done, F13 open** | **F13 (+F6)** QM/MM's MM terms (§13.13) | QM/MM SCF and gradients | MM-specific terms **15 % / 34 %** of a patched QM/MM SCF + gradient at 10⁴ / 10⁵ charges; the largest, the QM-nucleus–MM energy recomputed on the host every SCF cycle, is 17 % at 10⁵ (§12.3) | **F6 built** (`fastqmmm`): the QM-nucleus–MM energy and both pair-force sums on the device, cached across cycles — 10⁵ charges **11.36 → 8.19 s (1.39x)**, 10⁴ 6.80 → 6.60 s; ≤ 9e-15 relative.  **F13's `_ip` far field not built**: the two derivative integrals are what is left (1.44 s = 17.6 % at 10⁵), and `fast1e`'s 1.5x on them is worth ~0.5 s for an NVRTC port of `int3c1e_ip` |
-| 14 | **J5 / J7** periodic PP strain and per-atom `hcore` | k-point stress and gradients | J5 (GTH non-local PP strain) is **45–59 %** of a stress tensor, which costs 1.3–3.4 SCFs; J7 is **20–56 %** of a k-point FFTDF gradient (§11.6) | easy–mod: J7 has its G-space twin in the multigrid branch; J5 is Python loops over strains × k × atoms with CPU `eval_gto` |
+| 14 **done** | **J5 / J7** periodic PP strain and per-atom `hcore` (§13.14) | k-point stress and gradients | J5 (GTH non-local PP strain) is **45–59 %** of a stress tensor, which costs 1.3–3.4 SCFs; J7 is **20–56 %** of a k-point FFTDF gradient (§11.6) | **both built** (`fastpbcgrad`).  J7: the per-atom `hcore_generator` loop replaced by one density on the grid — 8-atom 2×2×2 gradient **7.12 → 3.56 s (2.0x)**.  J5: projectors once per species, atoms batched on the device, `ft_ao` sorted/allocated once — the term 7.43 → 1.25 s (5.9x), stress **17.30 → 10.93 s (1.58x)**; 1.6x also at 2-atom 3×3×3 and under multigrid_v2.  ≤ 2e-14 (J7), ≤ 3e-11 (J5, a central difference) |
 | 15 | **A21** GKS multi-collinear XC | GKS / spin–orbit DFT on small heavy-element systems | `mcfun.eval_xc_eff` is **90–94 %** of a patched GKS SCF (§11.8) | mod; narrow reach.  FeCl₄⁻'s GKS also does not converge in 50 cycles — a robustness note for upstream |
 | 16 | **J3** FFTDF k-point exchange | every k-point hybrid on the default back end | **94–97 %** of a k-point PBE0 SCF (§10.11) | the largest periodic share; no measured treatment transfers.  mod–hard |
 | 17 | **B9** grid-response Hessian | Hessians with `grid_response=True` | **32–40 %** of a patched grid-response Hessian, `get_d2weight_dAdB` 17–20 % of it (§11.5) | opt-in feature; fusing the derivative with its contraction also removes the 241-atom wall (below).  mod |
@@ -1587,3 +1587,34 @@ the same `GINT_g1e`, the `ip2` ones a `*_save_u2` variant whose far-field
 `int3c1e_ip` translation unit and its host dispatch to NVRTC.  Left open;
 the estimate is an inference from `fast1e`'s ratios, not a measurement on
 these kernels.
+
+### 13.14 Rank 14 — J5 / J7: the periodic stress's non-local PP term and the gradient's per-atom `hcore` (`docs/README_fastpbcgrad.md`)
+
+**J7.**  The FFTDF gradients (`pbc/grad/{krhf,kuhf}.py:grad_elec`, Gamma
+`{rhf,uhf}.Gradients.grad_elec`) contract `hcore_generator(ia)` — every AO
+at every k-point over the whole grid, per atom — with the density.  Being
+linear in the density, the electronic part is `sum_r v_ia(r) rho(r)` with
+`rho` evaluated once, plus the `h1` corrections on atom `ia`'s rows and
+columns.  `fastpbcgrad.dh1e_local`; the four `grad_elec` are GPU4PySCF's
+source with the loop replaced.
+
+**J5.**  `_get_pp_nonloc_strain_derivatives` (18 strained cells) evaluated
+the non-local energy per k-point per atom with host `eval_gto`/`_qli`
+projectors copied atom by atom.  A cProfile of the 8-atom 2×2×2 term put
+the time in host→device copies and `ft_ao`'s per-call `nao × ngrids`
+allocations (synchronous `cudaMalloc`), not arithmetic.
+`fastpbcgrad.pp_nonloc_energy`: projectors once per species and k-point,
+atoms batched as one GEMM, the basis sorted once per cell, one reused
+`ft_ao` buffer, the basis transformation applied to the projected product.
+
+| diamond, PBE/gth-dzvp, against `FASTPBCGRAD_OFF=1` | 8-atom 2×2×2 FFTDF | 2-atom 3×3×3 FFTDF | 8-atom 2×2×2 multigrid_v2 |
+|---|---|---|---|
+| gradient | **7.12 → 3.56 s (2.0x)** | 1.64 → 1.52 s | (G-space branch, untouched) |
+| J5 term | 7.43 → 1.25 s (5.9x) | 5.37 → 1.90 s (2.8x) | 7.84 → 1.49 s (5.3x) |
+| stress | **17.30 → 10.93 s (1.58x)** | 8.65 → 5.39 s (1.60x) | 13.24 → 8.33 s (1.59x) |
+
+`tests/test_pbcgrad.py`: `grad_elec` ≤ 2.1e-14 Eh/bohr over KRKS/KUKS/RKS/UKS
+with GTH and all-electron cells; the J5 term ≤ 3e-11 on diamond and SiC (one
+and two species, k-points and Gamma).  What remains of a multigrid stress is
+J4's 28 density passes of the strain finite difference (7.95 s of 8.33 s),
+rank 22.

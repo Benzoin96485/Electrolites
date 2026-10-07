@@ -243,6 +243,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastdfmp2` | `mp.dfmp2_addons.get_df{,u}mp2_energy_pair_intra` — the DF-MP2 / DF-UMP2 pair-energy loops as block GEMMs | `docs/README_fastdfmp2.md` |
 | `fastc6` | `properties.c6._solve_full_spectrum`, `calc_c6` — the C6 full-spectrum solve with the ERI and the linear algebra on the device | `docs/README_fastc6.md` |
 | `fastqmmm` | `qmmm.itrf.QMMMSCF.energy_nuc`, `QMMMGrad.grad_nuc`, `grad_nuc_mm` — the QM-nucleus–MM-charge terms on the device, cached across SCF cycles | `docs/README_fastqmmm.md` |
+| `fastpbcgrad` | `pbc.grad.{krhf,kuhf}.grad_elec`, `pbc.grad.{rhf,uhf}.Gradients.grad_elec`, `pbc.grad.*_stress._get_pp_nonloc_strain_derivatives` — the periodic gradient's local 1e term from one density pass; the stress tensor's non-local PP term batched on the device | `docs/README_fastpbcgrad.md` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |
