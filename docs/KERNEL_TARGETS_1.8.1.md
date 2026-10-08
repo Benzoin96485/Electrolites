@@ -484,7 +484,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 15 **done** | **A21** GKS multi-collinear XC (§13.15) | GKS / spin–orbit DFT on small heavy-element systems | `mcfun.eval_xc_eff` is **90–94 %** of a patched GKS SCF (§11.8) | **built** (`fastmcfun`): the Lebedev set is inversion-symmetric and a collinear functional spin-swap symmetric, so every antipodal pair contributes twice one member's share at every derivative order — half the samples, exactly.  GKS SCF **79.1 → 41.7 s (1.90x)** CuCl₂, **390.2 → 201.5 s (1.94x)** FeCl₄⁻; energies to 1e-12.  Also: GKS with `-d3bj` crashes on stock 1.8.1 |
 | 16 **done (time reversal); ACE open** | **J3** FFTDF k-point exchange (§13.16) | every k-point hybrid on the default back end | **94–97 %** of a k-point PBE0 SCF (§10.11) | **time reversal built** (`fastfftk`): `K(-k) = conj(K(k))` when the set and the densities allow — 2-atom 3×3×3 PBE0 SCF **149.5 → 78.8 s (1.90x)**, `get_k` 1.78–2.08x on 3×3×3, 4×4×4, 3×3×1; **1.00x on Gamma-centred 2×2×2** (every point its own partner).  Wider FFT batches measured 1.00x, dropped.  The rest is FFT-bound at `nao·nocc` FFTs per pair; ACE would be `nocc²` but changes the K contract — not built |
 | 17 **done** | **B9** grid-response Hessian (§13.17) | Hessians with `grid_response=True` | **32–40 %** of a patched grid-response Hessian, `get_d2weight_dAdB` 17–20 % of it (§11.5) | **built** (`fastgridresp`): GPU4PySCF's two kernels as device functions, contracted with their vector on the fly (the translation-invariance fill folded into two accumulators) — `_get_exc_deriv2_grid_response` 3.4–3.5x, Hessian **56.0 → 44.9 s (1.25x)** penicillin V, 1.31x alanine dipeptide; **the 241-atom wall is gone** (PfPMT block 4.1 s where stock asserts).  ≤ 2.7e-12 Eh/bohr² |
-| 18 | **B15** `jk_ip1` (step a first) | every direct Hessian | **26.8 %** of a patched UKS TMC Hessian; 7.7 % of a 42-atom RKS one (§10.7) | host-bound (doubled under CPU contention, §10.7); step (a) is a device-query cache |
+| 18 **done (a, b); c open** | **B15** `jk_ip1` (§13.18) | every direct Hessian | **26.8 %** of a patched UKS TMC Hessian; 7.7 % of a 42-atom RKS one (§10.7) | **(a) and (b) built** (`fastjkip1`, `libmyjkip1`): the per-launch `cudaGetDeviceProperties` cached (host time in the C entry 7.4 → 0.11 s), K over several densities so both spins come from one integral pass, plus P1.  Ni UKS Hessian **78.3 → 67.3 s (1.16x)**, penicillin V RKS 34.4 → 34.0 s.  On an idle node the term is device-bound (10 s of kernels), so (a) alone is 1.06–1.13x; (c), faster kernels, is what is left |
 | 19 | **D13** spin-flip multi-collinear XC | spin-flip TDA and its gradient | the sampled libxc evaluation is **15–21 %** of a patched SF-TDA + gradient run; the gradient's XC kernel 18–24 %, 6x its collinear cost (§11.3) | mod–hard; the response half is already `fastxcfxc`'s |
 | 20 | **B3** `ejk_ip2`'s general kernel | every direct Hessian, esp. transition metals | **29.1 %** of a patched UKS TMC Hessian, 13.7 % of a 42-atom RKS one | a generator project |
 | 21 | **F9 / F11** PCM response and `h1` (also SMD) | PCM and SMD Hessians, TDDFT-PCM, PCM polarizabilities | PCM-specific terms **28–30 %** of a patched PCM Hessian, `_B_dot_x` **12.6–14.8 %** (§10.6); SMD's electrostatic d2 12–15 %, its CDS FD Hessian 0.3–0.5 % (§11.4) | batch `_B_dot_x`, not the `h1` loop |
@@ -1694,3 +1694,28 @@ half of the entry — skip `B` where the switching function saturates — was
 not built: the remaining grid-response time is `_get_vxc_deriv1_grid_response`
 (7.6 s of the 44.9 s, untouched), and the kernels' O(natm³) per point makes
 a 284-atom Hessian possible but slow (~830 blocks × 3 terms × 4 s).
+
+### 13.18 Rank 18 — B15: the direct Hessian's `jk_ip1` (`docs/README_fastjkip1.md`)
+
+* **(a), built.**  `libmyjkip1` is GPU4PySCF's `rys_contract_jk_ip1.cu`
+  driver and kernels with the multiprocessor count cached per device
+  (`codegen/gen_jk_ip1.py`).  Host time inside the C entry over 5292
+  launches (Ni dithiolene⁻): **7.73 → 0.11 s**.  But events around each
+  launch show **10.3–11.4 s of device time**: on an idle node the term was
+  device-bound, and §10.7's "host-bound" was the contended case.  (a) is
+  1.10x on the term here (penicillin V 3.86 → 3.43 s).
+* **(b), built.**  J alone costs as much as J+K (9.76 / 10.57 s), so the
+  per-spin calls of the open-shell `make_h1` computed every integral twice.
+  The 38 `rys_vjk_ip1` kernels loop K over densities `1..n_dm-1` (J from
+  density 0); `get_jk_ip1_spins` calls them on `[dma+dmb, dma, dmb]`.
+* **P1** on the kernels: ~2 %.
+
+| B3LYP/def2-SVP | off | (a)+P1 | (a)+P1+(b) |
+|---|---|---|---|
+| Ni(II) dithiolene⁻ UKS Hessian | 78.34 s | 76.66 s | **67.26 s (1.16x)** |
+| penicillin V RKS Hessian | 34.38 s | 33.95 s | |
+
+≤ 3.2e-13 single-density, ≤ 1.5e-10 spin path (union screening keeps a
+superset), whole UKS Hessians ≤ 4.4e-12 Eh/bohr² (`tests/test_jkip1.py`).
+**(c)** — regenerating the ip1 classes with the P2–P5 treatment of
+`fastejk` — is the remaining lever on the ~10 s of kernels; not built.

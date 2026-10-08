@@ -24,6 +24,7 @@ Overrides:
   ELECTROLITES_LIBMYKG   path to a prebuilt libmykg; used as-is
   ELECTROLITES_LIBMYEJK2 path to a prebuilt libmyejk2; used as-is
   ELECTROLITES_LIBMYIP2  path to a prebuilt libmyip2; used as-is
+  ELECTROLITES_LIBMYJKIP1 path to a prebuilt libmyjkip1; used as-is
   ELECTROLITES_CACHE     where to put the build (default ~/.cache/electrolites)
   ELECTROLITES_NVCC      the compiler to use (default: nvcc on PATH)
   ELECTROLITES_ARCH      compute capability digits, e.g. 80 (default: this GPU)
@@ -63,6 +64,15 @@ _IP2_SOURCES = (
 _IP2_DEPS = (
     'myip2/build_rys_gxyz.cuh',
     'myip2/ip2_cases.inc',
+)
+#: the direct Hessian's h1 two-electron kernels (catalogue B15): GPU4PySCF's
+#: rys_contract_jk_ip1.cu with the device query cached (codegen/gen_jk_ip1.py)
+_JKIP1_SOURCES = (
+    'gvhf-rys181/gvhf-rys/rys_roots_dat.cu',
+    'gvhf-rys181/gvhf-rys/rys_constant.cu',
+    'myjkip1/constants.cu',
+    'myjkip1/rys_contract_jk_ip1.cu',
+    'myjkip1/unrolled_rys_jk_ip1.cu',
 )
 _warned = False
 
@@ -190,5 +200,15 @@ def ip2_library():
                   deps=_IP2_DEPS)
 
 
-__all__ = ['general_k_library', 'ejk_ip2_library', 'ip2_library', 'cache_dir',
+@functools.lru_cache(maxsize=1)
+def jk_ip1_library():
+    """Path to ``libmyjkip1`` (catalogue B15) for this GPU, or None."""
+    return _build('libmyjkip1.so', _JKIP1_SOURCES,
+                  ('gvhf-rys181', 'gvhf-rys181/gvhf-rys'),
+                  "the Hessian's h1 two-electron kernels",
+                  'ELECTROLITES_LIBMYJKIP1',
+                  deps=('gvhf-rys181/gvhf-rys/build_rys_gxyz.cuh',))
+
+
+__all__ = ['general_k_library', 'jk_ip1_library', 'ejk_ip2_library', 'ip2_library', 'cache_dir',
            'compute_capability', 'nvcc_path']

@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -233,6 +233,9 @@ _TARGETS = {
     'fastgridresp': (('gpu4pyscf.hessian.rks', '_get_exc_deriv2_grid_response'),
                      ('gpu4pyscf.hessian.rks', '_get_enlc_deriv2'),
                      ('gpu4pyscf.hessian.uks', '_get_exc_deriv2_grid_response')),
+    # the direct Hessian's h1 two-electron kernels (B15): bound over
+    # `libvhf_rys.RYS_build_jk_ip1`, which `_get_jk_ip1` reads at call time
+    'fastjkip1': ('gpu4pyscf.hessian.rhf', 'libvhf_rys.RYS_build_jk_ip1'),
     'fastqmmm': (('gpu4pyscf.qmmm.itrf', 'QMMMSCF.energy_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc_mm')),
