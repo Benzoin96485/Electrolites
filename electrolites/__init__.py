@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -228,6 +228,11 @@ _TARGETS = {
     # FFTDF k-point exchange with time reversal and wide FFT batches (J3);
     # `FFTDF.get_jk` looks the name up on `fft_jk` at call time
     'fastfftk': ('gpu4pyscf.pbc.df.fft_jk', 'get_k_kpts'),
+    # the grid-response Hessian's weight second derivative contracted
+    # without being stored (B9); the drivers look the names up at call time
+    'fastgridresp': (('gpu4pyscf.hessian.rks', '_get_exc_deriv2_grid_response'),
+                     ('gpu4pyscf.hessian.rks', '_get_enlc_deriv2'),
+                     ('gpu4pyscf.hessian.uks', '_get_exc_deriv2_grid_response')),
     'fastqmmm': (('gpu4pyscf.qmmm.itrf', 'QMMMSCF.energy_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc_mm')),

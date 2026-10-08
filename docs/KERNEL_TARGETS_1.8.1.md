@@ -483,7 +483,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 14 **done** | **J5 / J7** periodic PP strain and per-atom `hcore` (§13.14) | k-point stress and gradients | J5 (GTH non-local PP strain) is **45–59 %** of a stress tensor, which costs 1.3–3.4 SCFs; J7 is **20–56 %** of a k-point FFTDF gradient (§11.6) | **both built** (`fastpbcgrad`).  J7: the per-atom `hcore_generator` loop replaced by one density on the grid — 8-atom 2×2×2 gradient **7.12 → 3.56 s (2.0x)**.  J5: projectors once per species, atoms batched on the device, `ft_ao` sorted/allocated once — the term 7.43 → 1.25 s (5.9x), stress **17.30 → 10.93 s (1.58x)**; 1.6x also at 2-atom 3×3×3 and under multigrid_v2.  ≤ 2e-14 (J7), ≤ 3e-11 (J5, a central difference) |
 | 15 **done** | **A21** GKS multi-collinear XC (§13.15) | GKS / spin–orbit DFT on small heavy-element systems | `mcfun.eval_xc_eff` is **90–94 %** of a patched GKS SCF (§11.8) | **built** (`fastmcfun`): the Lebedev set is inversion-symmetric and a collinear functional spin-swap symmetric, so every antipodal pair contributes twice one member's share at every derivative order — half the samples, exactly.  GKS SCF **79.1 → 41.7 s (1.90x)** CuCl₂, **390.2 → 201.5 s (1.94x)** FeCl₄⁻; energies to 1e-12.  Also: GKS with `-d3bj` crashes on stock 1.8.1 |
 | 16 **done (time reversal); ACE open** | **J3** FFTDF k-point exchange (§13.16) | every k-point hybrid on the default back end | **94–97 %** of a k-point PBE0 SCF (§10.11) | **time reversal built** (`fastfftk`): `K(-k) = conj(K(k))` when the set and the densities allow — 2-atom 3×3×3 PBE0 SCF **149.5 → 78.8 s (1.90x)**, `get_k` 1.78–2.08x on 3×3×3, 4×4×4, 3×3×1; **1.00x on Gamma-centred 2×2×2** (every point its own partner).  Wider FFT batches measured 1.00x, dropped.  The rest is FFT-bound at `nao·nocc` FFTs per pair; ACE would be `nocc²` but changes the K contract — not built |
-| 17 | **B9** grid-response Hessian | Hessians with `grid_response=True` | **32–40 %** of a patched grid-response Hessian, `get_d2weight_dAdB` 17–20 % of it (§11.5) | opt-in feature; fusing the derivative with its contraction also removes the 241-atom wall (below).  mod |
+| 17 **done** | **B9** grid-response Hessian (§13.17) | Hessians with `grid_response=True` | **32–40 %** of a patched grid-response Hessian, `get_d2weight_dAdB` 17–20 % of it (§11.5) | **built** (`fastgridresp`): GPU4PySCF's two kernels as device functions, contracted with their vector on the fly (the translation-invariance fill folded into two accumulators) — `_get_exc_deriv2_grid_response` 3.4–3.5x, Hessian **56.0 → 44.9 s (1.25x)** penicillin V, 1.31x alanine dipeptide; **the 241-atom wall is gone** (PfPMT block 4.1 s where stock asserts).  ≤ 2.7e-12 Eh/bohr² |
 | 18 | **B15** `jk_ip1` (step a first) | every direct Hessian | **26.8 %** of a patched UKS TMC Hessian; 7.7 % of a 42-atom RKS one (§10.7) | host-bound (doubled under CPU contention, §10.7); step (a) is a device-query cache |
 | 19 | **D13** spin-flip multi-collinear XC | spin-flip TDA and its gradient | the sampled libxc evaluation is **15–21 %** of a patched SF-TDA + gradient run; the gradient's XC kernel 18–24 %, 6x its collinear cost (§11.3) | mod–hard; the response half is already `fastxcfxc`'s |
 | 20 | **B3** `ejk_ip2`'s general kernel | every direct Hessian, esp. transition metals | **29.1 %** of a patched UKS TMC Hessian, 13.7 % of a 42-atom RKS one | a generator project |
@@ -1670,3 +1670,27 @@ batches, AOs for every k on the full grid, and no time-reversal symmetry.
   virtual orbital energies and AO-basis K — a change of contract, not a
   drop-in replacement; not built.  The 2×2×2 benchmarks of §10.11 are
   therefore unchanged by this round.
+
+### 13.17 Rank 17 — B9: the grid-response Hessian (`docs/README_fastgridresp.md`)
+
+The entry's treatment, as written: "fuse each derivative kernel with its
+contraction so `d2w` is never stored".  `codegen/gen_d2w_fused.py` lifts
+GPU4PySCF's off-diagonal and diagonal second-derivative kernels verbatim
+into `__device__` functions returning each point's 3×3 block; the wrappers
+multiply by the contraction vector and accumulate, warp-reduced, into the
+plain term and the two translation-invariance terms that GPU4PySCF fills
+with `18·natm` launches over the stored array.
+
+| B3LYP/def2-SVP, `grid_response=True` | `exc_deriv2` grid response | Hessian |
+|---|---|---|
+| alanine dipeptide | 4.64 → 1.36 s | 13.68 → 10.44 s (1.31x) |
+| penicillin V | 16.10 → 4.58 s | 56.04 → 44.87 s (1.25x) |
+| one block, taxol | 0.721 → 0.250 s | |
+| one block, PfPMT (284 atoms) | `AssertionError` → 4.11 s | |
+
+≤ 8.5e-16 per block (both schemes, ± radii adjustment); whole Hessians
+(RKS, UKS, VV10) ≤ 2.7e-12 Eh/bohr² (`tests/test_gridresp.py`).  The second
+half of the entry — skip `B` where the switching function saturates — was
+not built: the remaining grid-response time is `_get_vxc_deriv1_grid_response`
+(7.6 s of the 44.9 s, untouched), and the kernels' O(natm³) per point makes
+a 284-atom Hessian possible but slow (~830 blocks × 3 terms × 4 s).
