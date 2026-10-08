@@ -213,6 +213,122 @@ def rename_entries(text):
     return text, n
 
 
+#: the per-class instances of the general kernels: every class with a d shell
+#: and nothing above it (the classes up to p are GPU4PySCF's unrolled ones)
+TMPL_LMAX = 2
+_CONSTS = (('int li = bounds.li;', 'constexpr int li = LI;'),
+           ('int lj = bounds.lj;', 'constexpr int lj = LJ;'),
+           ('int lk = bounds.lk;', 'constexpr int lk = LK;'),
+           ('int ll = bounds.ll;', 'constexpr int ll = LL;'),
+           ('int stride_j = bounds.stride_j;', 'constexpr int stride_j = LI + 2;'),
+           ('int stride_k = bounds.stride_k;',
+            'constexpr int stride_k = (LI + 2) * (LJ + 2);'),
+           ('int stride_l = bounds.stride_l;',
+            'constexpr int stride_l = (LI + 2) * (LJ + 2) * (LK + 2);'),
+           ('int g_size = bounds.g_size;',
+            'constexpr int g_size = (LI + 2) * (LJ + 2) * (LK + 2) * (LL + 2);'),
+           ('int nroots = bounds.nroots;',
+            'constexpr int nroots = (LI + LJ + LK + LL + 2) / 2 + 1;'),
+           ('int nfi = bounds.nfi;', 'constexpr int nfi = (LI+1)*(LI+2)/2;'),
+           ('int nfj = bounds.nfj;', 'constexpr int nfj = (LJ+1)*(LJ+2)/2;'),
+           ('int nfk = bounds.nfk;', 'constexpr int nfk = (LK+1)*(LK+2)/2;'),
+           ('int nfl = bounds.nfl;', 'constexpr int nfl = (LL+1)*(LL+2)/2;'))
+
+_SM_HELPER = (
+    '\n// electrolites (codegen/gen_ejk_ip2.py): the multiprocessor count of the\n'
+    '// current device, queried once per device instead of once per launch\n'
+    'static int myejk2_sm_count()\n'
+    '{\n'
+    '    static int cache[64] = {0};\n'
+    '    int dev = 0;\n'
+    '    cudaGetDevice(&dev);\n'
+    '    if (dev < 0 || dev >= 64) {\n'
+    '        int m = 0;\n'
+    '        cudaDeviceGetAttribute(&m, cudaDevAttrMultiProcessorCount, dev);\n'
+    '        return m;\n'
+    '    }\n'
+    '    if (cache[dev] == 0)\n'
+    '        cudaDeviceGetAttribute(&cache[dev], cudaDevAttrMultiProcessorCount, dev);\n'
+    '    return cache[dev];\n'
+    '}\n')
+
+
+def templated(text):
+    """Per-class instances of the two general kernels (catalogue B3, the P6
+    problem): the angular momenta, the strides, the g-array size, the root
+    count and the cartesian counts become compile-time constants, so every
+    index table, division and loop bound in the kernel is resolved by nvcc.
+    The arithmetic is the general kernel's, unchanged.  The drivers launch an
+    instance for every long-range class whose shells are all at most d, and
+    the run-time kernel otherwise.  Also: the multiprocessor count is
+    queried once per device, not per launch."""
+    total = 0
+    for kind in ('type12', 'type3'):
+        name = f'rys_ejk_ip2_{kind}_kernel'
+        head = f'__global__ static\nvoid {name}('
+        i = text.index(head)
+        # the kernel's own closing brace, by matching (its while-loop also
+        # closes in column 0)
+        j, depth = text.index('{', i) + 1, 1
+        while depth:
+            depth += (text[j] == '{') - (text[j] == '}')
+            j += 1
+        j += 1
+        body = text[i:j]
+        t = body.replace(head, 'template <int LI, int LJ, int LK, int LL>\n'
+                               f'__global__ static\nvoid {name}_t(')
+        consts = _CONSTS
+        if kind == 'type3':
+            # the type3 driver's g-array: j and l are not raised
+            # (stride_k = stride_j*(lj+1), g_size = stride_l*(ll+1))
+            consts = tuple(
+                (o, n.replace('(LI + 2) * (LJ + 2)', '(LI + 2) * (LJ + 1)')
+                     .replace('* (LL + 2)', '* (LL + 1)'))
+                for o, n in _CONSTS)
+        for old, new in consts:
+            t = t.replace(old, new)
+        assert 'bounds.li' not in t and 'bounds.nroots' not in t, kind
+        text = text[:j] + '\n' + t + text[j:]
+        launch = f'        {name}<<<workers, threads, buflen>>>('
+        k = text.index(launch)
+        end = text.index(');', k) + 2
+        args = text[k + len(launch):end - 2]
+        cases = []
+        for li in range(TMPL_LMAX + 1):
+            for lj in range(TMPL_LMAX + 1):
+                for lk in range(TMPL_LMAX + 1):
+                    for ll in range(TMPL_LMAX + 1):
+                        if max(li, lj, lk, ll) < TMPL_LMAX:
+                            continue
+                        key = ((li * 3 + lj) * 3 + lk) * 3 + ll
+                        f = f'{name}_t<{li},{lj},{lk},{ll}>'
+                        cases.append(
+                            f'        case {key}:\n'
+                            f'            if (buflen > 48000) cudaFuncSetAttribute('
+                            f'(const void *)&{f}, cudaFuncAttributeMaxDynamicSharedMemorySize, buflen);\n'
+                            f'            {f}<<<workers, threads, buflen>>>({args});\n'
+                            f'            break;\n')
+                        total += 1
+        disp = ('        if (omega >= 0 && li <= %d && lj <= %d && lk <= %d && '
+                'll <= %d) {\n'
+                '        switch (((li * 3 + lj) * 3 + lk) * 3 + ll) {\n'
+                % ((TMPL_LMAX,) * 4) + ''.join(cases) +
+                '        default:\n'
+                f'            {name}<<<workers, threads, buflen>>>({args});\n'
+                '        }\n        } else\n')
+        text = text[:k] + disp + text[k:]
+    old = ('    cudaDeviceProp prop;\n'
+           '    cudaGetDeviceProperties(&prop, 0);\n'
+           '    int workers = prop.multiProcessorCount;\n')
+    n = text.count(old)
+    text = text.replace(old, '    int workers = myejk2_sm_count();\n')
+    inc = '#include "build_rys_gxyz.cuh"\n'
+    text = text.replace(inc, inc + _SM_HELPER, 1)
+    sys.stderr.write(f'  templated: {total} class instances, {n} device queries '
+                     f'cached\n')
+    return text, total
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('src', help='GPU4PySCF lib/gvhf-rys of a 1.8.x checkout')
@@ -227,6 +343,9 @@ def main():
                          'place, which the P3 cap switches on and which then '
                          'computes wrong numbers -- the measurement behind '
                          'the module docstring')
+    ap.add_argument('--no-templated', action='store_true',
+                    help='no per-class instances of the general kernels and '
+                         'the per-launch device query kept (the ablation)')
     ap.add_argument('--no-p1', action='store_true',
                     help='keep the divisions (the ablation)')
     ap.add_argument('--p3', action='store_true',
@@ -275,6 +394,8 @@ def main():
             text, _ = p3(text, f, a.maxthreads, a.minblocks)
         if f == 'rys_contract_jk_ip2.cu':
             text, _ = rename_entries(text)
+            if not a.no_templated:
+                text, _ = templated(text)
         open(os.path.join(ker, f), 'w').write(text)
         sys.stderr.write(f'  wrote {os.path.join(ker, f)}\n')
 

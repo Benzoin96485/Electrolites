@@ -325,3 +325,30 @@ the measurement with it.
   in the `cicj` cache loop with a division.  It is once per bra primitive pair
   per block, so P1 leaves it alone deliberately — recorded so the next round
   does not spend time rediscovering that it does not matter.
+
+---
+
+## Addendum: per-class instances of the general kernels (catalogue B3, §13.20)
+
+63 % of `ejk_ip2` runs on `rys_contract_jk_ip2.cu`'s two general kernels,
+whose angular momenta, strides, g-array size, root count and cartesian
+counts are all run-time values.  `codegen/gen_ejk_ip2.py` now (unless
+`--no-templated`) emits a `template <LI, LJ, LK, LL>` copy of each with those
+as compile-time constants — the arithmetic unchanged — and the two drivers
+launch an instance for every long-range class whose shells are all at most
+d (130 instances, one nvcc minute), the run-time kernel otherwise.  The
+type3 driver's g-array differs (`stride_k = stride_j·(lj+1)`,
+`g_size = stride_l·(ll+1)`), which the generator carries over.  The drivers
+also stop calling `cudaGetDeviceProperties` on every launch.
+
+`benchmarks/ejk_ip2_bench.py`, `_partial_ejk_ip2` in one process:
+
+| | stock | scheme only | kernels only | kernels + scheme |
+|---|---|---|---|---|
+| penicillin V (RKS) | 7.429 s | 6.586 (1.13x) | 6.643 (1.12x) | **5.917 (1.26x)** |
+| Ni(II) dithiolene⁻ (UKS) | 36.281 s | 25.310 (1.43x) | 32.901 (1.10x) | **22.955 (1.58x)** |
+
+("kernels only" was 1.02x with P1 alone.)  With that the kernel half is **on
+by default**; `FASTEJK2_NO_KERNELS=1` is the ablation.  Whole Hessians:
+penicillin V 34.08 → 33.39 s, Ni 66.76 → 64.52 s; `tests/test_ejk_ip2.py`
+≤ 6.7e-13 relative, Hessians ≤ 3e-11.

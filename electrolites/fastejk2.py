@@ -92,13 +92,14 @@ SUPPORTED = ('1.8.0', '1.8.1')
 
 _OFF = bool(os.environ.get('FASTEJK2_OFF'))
 _NO_SCHEME = bool(os.environ.get('FASTEJK2_NO_SCHEME'))
-#: The kernel half is **opt-in**, and this is the one switch in the repository
-#: that is off by default.  It is correct (1e-13 against upstream over five
-#: molecule/basis pairs) but it is worth 1.02x, against 1.13x for the
-#: launch-scheme half that costs two lines of Python and no compiler -- see
-#: README_fastejk2.md 2.  Keeping it available and off is what makes the
-#: measurement reproducible without charging every user an nvcc build.
-_KERNELS = bool(os.environ.get('FASTEJK2_KERNELS'))
+#: The kernel half was opt-in while it was P1 alone (1.02x, README_fastejk2.md
+#: 2).  Since catalogue B3's round (docs/KERNEL_TARGETS_1.8.1.md §13.20) the
+#: library also carries per-class instances of the general kernels and a
+#: cached device query, worth 1.10x more on top of the launch scheme (1.26x
+#: and 1.58x together on penicillin V and a Ni complex), so it is **on by
+#: default**; ``FASTEJK2_NO_KERNELS=1`` keeps GPU4PySCF's kernels.  Without
+#: nvcc the module still stands down to the scheme half.
+_KERNELS = not bool(os.environ.get('FASTEJK2_NO_KERNELS'))
 #: quartets-per-block halvings; 1 is what benchmarks/ejk_ip2_sweep.py measured
 _SHIFT = int(os.environ.get('FASTEJK2_SHIFT', 1))
 _PATCHED = False
@@ -165,7 +166,7 @@ def unpatch_scheme():
 def apply_patch(force=False):
     """Bind our two kernels over GPU4PySCF's on the ctypes handle.
 
-    Off unless ``FASTEJK2_KERNELS`` is set or ``force`` is passed; ``force`` is
+    On unless ``FASTEJK2_NO_KERNELS`` is set (``force`` overrides it); ``force`` is
     what `tests/test_ejk_ip2.py` and `benchmarks/ejk_ip2_bench.py` use, since
     a switch that hides the thing under test would hide the measurement too.
 
