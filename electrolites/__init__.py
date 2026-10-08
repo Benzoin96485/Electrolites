@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1', 'fastsfxc',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -236,6 +236,9 @@ _TARGETS = {
     # the direct Hessian's h1 two-electron kernels (B15): bound over
     # `libvhf_rys.RYS_build_jk_ip1`, which `_get_jk_ip1` reads at call time
     'fastjkip1': ('gpu4pyscf.hessian.rhf', 'libvhf_rys.RYS_build_jk_ip1'),
+    # the spin-flip multi-collinear XC kernel without the full tensors (D13)
+    'fastsfxc': (('gpu4pyscf.tdscf._uhf_resp_sf', 'mcfun_eval_xc_adapter_sf'),
+                 ('gpu4pyscf.grad.tduks_sf', 'mcfun_eval_xc_adapter_sf')),
     'fastqmmm': (('gpu4pyscf.qmmm.itrf', 'QMMMSCF.energy_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc_mm')),

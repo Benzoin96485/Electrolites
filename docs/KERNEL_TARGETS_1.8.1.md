@@ -485,7 +485,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 16 **done (time reversal); ACE open** | **J3** FFTDF k-point exchange (§13.16) | every k-point hybrid on the default back end | **94–97 %** of a k-point PBE0 SCF (§10.11) | **time reversal built** (`fastfftk`): `K(-k) = conj(K(k))` when the set and the densities allow — 2-atom 3×3×3 PBE0 SCF **149.5 → 78.8 s (1.90x)**, `get_k` 1.78–2.08x on 3×3×3, 4×4×4, 3×3×1; **1.00x on Gamma-centred 2×2×2** (every point its own partner).  Wider FFT batches measured 1.00x, dropped.  The rest is FFT-bound at `nao·nocc` FFTs per pair; ACE would be `nocc²` but changes the K contract — not built |
 | 17 **done** | **B9** grid-response Hessian (§13.17) | Hessians with `grid_response=True` | **32–40 %** of a patched grid-response Hessian, `get_d2weight_dAdB` 17–20 % of it (§11.5) | **built** (`fastgridresp`): GPU4PySCF's two kernels as device functions, contracted with their vector on the fly (the translation-invariance fill folded into two accumulators) — `_get_exc_deriv2_grid_response` 3.4–3.5x, Hessian **56.0 → 44.9 s (1.25x)** penicillin V, 1.31x alanine dipeptide; **the 241-atom wall is gone** (PfPMT block 4.1 s where stock asserts).  ≤ 2.7e-12 Eh/bohr² |
 | 18 **done (a, b); c open** | **B15** `jk_ip1` (§13.18) | every direct Hessian | **26.8 %** of a patched UKS TMC Hessian; 7.7 % of a 42-atom RKS one (§10.7) | **(a) and (b) built** (`fastjkip1`, `libmyjkip1`): the per-launch `cudaGetDeviceProperties` cached (host time in the C entry 7.4 → 0.11 s), K over several densities so both spins come from one integral pass, plus P1.  Ni UKS Hessian **78.3 → 67.3 s (1.16x)**, penicillin V RKS 34.4 → 34.0 s.  On an idle node the term is device-bound (10 s of kernels), so (a) alone is 1.06–1.13x; (c), faster kernels, is what is left |
-| 19 | **D13** spin-flip multi-collinear XC | spin-flip TDA and its gradient | the sampled libxc evaluation is **15–21 %** of a patched SF-TDA + gradient run; the gradient's XC kernel 18–24 %, 6x its collinear cost (§11.3) | mod–hard; the response half is already `fastxcfxc`'s |
+| 19 **done** | **D13** spin-flip multi-collinear XC (§13.19) | spin-flip TDA and its gradient | the sampled libxc evaluation is **15–21 %** of a patched SF-TDA + gradient run; the gradient's XC kernel 18–24 %, 6x its collinear cost (§11.3) | **built** (`fastsfxc`): the entry's "evaluate only the needed spin blocks … without materialising" — libxc's raw derivatives to `fxc_ts[1,:,1]`/`kxc_ts[1,:,1,:,c]` by the chain rule in the total/spin basis, summed over samples in one kernel (`transform_kxc` was ~75 % of the evaluation).  Gradient XC kernel **3.0–3.3x**; SF-TDA + gradient 6.68 → 4.85 s (alanine dipeptide), 21.3 → 17.2 s (penicillin V); ≤ 3e-16 |
 | 20 | **B3** `ejk_ip2`'s general kernel | every direct Hessian, esp. transition metals | **29.1 %** of a patched UKS TMC Hessian, 13.7 % of a 42-atom RKS one | a generator project |
 | 21 | **F9 / F11** PCM response and `h1` (also SMD) | PCM and SMD Hessians, TDDFT-PCM, PCM polarizabilities | PCM-specific terms **28–30 %** of a patched PCM Hessian, `_B_dot_x` **12.6–14.8 %** (§10.6); SMD's electrostatic d2 12–15 %, its CDS FD Hessian 0.3–0.5 % (§11.4) | batch `_B_dot_x`, not the `h1` loop |
 | 22 | **J4** multigrid stress by strain FD | multigrid k-point stress | 18 strain passes = **46 %** of a multigrid stress (§11.6) | analytic strain derivative; mod |
@@ -1719,3 +1719,23 @@ a 284-atom Hessian possible but slow (~830 blocks × 3 terms × 4 s).
 superset), whole UKS Hessians ≤ 4.4e-12 Eh/bohr² (`tests/test_jkip1.py`).
 **(c)** — regenerating the ip1 classes with the P2–P5 treatment of
 `fastejk` — is the remaining lever on the ~10 s of kernels; not built.
+
+### 13.19 Rank 19 — D13: the spin-flip multi-collinear XC kernel (`docs/README_fastsfxc.md`)
+
+Measured first: in `NumInt.eval_xc_eff(spin=1, deriv=3)` on the 20-sample
+projected densities, `xc_deriv.transform_kxc` — the conversion of libxc's
+`(rho, sigma)` derivatives into the full `(2,4)^3` tensor — is ~75 % of the
+time, `ud2ts` and the slicing most of the rest; `eval_xc_eff_sf` then keeps
+`fxc_ts[1,:,1]` and `kxc_ts[1,:,1,:,c]`.  `fastsfxc` computes exactly those
+from the raw derivatives: the chain rule over `(ρ_u, ρ_d, σ_uu, σ_ud, σ_dd)`
+written in the total/spin basis, one thread per (point, output pair),
+summing the samples in registers.
+
+| B3LYP/def2-SVP, SF-TDA + gradient | gradient XC kernel | whole |
+|---|---|---|
+| alanine dipeptide | 2.57 → 0.85 s | 6.68 → 4.85 s (1.38x) |
+| penicillin V | 5.27 → 1.61 s | 21.32 → 17.24 s (1.24x) |
+
+≤ 3e-16 against GPU4PySCF's adapter (LDA, PBE, B3LYP, PBE0; second and
+third order); whole SF-TDA gradients to 4e-15 (`tests/test_sfxc.py`).
+Meta-GGA keeps GPU4PySCF's path.

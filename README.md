@@ -248,6 +248,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastfftk` | `pbc.df.fft_jk.get_k_kpts` — FFTDF k-point exchange built for one k of each time-reversal pair | `docs/README_fastfftk.md` |
 | `fastgridresp` | `hessian.{rks,uks}._get_exc_deriv2_grid_response`, `hessian.rks._get_enlc_deriv2` — the Becke weights' second derivative contracted on the fly, never stored | `docs/README_fastgridresp.md` |
 | `fastjkip1` | `libvhf_rys.RYS_build_jk_ip1` (via `hessian.rhf._get_jk_ip1`), `hessian.{uhf,uks}.make_h1` — the Hessian's h1 two-electron kernels without per-launch device queries, both spins from one integral pass | `docs/README_fastjkip1.md` |
+| `fastsfxc` | `tdscf._uhf_resp_sf.mcfun_eval_xc_adapter_sf` (and `grad.tduks_sf`'s binding) — the spin-flip multi-collinear XC kernel from libxc's raw derivatives, chain rule in the total/spin basis | `docs/README_fastsfxc.md` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |
