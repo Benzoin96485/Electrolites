@@ -1786,7 +1786,7 @@ TDA 6.5e-15 (`tests/test_pcmbatch.py`).  Measured on a node allocated with
 ### 13.22 Rank 22 — J4: the multigrid stress's strain finite difference — measured, not built
 
 After rank 14 the multigrid stress of 8-atom diamond 2×2×2 is 8.33 s, of
-which `_rks_exc_strain_deriv` is 7.95 s.  A cProfile of it (penicillin-free:
+which `_rks_exc_strain_deriv` is 7.95 s.  A cProfile of it (
 diamond8, PBE/gth-dzvp): 19 calls of `evaluate_density_on_g_mesh` (the
 unstrained density and the 9 × 2 strained ones) take 4.08 of 4.86 s, each
 0.19–0.21 s and device-bound; the rest is first-call NVRTC and FFTs.  So the
