@@ -487,7 +487,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 18 **done (a, b); c open** | **B15** `jk_ip1` (§13.18) | every direct Hessian | **26.8 %** of a patched UKS TMC Hessian; 7.7 % of a 42-atom RKS one (§10.7) | **(a) and (b) built** (`fastjkip1`, `libmyjkip1`): the per-launch `cudaGetDeviceProperties` cached (host time in the C entry 7.4 → 0.11 s), K over several densities so both spins come from one integral pass, plus P1.  Ni UKS Hessian **78.3 → 67.3 s (1.16x)**, penicillin V RKS 34.4 → 34.0 s.  On an idle node the term is device-bound (10 s of kernels), so (a) alone is 1.06–1.13x; (c), faster kernels, is what is left |
 | 19 **done** | **D13** spin-flip multi-collinear XC (§13.19) | spin-flip TDA and its gradient | the sampled libxc evaluation is **15–21 %** of a patched SF-TDA + gradient run; the gradient's XC kernel 18–24 %, 6x its collinear cost (§11.3) | **built** (`fastsfxc`): the entry's "evaluate only the needed spin blocks … without materialising" — libxc's raw derivatives to `fxc_ts[1,:,1]`/`kxc_ts[1,:,1,:,c]` by the chain rule in the total/spin basis, summed over samples in one kernel (`transform_kxc` was ~75 % of the evaluation).  Gradient XC kernel **3.0–3.3x**; SF-TDA + gradient 6.68 → 4.85 s (alanine dipeptide), 21.3 → 17.2 s (penicillin V); ≤ 3e-16 |
 | 20 **partly done; exact-tile generator open** | **B3** `ejk_ip2`'s general kernel (§13.20) | every direct Hessian, esp. transition metals | **29.1 %** of a patched UKS TMC Hessian, 13.7 % of a 42-atom RKS one | **built the cheap half of the generator**: per-class compile-time instances of the two general kernels (130 classes up to d) plus a cached device query, `fastejk2`'s kernels now on by default — `_partial_ejk_ip2` 7.43 → 5.92 s (1.26x, penicillin V) and 36.3 → 23.0 s (1.58x, Ni UKS) with the launch scheme; Hessians 34.1 → 33.4 s and 66.8 → 64.5 s.  The exact-tile per-class generator (`gen_khigh`-style for second derivatives) is not built |
-| 21 | **F9 / F11** PCM response and `h1` (also SMD) | PCM and SMD Hessians, TDDFT-PCM, PCM polarizabilities | PCM-specific terms **28–30 %** of a patched PCM Hessian, `_B_dot_x` **12.6–14.8 %** (§10.6); SMD's electrostatic d2 12–15 %, its CDS FD Hessian 0.3–0.5 % (§11.4) | batch `_B_dot_x`, not the `h1` loop |
+| 21 **done (response half, dqdx once)** | **F9 / F11** PCM response and `h1` (also SMD) (§13.21) | PCM and SMD Hessians, TDDFT-PCM, PCM polarizabilities | PCM-specific terms **28–30 %** of a patched PCM Hessian, `_B_dot_x` **12.6–14.8 %** (§10.6); SMD's electrostatic d2 12–15 %, its CDS FD Hessian 0.3–0.5 % (§11.4) | **built** (`fastpcmbatch`): `int1e_grids` with ≥ 3 densities/charge vectors builds the plain integrals once per cavity chunk and GEMMs them — `_B_dot_x` 10.9 → 6.3 s (penicillin V), 1.85 → 0.32 s (alanine dipeptide); `get_dqsym_dx` computed once.  IEF-PCM Hessian **58.0 → 52.3 s (1.11x)**, 12.5 → 10.8 s (1.16x).  The `h1` loop (1.1 s) unchanged |
 | 22 | **J4** multigrid stress by strain FD | multigrid k-point stress | 18 strain passes = **46 %** of a multigrid stress (§11.6) | analytic strain derivative; mod |
 | 23 | **A5** the AO kernel (+ **A15**) | every DFT SCF, gradient, response | XC 10.2 % of a patched SCF, 34–38 % of it device-idle | the A15 half is easy and bounded at 4.5–7 % |
 | 24 | **A20** cheaper direct K | every hybrid SCF | **66.8 %** of a patched SCF; **87–89 %** of a patched def2-TZVPP UKS SCF on 3d metals (§11.7) | the largest share in the SCF; nothing measured transfers and it changes the answer |
@@ -1762,3 +1762,23 @@ penicillin V 34.08 → 33.39 s, Ni UKS 66.76 → 64.52 s; ≤ 6.7e-13 relative
 generator; with the stage at ~19 % of a 42-atom Hessian and ~3 % of a
 113-atom one, and the instances already taking the run-time-index cost out,
 it was not built in this round.
+
+### 13.21 Rank 21 — F9 / F11: PCM's response and `dqdx` (`docs/README_fastpcmbatch.md`)
+
+As §5.1 says, the response half, not the `h1` loop.  `int1e_grids` with a
+stack of densities or charge vectors looped one full integral pass per
+vector; `PCM._B_dot_x` calls it with every right-hand side of the CPHF
+twice per response.  `fastpcmbatch` builds the plain integrals once per
+chunk of cavity points (`fast1e._plain_chunk`, split out of
+`fast1e.get_int3c1e`) and contracts all vectors by GEMM; F11's cheapest
+part — `get_dqsym_dx`, three identical evaluations per Hessian — is kept
+once (bitwise).
+
+| IEF-PCM B3LYP/def2-SVP Hessian | `_B_dot_x` | `get_dqsym_dx` ×3 | whole |
+|---|---|---|---|
+| alanine dipeptide | 1.85 → 0.32 s | 0.47 → 0.19 s | 12.53 → 10.76 s (1.16x) |
+| penicillin V | 10.92 → 6.29 s | 1.19 → 0.45 s | 57.99 → 52.27 s (1.11x) |
+
+≤ 2.2e-15 against the per-vector loop; ethanol PCM Hessian 7.2e-12, C-PCM
+TDA 6.5e-15 (`tests/test_pcmbatch.py`).  Measured on a node allocated with
+`-L cfs` while `/pscratch` was down.

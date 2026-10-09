@@ -450,43 +450,51 @@ def get_int3c1e(mol, grids, charge_exponents, intopt):
     _push_bpcache(mod, intopt)
 
     for p0, p1 in lib.prange(0, ngrids, ngrids_per_split):
-        n_here = p1 - p0
-        sl_all = cp.zeros([n_here, nao, nao], order='C')
-        gslice = grids[p0:p1]
-        eslice = _ptr_or_null(charge_exponents, p0, p1)
-        for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
-            ntasks_ij = len(log_q_ij)
-            if ntasks_ij == 0:
-                continue
-            cpi = intopt.cp_idx[cp_ij_id]
-            cpj = intopt.cp_jdx[cp_ij_id]
-            i_l = intopt.angular[cpi]
-            j_l = intopt.angular[cpj]
-            name, pass_l = _plain_kernel(i_l, j_l)
-            i0, i1 = intopt.cart_ao_loc[cpi], intopt.cart_ao_loc[cpi + 1]
-            j0, j1 = intopt.cart_ao_loc[cpj], intopt.cart_ao_loc[cpj + 1]
-            ni, nj = i1 - i0, j1 - j0
-            sl = cp.zeros([n_here, j1 - j0, i1 - i0], order='C')
-            nprim_ij, bas_ij, prim_ij = _pair_block(intopt, cp_ij_id)
-            args = [sl, np.int32(ntasks_ij), np.int32(n_here),
-                    np.int32(bas_ij), np.int32(prim_ij), np.int32(nprim_ij),
-                    np.int32(ni), np.int32(ni * nj), np.int32(i0),
-                    np.int32(j0), np.float64(omega), gslice, eslice]
-            if pass_l:
-                args += [np.int32(i_l), np.int32(j_l)]
-            _function(lmax, name)(_blocks(ntasks_ij, n_here),
-                                  (THREADSX, THREADSY), tuple(args))
-            i0, i1 = intopt.ao_loc[cpi], intopt.ao_loc[cpi + 1]
-            j0, j1 = intopt.ao_loc[cpj], intopt.ao_loc[cpj + 1]
-            if not mol.cart:
-                sl = cart2sph(sl, axis=1, ang=j_l)
-                sl = cart2sph(sl, axis=2, ang=i_l)
-            sl_all[:, j0:j1, i0:i1] = sl
-        row, col = np.tril_indices(nao)
-        sl_all[:, row, col] = sl_all[:, col, row]
-        sl_all = intopt.unsort_orbitals(sl_all, axis=[1, 2])
+        sl_all = _plain_chunk(mol, intopt, mod, lmax, grids[p0:p1],
+                              _ptr_or_null(charge_exponents, p0, p1), omega)
         sl_all.get(out=int3c[p0:p1, :, :])
     return int3c
+
+
+def _plain_chunk(mol, intopt, mod, lmax, gslice, eslice, omega):
+    """``(n_here, nao, nao)`` on the device: the plain integrals of the points
+    ``gslice`` (their exponents' pointer ``eslice``), symmetrised and in the
+    molecule's AO order -- one chunk of `get_int3c1e`, and what
+    ``fastpcmbatch`` contracts with many densities or charge vectors at once."""
+    nao = mol.nao
+    n_here = gslice.shape[0]
+    sl_all = cp.zeros([n_here, nao, nao], order='C')
+    for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
+        ntasks_ij = len(log_q_ij)
+        if ntasks_ij == 0:
+            continue
+        cpi = intopt.cp_idx[cp_ij_id]
+        cpj = intopt.cp_jdx[cp_ij_id]
+        i_l = intopt.angular[cpi]
+        j_l = intopt.angular[cpj]
+        name, pass_l = _plain_kernel(i_l, j_l)
+        i0, i1 = intopt.cart_ao_loc[cpi], intopt.cart_ao_loc[cpi + 1]
+        j0, j1 = intopt.cart_ao_loc[cpj], intopt.cart_ao_loc[cpj + 1]
+        ni, nj = i1 - i0, j1 - j0
+        sl = cp.zeros([n_here, j1 - j0, i1 - i0], order='C')
+        nprim_ij, bas_ij, prim_ij = _pair_block(intopt, cp_ij_id)
+        args = [sl, np.int32(ntasks_ij), np.int32(n_here),
+                np.int32(bas_ij), np.int32(prim_ij), np.int32(nprim_ij),
+                np.int32(ni), np.int32(ni * nj), np.int32(i0),
+                np.int32(j0), np.float64(omega), gslice, eslice]
+        if pass_l:
+            args += [np.int32(i_l), np.int32(j_l)]
+        _function(lmax, name)(_blocks(ntasks_ij, n_here),
+                              (THREADSX, THREADSY), tuple(args))
+        i0, i1 = intopt.ao_loc[cpi], intopt.ao_loc[cpi + 1]
+        j0, j1 = intopt.ao_loc[cpj], intopt.ao_loc[cpj + 1]
+        if not mol.cart:
+            sl = cart2sph(sl, axis=1, ang=j_l)
+            sl = cart2sph(sl, axis=2, ang=i_l)
+        sl_all[:, j0:j1, i0:i1] = sl
+    row, col = np.tril_indices(nao)
+    sl_all[:, row, col] = sl_all[:, col, row]
+    return intopt.unsort_orbitals(sl_all, axis=[1, 2])
 
 
 # --------------------------------------------------------------------------

@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1', 'fastsfxc',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1', 'fastsfxc', 'fastpcmbatch',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -239,6 +239,9 @@ _TARGETS = {
     # the spin-flip multi-collinear XC kernel without the full tensors (D13)
     'fastsfxc': (('gpu4pyscf.tdscf._uhf_resp_sf', 'mcfun_eval_xc_adapter_sf'),
                  ('gpu4pyscf.grad.tduks_sf', 'mcfun_eval_xc_adapter_sf')),
+    # int1e_grids with many densities / charge vectors in one pass (F9)
+    'fastpcmbatch': (('gpu4pyscf.gto.int3c1e', 'int1e_grids'),
+                     ('gpu4pyscf.solvent.pcm', 'int1e_grids')),
     'fastqmmm': (('gpu4pyscf.qmmm.itrf', 'QMMMSCF.energy_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc_mm')),
