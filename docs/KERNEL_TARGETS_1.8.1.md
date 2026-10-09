@@ -488,7 +488,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 19 **done** | **D13** spin-flip multi-collinear XC (§13.19) | spin-flip TDA and its gradient | the sampled libxc evaluation is **15–21 %** of a patched SF-TDA + gradient run; the gradient's XC kernel 18–24 %, 6x its collinear cost (§11.3) | **built** (`fastsfxc`): the entry's "evaluate only the needed spin blocks … without materialising" — libxc's raw derivatives to `fxc_ts[1,:,1]`/`kxc_ts[1,:,1,:,c]` by the chain rule in the total/spin basis, summed over samples in one kernel (`transform_kxc` was ~75 % of the evaluation).  Gradient XC kernel **3.0–3.3x**; SF-TDA + gradient 6.68 → 4.85 s (alanine dipeptide), 21.3 → 17.2 s (penicillin V); ≤ 3e-16 |
 | 20 **partly done; exact-tile generator open** | **B3** `ejk_ip2`'s general kernel (§13.20) | every direct Hessian, esp. transition metals | **29.1 %** of a patched UKS TMC Hessian, 13.7 % of a 42-atom RKS one | **built the cheap half of the generator**: per-class compile-time instances of the two general kernels (130 classes up to d) plus a cached device query, `fastejk2`'s kernels now on by default — `_partial_ejk_ip2` 7.43 → 5.92 s (1.26x, penicillin V) and 36.3 → 23.0 s (1.58x, Ni UKS) with the launch scheme; Hessians 34.1 → 33.4 s and 66.8 → 64.5 s.  The exact-tile per-class generator (`gen_khigh`-style for second derivatives) is not built |
 | 21 **done (response half, dqdx once)** | **F9 / F11** PCM response and `h1` (also SMD) (§13.21) | PCM and SMD Hessians, TDDFT-PCM, PCM polarizabilities | PCM-specific terms **28–30 %** of a patched PCM Hessian, `_B_dot_x` **12.6–14.8 %** (§10.6); SMD's electrostatic d2 12–15 %, its CDS FD Hessian 0.3–0.5 % (§11.4) | **built** (`fastpcmbatch`): `int1e_grids` with ≥ 3 densities/charge vectors builds the plain integrals once per cavity chunk and GEMMs them — `_B_dot_x` 10.9 → 6.3 s (penicillin V), 1.85 → 0.32 s (alanine dipeptide); `get_dqsym_dx` computed once.  IEF-PCM Hessian **58.0 → 52.3 s (1.11x)**, 12.5 → 10.8 s (1.16x).  The `h1` loop (1.1 s) unchanged |
-| 22 | **J4** multigrid stress by strain FD | multigrid k-point stress | 18 strain passes = **46 %** of a multigrid stress (§11.6) | analytic strain derivative; mod |
+| 22 **measured; not built** | **J4** multigrid stress by strain FD (§13.22) | multigrid k-point stress | 18 strain passes = **46 %** of a multigrid stress (§11.6); after rank 14, **7.95 of 8.33 s** of an 8-atom 2×2×2 multigrid stress | profiled: 19 `evaluate_density_on_g_mesh` passes at 0.19–0.21 s, **85 %** of the term, device-bound (the rest NVRTC warm-up and FFTs) — nothing to trim around them.  The analytic strain derivative needs a position-weighted variant of `libgpbc`'s density (or XC-gradient) kernels: the strain derivative of each Gaussian pair is `Σ_i u_i,y ∂_{u_i,x}`, with `u` measured from each image's centre, and the obvious shortcuts through the density gradient and the per-atom force driver break at the cell boundary.  Kernel development in a C library this repository does not yet build; not attempted |
 | 23 | **A5** the AO kernel (+ **A15**) | every DFT SCF, gradient, response | XC 10.2 % of a patched SCF, 34–38 % of it device-idle | the A15 half is easy and bounded at 4.5–7 % |
 | 24 | **A20** cheaper direct K | every hybrid SCF | **66.8 %** of a patched SCF; **87–89 %** of a patched def2-TZVPP UKS SCF on 3d metals (§11.7) | the largest share in the SCF; nothing measured transfers and it changes the answer |
 | 25 | **B17** DF CPHF RHS count/precision (W46) | DF Hessians | 82 % of a 113-atom UKS DF Hessian | specified in `DF_WORK_LIST.md` |
@@ -1782,3 +1782,31 @@ once (bitwise).
 ≤ 2.2e-15 against the per-vector loop; ethanol PCM Hessian 7.2e-12, C-PCM
 TDA 6.5e-15 (`tests/test_pcmbatch.py`).  Measured on a node allocated with
 `-L cfs` while `/pscratch` was down.
+
+### 13.22 Rank 22 — J4: the multigrid stress's strain finite difference — measured, not built
+
+After rank 14 the multigrid stress of 8-atom diamond 2×2×2 is 8.33 s, of
+which `_rks_exc_strain_deriv` is 7.95 s.  A cProfile of it (penicillin-free:
+diamond8, PBE/gth-dzvp): 19 calls of `evaluate_density_on_g_mesh` (the
+unstrained density and the 9 × 2 strained ones) take 4.08 of 4.86 s, each
+0.19–0.21 s and device-bound; the rest is first-call NVRTC and FFTs.  So the
+finite difference cannot be made cheaper around the passes — only fewer
+passes help.
+
+* Fewer passes by symmetry does not work term by term: the XC part's
+  `dE/dε_xy` is not symmetric on its own (the AOs keep their orientation
+  under the strain); only the total stress is.
+* A one-sided difference halves the passes and costs the O(disp) accuracy.
+* The analytic derivative is the proposal.  Per Gaussian pair
+  `f(r − R₁ − T₁, r − R₂ − T₂)`, the strain derivative at a fixed fractional
+  grid point is `Σ_i u_i,y ∂f/∂u_i,x` with `u_i` measured from the centre of
+  each image.  Writing `u = r − (R + T)` splits it into `r_y ∂_x ρ` (from the
+  GGA density gradient GPU4PySCF already has) and an image-position-weighted
+  sum of per-atom derivative densities — but the first piece is not periodic
+  and the split fails at the cell boundary, and the per-atom force driver
+  (`evaluate_xc_gradient_driver`) sums images without their positions.  So it
+  needs a position-weighted variant of `libgpbc`'s density or XC-gradient
+  kernels.  That is kernel development in a C library this repository does
+  not build or vendor yet; for a term that is specific to multigrid k-point
+  stress it was not attempted.  Recorded as the remaining cost of that
+  feature.
