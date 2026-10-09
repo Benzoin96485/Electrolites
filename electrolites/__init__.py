@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1', 'fastsfxc', 'fastpcmbatch',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1', 'fastsfxc', 'fastpcmbatch', 'fastscfscreen',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -242,6 +242,12 @@ _TARGETS = {
     # int1e_grids with many densities / charge vectors in one pass (F9)
     'fastpcmbatch': (('gpu4pyscf.gto.int3c1e', 'int1e_grids'),
                      ('gpu4pyscf.solvent.pcm', 'int1e_grids')),
+    # direct SCF: loose screening while the density is far off, then a
+    # tight rebuild (A20)
+    'fastscfscreen': (('gpu4pyscf.dft.rks', 'RKS.get_veff'),
+                      ('gpu4pyscf.dft.uks', 'UKS.get_veff'),
+                      ('gpu4pyscf.scf.hf', 'RHF.get_veff'),
+                      ('gpu4pyscf.scf.uhf', 'UHF.get_veff')),
     'fastqmmm': (('gpu4pyscf.qmmm.itrf', 'QMMMSCF.energy_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc'),
                  ('gpu4pyscf.qmmm.itrf', 'QMMMGrad.grad_nuc_mm')),

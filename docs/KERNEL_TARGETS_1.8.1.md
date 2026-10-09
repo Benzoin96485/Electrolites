@@ -490,7 +490,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 21 **done (response half, dqdx once)** | **F9 / F11** PCM response and `h1` (also SMD) (§13.21) | PCM and SMD Hessians, TDDFT-PCM, PCM polarizabilities | PCM-specific terms **28–30 %** of a patched PCM Hessian, `_B_dot_x` **12.6–14.8 %** (§10.6); SMD's electrostatic d2 12–15 %, its CDS FD Hessian 0.3–0.5 % (§11.4) | **built** (`fastpcmbatch`): `int1e_grids` with ≥ 3 densities/charge vectors builds the plain integrals once per cavity chunk and GEMMs them — `_B_dot_x` 10.9 → 6.3 s (penicillin V), 1.85 → 0.32 s (alanine dipeptide); `get_dqsym_dx` computed once.  IEF-PCM Hessian **58.0 → 52.3 s (1.11x)**, 12.5 → 10.8 s (1.16x).  The `h1` loop (1.1 s) unchanged |
 | 22 **measured; not built** | **J4** multigrid stress by strain FD (§13.22) | multigrid k-point stress | 18 strain passes = **46 %** of a multigrid stress (§11.6); after rank 14, **7.95 of 8.33 s** of an 8-atom 2×2×2 multigrid stress | profiled: 19 `evaluate_density_on_g_mesh` passes at 0.19–0.21 s, **85 %** of the term, device-bound (the rest NVRTC warm-up and FFTs) — nothing to trim around them.  The analytic strain derivative needs a position-weighted variant of `libgpbc`'s density (or XC-gradient) kernels: the strain derivative of each Gaussian pair is `Σ_i u_i,y ∂_{u_i,x}`, with `u` measured from each image's centre, and the obvious shortcuts through the density gradient and the per-atom force driver break at the cell boundary.  Kernel development in a C library this repository does not yet build; not attempted |
 | 23 **measured; rejected** | **A5** the AO kernel (+ **A15**) (§13.23) | every DFT SCF, gradient, response | XC 10.2 % of a patched SCF, 34–38 % of it device-idle | **re-measured on today's patched path and both halves are small now**: taxol B3LYP/def2-SVP `nr_rks` is 0.14 s a call, **~88 % device-busy** (nsys), ~13 % of the SCF; the AO kernels (`_cart/_sph_kernel_deriv1`) are **15 % of it, ~2 % of the SCF**; the 16 ms `grouped_gemm` host time was waiting on the device (looped cuBLAS in its place: 0.141 vs 0.146 s, 0.043 vs 0.040 s).  The device time is the grouped GEMMs (46 %), `GDFTcontract_rho` (18 %) and `dscale_ao` (13 %) — none of them this entry's |
-| 24 | **A20** cheaper direct K | every hybrid SCF | **66.8 %** of a patched SCF; **87–89 %** of a patched def2-TZVPP UKS SCF on 3d metals (§11.7) | the largest share in the SCF; nothing measured transfers and it changes the answer |
+| 24 **done (cycle-dependent threshold); fp32 Rys open** | **A20** cheaper direct K (§13.24) | every hybrid SCF | **66.8 %** of a patched SCF; **87–89 %** of a patched def2-TZVPP UKS SCF on 3d metals (§11.7) | **the threshold half built** (`fastscfscreen`): 1e-10 while `max|ΔD|` > 1e-3, then a tight full rebuild and tight increments — SCF **1.19x** taxol, **1.24x** PfPMT, 1.03–1.05x at 21–42 atoms; converged energies within 1e-10 (taxol) and the SCF's own noise (PfPMT).  fp32 Rys for low-bound quartets not built |
 | 25 | **B17** DF CPHF RHS count/precision (W46) | DF Hessians | 82 % of a 113-atom UKS DF Hessian | specified in `DF_WORK_LIST.md` |
 | 26 | **I3** conventional MP2's ovov build | conventional RMP2 | the legacy `GINTfill_int2e` ovov is **95 %** of the MP2 step, and out of memory at 42 atoms on 40 GB (§12.4) | the DF path is the practical one; mod |
 | 27 | **I5 / I4** CCSD AO-direct vvvv and host update | CCSD | vvvv **48–53 %**; host einsum ≈ 22 %, `cudaMalloc` ≈ 16 % (§10.10) | the allocator half is cheap |
@@ -1837,3 +1837,25 @@ B3LYP/def2-SVP, steady state:
 
 Neither half is worth building; what is left of the XC build is the GEMMs
 and the two contraction kernels, which no catalogue entry names.
+
+### 13.24 Rank 24 — A20: cheaper direct K (`docs/README_fastscfscreen.md`)
+
+The entry offers two routes: fp32 Rys for quartets whose bound is under a
+budget, or a cycle-dependent threshold with incremental builds.  GPU4PySCF
+already builds incrementally, at 1e-13 from the first cycle; per-cycle
+`get_k` falls only ~3x over an SCF (taxol 0.84 → 0.27 s, PfPMT 3.3 →
+0.96 s).  Built: the threshold route, with the one safeguard that makes it
+not change the answer — a full rebuild at `direct_scf_tol` when
+`max|ΔD|` first drops below 1e-3, after which everything is tight.
+
+| B3LYP/def2-SVP, `conv_tol` 1e-9 | SCF | ΔE |
+|---|---|---|
+| penicillin V | 5.35 → 5.21 s | 1e-10 |
+| Ni(II) dithiolene⁻ UKS | 21.28 → 20.28 s | 1e-10 |
+| taxol | 16.45 → 13.81 s (1.19x) | 1.6e-10 |
+| PfPMT⁻ | 64.67 → 51.99 s (1.24x), 21 vs 18 cycles | 7e-9, inside the SCF's noise at this `conv_tol` |
+
+Loose at 1e-9 moved taxol by 1e-8 (rejected).  ≤ 3.6e-11 over RKS, UKS, RHF
+and ωB97X at `conv_tol` 1e-10 (`tests/test_scfscreen.py`).  The fp32 Rys
+route is untouched; it would change the integrals of the converged answer
+and needs the error budget the catalogue describes.
