@@ -491,7 +491,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 22 **measured; not built** | **J4** multigrid stress by strain FD (§13.22) | multigrid k-point stress | 18 strain passes = **46 %** of a multigrid stress (§11.6); after rank 14, **7.95 of 8.33 s** of an 8-atom 2×2×2 multigrid stress | profiled: 19 `evaluate_density_on_g_mesh` passes at 0.19–0.21 s, **85 %** of the term, device-bound (the rest NVRTC warm-up and FFTs) — nothing to trim around them.  The analytic strain derivative needs a position-weighted variant of `libgpbc`'s density (or XC-gradient) kernels: the strain derivative of each Gaussian pair is `Σ_i u_i,y ∂_{u_i,x}`, with `u` measured from each image's centre, and the obvious shortcuts through the density gradient and the per-atom force driver break at the cell boundary.  Kernel development in a C library this repository does not yet build; not attempted |
 | 23 **measured; rejected** | **A5** the AO kernel (+ **A15**) (§13.23) | every DFT SCF, gradient, response | XC 10.2 % of a patched SCF, 34–38 % of it device-idle | **re-measured on today's patched path and both halves are small now**: taxol B3LYP/def2-SVP `nr_rks` is 0.14 s a call, **~88 % device-busy** (nsys), ~13 % of the SCF; the AO kernels (`_cart/_sph_kernel_deriv1`) are **15 % of it, ~2 % of the SCF**; the 16 ms `grouped_gemm` host time was waiting on the device (looped cuBLAS in its place: 0.141 vs 0.146 s, 0.043 vs 0.040 s).  The device time is the grouped GEMMs (46 %), `GDFTcontract_rho` (18 %) and `dscale_ao` (13 %) — none of them this entry's |
 | 24 **done (cycle-dependent threshold); fp32 Rys open** | **A20** cheaper direct K (§13.24) | every hybrid SCF | **66.8 %** of a patched SCF; **87–89 %** of a patched def2-TZVPP UKS SCF on 3d metals (§11.7) | **the threshold half built** (`fastscfscreen`): 1e-10 while `max|ΔD|` > 1e-3, then a tight full rebuild and tight increments — SCF **1.19x** taxol, **1.24x** PfPMT, 1.03–1.05x at 21–42 atoms; converged energies within 1e-10 (taxol) and the SCF's own noise (PfPMT).  fp32 Rys for low-bound quartets not built |
-| 25 | **B17** DF CPHF RHS count/precision (W46) | DF Hessians | 82 % of a 113-atom UKS DF Hessian | specified in `DF_WORK_LIST.md` |
+| 25 **measured; rejected on this GPU** | **B17** DF CPHF RHS count/precision (W46) (§13.25) | DF Hessians | 82 % of a 113-atom UKS DF Hessian | the precision lever does not exist on an A100: a taxol-sized cuTENSOR contraction is 16.3 ms fp64 (17.5 TF, the DMMA path), **15.9 ms fp32**, **17.4 ms 3xTF32** — no faster — and 9.0 ms TF32 at **6.4e-5** relative error, which a 1e-6 Krylov cannot take and mixed-precision refinement (an fp64 residual and a second solve) eats; `benchmarks/tf32_contract_probe.py` |
 | 26 | **I3** conventional MP2's ovov build | conventional RMP2 | the legacy `GINTfill_int2e` ovov is **95 %** of the MP2 step, and out of memory at 42 atoms on 40 GB (§12.4) | the DF path is the practical one; mod |
 | 27 | **I5 / I4** CCSD AO-direct vvvv and host update | CCSD | vvvv **48–53 %**; host einsum ≈ 22 %, `cudaMalloc` ≈ 16 % (§10.10) | the allocator half is cheap |
 | 28 | **C12** fused RSH response J+K | RSH polarizability, TDDFT | J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K | as `fastrsh` |
@@ -1859,3 +1859,28 @@ Loose at 1e-9 moved taxol by 1e-8 (rejected).  ≤ 3.6e-11 over RKS, UKS, RHF
 and ωB97X at `conv_tol` 1e-10 (`tests/test_scfscreen.py`).  The fp32 Rys
 route is untouched; it would change the integrals of the converged answer
 and needs the error budget the catalogue describes.
+
+### 13.25 Rank 25 — B17: the DF CPHF's set-calls and precision (W46) — measured, rejected on this GPU
+
+W46's premise is that the early Krylov cycles' exchange images do not need
+fp64, and fp32 would be cheaper.  On an A100 it is not: fp64 contractions
+run on the double-precision tensor cores (DMMA, 19.5 TF peak), and fp32
+without TF32 has the same 19.5 TF.  `benchmarks/tf32_contract_probe.py`, one
+`Lpq,qn->Lpn` contraction at taxol's `nao` (L 100, p q 1123, n 1130),
+cuTENSOR:
+
+| operands / compute | time | rate | error against fp64 |
+|---|---|---|---|
+| fp64 / 64F | 16.3 ms | 17.5 TF | — |
+| fp32 / 32F | 15.9 ms | 17.9 TF | 2.5e-6 |
+| fp32 / 3xTF32 | 17.4 ms | 16.4 TF | 2.5e-6 |
+| fp32 / TF32 | 9.0 ms | 31.8 TF | **6.4e-5** |
+
+Only TF32 is faster (1.8x here, with the casts not yet charged), and its
+6e-5 relative error per image is far above what a Krylov converged to 1e-6
+per atom tolerates in more than the first image.  Repairing that by
+iterative refinement costs an fp64 residual and a second solve, which on
+this cycle count (5–6) leaves nothing.  The other half of W46 — fewer
+set-calls through a better guess or preconditioner — and W45/W47 were not
+attempted in this round.  On hardware where fp32 throughput exceeds fp64
+(e.g. consumer or inference GPUs) the measurement should be repeated.
