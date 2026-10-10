@@ -251,6 +251,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastsfxc` | `tdscf._uhf_resp_sf.mcfun_eval_xc_adapter_sf` (and `grad.tduks_sf`'s binding) — the spin-flip multi-collinear XC kernel from libxc's raw derivatives, chain rule in the total/spin basis | `docs/README_fastsfxc.md` |
 | `fastpcmbatch` | `gto.int3c1e.int1e_grids` (and where imported), `solvent.hessian.pcm.get_dqsym_dx` — PCM's multi-vector integrals in one pass + GEMM; the charge derivative once per Hessian | `docs/README_fastpcmbatch.md` |
 | `fastscfscreen` | `dft.{rks,uks}.{RKS,UKS}.get_veff`, `scf.hf.RHF`, `scf.uhf.UHF` — direct SCF screens at 1e-10 while the density is far off, then rebuilds the Fock matrix tight | `docs/README_fastscfscreen.md` |
+| `fastmp2` | `scf.int4c2e.get_int4c2e_ovov` — conventional RMP2's (ia\|jb) as a blocked half transformation (strided-batched GEMMs into the half-transformed tensor), batched over occupied orbitals to fit the card | `electrolites/fastmp2.py` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |

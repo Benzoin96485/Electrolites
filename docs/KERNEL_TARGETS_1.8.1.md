@@ -492,7 +492,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 23 **measured; rejected** | **A5** the AO kernel (+ **A15**) (§13.23) | every DFT SCF, gradient, response | XC 10.2 % of a patched SCF, 34–38 % of it device-idle | **re-measured on today's patched path and both halves are small now**: taxol B3LYP/def2-SVP `nr_rks` is 0.14 s a call, **~88 % device-busy** (nsys), ~13 % of the SCF; the AO kernels (`_cart/_sph_kernel_deriv1`) are **15 % of it, ~2 % of the SCF**; the 16 ms `grouped_gemm` host time was waiting on the device (looped cuBLAS in its place: 0.141 vs 0.146 s, 0.043 vs 0.040 s).  The device time is the grouped GEMMs (46 %), `GDFTcontract_rho` (18 %) and `dscale_ao` (13 %) — none of them this entry's |
 | 24 **done (cycle-dependent threshold); fp32 Rys open** | **A20** cheaper direct K (§13.24) | every hybrid SCF | **66.8 %** of a patched SCF; **87–89 %** of a patched def2-TZVPP UKS SCF on 3d metals (§11.7) | **the threshold half built** (`fastscfscreen`): 1e-10 while `max|ΔD|` > 1e-3, then a tight full rebuild and tight increments — SCF **1.19x** taxol, **1.24x** PfPMT, 1.03–1.05x at 21–42 atoms; converged energies within 1e-10 (taxol) and the SCF's own noise (PfPMT).  fp32 Rys for low-bound quartets not built |
 | 25 **measured; rejected on this GPU** | **B17** DF CPHF RHS count/precision (W46) (§13.25) | DF Hessians | 82 % of a 113-atom UKS DF Hessian | the precision lever does not exist on an A100: a taxol-sized cuTENSOR contraction is 16.3 ms fp64 (17.5 TF, the DMMA path), **15.9 ms fp32**, **17.4 ms 3xTF32** — no faster — and 9.0 ms TF32 at **6.4e-5** relative error, which a 1e-6 Krylov cannot take and mixed-precision refinement (an fp64 residual and a second solve) eats; `benchmarks/tf32_contract_probe.py` |
-| 26 | **I3** conventional MP2's ovov build | conventional RMP2 | the legacy `GINTfill_int2e` ovov is **95 %** of the MP2 step, and out of memory at 42 atoms on 40 GB (§12.4) | the DF path is the practical one; mod |
+| 26 **done** | **I3** conventional MP2's ovov build — `fastmp2` (§13.26) | conventional RMP2 | was: the legacy ovov build **95 %** of the MP2 step, out of memory at 42 atoms on 40 GB (§12.4) | **built and measured.**  The integrals were never the cost (~1 %): each class-pair block's last `einsum` wrote a whole o²v² temporary.  Now a half transformation per occupied batch, strided-batched GEMMs with β = 1 straight into `H[λ,σ,i,a]`, then two GEMMs: RMP2 step **12.6x** alanine dipeptide/SVP (8.22 → 0.65 s), **28x** /TZVP (128.7 → 4.54 s), **55x** penicillin V (470.1 → 8.55 s on 80 GB) and **runs on 40 GB** (ovov 10.2 s, 5 batches); |Δe_corr| ≤ 1e-14.  **Left**: the per-block virtual step (fp64 GEMM, ~60 % of what remains); o²v² itself bounds the size (taxol's would be ~330 GB) |
 | 27 | **I5 / I4** CCSD AO-direct vvvv and host update | CCSD | vvvv **48–53 %**; host einsum ≈ 22 %, `cudaMalloc` ≈ 16 % (§10.10) | the allocator half is cheap |
 | 28 | **C12** fused RSH response J+K | RSH polarizability, TDDFT | J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K | as `fastrsh` |
 | 29 | **J1** GDF k-point exchange | k-point hybrids with `density_fit()` | **50–54 %** (§10.11) | J2 is a 2–8 % tail |
@@ -1884,3 +1884,56 @@ this cycle count (5–6) leaves nothing.  The other half of W46 — fewer
 set-calls through a better guess or preconditioner — and W45/W47 were not
 attempted in this round.  On hardware where fp32 throughput exceeds fp64
 (e.g. consumer or inference GPUs) the measurement should be repeated.
+
+### 13.26 Rank 26 — I3: conventional MP2's (ia|jb) build (`electrolites/fastmp2.py`)
+
+Profiled first (`benchmarks/mp2_ovov_probe.py`, CUDA events around each
+`GINTfill_int2e` block): at alanine dipeptide/def2-SVP the integrals are
+0.07 s of the 8.6 s build.  The rest is the eight `einsum` chains per
+class-pair block, whose last step (`'oprl,lq->oprq'`) produces a full
+`ovov[o,v,o,v]` temporary that is then added in — per block an O(o²v²)
+allocation and write, 231 blocks at alanine dipeptide, 406 at penicillin V,
+which is also the 40 GB wall (ovov, a temporary of the same size, and the
+sum).
+
+Built: `fastmp2` replaces `int4c2e.get_int4c2e_ovov` (MP2's `_make_eris`
+looks it up at call time).  Per batch of occupied orbitals `I` it builds the
+half-transformed `H[λ,σ,i,a] = Σ (μν|λσ) C_occ[μ,i] C_vir[ν,a]`: each block's
+four (μν) orientations go through an occupied quarter step on the flattened
+block (one GEMM) and a virtual step as one `dgemmStridedBatched` per
+orientation with β = 1 writing **directly into H** (for one output row λ
+the (σ, i) rows are contiguous with stride nvir), only one (λ,σ) orientation
+is written and a small kernel adds the transpose at the end; then two GEMMs
+give `ovov[I,:,:,:]`.  Blocks are processed in slices of ≤ 2²⁵ doubles, the
+batch is sized from free memory, and integrals are recomputed per batch.  Two
+details were most of the wall time before they were fixed: GPU4PySCF's
+allocator sends every request > 100 MB to `cudaMalloc`/`cudaFree` (160 s of
+API time at penicillin V; the build now runs on the CuPy pool and frees its
+blocks afterwards), and `GINTfill`'s launch needs driver local memory outside
+the pool (2 GB headroom, and a batch-halving retry on failure).  A result too
+large for 45 % of free memory stays on the host as the
+`(nocc·nvir)²` matrix MP2's kernel already accepts.
+
+Measured (RHF → RMP2, `path_anatomy.py --feature mp2 --patch all`, A100 80 GB;
+`FASTMP2_OFF=1` for the stock column):
+
+| system / basis | nao | RMP2 step stock → patched | `_make_eris` | whole run |
+|---|---|---|---|---|
+| alanine dipeptide / def2-SVP | 200 | 8.22 → **0.65 s (12.6x)** | 8.04 → 0.48 s | 10.5 → 3.0 s |
+| alanine dipeptide / def2-TZVP | 382 | 128.7 → **4.54 s (28x)** | 128.2 → 4.06 s | 134.1 → 9.9 s |
+| penicillin V / def2-SVP | 430 | 470.1 → **8.55 s (55x)** | 469.3 → 8.08 s | 473.9 → 12.4 s |
+
+Correlation energies agree to 1e-14 Eh; the ovov elements to 2e-14
+(`tests/test_mp2.py`: glycine/def2-TZVP against the stock build with the
+automatic batch, 5 per batch and the host-resident result; water RMP2
+against PySCF's CPU MP2, 5e-11).  **40 GB**: with 40 GB held by a raw
+allocation, the stock build is out of memory at penicillin V (reproducing
+§12.4) and the patched one finishes in 10.2 s in 5 batches.
+
+After: at penicillin V the MP2 step is 69 % of the run and the SCF 31 %;
+inside the build (nsys) the per-block virtual GEMMs are ~60 %, the
+transposes ~20 %, `GINTfill` ~10 %.  The next lever would be accumulating
+the first quarter over the μ classes before the virtual step, which needs
+O(nao³) per occupied orbital.  The size limit is now the o²v² result itself
+(~330 GB at taxol/def2-SVP), which is DF-MP2's territory (I1).
+
