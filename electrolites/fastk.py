@@ -698,9 +698,13 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
     Screening for the fused classes uses the full-range q_cond, which is the
     larger of the two, so nothing that the separate long-range build would
     have kept is dropped.
+
+    ``hermi = 0`` (TDDFT and TDA trial densities) is served the way ``get_k``
+    serves it: the transposed densities ride along as extra ones and the two
+    halves are added on the way out.
     """
     assert num_devices == 1, 'fastk currently supports a single device'
-    assert hermi == 1
+    assert hermi in (0, 1, 2)
     if callable(dms):
         dms = dms()
     mol = opt_f.sorted_mol
@@ -711,6 +715,8 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
         raise NotImplementedError('fastk does not handle the CPU high-l path')
     dm_cond, log_cutoff, q_cond_f, pm_f = _prep(opt_f, dms, hermi)
     _, _, q_cond_l, pm_l = _prep(opt_l, dms, hermi)
+    if hermi == 0:
+        dms = cp.asarray(cp.vstack([dms, dms.transpose(0, 2, 1)]), order='C')
 
     n_dm, nao = dms.shape[:2]
     vk = cp.zeros(dms.shape)
@@ -785,7 +791,13 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
                              pm_kl, qc, dm_cond, log_cutoff, lll)
             vk += c * tmp
 
-    return transpose_sum(vk)
+    if hermi == 1:
+        return transpose_sum(vk)
+    if hermi == 2:
+        return transpose_sum(vk, hermi=2)
+    vk, vkT = vk[:n_dm//2], vk[n_dm//2:]
+    vk += vkT.transpose(0, 2, 1)
+    return vk
 
 
 _PATCHED = False
@@ -805,7 +817,7 @@ def _get_k_dispatch(self, dms, hermi, verbose, *rsh):
             # never evaluate erfc; erf + erfc == 1 turns the request into
             # sr*(full range) + (lr-sr)*(long range), which the fused kernels
             # build in one pass over the quartets (README_fastrsh.md).
-            if hermi != 1 or _FUSED_OFF:
+            if _FUSED_OFF:
                 return JK._VHFOpt._get_k_orig(self, dms, hermi, verbose, *rsh)
             if callable(dms):
                 dms = dms()

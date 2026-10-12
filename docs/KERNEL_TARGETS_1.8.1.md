@@ -494,7 +494,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 25 **measured; rejected on this GPU** | **B17** DF CPHF RHS count/precision (W46) (§13.25) | DF Hessians | 82 % of a 113-atom UKS DF Hessian | the precision lever does not exist on an A100: a taxol-sized cuTENSOR contraction is 16.3 ms fp64 (17.5 TF, the DMMA path), **15.9 ms fp32**, **17.4 ms 3xTF32** — no faster — and 9.0 ms TF32 at **6.4e-5** relative error, which a 1e-6 Krylov cannot take and mixed-precision refinement (an fp64 residual and a second solve) eats; `benchmarks/tf32_contract_probe.py` |
 | 26 **done** | **I3** conventional MP2's ovov build — `fastmp2` (§13.26) | conventional RMP2 | was: the legacy ovov build **95 %** of the MP2 step, out of memory at 42 atoms on 40 GB (§12.4) | **built and measured.**  The integrals were never the cost (~1 %): each class-pair block's last `einsum` wrote a whole o²v² temporary.  Now a half transformation per occupied batch, strided-batched GEMMs with β = 1 straight into `H[λ,σ,i,a]`, then two GEMMs: RMP2 step **12.6x** alanine dipeptide/SVP (8.22 → 0.65 s), **28x** /TZVP (128.7 → 4.54 s), **55x** penicillin V (470.1 → 8.55 s on 80 GB) and **runs on 40 GB** (ovov 10.2 s, 5 batches); |Δe_corr| ≤ 1e-14.  **Left**: the per-block virtual step (fp64 GEMM, ~60 % of what remains); o²v² itself bounds the size (taxol's would be ~330 GB) |
 | 27 **done (device driver + integral cache); the legacy kernel left** | **I5 / I4** CCSD AO-direct vvvv and host update — `fastccsd` (§13.27) | CCSD | was: vvvv **48–53 %**; host einsum ≈ 22 %, `cudaMalloc` ≈ 16 % (§10.10) | **built and measured.**  The device was busy ~11 s of a 165 s CCSD: the whole iteration (amplitudes, MO integrals, `ao2mo`'s accumulators, DIIS) now lives on the device and the AO integral blocks are computed once and cached (device, else host).  CCSD **10.9x** alanine dipeptide/SVP (110.2 → 10.1 s), **4.8x** glycine/SVP, **2.4x** glycine/TZVP (35.1 → 14.7 s); |Δe_corr| ≤ 5e-12 at matched convergence.  Found on the way: a (ff\|ff) `GINTfill` launch leaves **~37 GB** of driver local memory reserved on a 40 GB card until the stack limit is re-set.  **Left**: the legacy `GINTfill` itself in iteration 1 at f shells; the o²v² footprint (falls back to stock beyond ~0.8 of the card) |
-| 28 | **C12** fused RSH response J+K | RSH polarizability, TDDFT | J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K | as `fastrsh` |
+| 28 **done (one exchange pass, chosen per call shape); J not fused into it** | **C12** fused RSH response J+K — `fastrshresp` (§13.28) | RSH polarizability, TDDFT | was: J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K | **built and measured.**  `fastk.get_k_rsh` now takes `hermi = 0`; the response generators' RSH statements call it (K-only branches: always; J+K branches: `fastj` J + one exchange pass, or GPU4PySCF's two passes, whichever the first calls time faster per (hermi, density-count)).  wB97M-V TDA **1.27x** taxol (268.9 → 211.2 s), 1.06x penicillin V, UKS 1.07x; polarizability (hermi 1, 3 densities) keeps the two passes (the fused one is 13–25 % slower there; 2 % tuning cost).  **Rejected**: J in the same kernel — it needs a second, full-range set of gout registers |
 | 29 | **J1** GDF k-point exchange | k-point hybrids with `density_fit()` | **50–54 %** (§10.11) | J2 is a 2–8 % tail |
 | 30 | **A18** under-filled K classes | SCF, esp. TMCs | 1.056x on PfPMT `get_k` (login node) | owes a compute-node re-run |
 | 31 | **A7** RSH fusion, high-`l` classes | RSH SCF | ~9 % of K (06's estimate) | easy |
@@ -1998,4 +1998,58 @@ above 80 % of the free memory the stock driver runs (penicillin V's o²v²
 alone is 7.7 GB).  Left: the legacy `GINTfill` in `ao2mo` and iteration 1
 (and its launch-time local-memory reservation) at f shells, and the cached
 AO-direct GEMMs at 200 AO.
+
+### 13.28 Rank 28 — C12: the range-separated response's exchange in one pass (`electrolites/fastrshresp.py`)
+
+`scf/_response_functions.py` builds a range-separated hybrid's response as
+`mf.get_jk` (`fastjk`: J and full-range K) followed by
+`mf.get_k(..., omega)` (`fastk`: long-range K); the triplet and the no-J UHF
+branches do the same with `get_k` first.  `fastk.get_k_rsh` — the SCF's
+fused `hyb·K + (alpha−hyb)·K_LR` — served `hermi = 1` only.
+
+Built: `get_k_rsh` takes `hermi = 0` and `2` (transposed densities as extra
+ones, as `get_k` does; the omega < 0 dispatch no longer hands non-Hermitian
+requests back).  `fastrshresp` rewrites the five RSH statements of
+`_gen_rhf_response`/`_gen_uhf_response` (source transform on the live module,
+counts asserted) to `rsh_jk`:
+
+* K-only branches: the fused exchange;
+* J+K branches: either GPU4PySCF's arrangement or `fastj`'s J plus the fused
+  exchange.  Measured per call (`benchmarks/rsh_response_probe.py`, Davidson
+  start densities, wB97M-V):
+
+| system | hermi | nset | two passes (`fastjk` + `fastk`) | `fastj` + fused K | ratio |
+|---|---|---|---|---|---|
+| penicillin V | 0 | 1 / 5 / 10 | 0.370 / 0.944 / 1.668 s | 0.351 / 0.826 / 1.280 s | 1.06 / 1.14 / 1.30x |
+| penicillin V | 1 | 1 / 5 / 10 | 0.303 / 0.580 / 0.939 s | 0.318 / 0.643 / 0.915 s | 0.95 / 0.90 / 1.03x |
+| taxol | 0 | 1 / 5 | 3.12 / 10.75 s | 2.43 / 7.56 s | 1.28 / 1.42x |
+| taxol | 1 | 1 / 5 | 2.22 / 5.86 s | 2.01 / 5.11 s | 1.11 / 1.15x |
+
+  Neither wins everywhere, so the module times both on the 2nd–5th calls of
+  each (SCF object, hermi, log₂ density count) and keeps the faster
+  (`FASTRSHRESP_MODE=fused|split` fixes it).
+
+End to end (`response_anatomy.py --patch all`, `FASTRSHRESP_OFF=1` for "before";
+at most three jobs on the node):
+
+| run | before | after (auto) | forced fused | auto picked |
+|---|---|---|---|---|
+| taxol wB97M-V TDA, 5 roots | 268.9 s | **211.2 s (1.27x)** | — | fused |
+| penicillin V wB97M-V TDA, 5 roots | 25.3 s | 23.8 s (1.06x) | 23.1 s | fused |
+| penicillin V⁺ wB97M-V UKS TDA | 55.8 s | 52.4 s (1.07x) | 51.1 s | fused |
+| penicillin V wB97X-D3BJ polarizability | 9.16 s | 9.39 s (−2 %) | 10.53 s | two passes |
+| taxol wB97X-D3BJ polarizability | 66.0 s | 66.1 s | — | two passes |
+
+Excitation energies and polarizabilities unchanged (to the printed 1e-9 eV /
+1e-12); `tests/test_rshresp.py` (glycine: TDA singlet/triplet, TDDFT with
+wB97M-V, UKS TDA, polarizability; each forced fused, forced split and auto,
+against `FASTRSHRESP_OFF=1`).
+
+Not built: J in the fused exchange kernel.  The generated `fastjk` kernels
+contract J and K from one set of gout registers; with two ranges K wants
+`hyb·full + (alpha−hyb)·LR` and J the full range alone, i.e. a second set of
+registers in classes already register-bound, and the measured headroom (J is
+0.06–1.6 s of the calls above, and `fastj` computes it separately in the
+fused arrangement) does not pay for it.  The `hermi = 1`, few-density case —
+CPKS and polarizability — stays on the two passes.
 

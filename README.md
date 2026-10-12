@@ -253,6 +253,7 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastscfscreen` | `dft.{rks,uks}.{RKS,UKS}.get_veff`, `scf.hf.RHF`, `scf.uhf.UHF` — direct SCF screens at 1e-10 while the density is far off, then rebuilds the Fock matrix tight | `docs/README_fastscfscreen.md` |
 | `fastmp2` | `scf.int4c2e.get_int4c2e_ovov` — conventional RMP2's (ia\|jb) as a blocked half transformation (strided-batched GEMMs into the half-transformed tensor), batched over occupied orbitals to fit the card | `electrolites/fastmp2.py` |
 | `fastccsd` | `cc.ccsd_incore.CCSDBase.ccsd` — closed-shell CCSD iterations with amplitudes, MO integrals, `ao2mo` accumulators and DIIS on the device, AO integral blocks computed once and cached (device or host) | `electrolites/fastccsd.py` |
+| `fastrshresp` | `scf._response_functions._gen_{rhf,uhf}_response` — a range-separated hybrid's response exchange in one pass (`fastk.get_k_rsh`, now also `hermi = 0`), the J+K arrangement chosen per call shape by timing | `electrolites/fastrshresp.py` |
 | `fastejk2` | `hessian.rhf._ip2_quartets_scheme` — the ip2 launch scheme | `docs/README_fastejk2.md` |
 | `fastdf` | `df.df_jk.get_jk` — the density-fitted J and K build | `docs/README_fastdf.md`, `docs/README_fastdfblock.md`, `docs/README_fastdfunpack.md` |
 | `fastdfj` | `df.df_jk._DFHF.get_jk` — **RIJONX**, which 1.8.1 cannot run | `docs/README_fastdfj.md` |
