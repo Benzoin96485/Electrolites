@@ -493,7 +493,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 24 **done (cycle-dependent threshold); fp32 Rys open** | **A20** cheaper direct K (§13.24) | every hybrid SCF | **66.8 %** of a patched SCF; **87–89 %** of a patched def2-TZVPP UKS SCF on 3d metals (§11.7) | **the threshold half built** (`fastscfscreen`): 1e-10 while `max|ΔD|` > 1e-3, then a tight full rebuild and tight increments — SCF **1.19x** taxol, **1.24x** PfPMT, 1.03–1.05x at 21–42 atoms; converged energies within 1e-10 (taxol) and the SCF's own noise (PfPMT).  fp32 Rys for low-bound quartets not built |
 | 25 **measured; rejected on this GPU** | **B17** DF CPHF RHS count/precision (W46) (§13.25) | DF Hessians | 82 % of a 113-atom UKS DF Hessian | the precision lever does not exist on an A100: a taxol-sized cuTENSOR contraction is 16.3 ms fp64 (17.5 TF, the DMMA path), **15.9 ms fp32**, **17.4 ms 3xTF32** — no faster — and 9.0 ms TF32 at **6.4e-5** relative error, which a 1e-6 Krylov cannot take and mixed-precision refinement (an fp64 residual and a second solve) eats; `benchmarks/tf32_contract_probe.py` |
 | 26 **done** | **I3** conventional MP2's ovov build — `fastmp2` (§13.26) | conventional RMP2 | was: the legacy ovov build **95 %** of the MP2 step, out of memory at 42 atoms on 40 GB (§12.4) | **built and measured.**  The integrals were never the cost (~1 %): each class-pair block's last `einsum` wrote a whole o²v² temporary.  Now a half transformation per occupied batch, strided-batched GEMMs with β = 1 straight into `H[λ,σ,i,a]`, then two GEMMs: RMP2 step **12.6x** alanine dipeptide/SVP (8.22 → 0.65 s), **28x** /TZVP (128.7 → 4.54 s), **55x** penicillin V (470.1 → 8.55 s on 80 GB) and **runs on 40 GB** (ovov 10.2 s, 5 batches); |Δe_corr| ≤ 1e-14.  **Left**: the per-block virtual step (fp64 GEMM, ~60 % of what remains); o²v² itself bounds the size (taxol's would be ~330 GB) |
-| 27 | **I5 / I4** CCSD AO-direct vvvv and host update | CCSD | vvvv **48–53 %**; host einsum ≈ 22 %, `cudaMalloc` ≈ 16 % (§10.10) | the allocator half is cheap |
+| 27 **done (device driver + integral cache); the legacy kernel left** | **I5 / I4** CCSD AO-direct vvvv and host update — `fastccsd` (§13.27) | CCSD | was: vvvv **48–53 %**; host einsum ≈ 22 %, `cudaMalloc` ≈ 16 % (§10.10) | **built and measured.**  The device was busy ~11 s of a 165 s CCSD: the whole iteration (amplitudes, MO integrals, `ao2mo`'s accumulators, DIIS) now lives on the device and the AO integral blocks are computed once and cached (device, else host).  CCSD **10.9x** alanine dipeptide/SVP (110.2 → 10.1 s), **4.8x** glycine/SVP, **2.4x** glycine/TZVP (35.1 → 14.7 s); |Δe_corr| ≤ 5e-12 at matched convergence.  Found on the way: a (ff\|ff) `GINTfill` launch leaves **~37 GB** of driver local memory reserved on a 40 GB card until the stack limit is re-set.  **Left**: the legacy `GINTfill` itself in iteration 1 at f shells; the o²v² footprint (falls back to stock beyond ~0.8 of the card) |
 | 28 | **C12** fused RSH response J+K | RSH polarizability, TDDFT | J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K | as `fastrsh` |
 | 29 | **J1** GDF k-point exchange | k-point hybrids with `density_fit()` | **50–54 %** (§10.11) | J2 is a 2–8 % tail |
 | 30 | **A18** under-filled K classes | SCF, esp. TMCs | 1.056x on PfPMT `get_k` (login node) | owes a compute-node re-run |
@@ -1936,4 +1936,66 @@ transposes ~20 %, `GINTfill` ~10 %.  The next lever would be accumulating
 the first quarter over the μ classes before the virtual step, which needs
 O(nao³) per occupied orbital.  The size limit is now the o²v² result itself
 (~330 GB at taxol/def2-SVP), which is DF-MP2's territory (I1).
+
+### 13.27 Rank 27 — I5 / I4: CCSD on the device (`electrolites/fastccsd.py`)
+
+Profiled first (alanine dipeptide/def2-SVP, `ccsd_incore`, 14 cycles): nsys
+puts **~11.7 s** of device time in a 165 s CCSD.  cProfile: `update_amps`'
+own host arithmetic 33 s, `.get()` 27 s, host `einsum` 17 s, numpy
+`reshape` copies 15 s, h5py DIIS ~13 s, the AO-direct step's host
+bookkeeping 16 s.  So the "vvvv" share of §10.10 was mostly host traffic
+around a GPU kernel, and I4 and I5's host half are one problem.
+
+Built: `fastccsd` replaces `CCSDBase.ccsd` with PySCF's `kernel` loop on
+device arrays:
+
+* `ao2mo`: GPU4PySCF's `_make_eris_incore` algorithm with `ppOO`/`pPoO` on the
+  device (no per-block `.get()`); the MO integrals stay there;
+* `update_amps`: the same algebra as `ccsd_incore.update_amps`, term by term,
+  on the device (one step agrees with the stock one to 5e-14);
+* the AO-direct `ovvv`/`vvvv` step: the same `GINTfill_int2e` blocks and
+  `dgemm` into `Ht2ao`, `wVVoo`/`wVvoO` on the device, and the integral blocks
+  **computed once** and kept — on the device when they fit in a third of the
+  memory left beside the integral kernels' local memory, else in host
+  memory (8.7 GB at glycine/TZVP), copied back per block — pageable, since
+  pinning 8.7 GB cost 5.8 s of `cudaHostAlloc`, more than the faster copies
+  (27 vs 14 GB/s) save over 11 iterations (16.5 → 14.7 s);
+* DIIS: `gpu4pyscf.lib.diis.DIIS` on PySCF's packed vector, so the
+  extrapolation sees PySCF's inner products;
+* all on the CuPy pool (GPU4PySCF's allocator sends > 100 MB requests to
+  `cudaMalloc`).
+
+**The (ff|ff) local-memory wall.**  `GINTfill_int2e_kernel<6,…>`/`<7,…>`
+need ~170 KB of stack per thread; the driver reserves that for every
+resident thread at the first launch — **~37 GB of the 40 GB card** — and
+keeps it (CUDA 12 always does).  Stock survives because its arrays are on
+the host; a device-resident CCSD does not.  Re-setting
+`cudaLimitStackSize` (to its pre-launch value; the driver raises the
+reported one) hands it back (2.75 → 40.0 GB free); `fastccsd` does that
+after each high-l fill and at the end of each integral loop, and sizes the
+integral cache against the measured reservation.  The same applies to any
+Electrolites module that holds device memory across a legacy `GINTfill`
+call with f shells.
+
+Measured (RHF → CCSD, `path_anatomy.py --feature ccsd --patch all`, one job
+on the node, A100 40 GB; `FASTCCSD_OFF=1` for the stock column):
+
+| system / basis | nao | CCSD stock → patched | cycles | after: largest part |
+|---|---|---|---|---|
+| glycine / def2-SVP | 95 | 6.41 → **1.33 s (4.8x)** | 11 / 11 | AO-direct 0.74 s |
+| alanine dipeptide / def2-SVP | 200 | 110.2 → **10.1 s (10.9x)** | 14 / 14 | AO-direct 5.8 s (cached integrals: GEMMs), rest of `update_amps` 3.2 s, `ao2mo` 0.9 s |
+| glycine / def2-TZVP (f) | 185 | 35.1 → **14.7 s (2.4x)** | 11 / 11 | `ao2mo` 2.3 s (1.7 s of it `GINTfill`), iteration 1's fills 1.3 s, the host-cache copies |
+
+`tests/test_ccsd.py`: e_corr against the stock driver to 5e-12 with equal
+cycle counts (glycine/SVP, integral cache on and off, and a forced fallback);
+glycine/TZVP, a slowly converging case, to 2e-12 at `conv_tol_normt` 1e-9 in
+four runs of five and 1.4e-9 in the fifth (at 1e-7 the two DIIS paths
+part at 2e-9 Eh — stock −1.1112244424, device −1.1112244407, PySCF CPU
+−1.1112244404); water against PySCF's CPU CCSD to 1e-11.
+
+Limits: the device footprint is ~14 o²v² arrays plus the DIIS vectors;
+above 80 % of the free memory the stock driver runs (penicillin V's o²v²
+alone is 7.7 GB).  Left: the legacy `GINTfill` in `ao2mo` and iteration 1
+(and its launch-time local-memory reservation) at f shells, and the cached
+AO-direct GEMMs at 200 AO.
 
