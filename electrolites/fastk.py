@@ -45,6 +45,8 @@ from .compat import (
 # the bra-pair sweep, so a queue that is too small costs extra passes on large
 # systems while a queue that is too large only costs pool memory.
 QUEUE_DEPTH = int(os.environ.get('FASTK_QUEUE_DEPTH', 1 << 16))
+# A7: the high-l classes' one-launch range fusion; 1 restores two passes
+_FUSED_KH_OFF = bool(os.environ.get('FASTK_FUSED_KH_OFF'))
 # Persistent grid width, in blocks per SM.
 BLOCKS_PER_SM = int(os.environ.get('FASTK_BLOCKS_PER_SM', 4))
 #: Bra primitive pairs the kernels cache in shared memory.  36 is 6x6, the
@@ -450,7 +452,7 @@ def _run_k1(name, nthreads, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
 
 
 def _run_k2(tag, e, prim, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
-            q_cond, dm_cond, log_cutoff, inv_om2, coef0, n_dm=1):
+            q_cond, dm_cond, log_cutoff, inv_om2, coef0, n_dm=1, coef1=None):
     """One of the 4 classes GPU4PySCF splits across threadIdx.y."""
     iprim, jprim, kprim, lprim = prim
     d_bas, d_env, d_ao_loc = dev
@@ -468,7 +470,8 @@ def _run_k2(tag, e, prim, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
                   np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
                   q_cond, dm_cond, np.float32(log_cutoff), lane.pool, lane.head,
                   np.int32(POOL_STRIDE), tab, np.int32(iprim), np.int32(jprim),
-                  np.int32(kprim), np.int32(lprim), inv_om2, coef0, _ZERO),
+                  np.int32(kprim), np.int32(lprim), inv_om2, coef0,
+                  _ZERO if coef1 is None else coef1),
                  shared_mem=shm)
 
 
@@ -833,9 +836,20 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
                     None if mpp == MAX_PRIM_PAIR else mpp_lmax)
             continue
         entry2 = IMPLEMENTED2.get(lll) if (ok and mpp == MAX_PRIM_PAIR) else None
+        if entry2 is not None and str(entry2[1].get('name', '')).startswith('kh_') \
+                and not _FUSED_KH_OFF:
+            # gen_khigh's classes take both operators in one launch
+            # (coef1 != 0 turns their range loop on; catalogue A7)
+            tag, e = entry2
+            pm_ij, pm_kl = pm_f[i, j], pm_f[k, l]
+            if pm_ij.size and pm_kl.size:
+                _run_k2(tag, e, prim, ws, tab, dev_f, vk, dms, nao, mol.nbas,
+                        pm_ij, pm_kl, q_cond_f, dm_cond, log_cutoff, inv_om2,
+                        c_f, n_dm, coef1=c_l)
+            continue
         if entry2 is not None:
-            # These still take one pass per operator; the coefficient rides on
-            # the geometric prefactor inside the kernel.
+            # GPU4PySCF's lifted kernels (gen_k2) take one pass per operator;
+            # the coefficient rides on the geometric prefactor inside the kernel.
             tag, e = entry2
             for dev, pm, qc, io2, cf in ((dev_f, pm_f, q_cond_f, _ZERO, c_f),
                                          (dev_l, pm_l, q_cond_l, inv_om2, c_l)):

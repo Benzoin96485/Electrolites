@@ -497,7 +497,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 28 **done (one exchange pass, chosen per call shape); J not fused into it** | **C12** fused RSH response J+K — `fastrshresp` (§13.28) | RSH polarizability, TDDFT | was: J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K | **built and measured.**  `fastk.get_k_rsh` now takes `hermi = 0`; the response generators' RSH statements call it (K-only branches: always; J+K branches: `fastj` J + one exchange pass, or GPU4PySCF's two passes, whichever the first calls time faster per (hermi, density-count)).  wB97M-V TDA **1.27x** taxol (268.9 → 211.2 s), 1.06x penicillin V, UKS 1.07x; polarizability (hermi 1, 3 densities) keeps the two passes (the fused one is 13–25 % slower there; 2 % tuning cost).  **Rejected**: J in the same kernel — it needs a second, full-range set of gout registers |
 | 29 **done (device cderi when it fits); the int3c2e kernel left** | **J1** GDF k-point exchange — `fastpbcdf` (§13.29) | k-point hybrids with `density_fit()` | was: **50–54 %** (§10.11), which counted the one-time cderi build inside the first `get_k_kpts` | **measured and built.**  Split: the build is 36–42 % of the SCF and the per-cycle K 0.15–0.24 s; both were paying for the cderi in pinned *mapped* host memory (1.9 s of `cudaHostAlloc` in a 6.2 s build, then a PCIe read per K).  On the device when it fits in ⅓ of free memory: build 6.24 → 4.41 s and K 0.233 → 0.105 s/call at diamond8 2×2×2, SCF **1.24x** (14.76 → 11.95 s); diamond 4×4×4 **1.17x**; 3×3×3 1.06x; bit-identical cderi.  **Left**: diamond8 3×3×3 (≈22 GB cderi) does not fit a 40 GB card and runs stock; the build's `pbc_int3c2e_latsum23_kernel` (3.2 s at diamond8) |
 | 30 **done** | **A18** under-filled K classes — side streams in `fastk`/`fastjk` (§13.30) | SCF, esp. TMCs | was: 1.056x on PfPMT `get_k` (login node) | **built and measured on compute nodes — far larger than the login-node lead.**  A class with fewer bra pairs than the 432-block grid now runs on one of 4 side streams with its own task pool, overlapping the others.  `get_k`: **2.4x** Ni dithiolene⁻ UKS def2-TZVP, **2.6x** Pt amine, **2.0x** Co sextet (113 atoms), 1.5x Cu macrocycle and penicillin V/TZVP, 1.13x PfPMT 6-31G\*, 1.0x taxol/SVP.  SCF **2.05x** Ni (100.0 → 48.7 s), **1.77x** Co (98.7 → 55.7 s), 1.36x penicillin V/TZVP, 1.10x PfPMT; TDA (fastjk) 1.56x Ni, 1.20x penicillin V/TZVP; energies to 1e-11 |
-| 31 | **A7** RSH fusion, high-`l` classes | RSH SCF | ~9 % of K (06's estimate) | easy |
+| 31 **done** | **A7** RSH fusion, high-`l` classes — `gen_khigh` range loop (§13.31) | RSH SCF | was: ~9 % of K (06's estimate) | **measured and built.**  Upper bound first (the high-`l` classes' long-range pass dropped): **15–17 %** of the RSH K at taxol/PfPMT def2-SVP, **37–38 %** at def2-TZVP (penicillin V, Ni dithiolene⁻).  The generated kernels now loop over both operators into the same gout when `coef1 ≠ 0`: RSH `get_k` **1.06x** (taxol, PfPMT SVP), **1.14–1.16x** (TZVP); wB97M-V SCF penicillin V/TZVP 1.06x, wB97X-D3BJ Ni UKS 1.09x; single-range kernels unchanged.  The lifted `k2_2021` class keeps two passes |
 
 **Not a target any more** (closed by §10 and §11):
 
@@ -2151,4 +2151,52 @@ pass with lanes on.  The §11.7 finding that K is 87–89 % of a 3d-metal
 def2-TZVPP UKS SCF was largely this.  Not covered: the gradient and Hessian
 integral drivers (`fastejk`, `fastjkip1`, `fastejk2`) launch per class the
 same way and are the obvious next place for the same change.
+
+### 13.31 Rank 31 — A7: the range-separated exchange in one launch for the high-`l` classes (`codegen/gen_khigh.py`, `fastk.get_k_rsh`)
+
+`fastk.get_k_rsh` fused the two operators of a range-separated exchange
+(`hyb·K + (alpha−hyb)·K_LR`) only in the one-thread-per-quartet classes; the
+classes whose gout is spread over `threadIdx.y` -- the 40 `gen_khigh`
+classes an spdf basis reaches, and GPU4PySCF's lifted `k2_2021` -- still
+took one launch per operator.
+
+Sized first (`benchmarks/a7_probe.py`, an earlier version that dropped those
+classes' long-range pass: the most a fusion could save, since it still
+evaluates the second root set), on a 6-cycle density:
+
+| system / basis / functional | RSH `get_k` | without the high-`l` long-range pass | bound |
+|---|---|---|---|
+| taxol / def2-SVP / wB97M-V | 1.484 s | 1.232 s | 17.0 % |
+| PfPMT⁻ / def2-SVP / wB97M-V | 5.097 s | 4.308 s | 15.5 % |
+| penicillin V / def2-TZVP / wB97M-V | 2.004 s | 1.269 s | **36.7 %** |
+| Ni dithiolene⁻ UKS / def2-TZVP / wB97X-D3BJ | 2.191 s | 1.364 s | **37.8 %** |
+
+Built: `gen_khigh.py`'s exchange-only template wraps the per-primitive-pair
+work (the `rsqrt` with `inv_om2`, the prefactor, the roots and the
+recurrences into gout) in `for (h_rs = 0; h_rs < nrange; ++h_rs)`, with
+`nrange = coef1 != 0 ? 2 : 1`, the full-range operator and `coef0` at
+`h_rs = 0` and the long-range one and `coef1` at `h_rs = 1`, so both
+accumulate into the same gout registers and the task filter, the ket
+geometry and the density contraction run once.  A single-range call passes
+`coef1 = 0` as before and runs the loop once (single-range `get_k` on
+penicillin V/TZVP: 1.077 → 1.090 s, noise).  The fused-J family
+(`jkh_`) keeps one operator (`nrange = 1`): J must see the full range alone.
+`get_k_rsh` launches a `kh_` class once on the full-range screening;
+`FASTK_FUSED_KH_OFF=1` restores two passes.
+
+| system | RSH `get_k` two passes → one | SCF (`path_anatomy.py --feature scf`) |
+|---|---|---|
+| taxol / SVP / wB97M-V | 1.484 → 1.394 s (1.065x) | 68.4 → 67.8 s (VV10-bound) |
+| PfPMT⁻ / SVP / wB97M-V | 5.106 → 4.814 s (1.061x) | — |
+| penicillin V / TZVP / wB97M-V | 2.026 → 1.753 s (**1.156x**) | 34.35 → 32.54 s (1.06x) |
+| Ni dithiolene⁻ UKS / TZVP / wB97X-D3BJ | 2.210 → 1.939 s (**1.140x**) | 99.1 → 90.9 s (1.09x; 50 cycles, unconverged in both) |
+
+About 40 % of the bound is collected: the second root set and recurrence
+are the expensive part of these classes.  `tests/test_khrsh.py`: glycine and
+the Ni anion in def2-TZVP, hermi 1 and 0, fusion on and off, against
+`hyb·K + (alpha−hyb)·K_LR` from two single-range builds -- 3e-13 relative
+either way (the residual is the fused screening the one-thread classes
+already had).  The probe's 1e-12 absolute difference between the two
+arrangements is that same screening.  Left: `k2_2021` (GPU4PySCF's lifted
+kernel) still takes two launches.
 

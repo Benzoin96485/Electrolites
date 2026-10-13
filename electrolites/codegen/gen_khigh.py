@@ -576,6 +576,7 @@ extern "C" __global__ void __launch_bounds__(NTHREADS_%(tag)s, MINBLOCKS_%(tag)s
     constexpr int NROOTS = %(nroots)d;
     constexpr int g_size = %(gsz)d;
     constexpr int nsq_per_block = NSQ;
+    const int nrange = %(nrange)s;
     __shared__ double s_aij[MAX_PRIM_PAIR], s_iaij[MAX_PRIM_PAIR], s_ajaij[MAX_PRIM_PAIR];
     __shared__ double s_xij[MAX_PRIM_PAIR], s_yij[MAX_PRIM_PAIR], s_zij[MAX_PRIM_PAIR];
     __shared__ double s_cicj[MAX_PRIM_PAIR];
@@ -708,8 +709,16 @@ while (pair_ij < npairs_ij) {
                 // Range separation: inv_om2 = 0 is the full-range operator,
                 // 1/omega^2 the long-range (erf) one -- scaling the Rys
                 // argument and roots by w^2/(w^2+theta) is exactly
-                // rsqrt(s) -> rsqrt(s + aij*akl/w^2) here.
-                double inv_s = rsqrt(fma(aij * akl, inv_om2, aij + akl));
+                // rsqrt(s) -> rsqrt(s + aij*akl/w^2) here.  With nrange == 2
+                // (coef1 != 0, catalogue A7) the quartet is evaluated for
+                // both operators into the same gout registers:
+                // coef0*(full range) + coef1*(long range), so the screening,
+                // the ket geometry and the contraction below are paid once.
+                for (int h_rs = 0; h_rs < nrange; ++h_rs) {
+                if (h_rs) __syncthreads();
+                double om2_h = (nrange == 2 && h_rs == 0) ? 0. : inv_om2;
+                double coef_h = h_rs == 0 ? coef0 : coef1;
+                double inv_s = rsqrt(fma(aij * akl, om2_h, aij + akl));
                 double inv_s2 = inv_s * inv_s;
                 double xkl = rk[0] + rlrk[0*NSQ] * al_akl;
                 double ykl = rk[1] + rlrk[1*NSQ] * al_akl;
@@ -722,7 +731,7 @@ while (pair_ij < npairs_ij) {
                     Rpq[1*NSQ] = ypq;
                     Rpq[2*NSQ] = zpq;
                     // fac = cicj*ckcl/(aij*akl*sqrt(aij+akl)), no division
-                    gx[NSQ*g_size] = s_cicj[ijp] * iaij * iakl * inv_s * coef0;
+                    gx[NSQ*g_size] = s_cicj[ijp] * iaij * iakl * inv_s * coef_h;
                 }
                 double rr = xpq*xpq + ypq*ypq + zpq*zpq;
                 rys_roots_tab<NROOTS>(aij*akl*inv_s2 * rr, rw, NSQ, gout_id,
@@ -741,6 +750,7 @@ while (pair_ij < npairs_ij) {
 %(recur)s
                     __syncthreads();
 %(gout)s
+                }
                 }
             }
         }
@@ -808,9 +818,13 @@ def scheme(c, threads, gout_max, shm_max):
 
 #: What differs between the exchange-only and the fused build.
 FLAVOUR = {
-    False: dict(pfx='kh', args='KARGS2', fill='fill_vk_tasks2', vjdecl=''),
+    False: dict(pfx='kh', args='KARGS2', fill='fill_vk_tasks2', vjdecl='',
+                nrange='coef1 != 0. ? 2 : 1'),
+    # J must see the full-range integrals alone, so the fused family keeps
+    # one operator per launch
     True: dict(pfx='jkh', args='JKARGS2', fill='fill_vjk_tasks2',
-               vjdecl='            double *vj = vj_all + i_dm * nao2;\n'),
+               vjdecl='            double *vj = vj_all + i_dm * nao2;\n',
+               nrange='1'),
 }
 
 
