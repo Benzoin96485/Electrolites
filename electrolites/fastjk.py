@@ -200,14 +200,16 @@ def _run_jk1(name, nthreads, ws, tab, dev, vj, vk, dms, n_dm, nao, nbas,
     d_bas, d_env, d_ao_loc = dev
     kern = _function(name, mpp, mpp_lmax)
     n_blocks = min(ws.n_blocks, int(pm_ij.size))
-    for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
-        ws.head.fill(0)
-        kern((n_blocks,), (nthreads,),
-             (vj, vk, dms, np.int32(n_dm), np.int32(nao),
-              d_bas, d_env, d_ao_loc, np.int32(nbas),
-              np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
-              q_cond, dm_cond, np.float32(log_cutoff), ws.pool, ws.head,
-              np.int32(POOL_STRIDE), tab, inv_om2, _ONE, _ZERO))
+    lane = fastk._lane_for(ws, int(pm_ij.size))
+    with fastk._on(lane):
+        for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
+            lane.head.fill(0)
+            kern((n_blocks,), (nthreads,),
+                 (vj, vk, dms, np.int32(n_dm), np.int32(nao),
+                  d_bas, d_env, d_ao_loc, np.int32(nbas),
+                  np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
+                  q_cond, dm_cond, np.float32(log_cutoff), lane.pool, lane.head,
+                  np.int32(POOL_STRIDE), tab, inv_om2, _ONE, _ZERO))
 
 
 def _run_jk2(name, e, prim, ws, tab, dev, vj, vk, dms, n_dm, nao, nbas,
@@ -219,16 +221,18 @@ def _run_jk2(name, e, prim, ws, tab, dev, vj, vk, dms, n_dm, nao, nbas,
     nthreads = (e['nsq'], e['gout_stride'])
     n_blocks = min(ws.n_blocks, int(pm_ij.size))
     kern = _function(name)
-    for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
-        ws.head.fill(0)
-        kern((n_blocks,), nthreads,
-             (vj, vk, dms, np.int32(n_dm), np.int32(nao),
-              d_bas, d_env, d_ao_loc, np.int32(nbas),
-              np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
-              q_cond, dm_cond, np.float32(log_cutoff), ws.pool, ws.head,
-              np.int32(POOL_STRIDE), tab, np.int32(iprim), np.int32(jprim),
-              np.int32(kprim), np.int32(lprim), inv_om2, _ONE, _ZERO),
-             shared_mem=shm)
+    lane = fastk._lane_for(ws, int(pm_ij.size))
+    with fastk._on(lane):
+        for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
+            lane.head.fill(0)
+            kern((n_blocks,), nthreads,
+                 (vj, vk, dms, np.int32(n_dm), np.int32(nao),
+                  d_bas, d_env, d_ao_loc, np.int32(nbas),
+                  np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
+                  q_cond, dm_cond, np.float32(log_cutoff), lane.pool, lane.head,
+                  np.int32(POOL_STRIDE), tab, np.int32(iprim), np.int32(jprim),
+                  np.int32(kprim), np.int32(lprim), inv_om2, _ONE, _ZERO),
+                 shared_mem=shm)
 
 
 def _run_ref(self, ws, vj, vk, dms, n_dm, nao, shls_slice, ij, kl, dm_cond,
@@ -336,6 +340,7 @@ def get_jk(self, dms, hermi, verbose=None):
         _run_ref(self, ws, vj, vk, dms, n_dm, nao, shls_slice, (i, j), (k, l),
                  dm_cond, log_cutoff, dm_penalty, lll)
         n_ref += 1
+    fastk._join_lanes()
     log.debug1('fastjk: %d classes here, %d handed back', n_ours, n_ref)
 
     if hermi == 1:

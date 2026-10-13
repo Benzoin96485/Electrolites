@@ -95,4 +95,7 @@ profile before the change: 0.60 s), about 1 % of that SCF.  `ELECTROLITES_TRIL=p
 
 ## 4. Owed
 
-Item 4 (the K split) was measured on the login node only.
+Item 4 (the K split) was measured on the login node only.  Done since:
+the compute-node measurement and the change are `KERNEL_TARGETS_1.8.1.md`
+§13.30 -- 1.13x on PfPMT 6-31G\* `get_k` and 2.0-2.6x on transition-metal
+complexes and triple-zeta bases, where small classes are the rule.

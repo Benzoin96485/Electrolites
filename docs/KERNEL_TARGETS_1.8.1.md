@@ -496,7 +496,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 27 **done (device driver + integral cache); the legacy kernel left** | **I5 / I4** CCSD AO-direct vvvv and host update — `fastccsd` (§13.27) | CCSD | was: vvvv **48–53 %**; host einsum ≈ 22 %, `cudaMalloc` ≈ 16 % (§10.10) | **built and measured.**  The device was busy ~11 s of a 165 s CCSD: the whole iteration (amplitudes, MO integrals, `ao2mo`'s accumulators, DIIS) now lives on the device and the AO integral blocks are computed once and cached (device, else host).  CCSD **10.9x** alanine dipeptide/SVP (110.2 → 10.1 s), **4.8x** glycine/SVP, **2.4x** glycine/TZVP (35.1 → 14.7 s); |Δe_corr| ≤ 5e-12 at matched convergence.  Found on the way: a (ff\|ff) `GINTfill` launch leaves **~37 GB** of driver local memory reserved on a 40 GB card until the stack limit is re-set.  **Left**: the legacy `GINTfill` itself in iteration 1 at f shells; the o²v² footprint (falls back to stock beyond ~0.8 of the card) |
 | 28 **done (one exchange pass, chosen per call shape); J not fused into it** | **C12** fused RSH response J+K — `fastrshresp` (§13.28) | RSH polarizability, TDDFT | was: J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K | **built and measured.**  `fastk.get_k_rsh` now takes `hermi = 0`; the response generators' RSH statements call it (K-only branches: always; J+K branches: `fastj` J + one exchange pass, or GPU4PySCF's two passes, whichever the first calls time faster per (hermi, density-count)).  wB97M-V TDA **1.27x** taxol (268.9 → 211.2 s), 1.06x penicillin V, UKS 1.07x; polarizability (hermi 1, 3 densities) keeps the two passes (the fused one is 13–25 % slower there; 2 % tuning cost).  **Rejected**: J in the same kernel — it needs a second, full-range set of gout registers |
 | 29 **done (device cderi when it fits); the int3c2e kernel left** | **J1** GDF k-point exchange — `fastpbcdf` (§13.29) | k-point hybrids with `density_fit()` | was: **50–54 %** (§10.11), which counted the one-time cderi build inside the first `get_k_kpts` | **measured and built.**  Split: the build is 36–42 % of the SCF and the per-cycle K 0.15–0.24 s; both were paying for the cderi in pinned *mapped* host memory (1.9 s of `cudaHostAlloc` in a 6.2 s build, then a PCIe read per K).  On the device when it fits in ⅓ of free memory: build 6.24 → 4.41 s and K 0.233 → 0.105 s/call at diamond8 2×2×2, SCF **1.24x** (14.76 → 11.95 s); diamond 4×4×4 **1.17x**; 3×3×3 1.06x; bit-identical cderi.  **Left**: diamond8 3×3×3 (≈22 GB cderi) does not fit a 40 GB card and runs stock; the build's `pbc_int3c2e_latsum23_kernel` (3.2 s at diamond8) |
-| 30 | **A18** under-filled K classes | SCF, esp. TMCs | 1.056x on PfPMT `get_k` (login node) | owes a compute-node re-run |
+| 30 **done** | **A18** under-filled K classes — side streams in `fastk`/`fastjk` (§13.30) | SCF, esp. TMCs | was: 1.056x on PfPMT `get_k` (login node) | **built and measured on compute nodes — far larger than the login-node lead.**  A class with fewer bra pairs than the 432-block grid now runs on one of 4 side streams with its own task pool, overlapping the others.  `get_k`: **2.4x** Ni dithiolene⁻ UKS def2-TZVP, **2.6x** Pt amine, **2.0x** Co sextet (113 atoms), 1.5x Cu macrocycle and penicillin V/TZVP, 1.13x PfPMT 6-31G\*, 1.0x taxol/SVP.  SCF **2.05x** Ni (100.0 → 48.7 s), **1.77x** Co (98.7 → 55.7 s), 1.36x penicillin V/TZVP, 1.10x PfPMT; TDA (fastjk) 1.56x Ni, 1.20x penicillin V/TZVP; energies to 1e-11 |
 | 31 | **A7** RSH fusion, high-`l` classes | RSH SCF | ~9 % of K (06's estimate) | easy |
 
 **Not a target any more** (closed by §10 and §11):
@@ -2093,4 +2093,62 @@ through the patched loop.  After: at diamond8 2×2×2 the build is 37 % of the
 SCF (now mostly the int3c2e kernel) and XC 41 %; per-cycle K is ~0.1 s.  An
 80 GB card would hold diamond8 3×3×3; on 40 GB it would need the cderi
 streamed in blocks of k_aux from pinned (not mapped) memory, not built here.
+
+### 13.30 Rank 30 — A18: under-filled K classes on side streams (`fastk`, `fastjk`)
+
+The lead (`DIRECT_SURVEY.md` §2.4) was a login-node measurement: classes
+with fewer bra pairs than the grid (`n_blocks = min(432, npairs_ij)`) leave
+SMs idle, and every class goes on the caller's stream after the previous
+one; splitting them across streams had measured 1.056x on PfPMT 6-31G\*
+`get_k`.  It was owed a compute-node run and a test on the chemistry it was
+expected to matter for.
+
+Built in `fastk` (used by `fastjk` too): `_run_k1`/`_run_k2` and
+`fastjk._run_jk1`/`_run_jk2` send a class whose bra-pair list is shorter
+than the grid to one of `FASTK_LANES` (default 4) side streams, each with its
+own task pool and head counter; the side streams wait on an event recorded
+on the caller's stream at their first use in a call, and `_join_lanes()` makes
+the caller's stream wait for them before `vk` is symmetrised or scaled
+(`get_k`, `get_k_rsh`, `fastjk.get_jk`).  The sums into `vk`/`vj` are atomic
+either way; only the order of the additions changes.  `FASTK_LANES=0` is the
+previous single-stream behaviour.
+
+`get_k` on a 6-cycle B3LYP density, lanes 0 vs 4 in one process
+(`benchmarks/klanes_probe.py`, A100 40 GB):
+
+| system / basis | nao | classes on lanes / call | `get_k` 0 → 4 lanes | max\|ΔK\| |
+|---|---|---|---|---|
+| Ni dithiolene⁻, UKS, def2-TZVP | 689 | 6536 | 2.730 → 1.129 s (**2.42x**) | 2.5e-14 |
+| Pt amine, UKS, def2-TZVP | 459 | 2866 | 1.027 → 0.396 s (**2.59x**) | 1.2e-14 |
+| Co sextet (113 atoms), UKS, def2-SVP | 1059 | 1090 | 2.252 → 1.107 s (**2.04x**) | 3.2e-14 |
+| Cu macrocycle²⁺, UKS, def2-TZVP | 924 | 2973 | 4.225 → 2.736 s (1.54x) | 4.6e-14 |
+| penicillin V, def2-TZVP | 858 | 1551 | 1.615 → 1.077 s (1.50x) | 3.2e-14 |
+| PfPMT⁻, 6-31G\* | 2268 | 585 | 2.641 → 2.330 s (1.13x) | 1.7e-14 |
+| PfPMT⁻, def2-SVP | 2697 | 105 | 3.115 → 2.979 s (1.05x) | 2.7e-14 |
+| taxol, def2-SVP | 1123 | 1 | 0.849 → 0.848 s | 9e-15 |
+
+2 lanes give the same as 4 or 8.  The size of the effect follows the
+number of small classes, which a split-valence organic basis keeps low and
+a triple-zeta basis or a transition metal (singleton shell groups with
+their own contraction patterns) makes large.  `fastjk.get_jk` with five
+`hermi = 0` densities: 1.70x Ni dithiolene, 1.21x penicillin V/TZVP.
+
+End to end (`path_anatomy.py --feature scf`, B3LYP, and
+`response_anatomy.py --prop tda`, 5 roots; `FASTK_LANES=0` for "before"):
+
+| run | before | after |
+|---|---|---|
+| Ni dithiolene⁻ UKS def2-TZVP SCF (39 cycles) | 100.0 s (`get_k` 84.9 s) | **48.7 s (2.05x)** (`get_k` 33.8 s) |
+| Co sextet UKS def2-SVP SCF (50 cycles) | 98.7 s | **55.7 s (1.77x)** |
+| penicillin V def2-TZVP SCF | 25.0 s | 18.4 s (1.36x) |
+| PfPMT⁻ 6-31G\* SCF | 41.6 s | 37.7 s (1.10x) |
+| Ni dithiolene⁻ UKS TDA | 263.7 s | **169.1 s (1.56x)** |
+| penicillin V def2-TZVP TDA | 165.4 s | 137.8 s (1.20x) |
+
+Energies to 1e-11 Eh, excitation energies to the printed 1e-9 eV;
+`tests/test_jk.py` (K 1.0e-14, fused J 2.1e-14) and `tests/test_rshresp.py`
+pass with lanes on.  The §11.7 finding that K is 87–89 % of a 3d-metal
+def2-TZVPP UKS SCF was largely this.  Not covered: the gradient and Hessian
+integral drivers (`fastejk`, `fastjkip1`, `fastejk2`) launch per class the
+same way and are the obvious next place for the same change.
 

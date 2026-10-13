@@ -349,6 +349,85 @@ def _prep(self, dms, hermi):
     return dm_cond, log_cutoff, q_cond, pair_mappings
 
 
+# Catalogue A18: a class with fewer bra pairs than the grid's blocks
+# (``n_blocks = min(ws.n_blocks, npairs_ij)``) leaves most SMs idle, and the
+# classes go one after another on one stream.  Such launches are put on a few
+# side streams ("lanes"), each with its own task pool and head counter, so
+# they overlap with each other and with the large classes on the caller's
+# stream; ``_join_lanes`` makes the caller's stream wait for them before vk
+# is used.  The sums into vk are atomic either way, so only the order of the
+# floating-point additions changes.  FASTK_LANES=0 keeps one stream.
+LANES = int(os.environ.get('FASTK_LANES', 4))
+_LANE_STATE = {'next': 0, 'used': set(), 'event': None}
+
+
+class _Lane:
+    def __init__(self, n_blocks):
+        self.stream = cp.cuda.Stream(non_blocking=True)
+        self.pool = cp.empty(n_blocks * POOL_STRIDE, dtype=np.int32)
+        self.head = cp.zeros(1, dtype=np.int32)
+
+
+@functools.lru_cache(maxsize=1)
+def _lanes():
+    return [_Lane(_workspace().n_blocks) for _ in range(LANES)]
+
+
+class _Main:
+    """The caller's stream with the shared workspace's pool and head."""
+    def __init__(self, ws):
+        self.stream = None
+        self.pool = ws.pool
+        self.head = ws.head
+
+
+def _lane_for(ws, npairs_ij):
+    if LANES <= 0 or npairs_ij >= ws.n_blocks:
+        return _Main(ws)
+    lanes = _lanes()
+    i = _LANE_STATE['next'] % len(lanes)
+    _LANE_STATE['next'] += 1
+    lane = lanes[i]
+    if i not in _LANE_STATE['used']:
+        # the lane must see the caller's dms and vk before it starts
+        if _LANE_STATE['event'] is None:
+            ev = cp.cuda.Event(disable_timing=True)
+            ev.record(cp.cuda.get_current_stream())
+            _LANE_STATE['event'] = ev
+        lane.stream.wait_event(_LANE_STATE['event'])
+        _LANE_STATE['used'].add(i)
+    return lane
+
+
+def _join_lanes():
+    if not _LANE_STATE['used']:
+        _LANE_STATE['event'] = None
+        return
+    cur = cp.cuda.get_current_stream()
+    lanes = _lanes()
+    for i in sorted(_LANE_STATE['used']):
+        ev = cp.cuda.Event(disable_timing=True)
+        ev.record(lanes[i].stream)
+        cur.wait_event(ev)
+    _LANE_STATE['used'].clear()
+    _LANE_STATE['event'] = None
+    _LANE_STATE['next'] = 0
+
+
+class _on:
+    """``with _on(lane):`` -- the lane's stream, or nothing for _Main."""
+    def __init__(self, lane):
+        self.s = lane.stream
+
+    def __enter__(self):
+        if self.s is not None:
+            self.s.__enter__()
+
+    def __exit__(self, *exc):
+        if self.s is not None:
+            self.s.__exit__(*exc)
+
+
 def _run_k1(name, nthreads, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
             q_cond, dm_cond, log_cutoff, inv_om2, coef0, coef1, n_dm=1,
             mpp=MAX_PRIM_PAIR, mpp_lmax=None):
@@ -358,14 +437,16 @@ def _run_k1(name, nthreads, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
     # One block can only ever work on one bra pair at a time, so there is
     # nothing to gain from a grid wider than the number of bra pairs.
     n_blocks = min(ws.n_blocks, int(pm_ij.size))
-    for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
-        ws.head.fill(0)
-        kern((n_blocks,), (nthreads,),
-             (vk, dms, np.int32(n_dm), np.int32(nao),
-              d_bas, d_env, d_ao_loc, np.int32(nbas),
-              np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
-              q_cond, dm_cond, np.float32(log_cutoff), ws.pool, ws.head,
-              np.int32(POOL_STRIDE), tab, inv_om2, coef0, coef1))
+    lane = _lane_for(ws, int(pm_ij.size))
+    with _on(lane):
+        for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
+            lane.head.fill(0)
+            kern((n_blocks,), (nthreads,),
+                 (vk, dms, np.int32(n_dm), np.int32(nao),
+                  d_bas, d_env, d_ao_loc, np.int32(nbas),
+                  np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
+                  q_cond, dm_cond, np.float32(log_cutoff), lane.pool, lane.head,
+                  np.int32(POOL_STRIDE), tab, inv_om2, coef0, coef1))
 
 
 def _run_k2(tag, e, prim, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
@@ -377,16 +458,18 @@ def _run_k2(tag, e, prim, ws, tab, dev, vk, dms, nao, nbas, pm_ij, pm_kl,
     nthreads = (e['nsq'], e['gout_stride'])
     n_blocks = min(ws.n_blocks, int(pm_ij.size))
     kern = _function(e.get('name', 'k2_' + tag))
-    for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
-        ws.head.fill(0)
-        kern((n_blocks,), nthreads,
-             (vk, dms, np.int32(n_dm), np.int32(nao),
-              d_bas, d_env, d_ao_loc, np.int32(nbas),
-              np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
-              q_cond, dm_cond, np.float32(log_cutoff), ws.pool, ws.head,
-              np.int32(POOL_STRIDE), tab, np.int32(iprim), np.int32(jprim),
-              np.int32(kprim), np.int32(lprim), inv_om2, coef0, _ZERO),
-             shared_mem=shm)
+    lane = _lane_for(ws, int(pm_ij.size))
+    with _on(lane):
+        for kl0, kl1 in lib.prange(0, int(pm_kl.size), QUEUE_DEPTH):
+            lane.head.fill(0)
+            kern((n_blocks,), nthreads,
+                 (vk, dms, np.int32(n_dm), np.int32(nao),
+                  d_bas, d_env, d_ao_loc, np.int32(nbas),
+                  np.int32(pm_ij.size), np.int32(kl1 - kl0), pm_ij, pm_kl[kl0:],
+                  q_cond, dm_cond, np.float32(log_cutoff), lane.pool, lane.head,
+                  np.int32(POOL_STRIDE), tab, np.int32(iprim), np.int32(jprim),
+                  np.int32(kprim), np.int32(lprim), inv_om2, coef0, _ZERO),
+                 shared_mem=shm)
 
 
 # Angular-momentum classes GPU4PySCF unrolls into a dedicated kernel (the tags
@@ -636,6 +719,7 @@ def get_k(self, dms, hermi, verbose, omega=None, lr_factor=None,
         else:
             _run_ref(self, ws, vk, dms, n_dm, nao, shls_slice, pm_ij, pm_kl,
                      q_cond, dm_cond, log_cutoff, lll)
+    _join_lanes()
 
     if hermi == 1:
         vk = transpose_sum(vk)
@@ -762,6 +846,7 @@ def get_k_rsh(opt_f, opt_l, dms, hermi, coef_f, coef_l, verbose=None):
                         pm_ij, pm_kl, qc, dm_cond, log_cutoff, io2, cf, n_dm)
             continue
         fallthrough.append(((i, j, k, l), lll))
+    _join_lanes()
 
     if fallthrough:
         # GPU4PySCF's kernel has no coefficient, so these accumulate into a
