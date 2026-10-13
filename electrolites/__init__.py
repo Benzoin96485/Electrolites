@@ -38,7 +38,7 @@ MODULES = (
     'fastejk', 'fastgrad', 'fastxcgrad', 'fastgradh', 'fastxchess',
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
-    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1', 'fastsfxc', 'fastpcmbatch', 'fastscfscreen', 'fastmp2', 'fastccsd', 'fastrshresp',
+    'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1', 'fastsfxc', 'fastpcmbatch', 'fastscfscreen', 'fastmp2', 'fastccsd', 'fastrshresp', 'fastpbcdf',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -250,6 +250,9 @@ _TARGETS = {
                       ('gpu4pyscf.scf.uhf', 'UHF.get_veff')),
     # conventional MP2's (ia|jb): blocked half transformation (I3)
     'fastmp2': ('gpu4pyscf.scf.int4c2e', 'get_int4c2e_ovov'),
+    # GDF k-point cderi on the device when it fits (J1)
+    'fastpbcdf': (('gpu4pyscf.pbc.df.rsdf_builder', 'compressed_cderi_kk'),
+                  ('gpu4pyscf.pbc.df.df', 'GDF.loop')),
     # range-separated hybrids' response J + K: both exchange ranges in one
     # pass (C12)
     'fastrshresp': (('gpu4pyscf.scf._response_functions', '_gen_rhf_response'),

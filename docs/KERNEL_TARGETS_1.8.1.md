@@ -495,7 +495,7 @@ named, after `patch_all()`, unless the cell says otherwise.
 | 26 **done** | **I3** conventional MP2's ovov build — `fastmp2` (§13.26) | conventional RMP2 | was: the legacy ovov build **95 %** of the MP2 step, out of memory at 42 atoms on 40 GB (§12.4) | **built and measured.**  The integrals were never the cost (~1 %): each class-pair block's last `einsum` wrote a whole o²v² temporary.  Now a half transformation per occupied batch, strided-batched GEMMs with β = 1 straight into `H[λ,σ,i,a]`, then two GEMMs: RMP2 step **12.6x** alanine dipeptide/SVP (8.22 → 0.65 s), **28x** /TZVP (128.7 → 4.54 s), **55x** penicillin V (470.1 → 8.55 s on 80 GB) and **runs on 40 GB** (ovov 10.2 s, 5 batches); |Δe_corr| ≤ 1e-14.  **Left**: the per-block virtual step (fp64 GEMM, ~60 % of what remains); o²v² itself bounds the size (taxol's would be ~330 GB) |
 | 27 **done (device driver + integral cache); the legacy kernel left** | **I5 / I4** CCSD AO-direct vvvv and host update — `fastccsd` (§13.27) | CCSD | was: vvvv **48–53 %**; host einsum ≈ 22 %, `cudaMalloc` ≈ 16 % (§10.10) | **built and measured.**  The device was busy ~11 s of a 165 s CCSD: the whole iteration (amplitudes, MO integrals, `ao2mo`'s accumulators, DIIS) now lives on the device and the AO integral blocks are computed once and cached (device, else host).  CCSD **10.9x** alanine dipeptide/SVP (110.2 → 10.1 s), **4.8x** glycine/SVP, **2.4x** glycine/TZVP (35.1 → 14.7 s); |Δe_corr| ≤ 5e-12 at matched convergence.  Found on the way: a (ff\|ff) `GINTfill` launch leaves **~37 GB** of driver local memory reserved on a 40 GB card until the stack limit is re-set.  **Left**: the legacy `GINTfill` itself in iteration 1 at f shells; the o²v² footprint (falls back to stock beyond ~0.8 of the card) |
 | 28 **done (one exchange pass, chosen per call shape); J not fused into it** | **C12** fused RSH response J+K — `fastrshresp` (§13.28) | RSH polarizability, TDDFT | was: J+K 58.8 % of a wB97M-V TDA; fusion 1.12–1.16x of K | **built and measured.**  `fastk.get_k_rsh` now takes `hermi = 0`; the response generators' RSH statements call it (K-only branches: always; J+K branches: `fastj` J + one exchange pass, or GPU4PySCF's two passes, whichever the first calls time faster per (hermi, density-count)).  wB97M-V TDA **1.27x** taxol (268.9 → 211.2 s), 1.06x penicillin V, UKS 1.07x; polarizability (hermi 1, 3 densities) keeps the two passes (the fused one is 13–25 % slower there; 2 % tuning cost).  **Rejected**: J in the same kernel — it needs a second, full-range set of gout registers |
-| 29 | **J1** GDF k-point exchange | k-point hybrids with `density_fit()` | **50–54 %** (§10.11) | J2 is a 2–8 % tail |
+| 29 **done (device cderi when it fits); the int3c2e kernel left** | **J1** GDF k-point exchange — `fastpbcdf` (§13.29) | k-point hybrids with `density_fit()` | was: **50–54 %** (§10.11), which counted the one-time cderi build inside the first `get_k_kpts` | **measured and built.**  Split: the build is 36–42 % of the SCF and the per-cycle K 0.15–0.24 s; both were paying for the cderi in pinned *mapped* host memory (1.9 s of `cudaHostAlloc` in a 6.2 s build, then a PCIe read per K).  On the device when it fits in ⅓ of free memory: build 6.24 → 4.41 s and K 0.233 → 0.105 s/call at diamond8 2×2×2, SCF **1.24x** (14.76 → 11.95 s); diamond 4×4×4 **1.17x**; 3×3×3 1.06x; bit-identical cderi.  **Left**: diamond8 3×3×3 (≈22 GB cderi) does not fit a 40 GB card and runs stock; the build's `pbc_int3c2e_latsum23_kernel` (3.2 s at diamond8) |
 | 30 | **A18** under-filled K classes | SCF, esp. TMCs | 1.056x on PfPMT `get_k` (login node) | owes a compute-node re-run |
 | 31 | **A7** RSH fusion, high-`l` classes | RSH SCF | ~9 % of K (06's estimate) | easy |
 
@@ -2052,4 +2052,45 @@ registers in classes already register-bound, and the measured headroom (J is
 0.06–1.6 s of the calls above, and `fastj` computes it separately in the
 fused arrangement) does not pay for it.  The `hermi = 1`, few-density case —
 CPKS and polarizability — stays on the two passes.
+
+### 13.29 Rank 29 — J1: the GDF k-point cderi on the device (`electrolites/fastpbcdf.py`)
+
+Re-measured first, split (`benchmarks/gdf_k_probe.py`: a fresh `GDF.build`
+and `get_k_kpts` on the converged PBE0 density, timed apart).  §10.11's
+"J1 50–54 %" timed `get_k_kpts` with the lazy cderi build inside its first
+call:
+
+| cell, k mesh | SCF | cderi build | `get_k_kpts` per call |
+|---|---|---|---|
+| diamond8, 2×2×2 (nao 104) | 15.3 s | 6.05 s | 0.233 s |
+| diamond, 4×4×4 (nao 26) | 12.5 s | 2.68 s | 0.150 s |
+| diamond8, 3×3×3 | 49.1 s | 17.07 s | 1.19 s |
+
+In the build, cProfile has 1.9 s of 6.2 s in `empty_mapped`
+(`cudaHostAlloc(hostAllocMapped)` for the cderi) and 4.1 s waiting on the
+GPU, 3.2 s of it one `pbc_int3c2e_latsum23_kernel`.  In K, the unpack kernel
+(`z_decompress_and_transpose`) reads that mapped buffer across PCIe in every
+call.
+
+Built: `fastpbcdf` (source transforms of `rsdf_builder.compressed_cderi_kk`
+and `GDF.loop`, substitution counts asserted).  When the whole cderi fits in
+a third of the free device memory, the builder allocates it on the device
+*before* it sizes its own work buffers, stores each batch by slice
+assignment instead of `store_col_segment`, and the loop copies device to
+device (the unpack kernel already takes device input).  Otherwise the stock
+path runs.
+
+| cell, k mesh | cderi | build | K per call | SCF (`kpt_anatomy.py`, GDF, PBE0) |
+|---|---|---|---|---|
+| diamond8, 2×2×2 | 3.7 GB, device | 6.05 → 4.19 s | 0.233 → 0.105 s | 14.76 → **11.95 s (1.24x)** |
+| diamond, 4×4×4 | 2.2 GB, device | 2.68 → 1.57 s | 0.150 → ~0.07 s | 9.95 → **8.47 s (1.17x)** |
+| diamond, 3×3×3 | device | 2.36 → 2.20 s | — | 6.12 → 5.77 s (1.06x) |
+| diamond8, 3×3×3 | ≈22 GB: host (stock) | 17.07 s | 1.19 s | unchanged |
+
+`tests/test_pbcdf.py`: the cderi is bit-identical to the stock build and J/K
+agree to 3e-14 (2×2×2 and 3×3×3), and a forced host build still runs
+through the patched loop.  After: at diamond8 2×2×2 the build is 37 % of the
+SCF (now mostly the int3c2e kernel) and XC 41 %; per-cycle K is ~0.1 s.  An
+80 GB card would hold diamond8 3×3×3; on 40 GB it would need the cderi
+streamed in blocks of k_aux from pinned (not mapped) memory, not built here.
 
