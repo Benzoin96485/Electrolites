@@ -215,6 +215,13 @@ electrolites.patched()                # what is active in this process
 There is no unpatch: the patches are global, so the benchmarks compare
 separate processes.  Every module asserts a **single device** except `fast1e`.
 
+Features GPU4PySCF does not have at all are *added* rather than patched, and
+go through `electrolites.enable(...)`: each one first checks that its slot is
+still empty upstream, so a GPU4PySCF that grows its own version is noticed
+rather than shadowed (`electrolites/features.py`,
+`docs/FEATURE_TARGETS_PYSCF_2.13.md`).  Their GPU-against-CPU numbers follow
+`docs/CPU_BASELINE.md`.
+
 ## What each module replaces
 
 | module | replaces | round |
@@ -265,6 +272,8 @@ separate processes.  Every module asserts a **single device** except `fast1e`.
 | `fastdfhessip` | `df.hessian.{rhf,uhf}._jk_energy_per_atom` and `_get_veff` — the DF Hessian's `ip2` and `h1` two-electron terms, restricted and unrestricted | `docs/README_fastdfhessip.md`, `docs/README_fastdfhessip2.md`, `docs/README_fastdfuhessip.md`, `docs/README_fastdfh1occ.md`, `docs/README_fastdfhessip3.md` |
 | `fastdffp32` | `DF.loop` and the DF Hessian's cderi transfer — carries `FASTDF_FP32=1`, which is inert unless set and **changes the answer** when it is | `docs/README_fastdffp32.md` |
 | `fastdfrsh` | `df.df_jk._DFHF.get_veff` for a range-separated hybrid — one cderi tensor where upstream keeps two: exactly, for the long-range-only functionals (ωB97, LC-ωPBE, LC-VV10), and under `FASTDFRSH=fuse`, which **changes the answer** by 1e-7–1e-6 Eh, for the rest | `docs/README_fastdfrsh.md` |
+| `guards` | `scf.rohf.ROHF`, `dft.roks.ROKS` (`Hessian`, `Gradients`, `TDA`/`TDHF`/`TDDFT`), `df.df_jk._DFHF.Gradients`/`Hessian`, `qmmm.itrf.QMMMSCF.Hessian` — not a kernel: the entry points that return a **wrong** answer on 1.8.1 (the ROHF/ROKS and QM/MM Hessians) now raise, the ROHF/ROKS gradient goes to PySCF on the CPU with a warning | `docs/FEATURE_TARGETS_PYSCF_2.13.md` §3.2, §9 |
+| `fixes` | `dft.{rks,uks,roks}` vSAP, `scf.rohf.ROHF.get_init_guess`, `cc.ccsd_incore.CCSDBase.to_cpu`/`CCSD.__init__`, `mp.dfmp2.DFMP2._kernel_impl`, `mp.dfump2.DFUMP2._kernel_impl` — not a kernel: five 1.8.1 crashes on legal inputs (vSAP guess, ROHF Newton, `CCSD.to_cpu`, open-shell CCSD's error, frozen-core DF-MP2 with `with_t2`) | `docs/FEATURE_TARGETS_PYSCF_2.13.md` §3.3, §9 |
 | `planguard` | `lib.cutensor.contraction` — not a kernel: every `contract` in GPU4PySCF and here goes through it, and a contraction cuTENSOR refuses (an output past 2²⁹ elements whose extents do not factor) is cut into pieces it plans instead of raising | `docs/README_fastdfaudit.md` |
 
 `docs/CATALOGUE_06_STATUS.md` maps these onto the kernel-target catalogue,

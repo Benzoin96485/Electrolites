@@ -21,8 +21,8 @@ to its pair energies,
 with no host synchronisation until the end.  These are GPU4PySCF's
 expressions (``t = g / D``, ``e = sum t g``) with the division folded in.
 ``B`` is chosen from free memory.  The amplitudes, when the caller asks
-for them (``t2``, which ``with_t2`` -- on by default -- allocates), are
-written block by block from the same GEMM output.  The pair sums are
+for them (``t2``, which ``with_t2`` -- off by default in GPU4PySCF 1.8.1
+-- allocates), are written block by block from the same GEMM output.  The pair sums are
 accumulated in double precision whatever the precision of the integrals
 (``dtype_cderi`` is float32 by default, and GPU4PySCF sums in float32).
 

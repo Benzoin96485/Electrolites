@@ -75,6 +75,9 @@ ap.add_argument('--memsample', action='store_true',
                 help='sample the device free memory every 20 ms and report '
                      'the peak in use (GPU4PySCF allocates outside the CuPy '
                      "pool, so the pool's counters do not see it)")
+ap.add_argument('--cc-conv-tol', type=float, default=0,
+                help="ccsd: the CCSD energy tolerance (0: PySCF's 1e-7); "
+                     "benchmarks/cpu_baseline.py uses 1e-9")
 ap.add_argument('--cprofile', default='',
                 help='write a cProfile of the feature to this file and print '
                      'the 40 functions with the most self time')
@@ -1041,6 +1044,8 @@ def feature_ccsd(mol):
     run_scf(mf)
     cc = ccsd_incore.CCSD(mf)
     cc.verbose = 0
+    if a.cc_conv_tol:
+        cc.conv_tol = a.cc_conv_tol
     with stage('ccsd total'):
         cc.kernel()
     INFO['e_corr'] = float(cc.e_corr)

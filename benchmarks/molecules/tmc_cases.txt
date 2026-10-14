@@ -11,3 +11,8 @@
 # tmc_ni_dithiolene.xyz          -1      2    21  NiC8F6N2S4     HITXIS05_comp_0
 # tmc_pt_amine.xyz                0      3    23  PtC8Cl2H11N    MPEYPT11_comp_0
 # tmc_cu_macrocycle.xyz           2      4    60  CuC16H38N4O    CUCJOZ_comp_0
+#
+# Added for restricted-only methods (RCCSD(T), RMP2 gradients), which the
+# open-shell cases above cannot exercise (docs/FEATURE_TARGETS_PYSCF_2.13.md
+# 0 rule 3).  Built from textbook parameters, not a CSD record:
+# tmc_ferrocene.xyz               0      1    21  FeC10H10       idealised D5h (Fe-C 2.05 A)

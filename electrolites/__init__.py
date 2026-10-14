@@ -39,6 +39,10 @@ MODULES = (
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
     'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1', 'fastsfxc', 'fastpcmbatch', 'fastscfscreen', 'fastmp2', 'fastccsd', 'fastrshresp', 'fastpbcdf',
+    # not kernels: correctness guards and small upstream repairs
+    # (docs/FEATURE_TARGETS_PYSCF_2.13.md 3.2, 3.3).  Last, so that they wrap
+    # whatever the modules above put in place
+    'guards', 'fixes',
 )
 
 # What each module replaces: one ``(module path, dotted attribute)`` pair, or a
@@ -270,6 +274,21 @@ _TARGETS = {
                  ('gpu4pyscf.hessian.uhf', 'solve_mo1'),
                  ('gpu4pyscf.lib.cupy_helper', 'krylov'),
                  ('gpu4pyscf.lib.cupy_helper', '_stable_qr')),
+    # the ROHF/ROKS entry points that return a wrong Hessian or crash, and
+    # the QM/MM Hessian that silently drops the MM terms (FEATURE_TARGETS
+    # 3.2); the density-fitted dispatch is wrapped, not replaced
+    'guards': (('gpu4pyscf.scf.rohf', 'ROHF.Hessian'),
+               ('gpu4pyscf.dft.roks', 'ROKS'),
+               ('gpu4pyscf.df.df_jk', '_DFHF.Gradients'),
+               ('gpu4pyscf.df.df_jk', '_DFHF.Hessian'),
+               ('gpu4pyscf.qmmm.itrf', 'QMMMSCF')),
+    # FEATURE_TARGETS 3.3 D1, D2, D3, D4, D7
+    'fixes': (('gpu4pyscf.dft.rks', 'RKS.init_guess_by_vsap'),
+              ('gpu4pyscf.dft.uks', 'UKS.get_vasp'),
+              ('gpu4pyscf.scf.rohf', 'ROHF.get_init_guess'),
+              ('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.to_cpu'),
+              ('gpu4pyscf.mp.dfmp2', 'DFMP2._kernel_impl'),
+              ('gpu4pyscf.mp.dfump2', 'DFUMP2._kernel_impl')),
 }
 
 _patched = []
@@ -336,5 +355,11 @@ def patched():
     return tuple(_patched)
 
 
+# Features this repository *adds* to GPU4PySCF (stability analysis, CCSD(T),
+# CASSCF, ...): the inverse of the patch modules above, see `features.py`
+from .features import (enable, enable_all, enabled,         # noqa: E402
+                       check_absent, FEATURES)
+
 __all__ = ['patch', 'patch_all', 'patched', 'check_targets',
-           'gpu4pyscf_version', 'MODULES', 'TESTED_GPU4PYSCF', '__version__']
+           'gpu4pyscf_version', 'MODULES', 'TESTED_GPU4PYSCF', '__version__',
+           'enable', 'enable_all', 'enabled', 'check_absent', 'FEATURES']
