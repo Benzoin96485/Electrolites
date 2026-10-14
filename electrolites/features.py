@@ -207,6 +207,11 @@ register('casscf', 'casscf',
          absent=[('gpu4pyscf.scf.hf', 'SCF.CASSCF'),
                  ('gpu4pyscf.scf.hf', 'SCF.CASCI')],
          doc='[M1-M5, M2] CASSCF/CASCI (DF or exact) with integrals, J/K and FCI on the GPU')
+register('dfmp2_grad', 'dfmp2_grad',
+         absent=[('gpu4pyscf.mp.dfmp2', 'DFMP2.make_rdm1_relaxed')],
+         doc='[P3] DF-MP2 relaxed density and nuclear gradient (RHF)')
+register('dhdft', 'dhdft',
+         doc='[P4] double-hybrid DFT energies and gradients (DoubleHybrid)')
 register('ccsd_t', 'ccsd_t',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ccsd_t')],
          doc='[P1] closed-shell (T) on the device')

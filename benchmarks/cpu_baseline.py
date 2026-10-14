@@ -21,7 +21,10 @@ in `docs/` is taken the same way and carries its machine with it:
 Features: ``scf`` (exact exchange, the reference COSX is checked against),
 ``sgx`` (COSX), ``ccsd_t`` (CCSD then (T), split), ``casscf`` (CASSCF or
 SA-CASSCF, conventional or ``--density-fit``), ``nevpt2`` (after a CASSCF),
-``stability`` (internal and external).
+``stability`` (internal and external), ``mp2grad`` (conventional MP2 and its
+analytic gradient -- PySCF has no DF-MP2 gradient), ``dfmp2`` (DF-MP2 energy
+and ``dfmp2_native``'s relaxed density: the pieces of a DF-MP2 gradient PySCF
+has; with ``--density-fit`` for the SCF).
 """
 import json
 import os
@@ -40,7 +43,7 @@ from _common import parser, needs_ecp                       # noqa: E402
 ap = parser(__doc__.splitlines()[0])
 ap.add_argument('--feature', required=True,
                 choices=('scf', 'sgx', 'ccsd_t', 'casscf', 'nevpt2',
-                         'stability'))
+                         'stability', 'mp2grad', 'dfmp2'))
 ap.add_argument('--hf', action='store_true',
                 help='Hartree-Fock reference instead of --xc')
 ap.add_argument('--density-fit', action='store_true')
@@ -49,7 +52,9 @@ ap.add_argument('--sgx-level', type=int, default=2)
 ap.add_argument('--pjs', action='store_true',
                 help='sgx: DF-J with P-junction-screened K (ORCA RIJCOSX-like)')
 ap.add_argument('--frozen', type=int, default=0,
-                help='ccsd_t: frozen core orbitals')
+                help='ccsd_t/mp2grad/dfmp2: frozen core orbitals')
+ap.add_argument('--ri-auxbasis', default=None,
+                help='dfmp2: the RI (mp2fit) basis; default make_auxbasis')
 ap.add_argument('--cas', default='10,10', help="casscf/nevpt2: 'norb,nelec'")
 ap.add_argument('--nroots', type=int, default=1,
                 help='casscf: state-average over this many roots')
@@ -283,6 +288,23 @@ elif a.feature in ('casscf', 'nevpt2'):
             raise SystemExit('nevpt2: run it on a single-root CASSCF')
         e2 = timed_stage('NEVPT2', lambda: mrpt.NEVPT(mc).kernel())
         RESULT['e_nevpt2_corr'] = e2
+elif a.feature == 'mp2grad':
+    from pyscf import mp
+    pt = mp.MP2(mf, frozen=a.frozen or None)
+    timed_stage('MP2', lambda: pt.kernel(with_t2=True))
+    g = timed_stage('MP2 gradient', lambda: pt.nuc_grad_method().kernel())
+    RESULT.update(e_mp2=pt.e_tot, grad=np.asarray(g).tolist())
+elif a.feature == 'dfmp2':
+    from pyscf.mp import dfmp2, dfmp2_native
+    pt = dfmp2.DFMP2(mf, frozen=a.frozen or None)
+    if a.ri_auxbasis:
+        pt.with_df.auxbasis = a.ri_auxbasis
+    timed_stage('DF-MP2 energy', pt.kernel)
+    nat = dfmp2_native.DFRMP2(mf, frozen=a.frozen or None,
+                              auxbasis=a.ri_auxbasis)
+    timed_stage('DF-MP2 relaxed density (dfmp2_native)',
+                lambda: nat.make_rdm1(relaxed=True))
+    RESULT.update(e_dfmp2=pt.e_tot)
 elif a.feature == 'stability':
     st = mf.stability
     out = timed_stage('stability', lambda: st(external=a.external,

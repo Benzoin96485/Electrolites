@@ -474,8 +474,8 @@ as KT's was.
 |---|---|---|---|
 | 1 **done** (P1, P5; P2 open) | **P1** RCCSD(T) (+ **P5** FNO, **P2** DF-CCSD) | every CCSD(T) single point | Once `fastccsd` has made CCSD 2.4–10.9x faster (KT §13.27), (T) — still CPU-only — is ≈ 2o ladder iterations of work, so it is **the** step of a CCSD(T) run `[?]`. Every input but ovvv is already on the device, and the AO blocks ovvv needs are computed and then thrown away (`fastccsd.py:658`). The work is DGEMM-bound on fp64 tensor cores. The oracle is exact and deterministic. Highest demand of any correlated method. Contamination is high (ByteQC), which is fine for throughput but poor for the benchmark track. **Measured (§11.2)**: CPU (T) is 76–91 % of today's fastest route. **Built (§12.2)**: GPU (T) 7.1–7.9x the CPU node, ≤ 6e-15 Eh from PySCF |
 | 2 **done** (M1, M3, M5, M2; M4's J/K) | **M1 → M3 → M4 → M5** a GPU (DF-)CASSCF | CASCI, CASSCF, SA-CASSCF; then M6–M8 | The largest capability gap, on this repository's own workload (open-shell TMCs). Every piece but the FCI Davidson/RDMs exists and is verified: the σ kernel at 34–39x, DF B[u,p,L], ppaa/papa from J/K and from `fastmp2`. PySCF's DF-CASSCF writes naux·nmo² to disk every macro-iteration and does a J/K per AH step on the host. **Measured (§11.3)**: J/K + `_ERIS` 85–93 % at CAS ≤ (10,9), FCI 29 % at (14,13), no gain from more CPU cores **Built (§13)**: DF-CASSCF 20–38x a CPU node per macro-iteration on two open-shell TMCs, 8.8–15.6x on p-benzyne; energies ≤ 1e-9 from PySCF |
-| 3 | **S1** COSX energy (gradient after) | every hybrid SCF at TZ/QZ or with diffuse functions, opt-in | The one new **integral kernel** in this plan with throughput upside on the SCF itself, and the place KT left off: exact K is 66.8 % of a patched SCF and at the machine (KT §2.1). It is an approximation and an *alternative route*, so its baseline is `fastk`, and its rank is gated on §8 item 1's crossover. Rank 3 if it wins at def2-TZVP; drop to §5.4 if it does not win anywhere `fastk` runs. **Measured (§11.1)**: CPU COSX loses to GPU exact K by 20x at SVP but only 3.7x at TZVPD and 2.6x on open-shell TZVP; kept for TZVP+/diffuse, error 3e-4–1.2e-3 Eh |
-| 4 | **P3 + P4** DF-MP2 gradient; double hybrids | RI-MP2 and double-hybrid geometries | **Ahead of PySCF**, which has neither. No new integral kernel: G's general three-index derivative contraction, `fastdfgrad`, `fastdfmp2` and CPHF carry it. Double-hybrid energies are a front end on the same code |
+| 3 → §5.4 (gate failed, §14.3) | **S1** COSX energy (gradient after) | every hybrid SCF at TZ/QZ or with diffuse functions, opt-in | The one new **integral kernel** in this plan with throughput upside on the SCF itself, and the place KT left off: exact K is 66.8 % of a patched SCF and at the machine (KT §2.1). It is an approximation and an *alternative route*, so its baseline is `fastk`, and its rank is gated on §8 item 1's crossover. Rank 3 if it wins at def2-TZVP; drop to §5.4 if it does not win anywhere `fastk` runs. **Measured (§11.1)**: CPU COSX loses to GPU exact K by 20x at SVP but only 3.7x at TZVPD and 2.6x on open-shell TZVP; kept for TZVP+/diffuse, error 3e-4–1.2e-3 Eh **Gate (§14.3)**: an unscreened GPU sn-K on GPU4PySCF's int3c1e kernel costs 42x the exact K at penicillin V/TZVPD (131 s against 3.1 s per build) -- slower even than the CPU COSX. Not built |
+| 4 **done** | **P3 + P4** DF-MP2 gradient; double hybrids | RI-MP2 and double-hybrid geometries | **Ahead of PySCF**, which has neither. No new integral kernel: G's general three-index derivative contraction, `fastdfgrad`, `fastdfmp2` and CPHF carry it. Double-hybrid energies are a front end on the same code **Built (§14)**: DF-MP2 gradient 1.2 s (alanine dipeptide/SVP) to 80 s (taxol/SVP) on one A100, 19-58x PySCF's DF-MP2 relaxed density alone; double hybrids (B2PLYP & co.) with analytic gradients |
 | 5 | **O1** GIAO two-electron kernel (KT:C6) + UKS NMR; **O2** spin–spin coupling | every NMR run; open-shell NMR; J-couplings | O1 is the **measured** remainder of NMR after `fastnmr`: 69–97 % (`README_fastnmr.md`), the only entry here with a share already in hand. O2 is a many-RHS triplet + PSO CPHF, the batching this repository is best at. Both are low contamination |
 | 6 | **X1 → X2** PBC TDA/TDDFT | excited states of solids and surfaces | No GPU path exists. `gen_response`, `fxc`, the Davidson and `fastfftk`'s multi-density K are in place; batching K over nroots·nk² pays more here than in the SCF |
 | 7 | **M6** DF-(SA-)CASSCF gradients and NACs | geometry optimisation, conical intersections | Nearly a hook on G's DF gradient machinery, which `fastdfgrad` already speeds up. After rank 2 |
@@ -534,6 +534,7 @@ statistics** with replacement kernels (06's B10 rule):
 | ddCOSMO/ddPCM (V1) | the PCM family covers it |
 | full 4c DHF direct SSSS (S4) | X2C covers the users; keep S4's DF form as a benchmark only |
 | P11 EPH, PBC CC/CI/ADC/GW | niche, or too far from what exists |
+| S1 COSX / sn-K on the GPU | §14.3: the one GPU kernel for its integrals (GPU4PySCF's `GINTfill_int3c1e`) makes an unscreened sn-K build 33-240x the exact K it would replace, and 16x the CPU COSX build at penicillin V/TZVPD. Reopen only with a new grid-integral kernel ≥ 40x faster, with screening |
 
 ---
 
@@ -698,6 +699,9 @@ J/K on the device, DF and exact. Left: M4's host loops (`gen_g_hop`,
   gradient.
 - **P3 + P4**: the DF-MP2 relaxed density and gradient, double-hybrid energies
   and gradients.
+
+*Status (2026-10-14)* — Phase 3 done: §14. P3 and P4 built (`dfmp2_grad`,
+`dhdft`). S1's gate measured and failed, so S1 moves to §5.4.
 
 **Phase 4 — on top of Phase 2, and the independent tracks**
 
@@ -1372,3 +1376,250 @@ Reading:
 | **M1 → M3 → M4 → M5** rank 2 | **built** (M4 = its J/K; the host loops are left) | DF-CASSCF 20–38x a CPU node per macro-iteration on two open-shell TMCs at (10,9)–(14,13), 8.8–15.6x on an organic diradical; energies to ≤ 1e-9 against PySCF where both converge |
 | **M2** | **built** | correct to 1e-10; 3.5x (Ni) and 6.3x (Cu) the CPU node's in-core exact CASSCF per macro-iteration, 0.9x on the 104-AO organic. The GPU's DF route is the fast one: 3.2–4.5x faster per macro-iteration than its exact route on the TMCs |
 | **M6–M8** | unblocked | they sit on this object (`mc.ci`, `mc.mo_coeff`, the RDMs on the device) |
+
+---
+
+## 14. Phase 3, built (2026-10-14): DF-MP2 gradient, double hybrids, and the COSX gate
+
+Two features and one negative result:
+
+| file | what |
+|---|---|
+| `electrolites/dfmp2_grad.py` | P3: `DFMP2.Gradients()`, `DFMP2.make_rdm1_relaxed()` (feature `dfmp2_grad`) |
+| `electrolites/dhdft.py` | P4: `DoubleHybrid(mol, 'B2PLYP')`, energies and gradients (feature `dhdft`) |
+| `tests/test_dfmp2_grad.py`, `tests/test_dhdft.py` | 8 + 4 checks |
+| `benchmarks/dfmp2_grad_bench.py` | GPU timing with a stage split |
+| `benchmarks/snk_gate.py` | S1's gate |
+| `benchmarks/cpu_baseline.py` | new features `mp2grad`, `dfmp2` |
+
+Timings are on one A100-SXM4-80GB, one process per card, after a warm-up
+run. The CPU side is the §11 node (2× EPYC 7763, 128 threads).
+
+### 14.1 P3 — the DF-MP2 relaxed density and gradient (`enable('dfmp2_grad')`)
+
+**What it is.** The closed-shell RI-MP2 gradient. **PySCF has none**: every
+PySCF DF-MP2 class raises in `nuc_grad_method`, and only `dfmp2_native` has
+the relaxed density. GPU4PySCF's `DFMP2.Gradients` is a stub raising
+`NotImplementedError`. Supported:
+
+- an RHF reference, exact or density-fitted;
+- frozen core;
+- spin-component scaling (`mp.ps`, `mp.pt`, PySCF's names);
+- through P4, a global-hybrid or pure RKS reference.
+
+**Derivation.** It was checked first as a numpy prototype, to 4e-11 against
+finite differences. In outline:
+
+- E2 = Σ t̃ (ia|jb)_RI, with t̃ = (c_os + c_ss) t − c_ss tᵀ.
+- The Hylleraas form gives dE2 = P·dF + Σ D2 d(ia|jb), with:
+  - P_ij = −2 Σ t t̃ and P_ab = 2 Σ t t̃;
+  - D2 = 2t̃;
+  - the three-index two-particle density Γ^P_ia = Σ_jb D2 c^P_jb on the
+    raw auxiliary index.
+- The orbital response:
+  - occupied-occupied and virtual-virtual rotations take the symmetric
+    gauge (−½S¹), which is valid because the non-canonical Hylleraas
+    functional is invariant to them;
+  - frozen-active rotations follow from keeping the orbitals canonical
+    (non-iterative, as `dfmp2_native` does);
+  - the virtual-occupied ones go through one Z-vector.
+- The result is a relaxed density P_rel and an energy-weighted W.
+- The gradient is the sum of:
+  - the SCF's own gradient at D;
+  - h¹ and S¹ contracted with P_rel and W;
+  - the skeleton cross term P_rel·(J − ½a_x K)¹[D], plus P_rel·V_xc¹[D] on
+    a KS reference;
+  - the non-separable 2 Σ (μν|P)¹ Γ^P_μν − Σ (P|Q)¹ Γ̃_PQ.
+
+**On the GPU.**
+
+- **Amplitudes.** Fitted (ia|P) come from GPU4PySCF's bdiv int3c2e. The
+  amplitudes are blocked over the first occupied index and never stored
+  whole; per block:
+  - K is one GEMM;
+  - t and t̃ come from a division kernel and a tiled transpose kernel
+    (shared-memory 32×32: 2.2 s → 0.07 s per five taxol-sized blocks
+    against CuPy's 4-D transpose);
+  - P_vv is one 2-D GEMM per occupied orbital (CuPy's batched matmul with a
+    transposed operand copies it — the same trap as §12.2's (T));
+  - P_oo is a batched GEMM;
+  - Γ is one GEMM;
+  - E2 is read off Γ at the end (½ Σ Γ·(ia|P)) instead of a per-block
+    reduction.
+- **Y and Z** (the Lagrangian's Γ-integral contractions) come from one pass
+  over the AO three-index integrals (GPU4PySCF's evaluator), not from MO
+  integrals per orbital block: 10.2 → 1.2 s at penicillin V/TZVP.
+- **The non-separable derivative** is GPU4PySCF's `sum_ejk_int3c2e_ip1` —
+  the kernel of its DF J/K gradient — fed Γ as a general pair density, plus
+  `int2c2e_ip1_per_atom`.
+  - The kernel's normalisation was measured element-wise against PySCF's
+    `int3c2e_ip1`/`ip2`/`int2c2e_ip1`: ½ on the 3c part, −1 on the 2c part.
+  - The two MO indices are contracted larger-first, which keeps the pair
+    density at nao²·min(ni, nj).
+- **The SCF cross term on a DF reference.**
+  - J goes by polarisation (any rank costs the same).
+  - K goes through the same three-index kernel, with D's occupied factor
+    on one side and P_rel in the MO basis on the other.
+  - The first build polarised the full J/K gradient instead. That
+    factorises a full-rank P_rel, which ran out of memory at taxol and took
+    13 s at penicillin V/TZVP.
+- **The Z-vector** is preconditioned CG through the SCF's own response
+  (`mf.gen_response`), to |r| < 1e-7 |b|. GPU4PySCF's DF response builds
+  stagnate near 3e-8 relative; that is their round-off.
+
+**Correctness** (`tests/test_dfmp2_grad.py`, 8 checks, all pass on the
+login node and on a compute node):
+
+| check | worst |
+|---|---|
+| three-index derivative contraction against PySCF's ip integrals (random Γ) | 4.8e-13 relative |
+| water/cc-pVDZ, all 9 components, against Richardson FD of the GPU DF-MP2 energy | 2.2e-10 |
+| the same with frozen core | 2.0e-10 |
+| formaldehyde/def2-SVP, frozen core, 4 components | 5.8e-10 |
+| relaxed density against PySCF `dfmp2_native` (exact RHF), with and without frozen core | 1.6e-7 (PySCF's side, below) |
+| the feature binding; a range-separated reference raises | — |
+
+**Found on the way** `[X]`: PySCF's `dfmp2_native` relaxed density is good
+only to about 1e-7.
+
+- Its `cphf.solve`, at `cphf_tol` 1e-12, leaves a 2e-7 error in the
+  Z-vector.
+- Solving the same equations exactly (a dense solve in the prototype) moves
+  the prototype's gradient from 4e-8 to 4e-11 against finite differences.
+- The 1.6e-7 in the table is that error, not this code's.
+
+**Timed** (frozen chemical core, DF-RHF with the default JK-fit basis, RI with
+PySCF's default mp2fit basis):
+
+| system / basis | nao / naux | GPU SCF | GPU SCF grad | GPU DF-MP2 energy | **GPU DF-MP2 gradient** | CPU: PySCF conventional MP2 gradient | CPU: PySCF `dfmp2_native` relaxed density alone |
+|---|---|---|---|---|---|---|---|
+| alanine dipeptide / SVP | 200 / 648 | 1.2 s | 0.3 s | 0.3 s | **1.2 s** | 27.7 s (23x) | 23.0 s (19x) |
+| ferrocene / SVP | 221 / 763 | 2.4 s | 0.6 s | 0.6 s | **2.4 s** | 42.7 s (18x) | 27.7 s (12x) |
+| ferrocene / TZVP | 415 / 1092 | 1.8 s | 0.9 s | 0.9 s | **4.6 s** | — | 73.6 s (16x) |
+| penicillin V / SVP | 430 / 1418 | 2.0 s | 0.7 s | 0.6 s | **4.5 s** | 506.5 s (113x) | 262.3 s (58x) |
+| penicillin V / TZVP | 858 / 2131 | 3.1 s | 1.4 s | 1.9 s | **15.3 s** | — | — |
+| taxol / SVP | 1123 / 3690 | 12.1 s | 2.7 s | 10.9 s | **80.4 s** | — | — |
+
+Reading:
+
+- **There is no like-for-like CPU number.** PySCF has no DF-MP2 gradient.
+  - Its analytic MP2 gradient is the conventional one, a different
+    approximation, 18-113x slower.
+  - Its DF route can produce only the relaxed density, which alone is
+    12-58x slower than the whole GPU gradient.
+  - A CPU DF-MP2 gradient today means finite differences: 6N energies.
+- **The gradient costs 4-8x the GPU DF-MP2 energy.**
+- **What the taxol gradient is** (80 s):
+  - amplitudes, P and Γ: 27 s, 2.5x the energy's K GEMMs, as the extra
+    Γ and P GEMMs make it;
+  - the Z-vector: 22.5 s, 17 DF response builds;
+  - the DF K cross term: 13.7 s;
+  - everything else: under 5 s each.
+- **Optimisation rounds** at penicillin V/TZVP: 39.9 s → 19.7 s (Y/Z
+  through AO integrals; K cross term by the three-index kernel) → 16.8 s
+  (batched P GEMMs) → 15.3 s (fused t̃, E2 from Γ, 2-D GEMMs for P_vv).
+  Taxol: out of memory → 111 → 80 s.
+- **What is left.**
+  - The Z-vector's response builds (one DF J/K each), and the
+    K cross term's (pi|P).
+  - P_oo as one GEMM after a transpose kernel (now a batched GEMM over
+    nv·ni small products, 1.6-1.9 s per five taxol blocks).
+
+### 14.2 P4 — double hybrids (`electrolites.dhdft`, `enable('dhdft')`)
+
+**What it is.** Neither PySCF nor GPU4PySCF has them. `B2PLYP` is a
+`KeyError`: the wheel's libxc lacks its double-hybrid entries, and so do the
+`HYB_GGA_XC_*` names. `DoubleHybrid(mol, name)` is:
+
+- a GPU RKS with the functional's DFT part (a PySCF xc string);
+- then GPU4PySCF's DF-MP2 on its orbitals, scaled per spin component:
+  E = E_KS + c_os E_os + c_ss E_ss.
+
+Built in: B2PLYP, B2GP-PLYP, mPW2PLYP, PBE0-DH and PBE-QIDH, with their
+literature parameters. Any (xc, c_os, c_ss) works as a custom functional.
+
+**The gradient** is §14.1's code on the RKS. Three things differ from RHF:
+
+- the response in the Z-vector and in every G[·] of the Lagrangian is the
+  KS one (`gen_response` with fxc and the scaled exact exchange);
+- the K cross term is scaled by a_x;
+- a new term, P_rel·V_xc¹[D] (`xc_cross_grad`): the AO derivatives of
+  V_xc's basis functions contracted with P_rel, plus those of ρ_D under
+  fxc·ρ_P contracted with D. It uses GPU4PySCF's own KS-gradient XC
+  kernels, has no grid response (as its KS gradient), and covers LDA and
+  GGA.
+
+Meta-GGA, range-separated and NLC parts raise.
+
+**Correctness** (`tests/test_dhdft.py`):
+
+| check | worst |
+|---|---|
+| B2PLYP/water energy against the CPU recipe (PySCF DF-RKS + 0.27 PySCF DF-MP2, same grid and basis sets) | 1.7e-10 |
+| B2PLYP gradient, all 9 components, against Richardson FD on a (99, 590) grid | 2.3e-7 |
+| PBE0-DH, frozen core, 4 components | 3.1e-8 |
+| a custom LDA double hybrid (0.5 HF + 0.5 Slater, 0.75 VWN5; c_os 0.25, c_ss 0.20), 4 components | 8.4e-8 |
+
+The 2.3e-7 is the KS gradient's own: GPU4PySCF's RKS gradient of the same
+DFT part, on the same grid, sits 2.3e-7 from its finite difference too
+(grid response). The double-hybrid terms add nothing measurable to it.
+
+**Timed** (DF-RKS, default grids, frozen core):
+
+| system / functional | GPU SCF | GPU DH energy (MP2 part) | **GPU DH gradient** |
+|---|---|---|---|
+| alanine dipeptide / SVP / B2PLYP | 2.0 s | 0.3 s | **2.0 s** |
+| ferrocene / SVP / PBE0-DH | 3.2 s | 0.7 s | **3.1 s** |
+| penicillin V / SVP / B2PLYP | 3.1 s | 0.7 s | **7.6 s** |
+| penicillin V / TZVP / B2PLYP | 5.3 s | 1.8 s | **16.4 s** |
+
+The KS response makes the Z-vector 2-5x the RHF one: each build also
+evaluates fxc on the grid. Everything else is as in §14.1. There is no CPU
+double-hybrid gradient to compare with.
+
+### 14.3 S1 — the COSX gate (not built)
+
+§11.1 left S1 at rank 3 on one condition: a GPU seminumerical exchange
+would have to beat `fastk`'s exact K at triple-ζ/diffuse sizes. The gate
+measured the floor of such a build with the GPU kernel that exists for its
+integrals.
+
+- **The build.** K_μν = Σ_g w_g φ_μ(g) Σ_λ A_νλ(g) F_λ(g), with
+  A_νλ(g) = (ν|1/|r−g||λ) from GPU4PySCF's `GINTfill_int3c1e` (the PCM/QM-MM
+  kernel). It runs device-resident in grid slices, on PySCF's SGX level-2
+  grids. The contraction is a batched GEMV plus a GEMM.
+- **No screening**, so this is the lower bound of an unscreened sn-K.
+- **The K it produces** sits 6e-5 to 2e-4 from the exact K: the expected
+  COSX error, which sanity-checks the contraction.
+
+`benchmarks/snk_gate.py`, one A100-80GB:
+
+| system / basis (SGX grid) | nao | grid points | **sn-K build** (of it: the A integrals) | exact K (`fastk`) | ratio |
+|---|---|---|---|---|---|
+| penicillin V / SVP (pruned) | 430 | 122 576 | 19.4 s (19.1 s) | 0.08 s | 240x slower |
+| penicillin V / TZVP (pruned) | 858 | 123 008 | 82.1 s (80.5 s) | 1.09 s | 75x slower |
+| penicillin V / TZVPD (pruned) | 1074 | 123 648 | 130.6 s (123.5 s) | 3.14 s | **42x slower** |
+| penicillin V / TZVPD (unpruned) | 1074 | 304 952 | 310.9 s (299.6 s) | 3.14 s | 99x slower |
+| Ni dithiolene⁻ / TZVP (pruned) | 689 | 67 776 | 31.3 s (29.2 s) | 0.96 s | 33x slower |
+
+**Reading.**
+
+- **The integrals are 95-98 % of the build.** The kernel runs at
+  5.8e8 grid-point × pair integrals per second at TZVPD (7.1e10 in 124 s).
+- **Even the CPU beats it.** The CPU COSX K build of §11.1 at the same size
+  is 8.3 s (116.8 s over 14 builds, 128 cores, screened, P-junction).
+- **What would be needed.** A GPU sn-K would have to evaluate those
+  integrals more than 40x faster before any screening to tie with `fastk`,
+  and more still to win.
+- **Verdict.** That is a new kernel project with an uncertain payoff, not
+  S1's "a K-contracted kernel on what exists". **S1 moves to §5.4.**
+  `fastk` stays the exact-exchange route on the GPU at every size measured,
+  diffuse TZVPD included.
+
+### 14.4 What §5 takes from Phase 3
+
+| entry | status | measured |
+|---|---|---|
+| **P3** rank 4 | **built** | the RI-MP2 gradient PySCF lacks: 1.2-80 s, 4-8x the GPU energy; 12-58x PySCF's relaxed density alone, 18-113x its conventional MP2 gradient; FD to ≤ 6e-10 |
+| **P4** rank 4 | **built** | double-hybrid energies (to 1.7e-10 against the CPU recipe) and gradients (FD to the KS gradient's own grid-response floor) |
+| **S1** rank 3 | **gate failed → §5.4** | an unscreened GPU sn-K is 33-240x the exact K and 16x the CPU COSX at TZVPD |

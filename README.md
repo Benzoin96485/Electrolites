@@ -294,6 +294,8 @@ first that its slot is still empty upstream
 | `mp2_rdm` | `make_rdm1` and `make_fno` (frozen natural orbitals) on conventional and DF MP2 | [P5], §12 |
 | `ccsd_t` | `CCSD.ccsd_t()`: the closed-shell (T) correction on the device | [P1], §12 |
 | `casscf` | `mf.CASSCF` / `mf.CASCI` (and `electrolites.casscf_gpu.CASSCF`): PySCF's CASSCF/CASCI, state averaging included, with the FCI solver (σ, Davidson, RDMs), the `_ERIS`, and every J/K on the device; density-fitted for a DF mean field, exact integrals otherwise | [M1–M5, M2], §13 |
+| `dfmp2_grad` | `DFMP2.Gradients()` and `DFMP2.make_rdm1_relaxed()` on GPU4PySCF's DF-MP2: the RI-MP2 nuclear gradient (PySCF has none) on an RHF or global-hybrid RKS reference, exact or DF SCF, frozen core, spin-component scaling | [P3], §14 |
+| `dhdft` | `electrolites.dhdft.DoubleHybrid(mol, 'B2PLYP')` (also B2GP-PLYP, mPW2PLYP, PBE0-DH, PBE-QIDH, or custom): double-hybrid energies and analytic gradients, absent from both PySCF and GPU4PySCF | [P4], §14 |
 
 ## Tests
 
