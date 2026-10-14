@@ -203,6 +203,10 @@ register('mp2_rdm', 'mp2_rdm',
          absent=[('gpu4pyscf.mp.mp2', 'MP2Base.make_rdm1'),
                  ('gpu4pyscf.mp.mp2', 'MP2Base.make_fno')],
          doc='[P5] MP2 unrelaxed 1-RDM and frozen natural orbitals')
+register('casscf', 'casscf',
+         absent=[('gpu4pyscf.scf.hf', 'SCF.CASSCF'),
+                 ('gpu4pyscf.scf.hf', 'SCF.CASCI')],
+         doc='[M1-M5, M2] CASSCF/CASCI (DF or exact) with integrals, J/K and FCI on the GPU')
 register('ccsd_t', 'ccsd_t',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ccsd_t')],
          doc='[P1] closed-shell (T) on the device')

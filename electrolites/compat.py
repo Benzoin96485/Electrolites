@@ -142,6 +142,8 @@ def tril_pair_mappings(l_ctr_bas_loc, q_cond, cutoff, tile=6):
     keys, allp, gid = _tril_geometry(l_ctr_bas_loc, nbas, tile)
     idx = cp.nonzero(q_flat[allp] > cutoff)[0]
     sel = allp[idx]
+    if idx.size == 0:            # an all-zero density: nothing survives
+        return {k: sel for k in keys}
     counts = cp.bincount(gid[idx], minlength=len(keys)).get()
     offs = np.append(0, np.cumsum(counts))
     return {k: sel[offs[g]:offs[g + 1]] for g, k in enumerate(keys)}

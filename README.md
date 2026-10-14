@@ -293,6 +293,7 @@ first that its slot is still empty upstream
 | `sap` | `init_guess='sap'` (the Gaussian-fit SAP guess) for RHF/UHF/ROHF and KS | [S8], §12 |
 | `mp2_rdm` | `make_rdm1` and `make_fno` (frozen natural orbitals) on conventional and DF MP2 | [P5], §12 |
 | `ccsd_t` | `CCSD.ccsd_t()`: the closed-shell (T) correction on the device | [P1], §12 |
+| `casscf` | `mf.CASSCF` / `mf.CASCI` (and `electrolites.casscf_gpu.CASSCF`): PySCF's CASSCF/CASCI, state averaging included, with the FCI solver (σ, Davidson, RDMs), the `_ERIS`, and every J/K on the device; density-fitted for a DF mean field, exact integrals otherwise | [M1–M5, M2], §13 |
 
 ## Tests
 

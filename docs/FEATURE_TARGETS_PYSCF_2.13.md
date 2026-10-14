@@ -473,7 +473,7 @@ as KT's was.
 | Rank | Entry | Reaches | Why this rank |
 |---|---|---|---|
 | 1 **done** (P1, P5; P2 open) | **P1** RCCSD(T) (+ **P5** FNO, **P2** DF-CCSD) | every CCSD(T) single point | Once `fastccsd` has made CCSD 2.4–10.9x faster (KT §13.27), (T) — still CPU-only — is ≈ 2o ladder iterations of work, so it is **the** step of a CCSD(T) run `[?]`. Every input but ovvv is already on the device, and the AO blocks ovvv needs are computed and then thrown away (`fastccsd.py:658`). The work is DGEMM-bound on fp64 tensor cores. The oracle is exact and deterministic. Highest demand of any correlated method. Contamination is high (ByteQC), which is fine for throughput but poor for the benchmark track. **Measured (§11.2)**: CPU (T) is 76–91 % of today's fastest route. **Built (§12.2)**: GPU (T) 7.1–7.9x the CPU node, ≤ 6e-15 Eh from PySCF |
-| 2 | **M1 → M3 → M4 → M5** a GPU (DF-)CASSCF | CASCI, CASSCF, SA-CASSCF; then M6–M8 | The largest capability gap, on this repository's own workload (open-shell TMCs). Every piece but the FCI Davidson/RDMs exists and is verified: the σ kernel at 34–39x, DF B[u,p,L], ppaa/papa from J/K and from `fastmp2`. PySCF's DF-CASSCF writes naux·nmo² to disk every macro-iteration and does a J/K per AH step on the host. **Measured (§11.3)**: J/K + `_ERIS` 85–93 % at CAS ≤ (10,9), FCI 29 % at (14,13), no gain from more CPU cores |
+| 2 **done** (M1, M3, M5, M2; M4's J/K) | **M1 → M3 → M4 → M5** a GPU (DF-)CASSCF | CASCI, CASSCF, SA-CASSCF; then M6–M8 | The largest capability gap, on this repository's own workload (open-shell TMCs). Every piece but the FCI Davidson/RDMs exists and is verified: the σ kernel at 34–39x, DF B[u,p,L], ppaa/papa from J/K and from `fastmp2`. PySCF's DF-CASSCF writes naux·nmo² to disk every macro-iteration and does a J/K per AH step on the host. **Measured (§11.3)**: J/K + `_ERIS` 85–93 % at CAS ≤ (10,9), FCI 29 % at (14,13), no gain from more CPU cores **Built (§13)**: DF-CASSCF 20–38x a CPU node per macro-iteration on two open-shell TMCs, 8.8–15.6x on p-benzyne; energies ≤ 1e-9 from PySCF |
 | 3 | **S1** COSX energy (gradient after) | every hybrid SCF at TZ/QZ or with diffuse functions, opt-in | The one new **integral kernel** in this plan with throughput upside on the SCF itself, and the place KT left off: exact K is 66.8 % of a patched SCF and at the machine (KT §2.1). It is an approximation and an *alternative route*, so its baseline is `fastk`, and its rank is gated on §8 item 1's crossover. Rank 3 if it wins at def2-TZVP; drop to §5.4 if it does not win anywhere `fastk` runs. **Measured (§11.1)**: CPU COSX loses to GPU exact K by 20x at SVP but only 3.7x at TZVPD and 2.6x on open-shell TZVP; kept for TZVP+/diffuse, error 3e-4–1.2e-3 Eh |
 | 4 | **P3 + P4** DF-MP2 gradient; double hybrids | RI-MP2 and double-hybrid geometries | **Ahead of PySCF**, which has neither. No new integral kernel: G's general three-index derivative contraction, `fastdfgrad`, `fastdfmp2` and CPHF carry it. Double-hybrid energies are a front end on the same code |
 | 5 | **O1** GIAO two-electron kernel (KT:C6) + UKS NMR; **O2** spin–spin coupling | every NMR run; open-shell NMR; J-couplings | O1 is the **measured** remainder of NMR after `fastnmr`: 69–97 % (`README_fastnmr.md`), the only entry here with a share already in hand. O2 is a many-RHS triplet + PSO CPHF, the batching this repository is best at. Both are low contamination |
@@ -684,6 +684,11 @@ summary.
 *Accept*: CASSCF energies to 1e-9 against PySCF with the same auxbasis, at
 CAS(10,10) and CAS(14,14), on an organic diradical and on Ni dithiolene⁻ and
 the Cu macrocycle; GPU against the CPU node per macro-iteration.
+
+*Status (2026-10-14)* — Phase 2 done: §13. The `casscf` feature is PySCF's
+CASSCF/CASCI with the FCI solver (σ, Davidson, RDMs), the `_ERIS` and every
+J/K on the device, DF and exact. Left: M4's host loops (`gen_g_hop`,
+`solve_approx_ci`), and CAS above 65 535 strings per spin.
 
 **Phase 3 — the kernels with an open crossover question**
 
@@ -1116,3 +1121,254 @@ With P1 this gives FNO-CCSD(T): `frozen, no = pt.make_fno(...)` →
 | **S3** glue #4 | **built** | GPU ROHF/ROKS gradients, direct and DF; the CPU fallback is no longer reached when enabled |
 | **S8** glue #5 | **built** (SAP; vSAP was Phase 0's D1) | no convergence gain on the one TMC tried |
 | **P5** | **built** | prerequisite for FNO-CCSD(T) |
+
+---
+
+## 13. Phase 2, built (2026-10-14): a GPU CASSCF
+
+One feature, `casscf` (`electrolites.enable('casscf')` binds `mf.CASSCF` and
+`mf.CASCI` on GPU4PySCF mean fields; `electrolites.casscf_gpu.CASSCF` /
+`CASCI` are the same without the binding). It covers §9's items M1, M3, M4's
+J/K, M5 and M2:
+
+| file | what |
+|---|---|
+| `electrolites/fci_gpu.py` | M1: the FCI solver |
+| `electrolites/casscf_gpu.py` | M3/M4/M2: the integrals, the J/K, and the assembly onto PySCF's CASSCF |
+| `electrolites/casscf.py` | the feature binding |
+| `tests/test_casscf_gpu.py` | 17 checks against PySCF 2.13 |
+| `benchmarks/casscf_bench.py` | timing, with three CPU cross-checks (`--cpu-ref`, `--casci-check`, `--polish`) |
+| `benchmarks/molecules/pbenzyne.xyz` | the organic diradical (idealised D2h p-benzyne) |
+
+Timings are on one A100-SXM4-80GB against the CPU node of §11.3 (2× EPYC
+7763, DF-CASSCF at 32 threads, `docs/CPU_BASELINE.md`), all def2-SVP from
+(RO)HF orbitals.
+
+### 13.1 What it is
+
+**The object is PySCF's.** `CASSCF(mf, ncas, nelecas)` returns PySCF's own
+`mcscf.CASSCF` (or `DFCASSCF`) built on `mf.to_cpu()`, with a mixin ahead of
+it in the MRO. The macro/micro iteration, the augmented-Hessian solver, the
+convergence tests, state averaging (`state_average_`), `frozen`, `natorb`,
+the results and their attributes are PySCF's code. What moved to the device:
+
+- **The FCI solver (M1)**, `fci_gpu.FCISolver`, a `direct_spin1.FCISolver`:
+  - σ is GPU4PySCF's two kernels behind PySCF's signature (optional
+    `link_index`, 1-D or 2-D vectors), with the address tables built once per
+    (norb, nelec) and kept on the device.
+  - The RDMs (`make_rdm1/12`, `trans_rdm1/12`): one gather kernel builds
+    T[pq, I] = (E_pq c)[I] block by block, then dm1 = T c and
+    ⟨E_pq E_rs⟩ = T Tᵀ are GEMMs; PySCF's `reorder_rdm` follows.
+  - The Davidson runs on device vectors (`kernel`/`eig` overrides). It keeps
+    `lib.davidson1`'s rules — |Δe| < tol and |r| < √tol, the subspace size
+    `max_space + 4(nroots − 1)`, restart from the Ritz vectors, the
+    level-shifted diagonal preconditioner taken at the lowest root for every
+    root — so it takes the same path as PySCF's (13.4 says why that matters).
+    PySCF's `kernel_ms1` still makes `hdiag`, the pspace step and the initial
+    guess.
+- **DF `_ERIS` (M3)**: three-centre integrals from GPU4PySCF's
+  `get_j3c_ovl_gpu_bdiv`, fitted by the Cholesky factor of the metric (fp64),
+  then ppaa, papa = B Bᵀ, j_pc, k_pc in blocks of p on the device. No HDF5 —
+  PySCF's DF route writes naux·nmo² to disk and reads it back every
+  macro-iteration (§11.3).
+- **Every J/K (M4's)**: the AO-basis fitted tensor L[μ,ν,P] is built once and
+  kept (when 2.5·nao²·naux·8 B fits in 30 % of free memory). J is two GEMVs;
+  K for a symmetric density goes through its eigendecomposition — the CASSCF
+  densities (core; the AH step's core/active rotations) are low rank — as
+  K = Σ_P M_P s M_Pᵀ with M_P = L_P U. Otherwise GPU4PySCF's DF J/K.
+- **The exact-integral route (M2)**, taken for a non-DF mean field (as
+  `mcscf.CASSCF` does) or with `density_fit=False`:
+  - ppaa and papa come from one batch of GPU4PySCF direct J and K over the
+    active-pair densities D_uv = c_u c_vᵀ (u ≤ v): J[D_uv + D_vu] = 2(μν|uv)
+    and K[D_uv] = (μu|νv).
+  - Every other J/K is GPU4PySCF's direct J/K.
+  - j_pc and k_pc, which PySCF reads only for the orbital step's diagonal
+    preconditioner (`mc1step.py:150`), come from the fitted integrals, so
+    the converged result does not depend on them.
+  - The first build transformed the four-centre integrals
+    (`fastmp2.get_int4c2e_ovpq`, two passes). The J/K form is 2.8x faster
+    on the TMCs: 8.4 → 3.0 s per macro-iteration on Ni, 33.6 → 12.3 s on Cu.
+
+**What is not on the device**: `gen_g_hop`'s Python loops and the AH
+Davidson (PySCF's, on nmo² vectors), `solve_approx_ci`'s host σ calls (one
+transfer each), and the CI vectors between macro-iterations. 13.4 says what
+they cost.
+
+### 13.2 Correctness
+
+`tests/test_casscf_gpu.py` (17 checks, all pass on the login node; PySCF on
+the same orbitals and the same auxiliary basis):
+
+| check | worst difference |
+|---|---|
+| σ, rdm12 (both orderings), trans_rdm12; CAS(6,(3,3)) … CAS(9,(5,4)), random integrals | 2.4e-15 relative |
+| device Davidson, 1–3 roots, CAS(10,(5,5)), (10,(5,4)), (11,(6,5)) | 3.6e-14 Eh |
+| N₂/6-31G CAS(8,8) DF-CASSCF; CAS(6,6) DF-CASCI | 6.7e-13; 8.0e-13 |
+| N₂ SA-4 DF-CASSCF from the same start | 1e-12 (states 5e-9: a degenerate Π pair) |
+| O₂ triplet CAS(6,8) DF-CASSCF (ROHF) | 6.5e-13 |
+| the same three without DF (M2) | 7e-14 – 8e-13 |
+| `gpu_mf.CASSCF` = `CASSCF(gpu_mf)`, DF and not | 1e-9 gate |
+
+**At scale**, three cross-checks, all in `casscf_bench.py`:
+
+- **Independent runs.** GPU and CPU (§11.3's runs, which started from DF-ROHF
+  orbitals, not the GPU's) land on the same minimum: Ni (10,9) **7.9e-13**,
+  p-benzyne (14,14) **3.3e-10**, p-benzyne (10,10) exact **2.7e-11**, Cu
+  exact **2.6e-10** (the CPU's from its unconverged ROHF).
+- **Polish.** PySCF's CPU CASSCF is restarted from the GPU's converged
+  orbitals and CI vectors at `conv_tol` 1e-10. It stops in 1 macro-iteration
+  and moves the energy by **4e-11 – 1.0e-10** wherever the GPU ran at 1e-10
+  (Ni SA-5, the exact route on all four systems). From GPU runs at PySCF's
+  1e-9 the move is 0.8–1.1e-9 in 3–4 macro-iterations: that is the
+  convergence tolerance, not a difference between the codes.
+- **Same-orbital CASCI** (`--casci-check`, round 6). At the GPU's final
+  orbitals, the GPU and CPU CASCI energies, both with CI tolerance 1e-12,
+  agree to **1.8e-12 – 1.2e-11** on all six DF systems: p-benzyne (10,10)
+  and (14,14); Ni (10,9), SA-5 and (14,13); Cu. This is the
+  implementation's agreement with convergence taken out. The CASSCF's own
+  `e_tot` is up to 9e-9 above it at (14,13), because PySCF solves the last
+  CI only to `fcisolver.conv_tol` 1e-8.
+
+**The 1e-9 acceptance of §9 is met** on every system. Converged-energy
+checks hold on p-benzyne (10,10) and (14,14), Ni dithiolene⁻ (10,9) and
+SA-5, and the Cu macrocycle (10,9), DF and exact. The same-orbital check
+holds on all six, including Ni (14,13), whose CASSCF does not converge to
+1e-9 on either code (13.4).
+
+### 13.3 Timed
+
+**DF-CASSCF, GPU against the CPU node per macro-iteration** (round 4, final
+code; `conv_tol` 1e-9 except SA-5 at 1e-10; the CPU side is §11.3 plus two
+new p-benzyne runs, `cpu_cas10_pb`/`cpu_cas14_pb`; macro-iterations counted
+as `_ERIS` builds on both sides):
+
+| system, CAS | GPU: macro, wall | **GPU s / macro** | CPU s / macro (macro) | **ratio** | GPU J/K, `_ERIS`, rest per macro |
+|---|---|---|---|---|---|
+| p-benzyne (10,10) | 35, 12.4 s | **0.35** | 5.47 (39) | **15.6x** | 0.10, 0.03, 0.22 |
+| p-benzyne (14,14) | 30, 122.7 s | **4.09** | 35.8 (25) | **8.8x** | 0.10, 0.03, 3.96 |
+| Ni dithiolene⁻ (10,9) | 112, 241.6 s | **2.16** | 42.9 (45) | **19.9x** | 0.99, 0.20, 0.97 |
+| Ni dithiolene⁻ (10,9) SA-5 | 46, 67.3 s | **1.46** | 41.7 (42) | **28.6x** | 0.52, 0.11, 0.83 |
+| Ni dithiolene⁻ (14,13) | 59, 369.7 s | **6.27** | 97.4 (51, unconverged) | **15.5x** | 0.97, 0.15, 5.15 |
+| Cu macrocycle²⁺ (10,9) | 33, 135.0 s | **4.09** | 155.5 (17) | **38.0x** | 1.81, 0.36, 1.92 |
+
+Whole runs are not compared: the two sides start from different orbitals,
+so they take different numbers of macro-iterations (Ni (10,9): 112 on the
+GPU, 45 on the CPU, to the same energy). On the Cu macrocycle they even end
+at different minima (13.4).
+
+**Exact integrals (M2)** (round 4/5; `conv_tol` 1e-10; the CPU side is new,
+`cpu_cas10_pb_exact`, `cpu_cas10_ni_exact`, `cpu_cas10_cu_exact`, 32
+threads, all with the ERIs in core):
+
+| system, CAS | GPU: macro, wall | **GPU s / macro** | CPU s / macro (macro) | ratio | GPU J/K, `_ERIS` per macro |
+|---|---|---|---|---|---|
+| p-benzyne (10,10) | 33, 27.2 s | 0.82 | 0.75 (38) | 0.9x | 0.21, 0.42 |
+| p-benzyne (14,14) | 35, 153.9 s | 4.40 | — | — | 0.20, 0.66 |
+| Ni dithiolene⁻ (10,9) | 110, 764.0 s | 6.95 | 24.5 (51, unconverged) | 3.5x | 3.29, 2.84 |
+| Cu macrocycle²⁺ (10,9) | 26, 477.0 s | 18.35 | 115.9 (34) | 6.3x | 6.72, 10.28 |
+
+Reading:
+
+- **DF route.** On the TMCs it is **20–38x per macro-iteration**, past
+  §11.3's Amdahl estimate of 7–14x for M3 + M4 alone. The FCI step went to
+  the device too (M1), and the CPU's J/K + `_ERIS` was not just moved but
+  replaced: no HDF5, and a J/K that reuses the fitted tensor.
+- **The organic diradical gains less** (8.8–15.6x). Its integrals are cheap
+  on the CPU as well (104 AOs). At (14,14) the GPU macro-iteration is 97 %
+  CI work: σ (11.8 M determinants), RDMs, and the host side of PySCF's
+  `solve_approx_ci` and `gen_g_hop`.
+- **Exact route.** It is not faster than the CPU for a small molecule:
+  PySCF holds the 104-AO ERIs in memory, and the ERIs-in-core CASSCF is
+  0.75 s per macro-iteration. On the TMCs the CPU's in-core ERIs are still
+  cheaper than its DF route (24.5 against 42.9 s on Ni). The GPU's
+  exact-route cost is the direct J/K, about 20 builds per macro-iteration at
+  0.01–0.4 s each, plus the `_ERIS` J/K batch. **For a GPU CASSCF, DF is the
+  fast route**: 3.2x (Ni) and 4.5x (Cu) faster per macro-iteration than the
+  GPU's exact one.
+
+### 13.4 How it got there, and what was found
+
+**Rounds** (A100-80GB):
+
+| round | change | Ni (10,9) s / macro | p-benzyne (14,14) s / macro | Ni (14,13) s / macro |
+|---|---|---|---|---|
+| 1 | GPU DF integrals, GPU4PySCF DF J/K, GPU σ/RDMs, PySCF Davidson on the host | 3.37 | — | — |
+| 2 | J/K from the cached fitted tensor (low-rank K) | 2.53 | 8.36 | 16.4 |
+| 3 | Davidson on the device | 2.22 | 4.16 | 6.28 |
+| 4 | Davidson made PySCF's exact rule set; exact `_ERIS` through J/K | 2.16 | 4.09 | 6.27 |
+
+- **Round 2 → 3: from the profile.** cProfile of p-benzyne (14,14), 6
+  macro-iterations: of 58.5 s, `lib.davidson1`'s host work took about 30 s —
+  `_outprod_to_subspace` 12.5 s, `_normalize_xt_` 8.6 s, and 9.0 s of σ
+  results copied to the host. Moving the vectors to the device halved the
+  macro-iteration.
+- **What the (14,14) macro-iteration is now** (round 3 profile, 5
+  macro-iterations, 19.9 s):
+  - device synchronisation waits (`.get`) 6.0 s, mostly σ;
+  - the RDM GEMMs 5.3 s (29 calls);
+  - PySCF's `mc1step` Python 3.1 s;
+  - J/K 0.5 s.
+  
+  The next steps, at this CAS size, are `solve_approx_ci` on the device and
+  M4's vectorised `gen_g_hop`.
+
+**Found on the way:**
+
+- **Davidson rule parity is a correctness matter.** The first device
+  Davidson applied each root's own level shift and a `max_space + nroots`
+  subspace. Its energies matched PySCF's to 1e-13 on every non-degenerate
+  test. On one run of the N₂ SA-4 test, with its degenerate Π pair, it
+  converged to a solution 3.2e-3 Eh away. With PySCF's rules (preconditioner
+  at e₀, `max_space + 4(nroots − 1)`) it matches to 1e-12 on five
+  consecutive runs and on both J/K paths. `[X]` That one failure was not
+  reproduced in isolation, so its trigger is not pinned down.
+- **An Electrolites bug, fixed: `fastjk` crashed on an all-zero density.**
+  `compat.tril_pair_mappings` reduced an empty array (every shell pair
+  screened out) and raised `ValueError`. The CASSCF AH step asks for that
+  when a trial vector has no core–external block. It is now an empty pair
+  list, and the build returns zeros. `tests/test_jk.py` gained the check,
+  and it fails without the fix.
+- **The Cu macrocycle has many CASSCF minima a few mEh apart.** Seven GPU
+  DF runs from the GPU ROHF ended at five energies: −2558.0910 (twice),
+  −2558.0914, −2558.1155, −2558.1192 and −2558.1360 (twice); an eighth
+  (round 6) ended at −2558.1154. The CPU's
+  −2558.1154 came from its own, unconverged, ROHF. The selection is
+  sensitive to tolerances and round-off in the first 20 macro-iterations.
+  One `conv_tol` 1e-10 run sat 301 macro-iterations at −2558.09100 without
+  converging; the same settings converged in 35 in a separate job. Every end
+  point checks out against PySCF from the same orbitals (polish ≤ 3e-9). The
+  exact route, a different Hamiltonian, reached −2558.115845 twice,
+  identically. So Cu energies are not comparable between independent runs,
+  and §11.3's CPU Cu energy is not a reference.
+- **Ni (14,13) is flat.** GPU runs at 1e-9 stop at −4104.183761604 to
+  −4104.183761613. PySCF restarted from there still lowers the energy by
+  2.2e-8 over 50 macro-iterations without converging, as §11.3's own CPU run
+  did not converge in 50. This is PySCF's convergence test on a flat
+  surface, not a GPU difference.
+  - A GPU run at 1e-10 went 301 macro-iterations without converging
+    (−4104.183761616).
+  - At fixed orbitals the GPU and CPU agree to 1.2e-11 (13.2).
+
+### 13.5 What is left
+
+- **M4 proper**: `gen_g_hop`'s loops, `solve_approx_ci` and the AH vectors
+  on the device. They are most of the macro-iteration at CAS(14,14)
+  (13.4), and a small share for the TMCs at (10,9).
+- **CAS beyond 16 bits of strings.** GPU4PySCF's address tables are
+  16-bit, so above 65 535 strings per spin (e.g. CAS(18,18)) σ falls back to
+  PySCF's (logged), and so does the Davidson. M1's 32-bit addresses were
+  not needed for this plan's sizes and are not done.
+- **Memory.** The cached fitted tensor is 2.5·nao²·naux·8 B: 5 GB for the Cu
+  macrocycle. Past 30 % of free memory the J/K goes back to GPU4PySCF's DF
+  J/K, which is correct and about 2x slower (round 1 against round 2).
+- **Not covered**: UCASSCF (M9), `newton_casscf` (untested; it uses the
+  same hooks), `fix_spin_` (it runs on PySCF's Davidson by design), and
+  NEVPT2/MC-PDFT/gradients (M6–M8, Phase 4).
+
+### 13.6 What §5 takes from Phase 2
+
+| entry | status | measured |
+|---|---|---|
+| **M1 → M3 → M4 → M5** rank 2 | **built** (M4 = its J/K; the host loops are left) | DF-CASSCF 20–38x a CPU node per macro-iteration on two open-shell TMCs at (10,9)–(14,13), 8.8–15.6x on an organic diradical; energies to ≤ 1e-9 against PySCF where both converge |
+| **M2** | **built** | correct to 1e-10; 3.5x (Ni) and 6.3x (Cu) the CPU node's in-core exact CASSCF per macro-iteration, 0.9x on the 104-AO organic. The GPU's DF route is the fast one: 3.2–4.5x faster per macro-iteration than its exact route on the TMCs |
+| **M6–M8** | unblocked | they sit on this object (`mc.ci`, `mc.mo_coeff`, the RDMs on the device) |

@@ -187,6 +187,21 @@ def main():
                             f'  (J {relj:.1e}, K {relk:.1e})')
         print(f'{name:9s} {basis:10s} lmax={lmax}: '
               f'{"ok" if not case_fails else "FAILURES"}', flush=True)
+    # all-zero densities (a CASSCF AH step with no core rotation asks for
+    # one): every pair is screened out, and the build must return zeros
+    # instead of failing on the empty pair list
+    mol = gto.M(atom=H2O, basis='6-31G*', verbose=0)
+    opt = JK._VHFOpt(mol, 1e-14).build()
+    z = cp.asarray(opt.apply_coeff_C_mat_CT(cp.zeros((2, mol.nao, mol.nao))),
+                   order='C')
+    try:
+        gj, gk = fastjk.get_jk(opt, z.copy(), 1, 0)
+        okz = float(abs(gj).max()) == 0 and float(abs(gk).max()) == 0
+        detail = ''
+    except Exception as err:                      # noqa: BLE001
+        okz, detail = False, f'  {type(err).__name__}: {err}'
+    fails += not okz
+    print(f'{"ok  " if okz else "FAIL"} JK of all-zero densities{detail}')
     print(f'\nworst relative difference: K {worst["K"]:.3e}, '
           f'fused J {worst["J"]:.3e}, fused K {worst["JK"]:.3e}  '
           f'(tolerance {a.tol:.0e})')
