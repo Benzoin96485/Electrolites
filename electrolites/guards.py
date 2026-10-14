@@ -48,6 +48,10 @@ _QMMM_HESS = ('GPU4PySCF 1.8.1 has no QM/MM Hessian: mf.Hessian() would '
 
 
 def _rohf_gradients(self):
+    import sys
+    gpu = sys.modules.get('electrolites.rohf_grad')
+    if gpu is not None:                 # the GPU gradient feature is enabled
+        return gpu.gradients(self)
     return cpu_fallback(self, f'{type(self).__name__}.Gradients',
                         _ROHF_GRAD).Gradients()
 

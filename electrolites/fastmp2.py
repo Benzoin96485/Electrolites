@@ -122,6 +122,19 @@ def _avail():
 
 def get_int4c2e_ovov(mol, orbo, orbv, vhfopt=None, direct_scf_tol=1e-13,
                      stream=None, omega=None):
+    return _ovpq(mol, orbo, orbv, None, None, vhfopt, direct_scf_tol, omega)
+
+
+def get_int4c2e_ovpq(mol, orbo, orbv, orbp, orbq, vhfopt=None,
+                     direct_scf_tol=1e-13, omega=None):
+    """(ia|pq) as an (nocc, nvir, np, nq) array -- the same half
+    transformation with ``orbp``/``orbq`` in the last two GEMMs (the (T)
+    correction's ``ovvv`` is ``orbp = orbq = orbv``).  On the device when it
+    fits in 45 % of the free memory, else a host array of the same shape."""
+    return _ovpq(mol, orbo, orbv, orbp, orbq, vhfopt, direct_scf_tol, omega)
+
+
+def _ovpq(mol, orbo, orbv, orbp, orbq, vhfopt, direct_scf_tol, omega):
     from gpu4pyscf.scf import int4c2e
     if omega is None:
         omega = 0.0
@@ -129,21 +142,26 @@ def get_int4c2e_ovov(mol, orbo, orbv, vhfopt=None, direct_scf_tol=1e-13,
         vhfopt = int4c2e._VHFOpt(mol, 'int2e').build(direct_scf_tol)
     STATS['calls'] += 1
     coeff = vhfopt.coeff
+    plain = orbp is None
     orbo = coeff @ cp.asarray(orbo)
     orbv = coeff @ cp.asarray(orbv)
+    orbp = orbo if plain else coeff @ cp.asarray(orbp)
+    orbq = orbv if plain else coeff @ cp.asarray(orbq)
     nao, nocc = orbo.shape
     nvir = orbv.shape[1]
+    npp, nqq = orbp.shape[1], orbq.shape[1]
 
-    ovov_bytes = nocc * nvir * nocc * nvir * 8
+    ovov_bytes = nocc * nvir * npp * nqq * 8
     avail = _avail()
     on_device = (ovov_bytes < 0.45 * avail
                  and not os.environ.get('FASTMP2_HOST'))
     if on_device:
-        ovov = cp.empty((nocc, nvir, nocc, nvir))
+        ovov = cp.empty((nocc, nvir, npp, nqq))
         avail -= ovov_bytes
     else:
         STATS['host_result'] += 1
-        ovov = np.empty((nocc * nvir, nocc * nvir))
+        ovov = (np.empty((nocc * nvir, nocc * nvir)) if plain
+                else np.empty((nocc, nvir, npp, nqq)))
 
     # the largest integral block plus its intermediates
     cart_ao_loc = vhfopt.mol.ao_loc_nr(cart=True)
@@ -151,7 +169,7 @@ def get_int4c2e_ovov(mol, orbo, orbv, vhfopt=None, direct_scf_tol=1e-13,
     pairs = sorted(int(n[i]) * int(n[j]) for i in range(len(n)) for j in range(i + 1))
     blk = pairs[-1] * pairs[-1]
     per_occ = (nao * nao * nvir                   # H
-               + nocc * nao * nvir + nocc * nvir * nvir) * 8   # final stage
+               + npp * nao * nvir + npp * nqq * nvir) * 8   # final stage
     # the integral block itself, ~6 slice-sized temporaries, and headroom
     # for GINTfill's own cudaMalloc scratch outside the pool
     fixed = (blk + 6 * CHUNK) * 8 + (2 << 30)
@@ -169,7 +187,8 @@ def get_int4c2e_ovov(mol, orbo, orbv, vhfopt=None, direct_scf_tol=1e-13,
     while True:
         try:
             with cp.cuda.using_allocator(pool.malloc):
-                _batches(int4c2e, vhfopt, omega, orbo, orbv, ovov, nb, on_device)
+                _batches(int4c2e, vhfopt, omega, orbo, orbv, ovov, nb,
+                         on_device, orbp, orbq)
             break
         except (RuntimeError, cp.cuda.memory.OutOfMemoryError):
             pool.free_all_blocks()
@@ -181,8 +200,10 @@ def get_int4c2e_ovov(mol, orbo, orbv, vhfopt=None, direct_scf_tol=1e-13,
     return ovov
 
 
-def _batches(int4c2e, vhfopt, omega, orbo, orbv, ovov, nb, on_device):
+def _batches(int4c2e, vhfopt, omega, orbo, orbv, ovov, nb, on_device,
+             orbp, orbq):
     nao, nocc = orbo.shape
+    npp, nqq = orbp.shape[1], orbq.shape[1]
     nvir = orbv.shape[1]
     H = cp.empty((nao, nao, nb, nvir))
     for i0 in range(0, nocc, nb):
@@ -218,15 +239,18 @@ def _batches(int4c2e, vhfopt, omega, orbo, orbv, ovov, nb, on_device):
             del X, Xt, int4c
         _symmetrize(H)
         # ovov[i, a, j, b] = sum_{ls} H[l, s, i, a] C_occ[l, j] C_vir[s, b]
+        # (C_p, C_q in place of C_occ, C_vir for get_int4c2e_ovpq)
         m = (i1 - i0) * nvir
-        t = (orbo.T @ H.reshape(nao, nao * m)).reshape(nocc, nao, m)
-        out = cp.matmul(orbv.T, t)                        # [j, b, ia]
+        t = (orbp.T @ H.reshape(nao, nao * m)).reshape(npp, nao, m)
+        out = cp.matmul(orbq.T, t)                        # [p, q, ia]
         del t
-        out = out.reshape(nocc, nvir, i1 - i0, nvir).transpose(2, 3, 0, 1)
+        out = out.reshape(npp, nqq, i1 - i0, nvir).transpose(2, 3, 0, 1)
         if on_device:
             ovov[i0:i1] = out
+        elif ovov.ndim == 2:
+            ovov[i0 * nvir:i1 * nvir] = cp.asnumpy(out).reshape(m, npp * nqq)
         else:
-            ovov[i0 * nvir:i1 * nvir] = cp.asnumpy(out).reshape(m, nocc * nvir)
+            ovov[i0:i1] = cp.asnumpy(out)
         del out
 
 

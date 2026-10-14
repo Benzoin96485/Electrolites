@@ -80,6 +80,25 @@ def _get_vsap_uks(ks, mol=None):
     return cupy.stack([v, v])
 
 
+def geneig(h, s):
+    """h c = s c e by canonical orthogonalisation and a standard eigh.
+
+    GPU4PySCF's ``eig`` without an orthogonaliser calls cuSOLVER's
+    generalised solver, which failed ('failed in eigh kernel') on a compute
+    node in the job environment while the same call passed on the login
+    node -- the cause was not isolated.  The SCF itself never takes that
+    path (it passes ``x``), so neither does this.  ``h`` may be stacked
+    (2, n, n)."""
+    w, u = cupy.linalg.eigh((s + s.T) * .5)
+    x = u / cupy.sqrt(w)
+    if h.ndim == 3:
+        out = [geneig(hs, s) for hs in h]
+        return cupy.stack([o[0] for o in out]), cupy.stack([o[1] for o in out])
+    hx = x.T @ ((h + h.T) * .5) @ x
+    e, c = cupy.linalg.eigh(hx)
+    return e, x @ c
+
+
 def init_guess_by_vsap(mf, mol=None):
     """The vSAP guess density, on the device (PySCF's recipe)."""
     if mol is None:
@@ -87,7 +106,7 @@ def init_guess_by_vsap(mf, mol=None):
     vsap = mf.get_vsap(mol)
     t = cupy.asarray(mol.intor_symmetric('int1e_kin'))
     s = mf.get_ovlp(mol)
-    mo_energy, mo_coeff = mf.eig(t + vsap, s)
+    mo_energy, mo_coeff = geneig(t + vsap, s)
     mo_occ = mf.get_occ(mo_energy, mo_coeff)
     return mf.make_rdm1(mo_coeff, mo_occ)
 

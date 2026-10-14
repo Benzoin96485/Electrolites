@@ -183,6 +183,30 @@ def not_available(what, reason):
     return method
 
 
+# ------------------------------------------------------------ the catalogue
+# FEATURE_TARGETS_PYSCF_2.13.md IDs in brackets.
+
+register('stability', 'stability',
+         absent=[('gpu4pyscf.scf.hf', 'RHF.stability'),
+                 ('gpu4pyscf.scf.uhf', 'UHF.stability'),
+                 ('gpu4pyscf.scf.rohf', 'ROHF.stability')],
+         gpu_modules=['gpu4pyscf.scf.stability'],
+         doc='[S2] RHF/RKS, UHF/UKS internal + external, ROHF/ROKS internal')
+register('rohf_grad', 'rohf_grad',
+         absent=[('gpu4pyscf.scf.rohf', 'ROHF.nuc_grad_method'),
+                 ('gpu4pyscf.dft.roks', 'ROKS.nuc_grad_method')],
+         doc='[S3] ROHF/ROKS gradients, direct and DF')
+register('sap', 'sap',
+         absent=[('gpu4pyscf.scf.hf', 'SCF.init_guess_by_sap')],
+         doc='[S8] the SAP initial guess (Gaussian fit)')
+register('mp2_rdm', 'mp2_rdm',
+         absent=[('gpu4pyscf.mp.mp2', 'MP2Base.make_rdm1'),
+                 ('gpu4pyscf.mp.mp2', 'MP2Base.make_fno')],
+         doc='[P5] MP2 unrelaxed 1-RDM and frozen natural orbitals')
+register('ccsd_t', 'ccsd_t',
+         absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ccsd_t')],
+         doc='[P1] closed-shell (T) on the device')
+
 __all__ = ['FEATURES', 'register', 'check_absent', 'enable', 'enable_all',
            'enabled', 'attach', 'register_gpu_module', 'cpu_fallback',
            'not_available', 'is_absent']

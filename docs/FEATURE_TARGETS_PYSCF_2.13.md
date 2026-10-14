@@ -472,7 +472,7 @@ as KT's was.
 
 | Rank | Entry | Reaches | Why this rank |
 |---|---|---|---|
-| 1 | **P1** RCCSD(T) (+ **P5** FNO, **P2** DF-CCSD) | every CCSD(T) single point | Once `fastccsd` has made CCSD 2.4–10.9x faster (KT §13.27), (T) — still CPU-only — is ≈ 2o ladder iterations of work, so it is **the** step of a CCSD(T) run `[?]`. Every input but ovvv is already on the device, and the AO blocks ovvv needs are computed and then thrown away (`fastccsd.py:658`). The work is DGEMM-bound on fp64 tensor cores. The oracle is exact and deterministic. Highest demand of any correlated method. Contamination is high (ByteQC), which is fine for throughput but poor for the benchmark track. **Measured (§11.2)**: CPU (T) is 76–91 % of today's fastest route |
+| 1 **done** (P1, P5; P2 open) | **P1** RCCSD(T) (+ **P5** FNO, **P2** DF-CCSD) | every CCSD(T) single point | Once `fastccsd` has made CCSD 2.4–10.9x faster (KT §13.27), (T) — still CPU-only — is ≈ 2o ladder iterations of work, so it is **the** step of a CCSD(T) run `[?]`. Every input but ovvv is already on the device, and the AO blocks ovvv needs are computed and then thrown away (`fastccsd.py:658`). The work is DGEMM-bound on fp64 tensor cores. The oracle is exact and deterministic. Highest demand of any correlated method. Contamination is high (ByteQC), which is fine for throughput but poor for the benchmark track. **Measured (§11.2)**: CPU (T) is 76–91 % of today's fastest route. **Built (§12.2)**: GPU (T) 7.1–7.9x the CPU node, ≤ 6e-15 Eh from PySCF |
 | 2 | **M1 → M3 → M4 → M5** a GPU (DF-)CASSCF | CASCI, CASSCF, SA-CASSCF; then M6–M8 | The largest capability gap, on this repository's own workload (open-shell TMCs). Every piece but the FCI Davidson/RDMs exists and is verified: the σ kernel at 34–39x, DF B[u,p,L], ppaa/papa from J/K and from `fastmp2`. PySCF's DF-CASSCF writes naux·nmo² to disk every macro-iteration and does a J/K per AH step on the host. **Measured (§11.3)**: J/K + `_ERIS` 85–93 % at CAS ≤ (10,9), FCI 29 % at (14,13), no gain from more CPU cores |
 | 3 | **S1** COSX energy (gradient after) | every hybrid SCF at TZ/QZ or with diffuse functions, opt-in | The one new **integral kernel** in this plan with throughput upside on the SCF itself, and the place KT left off: exact K is 66.8 % of a patched SCF and at the machine (KT §2.1). It is an approximation and an *alternative route*, so its baseline is `fastk`, and its rank is gated on §8 item 1's crossover. Rank 3 if it wins at def2-TZVP; drop to §5.4 if it does not win anywhere `fastk` runs. **Measured (§11.1)**: CPU COSX loses to GPU exact K by 20x at SVP but only 3.7x at TZVPD and 2.6x on open-shell TZVP; kept for TZVP+/diffuse, error 3e-4–1.2e-3 Eh |
 | 4 | **P3 + P4** DF-MP2 gradient; double hybrids | RI-MP2 and double-hybrid geometries | **Ahead of PySCF**, which has neither. No new integral kernel: G's general three-index derivative contraction, `fastdfgrad`, `fastdfmp2` and CPHF carry it. Double-hybrid energies are a front end on the same code |
@@ -497,9 +497,9 @@ that users hit today (§3).
 |---|---|---|
 | 1 | **Z1** guards + **D1–D13** | two silent wrong answers; a dozen crashes |
 | 2 | **Z3** delivery, **Z5** CPU baseline harness | the mechanism and the measurement every §5.1 entry needs |
-| 3 | **S2** stability analysis | the check every open-shell TMC solution should get, currently CPU-only: **measured 53–126x the GPU SCF it follows (§11.4)**; first item of Phase 1 |
-| 4 | **S3** ROHF/ROKS gradient | ROKS geometries (ΔSCF, radicals) |
-| 5 | **S8** SAP guess, vSAP fix | a better guess for the TMCs that do not converge (`[?]` until tried) |
+| 3 **done** | **S2** stability analysis | the check every open-shell TMC solution should get, currently CPU-only: **measured 53–126x the GPU SCF it follows (§11.4)**; first item of Phase 1. **Built (§12.1)**: 41–66x the CPU node |
+| 4 **done** | **S3** ROHF/ROKS gradient (§12.3) | ROKS geometries (ΔSCF, radicals) |
+| 5 **done** | **S8** SAP guess (§12.4), vSAP fix | a better guess for the TMCs that do not converge (`[?]` until tried) |
 | 6 | **V3**, **V2** QM/MM Gaussian charges, QM/MM Hessian | the assertion; the wrong Hessian |
 | 7 | **V5** one TDDFT-PCM gradient build | 3x on that term `[?]` |
 | 8 | **T1** cube files on the GPU; CuPy shims (`lo`, `tools`, AVAS) | every visualisation and active-space selection workflow |
@@ -952,3 +952,167 @@ Still owed:
 - the wheel-against-source-build BLAS comparison for (T) and FCI
   (CPU_BASELINE §3);
 - §8 items 5–10.
+
+---
+
+## 12. Phase 1, built (2026-10-14)
+
+Five features. Each follows the same pattern:
+
+- added through `electrolites.features` (`enable(name)`), each refusing to
+  load if GPU4PySCF has filled its slot;
+- each with its test suite against PySCF 2.13 on the CPU;
+- all eight Phase 0/1 suites pass on a compute node, under `patch_all()`
+  where it applies (`~/vibeqc/_el_jobs/phase0/logs/p1_tests.log`).
+
+Timings are taken on one A100 (40 or 80 GB, as stated) against
+§11's CPU-node records, by `docs/CPU_BASELINE.md`.
+
+### 12.1 S2 — stability analysis (`electrolites/stability.py`, `enable('stability')`)
+
+**What it is.** PySCF's `scf/stability.py`, term by term:
+
+- RHF/RKS internal, real → complex and RHF → UHF;
+- UHF/UKS internal, real → complex and UHF → GHF;
+- ROHF/ROKS internal.
+
+The orbital-Hessian products are **batched**: a block of trial vectors is one
+`gen_response` call over a stack of transition densities. The eigensolver is
+a block Davidson on device vectors.
+
+**Correctness** (`tests/test_stability.py`). Seven cases: water RHF, B3LYP and
+DF-PBE0; N₂ at 2.0 Å (unstable in all three senses); H₂O⁺ UHF, UKS and ROHF.
+At Davidson tol 1e-8 on both sides, every lowest eigenvalue agrees with
+PySCF's to < 1e-5, and every stable/unstable verdict agrees. The rotated N₂
+orbitals take a UHF SCF 0.020 Eh below the RHF.
+
+**Found on the way** `[X]`: PySCF's UKS UHF → GHF "Hessian" is **not
+symmetric**. With its collinear XC kernel on spin-mixing densities,
+|H − Hᵀ| = 0.023 on H₂O⁺/B3LYP. PySCF's symmetric Davidson therefore
+returns a tolerance-dependent number: −0.07138 at its default tol and
+−0.07270 at 1e-8. The operator's actual lowest real eigenvalue, from the
+dense matrix, is **−0.07269**. This solver treats that one operator as
+non-symmetric and returns −0.072690, which is what the test checks.
+
+**Timed** (`benchmarks/stability_bench.py`, A100-80GB, `patch_all()`; the
+CPU side is §11.4, 128 cores):
+
+| system | GPU SCF (cycles) | **GPU stability, internal + external** | CPU stability (§11.4) | ratio | verdicts |
+|---|---|---|---|---|---|
+| Ni dithiolene⁻ / def2-SVP, UKS B3LYP | 13.7 s (35) | 7.8 + 6.9 = **14.7 s** | 596 s | **41x** | (stable, unstable) = CPU's |
+| Co(II) sextet / def2-SVP, UKS B3LYP (113 atoms) | 65.6 s (58) | 84.4 + 36.9 = **121.3 s** | 7997 s | **66x** | (stable, unstable) = CPU's |
+| penicillin V / def2-SVP, RKS B3LYP | 6.9 s (14) | 4.9 + 4.3 = **9.2 s** | — | — | (stable, stable) |
+
+Checking a solution's stability now costs about as much as the GPU SCF that
+found it (1.1–1.9x), where it cost 53–126x.
+
+### 12.2 P1 — the closed-shell (T) correction (`electrolites/ccsd_t.py`, `enable('ccsd_t')`)
+
+**What it is.** `CCSD.ccsd_t()` on GPU4PySCF's CCSD object.
+
+- **Loop order.** PySCF's energy, rearranged to a loop over occupied triples
+  i ≥ j ≥ k. For each (i, j) and a batch of k, the six occupied orders of W
+  are strided-batched cuBLAS GEMMs on views of (ia|bc), (ia|jk) and t₂. Two
+  CUDA passes form the permutation sum X and the energy.
+- **Integrals.** From a generalisation of `fastmp2`'s half transformation
+  (`get_int4c2e_ovpq`).
+- **Fock matrix.** From one GPU Fock build, so a non-canonical f_vo enters as
+  in PySCF.
+
+**Correctness** (`tests/test_ccsd_t.py`). On identical amplitudes and
+orbitals, it agrees with PySCF's `ccsd_t` to **≤ 6e-15 Eh**, across closed
+shells, frozen core, frozen core + virtuals, and the batched-k path.
+
+The first version assumed the summand symmetric in the occupied indices
+alone. It is not, and that version was 10 % off on water (caught by a numpy
+prototype). Each canonical triple now sums its six orders explicitly.
+
+**Timed** (`benchmarks/ccsd_t_bench.py`, A100-80GB, on `fastccsd`'s
+amplitudes at `conv_tol` 1e-9; the CPU side is §11.2):
+
+| system / basis | o / v | **GPU (T)** (integrals + triples) | CPU (T), best threads | ratio | whole CCSD(T), GPU | whole CCSD(T), CPU node | |Δe_T| vs CPU |
+|---|---|---|---|---|---|---|---|
+| glycine / def2-TZVP | 20 / 165 | **4.6 s** (1.5 + 3.1) | 35.3 s (64) | **7.7x** | 14.8 s | 138 s | 5.7e-8 (CCSD-limited) |
+| alanine dipeptide / def2-SVP | 39 / 161 | **21.4 s** (1.2 + 20.2) | 151.9 s (64) | **7.1x** | 38.2 s | 707 s | 1.8e-9 |
+| ferrocene / def2-SVP | 48 / 173 | **52.6 s** (6.2 + 46.4) | 413.9 s (128) | **7.9x** | 124.1 s | 1866 s | 4.1e-8 (CCSD-limited) |
+
+The (T) differences against the CPU runs are the CCSD amplitudes'
+differences (§11.2's 1e-7 gate), not the (T) kernel's. Against today's
+fastest route (GPU CCSD + CPU (T), 47–485 s), the all-GPU CCSD(T) is
+**3.1–4.4x**.
+
+**Profile and what is left** (`ELECTROLITES_T_PROFILE`, alanine dipeptide):
+
+- **The fix that mattered.** The first build spent 101 of 116 s in the W
+  GEMMs. CuPy's `matmul` with a broadcast operand copies it per batch
+  element. Replacing every contraction with a strided-batched cuBLAS call on
+  views took that to 13.4 s.
+- **What is left.**
+  - The GEMMs are 13.4 s, against an fp64 tensor-core floor of ~4.5 s for the
+    o³v⁴ work.
+  - The two energy passes are 6.8 s, memory-bound. Their permuted reads of
+    W and X are uncoalesced.
+  - A tiled energy kernel and larger GEMM batches (several (i, j) at once)
+    are the next steps.
+- **Memory.** It holds o·v³ for (ia|bc) and seven k-batch × v³ blocks.
+
+### 12.3 S3 — ROHF/ROKS gradients (`electrolites/rohf_grad.py`, `enable('rohf_grad')`)
+
+**What it is.** PySCF's ROHF/ROKS gradient — the UHF/UKS gradient with the
+Roothaan energy-weighted density and a UHF-shaped density tag — on
+GPU4PySCF's UHF/UKS gradient classes, direct and density-fitted. It replaces
+`guards`' CPU fallback when enabled (`guards` defers to it).
+
+**Correctness** (`tests/test_rohf_grad.py`, also with `--patch-all`).
+Against PySCF's ROHF/ROKS gradients, to **≤ 2.2e-8 Eh/bohr**, across:
+
+- ROHF, ROKS PBE, ROKS B3LYP, DF-ROKS B3LYP and DF-ROHF;
+- H₂O⁺ (doublet) and CH₂ (triplet).
+
+The analytic gradient agrees with a finite difference to 9e-6 (the step's
+error).
+
+### 12.4 S8 — the SAP initial guess (`electrolites/sap.py`, `enable('sap')`)
+
+**What it is.** PySCF's Gaussian-fit SAP. V_sap is one
+`contract_int3c2e_auxvec` call against all atoms' SAP charges, and the guess
+follows PySCF's recipe for RHF, UHF (with `init_guess_breaksym`) and ROHF.
+
+**Correctness** (`tests/test_sap.py`):
+
+- V_sap agrees with PySCF's `make_sap` to 1.2e-12, and the guess densities
+  to 1e-12.
+- An SCF from it lands on the minao energy (water RKS, H₂O⁺ UKS, Ni
+  dithiolene⁻ UKS). The Ni complex takes 35 cycles against 37: no
+  convergence rescue on this case (Q10 stays open for the two
+  non-converging TMCs).
+
+**Also fixed.** The generalised `eigh` the guess would have used fails on a
+compute node, though not on the login node (cause not isolated). The guess
+uses canonical orthogonalisation instead, as does `fixes`' vSAP.
+
+### 12.5 P5 — MP2 1-RDM and frozen natural orbitals (`electrolites/mp2_rdm.py`, `enable('mp2_rdm')`)
+
+**What it is.** PySCF's `make_rdm1` (unrelaxed, spin-traced) and `make_fno`
+on GPU4PySCF's conventional RMP2 and DF-MP2: the occupied and virtual blocks
+as two GEMMs over the device amplitudes, with the MP2 re-run with `with_t2`
+when none are stored.
+
+**Correctness** (`tests/test_mp2_rdm.py`), against PySCF on the same
+orbitals (the DF case against PySCF's DF-MP2), with and without frozen core:
+
+- the 1-RDM to 2e-14 (MO basis) and 2e-13 (AO basis);
+- the FNO frozen lists identical, and the active-virtual projectors to 2e-11.
+
+With P1 this gives FNO-CCSD(T): `frozen, no = pt.make_fno(...)` →
+`CCSD(mf, frozen=frozen, mo_coeff=no)` → `ccsd_t()`.
+
+### 12.6 What §5 takes from Phase 1
+
+| entry | status | measured |
+|---|---|---|
+| **P1** rank 1 | **built** | (T) 7.1–7.9x a CPU node; whole CCSD(T) 9.3–18.5x; the route GPU-CCSD + CPU-(T) is gone. Left: GEMM efficiency (3x headroom) and the energy pass |
+| **S2** glue #3 | **built** | 41–66x the CPU node's analysis; now 1.1–1.9x the GPU SCF |
+| **S3** glue #4 | **built** | GPU ROHF/ROKS gradients, direct and DF; the CPU fallback is no longer reached when enabled |
+| **S8** glue #5 | **built** (SAP; vSAP was Phase 0's D1) | no convergence gain on the one TMC tried |
+| **P5** | **built** | prerequisite for FNO-CCSD(T) |

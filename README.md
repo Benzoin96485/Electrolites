@@ -279,6 +279,21 @@ rather than shadowed (`electrolites/features.py`,
 `docs/CATALOGUE_06_STATUS.md` maps these onto the kernel-target catalogue,
 including the entries that turned out to be closed upstream or reversed.
 
+## Features added to GPU4PySCF
+
+Not replacements: things GPU4PySCF 1.8.1 does not run on the GPU at all,
+turned on with `electrolites.enable(name)` (or `enable_all()`).  Each checks
+first that its slot is still empty upstream
+(`docs/FEATURE_TARGETS_PYSCF_2.13.md`, whose IDs are in brackets).
+
+| feature | adds | round |
+|---|---|---|
+| `stability` | `mf.stability()` for RHF/RKS, UHF/UKS (internal and external) and ROHF/ROKS (internal) on the device; batched orbital-Hessian products | [S2], FEATURE_TARGETS §12 |
+| `rohf_grad` | ROHF/ROKS analytic gradients, direct and DF, on GPU4PySCF's UHF/UKS gradient kernels | [S3], §12 |
+| `sap` | `init_guess='sap'` (the Gaussian-fit SAP guess) for RHF/UHF/ROHF and KS | [S8], §12 |
+| `mp2_rdm` | `make_rdm1` and `make_fno` (frozen natural orbitals) on conventional and DF MP2 | [P5], §12 |
+| `ccsd_t` | `CCSD.ccsd_t()`: the closed-shell (T) correction on the device | [P1], §12 |
+
 ## Tests
 
 ```bash
