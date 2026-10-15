@@ -229,6 +229,9 @@ register('pbc_stability', 'pbc_stability',
 register('polar', 'polar_gpu',
          doc='[O3] static and frequency-dependent polarizability, RHF/RKS '
              'and UHF/UKS (polar_gpu.polarizability)')
+register('cubegen', 'cubegen_gpu',
+         doc='[T1] density / orbital / MEP cube files on the GPU '
+             '(cubegen_gpu.density, orbital, mep)')
 register('ssc', 'ssc_gpu',
          doc='[O2] NMR spin-spin coupling (RHF/RKS) on the GPU (ssc_gpu.SSC)')
 register('nmr_uks', 'nmr_uks',
