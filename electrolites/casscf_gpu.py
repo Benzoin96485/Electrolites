@@ -287,6 +287,31 @@ class _ERIS:
         logger.timer(casscf, 'GPU DF _ERIS', logger.process_clock(), t0)
 
 
+
+def _get_fock(mc, mo_coeff=None, ci=None, eris=None, casdm1=None,
+              verbose=None):
+    """PySCF ``casci.get_fock``; without ``eris`` PySCF builds the J/K from
+    ``mc._scf`` -- here the host, exact-integral SCF -- so that branch uses
+    the CASSCF's own GPU J/K (DF or direct, as the CASSCF itself)."""
+    from pyscf.mcscf import casci
+    if eris is not None:
+        return casci.get_fock(mc, mo_coeff, ci, eris, casdm1, verbose)
+    if mo_coeff is None:
+        mo_coeff = mc.mo_coeff
+    if casdm1 is None:
+        if ci is None:
+            ci = mc.ci
+        casdm1 = mc.fcisolver.make_rdm1(ci, mc.ncas, mc.nelecas)
+    mo_coeff = cp.asnumpy(mo_coeff)
+    ncore, ncas = mc.ncore, mc.ncas
+    nocc = ncore + ncas
+    dm_core = np.dot(mo_coeff[:, :ncore] * 2, mo_coeff[:, :ncore].T)
+    mocas = mo_coeff[:, ncore:nocc]
+    dm = dm_core + mocas @ casdm1 @ mocas.T
+    vj, vk = mc.get_jk(mc.mol, dm)
+    return mc.get_hcore() + np.asarray(vj) - .5 * np.asarray(vk)
+
+
 class _GPUCAS:
     """Mixin ahead of PySCF's DF-CASCI/CASSCF in the MRO."""
     __name_mixin__ = 'GPU'
@@ -299,6 +324,8 @@ class _GPUCAS:
         if mo_coeff is None:
             mo_coeff = self.mo_coeff
         return _ERIS(self, mo_coeff, self.with_df)
+
+    get_fock = _get_fock
 
     def nuc_grad_method(self):
         """The GPU DF-CASSCF gradient (``electrolites.casscf_grad``)."""
@@ -368,6 +395,8 @@ class _DirectERIS(_ERIS):
 class _GPUDirect:
     """Mixin ahead of PySCF's (exact-integral) CASCI/CASSCF in the MRO."""
     __name_mixin__ = 'GPU'
+
+    get_fock = _get_fock
 
     def nuc_grad_method(self):
         raise NotImplementedError(
