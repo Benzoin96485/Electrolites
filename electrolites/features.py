@@ -226,6 +226,9 @@ register('pbc_tda', 'pbc_tdscf',
 register('pbc_stability', 'pbc_stability',
          doc='[X3] periodic RHF/RKS stability (Gamma and k-points) on the '
              'GPU (pbc_stability.stability)')
+register('polar', 'polar_gpu',
+         doc='[O3] static and frequency-dependent polarizability, RHF/RKS '
+             'and UHF/UKS (polar_gpu.polarizability)')
 register('ssc', 'ssc_gpu',
          doc='[O2] NMR spin-spin coupling (RHF/RKS) on the GPU (ssc_gpu.SSC)')
 register('nmr_uks', 'nmr_uks',
