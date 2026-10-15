@@ -224,9 +224,11 @@ mfc = mfl.to_cpu().density_fit(auxbasis=mc.with_df.auxbasis)
 cm = mcscf.CASSCF(mfc, 4, 2)
 cm.fix_spin_(ss=0)
 cm = cm.state_average_([.5, .5])
-cm.conv_tol = 1e-11
-cm.kernel(cp.asnumpy(mc.mo_coeff), mc.ci)
+# the reference at exactly the GPU orbitals, CI vectors and state energies
+# (a NAC is divided by the energy gap and is sensitive to re-convergence)
 mo = cp.asnumpy(mc.mo_coeff)
+cm.mo_coeff, cm.ci = mo, mc.ci
+cm.fcisolver.e_states = np.asarray(mc.e_states)
 for etfs in (False, True):
     nac = mc.nac_method()
     nac.use_etfs = etfs
@@ -238,7 +240,8 @@ for etfs in (False, True):
         gc = nac_sa.NonAdiabaticCouplings(cm, use_etfs=etfs).kernel(
             state=(0, 1), mo=mo, ci=mc.ci, mf_grad=dfrhf_grad.Gradients(mfc))
     err = abs(g - gc).max() / abs(gc).max()
-    report(f'LiH SA-2 NAC <1|d0/dR>, use_etfs={etfs}', err < 1e-6,
+    # the rest is the Lagrange CG's tolerance (PySCF's, both sides)
+    report(f'LiH SA-2 NAC <1|d0/dR>, use_etfs={etfs}', err < 1e-7,
            f'{err:.1e} relative (|NAC| {abs(gc).max():.2f})')
 
 f = [(e_at(1.15 + d) - e_at(1.15 - d)) / (2 * d / 0.52917721092)
