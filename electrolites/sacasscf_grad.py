@@ -178,7 +178,15 @@ class Gradients(sacasscf_grad.Gradients):
             raise ValueError('SA-CASSCF gradient: give state=<root>')
         # PySCF builds a CPU SCF gradient object it does not need here
         kwargs.setdefault('mf_grad', object())
-        return super().kernel(state=state, **kwargs)
+        # the Lagrange equations' gradient/Hessian product
+        # (newton_casscf.gen_g_hop) with its orbital terms on the device
+        from pyscf.mcscf import newton_casscf
+        from electrolites import casscf_orb
+        if casscf_orb._host():
+            return super().kernel(state=state, **kwargs)
+        with lib.temporary_env(newton_casscf,
+                               gen_g_hop=casscf_orb.newton_gen_g_hop):
+            return super().kernel(state=state, **kwargs)
 
 
 class NonAdiabaticCouplings(Gradients):

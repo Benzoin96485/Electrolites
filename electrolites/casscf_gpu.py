@@ -57,6 +57,16 @@ from electrolites import fci_gpu
 STATS = {'eris': 0, 'eris_s': 0., 'jk': 0, 'jk_s': 0., 'l3c_s': 0.}
 
 
+def _stack(dm):
+    """A density or a list/tuple of them (host or device) as one array of
+    the array module of its first element."""
+    if isinstance(dm, (list, tuple)):
+        if any(isinstance(d, cp.ndarray) for d in dm):
+            return cp.stack([cp.asarray(d) for d in dm])
+        return np.asarray(dm)
+    return dm
+
+
 class GPUDF:
     """The parts of ``pyscf.df.DF`` a DF-CASSCF uses, on the GPU."""
 
@@ -159,24 +169,29 @@ class GPUDF:
         return self._jkmf
 
     def get_jk(self, dm, hermi=1, with_j=True, with_k=True, omega=None,
-               direct_scf_tol=None):
+               direct_scf_tol=None, device=False):
+        """DF J/K; ``device=True`` takes and returns device arrays (the
+        orbital step of ``casscf_orb``)."""
         t0 = time.perf_counter()
         STATS['jk'] += 1
         lao = self._ao_cderi() if omega is None else None
         if lao is not None:
-            out = self._jk_cached(lao, dm, hermi, with_j, with_k)
+            out = self._jk_cached(lao, dm, hermi, with_j, with_k, device)
             STATS['jk_s'] += time.perf_counter() - t0
             return out
+        if device:
+            dm = cp.asnumpy(_stack(dm))
         mf = self._gpu_mf()
         dm = np.asarray(dm)
         vj, vk = mf.get_jk(self.mol, cp.asarray(dm), hermi=hermi,
                            with_j=with_j, with_k=with_k, omega=omega)
-        out = (None if vj is None else cp.asnumpy(vj),
-               None if vk is None else cp.asnumpy(vk))
+        conv = cp.asarray if device else cp.asnumpy
+        out = (None if vj is None else conv(vj),
+               None if vk is None else conv(vk))
         STATS['jk_s'] += time.perf_counter() - t0
         return out
 
-    def _jk_cached(self, lao, dm, hermi, with_j, with_k):
+    def _jk_cached(self, lao, dm, hermi, with_j, with_k, device=False):
         """J and K from the cached fitted tensor L[mu, nu, P].
 
         J = L (L . D) as two GEMVs.  K = sum_P L_P D L_P: for a symmetric D
@@ -184,7 +199,7 @@ class GPUDF:
         core, and the AH step's core/active rotations -- are low rank), as
         M_P = L_P U and K = sum_P M_P s M_P^T, two GEMMs over rank r instead
         of nao; a non-symmetric D directly."""
-        dms = cp.asarray(np.asarray(dm), dtype=np.float64)
+        dms = cp.asarray(_stack(dm), dtype=np.float64)
         single = dms.ndim == 2
         dms = dms.reshape(-1, dms.shape[-2], dms.shape[-1])
         nao = dms.shape[-1]
@@ -216,6 +231,8 @@ class GPUDF:
         if single:
             vj = None if vj is None else vj[0]
             vk = None if vk is None else vk[0]
+        if device:
+            return vj, vk
         return (None if vj is None else cp.asnumpy(vj),
                 None if vk is None else cp.asnumpy(vk))
 
@@ -312,7 +329,10 @@ def _get_fock(mc, mo_coeff=None, ci=None, eris=None, casdm1=None,
     return mc.get_hcore() + np.asarray(vj) - .5 * np.asarray(vk)
 
 
-class _GPUCAS:
+from electrolites.casscf_orb import OrbStepMixin  # noqa: E402
+
+
+class _GPUCAS(OrbStepMixin):
     """Mixin ahead of PySCF's DF-CASCI/CASSCF in the MRO."""
     __name_mixin__ = 'GPU'
 
@@ -392,7 +412,7 @@ class _DirectERIS(_ERIS):
         STATS['eris_s'] += time.perf_counter() - t0
 
 
-class _GPUDirect:
+class _GPUDirect(OrbStepMixin):
     """Mixin ahead of PySCF's (exact-integral) CASCI/CASSCF in the MRO."""
     __name_mixin__ = 'GPU'
 
