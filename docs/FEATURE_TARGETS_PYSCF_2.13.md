@@ -476,11 +476,11 @@ as KT's was.
 | 2 **done** (M1, M3, M5, M2; M4's J/K) | **M1 → M3 → M4 → M5** a GPU (DF-)CASSCF | CASCI, CASSCF, SA-CASSCF; then M6–M8 | The largest capability gap, on this repository's own workload (open-shell TMCs). Every piece but the FCI Davidson/RDMs exists and is verified: the σ kernel at 34–39x, DF B[u,p,L], ppaa/papa from J/K and from `fastmp2`. PySCF's DF-CASSCF writes naux·nmo² to disk every macro-iteration and does a J/K per AH step on the host. **Measured (§11.3)**: J/K + `_ERIS` 85–93 % at CAS ≤ (10,9), FCI 29 % at (14,13), no gain from more CPU cores **Built (§13)**: DF-CASSCF 20–38x a CPU node per macro-iteration on two open-shell TMCs, 8.8–15.6x on p-benzyne; energies ≤ 1e-9 from PySCF |
 | 3 → §5.4 (gate failed, §14.3) | **S1** COSX energy (gradient after) | every hybrid SCF at TZ/QZ or with diffuse functions, opt-in | The one new **integral kernel** in this plan with throughput upside on the SCF itself, and the place KT left off: exact K is 66.8 % of a patched SCF and at the machine (KT §2.1). It is an approximation and an *alternative route*, so its baseline is `fastk`, and its rank is gated on §8 item 1's crossover. Rank 3 if it wins at def2-TZVP; drop to §5.4 if it does not win anywhere `fastk` runs. **Measured (§11.1)**: CPU COSX loses to GPU exact K by 20x at SVP but only 3.7x at TZVPD and 2.6x on open-shell TZVP; kept for TZVP+/diffuse, error 3e-4–1.2e-3 Eh **Gate (§14.3)**: an unscreened GPU sn-K on GPU4PySCF's int3c1e kernel costs 42x the exact K at penicillin V/TZVPD (131 s against 3.1 s per build) -- slower even than the CPU COSX. Not built |
 | 4 **done** | **P3 + P4** DF-MP2 gradient; double hybrids | RI-MP2 and double-hybrid geometries | **Ahead of PySCF**, which has neither. No new integral kernel: G's general three-index derivative contraction, `fastdfgrad`, `fastdfmp2` and CPHF carry it. Double-hybrid energies are a front end on the same code **Built (§14)**: DF-MP2 gradient 1.2 s (alanine dipeptide/SVP) to 80 s (taxol/SVP) on one A100, 19-58x PySCF's DF-MP2 relaxed density alone; double hybrids (B2PLYP & co.) with analytic gradients |
-| 5 | **O1** GIAO two-electron kernel (KT:C6) + UKS NMR; **O2** spin–spin coupling | every NMR run; open-shell NMR; J-couplings | O1 is the **measured** remainder of NMR after `fastnmr`: 69–97 % (`README_fastnmr.md`), the only entry here with a share already in hand. O2 is a many-RHS triplet + PSO CPHF, the batching this repository is best at. Both are low contamination |
-| 6 | **X1 → X2** PBC TDA/TDDFT | excited states of solids and surfaces | No GPU path exists. `gen_response`, `fxc`, the Davidson and `fastfftk`'s multi-density K are in place; batching K over nroots·nk² pays more here than in the SCF |
-| 7 | **M6** DF-(SA-)CASSCF gradients and NACs | geometry optimisation, conical intersections | Nearly a hook on G's DF gradient machinery, which `fastdfgrad` already speeds up. After rank 2 |
-| 8 | **M8** MC-PDFT, then **M7** NEVPT2 | dynamic correlation on CASSCF | MC-PDFT is about one XC evaluation once CASSCF is on the GPU. NEVPT2 is the cleanest high-value greenfield kernel (4-RDM contraction) and the cvcv half is `fastmp2`'s. After rank 2 |
-| 9 | **P8 → P9** RPA, then G0W0 | correlation energies; quasiparticle energies | Pure cuBLAS/cuSOLVER on G's device `cderi_ovl`. The design rule is never to build the full Lpq |
+| 5 **done** (O1, O2) | **O1** GIAO two-electron kernel (KT:C6) + UKS NMR; **O2** spin–spin coupling | every NMR run; open-shell NMR; J-couplings | O1 is the **measured** remainder of NMR after `fastnmr`: 69–97 % (`README_fastnmr.md`), the only entry here with a share already in hand. O2 is a many-RHS triplet + PSO CPHF, the batching this repository is best at. Both are low contamination **Built (§15.6–15.7)**: the GIAO J/K as blocks of ordinary GPU J/K on a shifted (l+1) basis — no new kernel; UKS NMR; SSC 16–67x pyscf-properties |
+| 6 **X1 done**; X2 open | **X1 → X2** PBC TDA/TDDFT | excited states of solids and surfaces | No GPU path exists. `gen_response`, `fxc`, the Davidson and `fastfftk`'s multi-density K are in place; batching K over nroots·nk² pays more here than in the SCF **Built (§15.5)**: Γ-point RKS/RHF TDA to 3e-7 eV, D10 fixed; C54 diamond in 64 s, PySCF's CPU TDA does not finish beyond C2 |
+| 7 **done** | **M6** DF-(SA-)CASSCF gradients and NACs | geometry optimisation, conical intersections | Nearly a hook on G's DF gradient machinery, which `fastdfgrad` already speeds up. After rank 2 **Built (§15.1)**: 7–9x per gradient on the TMCs; DF NACs, which PySCF lacks |
+| 8 **done** | **M8** MC-PDFT, then **M7** NEVPT2 | dynamic correlation on CASSCF | MC-PDFT is about one XC evaluation once CASSCF is on the GPU. NEVPT2 is the cleanest high-value greenfield kernel (4-RDM contraction) and the cvcv half is `fastmp2`'s. After rank 2 **Built (§15.2–15.3)**: MC-PDFT 8–10x; NEVPT2 15–24x, CAS(14,14) in 209 s against 3201 s |
+| 9 **done** | **P8 → P9** RPA, then G0W0 | correlation energies; quasiparticle energies | Pure cuBLAS/cuSOLVER on G's device `cderi_ovl`. The design rule is never to build the full Lpq **Built (§15.4)**: RPA 6–15x, G0W0 8–13x |
 | 10 | **S5** sfX2C1e gradient (Hessian after) | all-electron heavy-element geometries | Per-atom dense linear algebra, which maps to strided-batched GEMM; needs GPU `pnucp`-type ip integrals |
 | 11 | **S6** GHF/GKS TDDFT | spin–orbit and non-collinear excitations | A new complex four-component `fxc` grid kernel; GHF-TDHF is nearly glue |
 | 12 | **S7** IBO / PM / ER localisation | local correlation, embedding, analysis | Host-bound Python sweeps (IBO's triple loop, PM's uncached `orth_ao`), and ER via DF |
@@ -709,6 +709,10 @@ J/K on the device, DF and exact. Left: M4's host loops (`gen_g_hop`,
 - **O1** the GIAO two-electron kernel and UKS NMR; **O2** spin–spin coupling.
 - **X1 → X2** PBC TDA/TDDFT (with D10 fixed first).
 - **P8 → P9** RPA, then G0W0.
+
+*Status (2026-10-15)* — Phase 4 done: §15. All of M6, M7, M8, O1, O2,
+X1 (with D10), P8 and P9 built and tested against PySCF / pyscf-properties;
+X2 (k-point TDDFT) is not started.
 
 §5.2's glue items run alongside every phase. They need no kernel work, and
 each closes a crash or a host-only route that users hit today.
@@ -1623,3 +1627,456 @@ integrals.
 | **P3** rank 4 | **built** | the RI-MP2 gradient PySCF lacks: 1.2-80 s, 4-8x the GPU energy; 12-58x PySCF's relaxed density alone, 18-113x its conventional MP2 gradient; FD to ≤ 6e-10 |
 | **P4** rank 4 | **built** | double-hybrid energies (to 1.7e-10 against the CPU recipe) and gradients (FD to the KS gradient's own grid-response floor) |
 | **S1** rank 3 | **gate failed → §5.4** | an unscreened GPU sn-K is 33-240x the exact K and 16x the CPU COSX at TZVPD |
+
+## 15. Phase 4, built (2026-10-14/15): on top of the GPU CASSCF, and the independent tracks
+
+All nine Phase 4 items are built; O1's "hard" kernel turned out not to need
+a new kernel (15.6).
+
+| file | item | what |
+|---|---|---|
+| `electrolites/casscf_grad.py` | M6 | single-state DF-CASSCF gradient (`mc.nuc_grad_method()`) |
+| `electrolites/sacasscf_grad.py` | M6 | SA-CASSCF gradients and DF non-adiabatic couplings (`mc.nac_method()`) |
+| `electrolites/mcpdft_gpu.py` | M8 | MC-PDFT (`MCPDFT(gpu_mc, 'tPBE')`, `CASSCF`, `CASCI`) |
+| `electrolites/nevpt2_gpu.py` | M7 | SC-NEVPT2 (`NEVPT(gpu_mc)`) |
+| `electrolites/rpa_gpu.py` | P8 | direct RPA (`RPA(gpu_mf)`) |
+| `electrolites/gw_gpu.py` | P9 | G0W0-AC (`GWAC(gpu_mf)`) |
+| `electrolites/pbc_tdscf.py` | X1 | Γ-point periodic TDA, and the corrected periodic response (D10) |
+| `electrolites/ssc_gpu.py` | O2 | NMR spin–spin coupling (`SSC(gpu_mf)`) |
+| `electrolites/nmr_uks.py`, `electrolites/giao_jk.py` | O1 | UHF/UKS GIAO shielding; the GIAO two-electron term on the GPU (also used by the RKS path through `fastnmr`) |
+| `tests/test_{casscf_gpu,mcpdft_gpu,nevpt2_gpu,rpa_gpu,gw_gpu,pbc_tdscf,ssc_gpu,nmr_uks,giao_jk,nmr}.py` | | 96 checks (17 of them Phase 2's CASSCF), all pass on the login GPU |
+| `benchmarks/phase4_bench.py`, `pbc_tda_bench.py`, `ssc_bench.py`, `nmr_uks_bench.py` | | GPU (one warm-up run first) or `--cpu` (PySCF / pyscf-properties) |
+
+Timings: one A100-SXM4-80GB per process, four processes per node sharing its
+64 host cores (16 OpenMP threads each), after a warm-up run of the same step
+(the cold run is in each log as `*_cold`). The CPU side is the §11 node
+(2× EPYC 7763): 32 threads for the CAS-based methods as §13, 128 for the
+rest. pyscf-properties is not in `barw-dev`; its 2024-11-07 checkout
+(`4eee5a4`) is reached through `PYSCF_EXT_PATH`
+(`~/vibeqc/_el_jobs/ext/properties`), for the tests and the CPU timings.
+
+### 15.1 M6 — DF-CASSCF gradients, SA gradients and non-adiabatic couplings
+
+**What it is.** `mc.nuc_grad_method()` on a GPU DF-CASSCF from
+`casscf_gpu` (single state, or state-averaged with `kernel(state=i)`), and
+`mc.nac_method().kernel(state=(i, j))` on a GPU DF-SA-CASSCF.
+
+- **Single state** (`casscf_grad`) is PySCF's `df/grad/casscf.py` term by
+  term: the generalised Fock from the CASSCF's own fitted tensor and J/K; h¹
+  and S¹ through GPU4PySCF's `_hcore_energy`; the core–core and core–active
+  J/K derivative as E_G(D_c + D_a) − E_G(D_a) through its DF
+  `jk_energy_per_atom` on the CASSCF's auxiliary basis; the active–active
+  ½ Σ Γ_uvwx (uv|wx)_DF through `dfmp2_grad`'s three-index derivative kernel
+  with Γ^P_uv = ½ Σ Γ_uvwx c^P_wx. No response: the CASSCF is variational.
+- **State-averaged** (`sacasscf_grad`): PySCF's Lagrangian
+  (`grad/sacasscf.py`) unchanged as an algorithm, run on CASSCF objects that
+  carry the GPU mixin, so its Hessian-vector products, J/K and σ are the
+  GPU ones; the three derivative contractions (`grad_elec` with the
+  generalised Fock over all rows, `Lorb_dot_dgorb_dx`, `Lci_dot_dgci_dx`)
+  are GPU ports of PySCF's DF ones, the bilinear J/K terms by polarisation.
+- **NACs**: **PySCF has none with density fitting** (`nac/sacasscf.py` is
+  exact-integral only). Here: PySCF's NAC Lagrangian on the DF objects, the
+  transition-density "core" term and the CSF term (`use_etfs`,
+  `mult_ediff` as PySCF).
+- Found on the way `[X]`: the GPU CASSCF's `get_fock` (used by NEVPT2 and
+  the gradients) went through the host mean field's exact J/K, not the
+  CASSCF's DF one: 2e-5 Eh off a DF-NEVPT2. Fixed (`casscf_gpu._get_fock`).
+  GPU4PySCF's `factorize_dm` fails on an exactly zero transition density
+  (symmetry-forbidden pairs): the J/K derivative of a ~0 density is now 0.
+
+**Correctness** (`tests/test_casscf_gpu.py`, 9 new checks):
+
+| check | worst |
+|---|---|
+| N2 CAS(6,6), O2 triplet CAS(6,8): gradient against PySCF DF-CASSCF on the same orbitals/CI | 7.0e-11 |
+| N2 SA-3 CAS(6,6), states 0 and 1, against PySCF's DF-SA gradient | 8.3e-11 |
+| LiH SA-2 NAC ⟨1\|d0/dR⟩, with and without ETFs, against PySCF's NAC Lagrangian evaluated with the DF pieces (the reference PySCF cannot run directly) | 8.7e-11 relative |
+| N2 CAS(6,6) dE/dz against a Richardson finite difference of the GPU energy | 1.9e-7 (the CASSCF's own convergence) |
+| CASCI and exact-integral CASSCF gradients raise (not built) | — |
+
+**Timed** (DF, def2-SVP; CPU: PySCF `df/grad/casscf` / `grad/sacasscf` /
+`nac/sacasscf`, 32 threads; single-state CPU runs start from the GPU's
+converged orbitals, so only the gradient is compared):
+
+| system, CAS | nao | GPU CASSCF | **GPU gradient** | CPU gradient | ratio |
+|---|---|---|---|---|---|
+| p-benzyne (10,10) | 104 | 8.1 s | **0.46 s** | 0.78 s | 1.7x |
+| Ni dithiolene⁻ (10,9) | 327 | 494 s | **2.86 s** | 20.7 s | 7.2x |
+| Cu macrocycle²⁺ (10,9) | 515 | 109 s | **5.71 s** | 51.7 s | 9.1x |
+| p-benzyne (10,10) SA-2, state 0 | 104 | 7.9 s | **2.54 s** | 20.4 s | 8.0x |
+| Ni dithiolene⁻ (10,9) SA-3, state 0 | 327 | 125 s | **29–39 s** | — | — |
+| p-benzyne (10,10) SA-2 NAC ⟨1\|d0/dR⟩ | 104 | 35.7 s | **9.5 s** | 45.4 s | 4.8x |
+
+Reading:
+
+- The single-state gradient is 7–9x the CPU node on the two TMCs and
+  1.7x on the 104-AO organic (where both sides take under a second), and
+  cheap next to the CASSCF it follows (0.6–6 % of it).
+- The SA gradient and the NAC are PySCF's Lagrange CG on the host (its
+  orbital/CI Hessian-vector products call the GPU J/K and σ per iteration),
+  hence the smaller gain and the run-to-run spread on a node whose host
+  cores are shared by four processes (Ni SA-3: 29 s cold, 39 s warm).
+  Moving `lagrange.Gradients`' CG and `gen_g_hop` to the device is §13.5's
+  "M4 proper", which these inherit.
+
+### 15.2 M8 — MC-PDFT
+
+**What it is.** PySCF 2.13's `mcpdft` class put on top of a GPU
+CASSCF/CASCI (`MCPDFT(gpu_mc, 'tPBE')`; `mcpdft_gpu.CASSCF/CASCI(gpu_mf,
+ot, ncas, nelecas)`), with its two host pieces replaced:
+
+- `energy_mcwfn`: PySCF's expression with J and K from the CASSCF's own GPU
+  J/K;
+- `energy_dft`: the on-top energy on the device on the very grid PySCF
+  would use: AO values per block, ρ_α/β and their gradients, the on-top pair
+  density Π from one GEMM per block over the active pairs, the translation
+  ρ_α,β = ρ/2 (1 ± ζ), ζ = (1 − 4Π/ρ²)^½ (with its gradient for GGAs),
+  and GPU4PySCF's libxc evaluation. Translated LDA/GGA functionals and
+  their global hybrids (`tPBE0`); fully translated (`ft`) and meta-GGA
+  on-top functionals fall back to PySCF's host loop.
+- State averaging is PySCF's (`state_average_` on the MC-PDFT object).
+
+**Correctness** (`tests/test_mcpdft_gpu.py`, 7 checks): tLDA, tPBE,
+tBLYP, tPBE0 on N2 CAS(6,6), tPBE on O2 triplet from ROHF orbitals, every
+state of an SA-3: all ≤ 9.1e-13 Eh from PySCF on the same orbitals and CI;
+`CASSCF(...).run()` makes no host E_ot call.
+
+**Timed** (one MC-PDFT energy on CASCI orbitals; CPU 32 threads):
+
+| system, CAS | nao | **GPU** | CPU | ratio |
+|---|---|---|---|---|
+| Ni dithiolene⁻ (10,9), tPBE | 327 | **0.15 s** | 1.55 s | 10x |
+| Cu macrocycle²⁺ (10,9), tPBE | 515 | **0.58 s** | 4.72 s | 8.1x |
+
+The first timings were 2.0–2.8x: two thirds of the GPU energy was PySCF's
+host grid build, which its `energy_tot` repeats on every call (it resets
+the on-top functional). The device grid is now cached per molecule and grid
+setting (0.69 → 0.23 s on the login node at Ni). MC-PDFT is one J/K and one
+grid pass, so the absolute saving is seconds; what matters more is that the
+energy no longer sends the CASSCF back to the host.
+
+### 15.3 M7 — SC-NEVPT2
+
+**What it is.** `NEVPT(gpu_mc)` is PySCF's `mrpt.NEVPT` with its heavy
+pieces swapped for device ones:
+
+- **The 3-RDM and the 4-RDM×ERI contractions**, PySCF's host C kernels
+  `make_dm123('FCI3pdm_kern_sf')` and `_contract4pdm('NEVPTkern_*')`. The
+  4-RDM is never formed. Identified numerically against PySCF:
+  f3ca[0..5] = Σ (ki|5j) ⟨E01 E23 E4j Eki⟩, f3ac[0..5] = Σ (ik|j4)
+  ⟨E01 E23 Ej5 Eik⟩. All three six-index tensors are ⟨T_10| E_23 |V_45⟩ =
+  ⟨E_32 T_10|V_45⟩ with T_pq = E_pq|c⟩ and V ∈ {T, Σ_j E_4j W_aj,
+  Σ_j E_j5 W_aj}, W_aj = Σ_ki (ki|aj) T_ki. E_rs is applied by its α and β
+  excitation lists (two raw kernels, no atomics: each map is injective),
+  once per (r, s) to blocks of T, then one GEMM against each V set.
+  N_det·n²·(1 + 2) vectors are held at once: at CAS(14,14) (11.8 M
+  determinants) 55 GB, which fits an 80 GB card since W is built one column
+  at a time and the V sets are not stacked into a copy (the first build ran
+  out of memory there).
+- **The integrals** on a GPU DF CASSCF/CASCI (ppaa, papa, pacv, the core
+  Fock) from its fitted tensor, and **every subspace's core/virtual
+  contraction** (S_r, S_i, S_ijrs from the fitted (cv|Q), S_ijr, S_rsi,
+  S_rs, S_ij, S_ir) as device GEMMs/einsums; the active-space
+  intermediates (a3…a25, ncas⁴–⁶) stay PySCF's. The first version left the
+  last five spaces on the host: 3.2 of 3.8 s at ferrocene (10,10); now
+  0.75 s in all.
+
+**Correctness** (`tests/test_nevpt2_gpu.py`, 8 checks): dm1/dm2/dm3/f3ca/f3ac
+against PySCF's kernels on random CI vectors and ERIs, CAS(4,(2,2)) to
+CAS(8,(4,4)), ≤ 8e-16; NEVPT2 energies of a CPU CASCI with exact
+integrals, of GPU DF CASCI (6,6)/(10,10) and DF CASSCF (6,6) against PySCF's
+DF-NEVPT2 on the same orbitals and CI: ≤ 1.5e-13 Eh.
+
+**Timed** (CASCI on RHF orbitals; CPU PySCF 32 threads):
+
+| system, CAS | N_det | **GPU** | CPU | ratio |
+|---|---|---|---|---|
+| p-benzyne (10,10) | 63 504 | **0.35 s** | 8.0 s | 23x |
+| p-benzyne (12,12) | 853 776 | **7.2 s** | 143.3 s | 20x |
+| p-benzyne (14,14) | 11.8 M | **209 s** | 3201 s | 15x |
+| ferrocene (10,10) | 63 504 | **0.51 s** | 12.4 s | 24x |
+
+The (14,14) step is the 4-RDM contraction: 2·n⁶·N_det·3 ≈ 5e14 flops of
+GEMM plus n⁴ excitation sweeps over 18 GB of T vectors.
+
+### 15.4 P8 → P9 — direct RPA and G0W0
+
+**RPA** (`rpa_gpu.RPA(gpu_mf)`): PySCF's `gw.rpa.RPA` re-reads the (ov|P)
+tensor from HDF5 at every one of its 40 imaginary frequencies. Here the
+fitted B^P_ia (GPU4PySCF's bdiv integrals, Cholesky-fitted metric) stays on
+the device; per frequency one SYRK (1 − Π = 1 + XᵀX with
+X = |χ0|^½ B, positive definite) and a Cholesky log-determinant. E_HF is
+the exact-exchange energy of the reference orbitals with the same fitting.
+The auxiliary basis is PySCF's choice: the SCF's own on a density-fitted
+reference, mp2fit otherwise (the first build always used mp2fit, so a DF
+reference gave a different number from PySCF's; fixed, and tested).
+
+**G0W0-AC** (`gw_gpu.GWAC(gpu_mf)`) is PySCF's `gw.gw_ac.GWAC` with three
+host pieces on the device: L^P_pq (GPU integrals and fitting), the
+frequency loop of `get_sigma` (per point one SYRK for Π, one (1 − Π)⁻¹, one
+GEMM with the requested orbitals' L, two small GEMMs into Σ), and V_xc /
+Σ_x from the GPU SCF's own J/K/XC. The Padé continuation and the
+quasiparticle solve are PySCF's.
+
+**Correctness**: RPA E_corr and E_HF to ≤ 2.7e-12 Eh against PySCF on the
+same orbitals (water PBE/HF, glycine PBE, with and without frozen core, a
+DF reference) (`tests/test_rpa_gpu.py`, 8 checks). Σ_c(iω) to 9.8e-17;
+HOMO−2…LUMO+2 quasiparticle energies to ≤ 5.8e-7 Eh (`tests/test_gw_gpu.py`,
+4 checks). The QP gate is 1e-6 because the Padé continuation is
+ill-conditioned: rotating PySCF's own auxiliary basis by a random
+orthogonal matrix, an exact invariance, moves its water QP energies by
+1.7e-7.
+
+**Timed** (PBE/def2-SVP reference, DF; CPU PySCF 128 threads):
+
+| system / basis | nao | **GPU** | CPU | ratio |
+|---|---|---|---|---|
+| RPA penicillin V / SVP | 430 | **1.53 s** | 22.6 s | 15x |
+| RPA penicillin V / TZVP | 858 | **4.96 s** | 30.9 s | 6.2x |
+| RPA taxol / SVP | 1123 | **41.5 s** | — | — |
+| G0W0 alanine dipeptide / SVP (6 orbitals) | 200 | **0.73 s** | 5.6 s | 7.7x |
+| G0W0 penicillin V / SVP (6 orbitals) | 430 | **4.05 s** | 51.3 s | 12.7x |
+
+### 15.5 X1 — Γ-point periodic TDA, and D10
+
+**What it is.** `pbc_tdscf.TDA(gpu_cell_mf)` for a GPU4PySCF Γ-point RKS or
+RHF, singlet and triplet: PySCF's `pbc.tdscf.rhf.TDA` operator — the
+molecular TDA with the exchange evaluated at `exxdiv=None` and the orbital
+energies from that Fock — built on the GPU periodic SCF's own pieces,
+A z = (ε_a − ε_i) z + C_oᵀ v¹[D] C_v with D = 2 C_o z C_vᵀ and
+v¹ = f_xc,singlet|triplet[D/2] + (J[D] if singlet) − ½ a_x K[D].
+
+- `pbc_tdscf.gen_response(mf, singlet, hermi)` takes any number of
+  densities: the J and f_xc see the symmetric part, K the full density
+  (FFT exchange in groups that fit memory). The Γ-point f_xc is batched:
+  per grid block one GEMM for every density's ρ¹ and one batched GEMM for
+  the potentials (GPU4PySCF's `nr_rks_fxc` loops densities and einsums per
+  block).
+- The Davidson is `stability._davidson` with PySCF's residual criterion
+  (√conv_tol) and starting vectors on every e_ia degenerate with the
+  nstates-th lowest. Converging to 1e-6 residual instead took 70 products
+  where 24 do (C16 PBE: 25.7 → 3.7 s on the login GPU); converging loosely
+  from nstates + 1 unit vectors missed one of diamond's triply degenerate
+  roots (0.43 eV wrong) — hence the degenerate-aware start.
+- **D10** (§3.3) is fixed in `electrolites.fixes`: GPU4PySCF's Γ-point
+  `RKS.gen_response(singlet=True)` passed `singlet` into `nr_rks_fxc`'s
+  `fxc` slot, `singlet=False` dropped the triplet f_xc altogether, and both
+  took one density. Both now go to `pbc_tdscf.gen_response` (PySCF's
+  response to ≤ 4.4e-12 relative). The k-point `KRKS` version has the same
+  argument bug and now raises for `singlet` not None (X2 is not built);
+  `singlet=None` (SOSCF) is upstream's in both.
+
+**Correctness** (`tests/test_pbc_tdscf.py`, 12 checks): diamond/GTH-DZV,
+LDA, PBE, PBE0 and HF, singlet and triplet, lowest four roots against
+`pyscf.pbc.tdscf.TDA(mf.to_cpu())`: ≤ 2.8e-7 eV. D10's response against
+PySCF's for PBE and PBE0, singlet and triplet: ≤ 4.4e-12.
+
+**Timed** (diamond supercells, GTH-DZVP, PySCF's default mesh unless noted,
+five roots, conv_tol 1e-5; CPU PySCF 128 threads):
+
+| cell, functional | nao | mesh | GPU SCF | **GPU TDA** | CPU TDA |
+|---|---|---|---|---|---|
+| C2, PBE0 | 26 | default | 3.3 s | **2.0 s** | 4.7 s |
+| C16, PBE | 208 | 94³ | 10.5 s | **5.0 s** | killed (out of memory, 512 GB node) |
+| C16, PBE0 | 208 | 60³ | 107 s | **78 s** | killed (out of memory) |
+| C54, PBE | 702 | 141³ | 47.9 s | **63.5 s** | stopped after 34 min |
+
+- The PBE0 cost is GPU4PySCF's FFT exchange (its SCF takes 107 s on the
+  same cell); the C16 PBE0 run needed a reduced mesh because GPU4PySCF's
+  FFT K for that cell runs out of memory in the SCF itself at the default
+  94³ mesh.
+- There is no CPU number beyond C2: PySCF's own periodic TDA was killed by
+  the out-of-memory handler on C16 (both functionals) and was stopped after
+  34 minutes on C54.
+
+### 15.6 O1 — the GIAO two-electron term on the GPU, and UKS NMR
+
+**The GIAO two-electron term needs no new kernel.** GPU4PySCF (and
+pyscf-properties) form the first-order GIAO Coulomb and exchange from
+libcint's `int2e_ig1` on the host. That term is what §5.1 measured as the
+NMR remainder after `fastnmr`, and here it was 98 % of a GPU UKS NMR run at
+42 atoms and 914 of 930 s at taxol. Two facts make it a plain J/K problem:
+
+- libcint's operator is (g_x i j|k l) = −½ [(R_i − R_j) × (i r j|k l)]_x
+  (checked on `int1e_igovlp` to 3e-16, and on the result below);
+- r χ_j = (r − R_j) χ_j + R_j χ_j, and (r − R_j)_k χ_j is a Cartesian
+  Gaussian of angular momentum l+1 on the same centre with the same
+  exponents and coefficients (rescaled by libcint's s/p factors, and once
+  per shared coefficient block).
+
+So `giao_jk` builds a **shifted basis** (every shell's l + 1), concatenates
+it with the (Cartesian) original, and takes the GIAO J and K as blocks of
+ordinary GPU4PySCF direct J/K builds with the density on the original block:
+J^g = −½[(R_i − R_j) × M + (R_i × R_j) J] with M_k = (i, x_k j|D); K^g from
+one four-density K build (D and D·R_a, a = x, y, z), see the module
+docstring. It equals `int2e_ig1` to ≤ 1.4e-13 relative for s…f bases
+(`tests/test_giao_jk.py`: cc-pVDZ, def2-SVP d→f, def2-TZVP f→g, one and two
+spin densities), and the shieldings to ≤ 4.2e-12 ppm
+(`tests/test_nmr.py`). It is used by:
+
+- **the RKS shielding**: `fastnmr` now also patches `shielding.get_vxc`
+  (K only for hybrids; `FASTNMR_HOST2E=1` keeps the host term, J-only for
+  pure functionals, which alone saves 30 % of that term);
+- **UKS NMR** (`nmr_uks.NMR(gpu_uks)`): pyscf-properties' `nmr.uhf/uks`
+  (GIAO gauge). GPU4PySCF's shielding is closed-shell only (a ValueError on
+  UKS). Here: the spin-resolved GIAO XC matrix on the device (`fastnmr`'s
+  regrouped GEMM with the spin-polarised kernel, one grid pass for both
+  spins), the GIAO J of the total density once and K per spin
+  (`giao_jk`), and the coupled equations with S¹ (pyscf's `ucphf`
+  `solve_withs1`: occupied–occupied −S¹/2, Krylov in the virtual–occupied
+  block) on the device with `mf.gen_response(hermi=2)`. Pure functionals
+  are uncoupled, as in pyscf-properties.
+
+**Found on the way** `[X]`:
+
+- **pyscf-properties' UHF/UKS NMR fails for every open-shell hybrid or HF
+  reference**: its `uhf.gen_vind` `hstack`s (nset, nmo, nocc_α) with
+  (nset, nmo, nocc_β), which raises whenever nocc_α ≠ nocc_β. The test
+  reference is the same function with the blocks flattened first.
+- **GPU4PySCF's Krylov solver stops near a 1e-6 relative residual whatever
+  `tol`**: it ends when a new vector's squared norm falls below its absolute
+  `lindep` (1e-13). The UHF water CPHF residual was 2.6e-5 against
+  pyscf's 2.3e-7. `nmr_uks.krylov_refined` adds iterative refinement
+  (re-solve for the residual scaled to unit norm): 4e-13. SSC uses it too.
+- `cupy.einsum` with three operands materialises the full outer product
+  (no pairwise path): 'xpq,pi,qj->xij' over (3, nao, nao) ran out of memory
+  at 42 atoms. All such contractions here are matmul chains.
+
+**Correctness** (`tests/test_nmr_uks.py`, 8 checks): OH radical (UHF, LDA,
+PBE, B3LYP), CH3 radical (PBE, B3LYP) against pyscf-properties: uncoupled
+cases ≤ 2.7e-13 relative, coupled ≤ 4.5e-7 (the reference's own CPHF
+residual); closed-shell water UKS against GPU4PySCF's RKS shielding:
+4.2e-13 (PBE), 5.8e-7 (B3LYP, GPU4PySCF's CPHF).
+
+**Timed** (def2-SVP; GPU: whole shielding, all nuclei, the GIAO 2e term on
+the device, against the same GPU run with the host term (16 threads, the
+GPU node's share); CPU: pyscf-properties, 128 threads):
+
+| | system | nao | **GPU** | GPU, host 2e term | CPU | ratio to CPU |
+|---|---|---|---|---|---|---|
+| RKS PBE | glycine | 95 | **1.36 s** (host term: < 150 AOs) | 1.31 s | 2.48 s | 1.8x |
+| RKS PBE | alanine dipeptide | 200 | **1.81 s** | 4.46 s | 5.96 s | 3.3x |
+| RKS PBE | penicillin V | 430 | **11.8 s** | 31.9 s | 17.1 s | 1.4x |
+| RKS PBE | taxol | 1123 | **87.5 s** | 885 s | — | — |
+| RKS B3LYP | alanine dipeptide | 200 | **3.17 s** | 5.41 s | 7.41 s | 2.3x |
+| RKS B3LYP | penicillin V | 430 | **19.2 s** | 38.1 s | 27.2 s | 1.4x |
+| RKS B3LYP | taxol | 1123 | **199 s** | — | — | — |
+| UKS PBE (cation radical) | glycine⁺ | 95 | **1.29 s** (host term) | 1.26 s | 2.59 s | 2.0x |
+| UKS PBE | alanine dipeptide⁺ | 200 | **1.88 s** | 4.50 s | 7.77 s | 4.1x |
+| UKS PBE | penicillin V⁺ | 430 | **11.0 s** | 32.5 s | 24.6 s | 2.2x |
+| UKS PBE | taxol⁺ | 1123 | **79.6 s** | — | — | — |
+| UKS B3LYP | alanine dipeptide⁺ | 200 | **4.01 s** | 6.55 s | 11.0 s | 2.7x |
+| UKS B3LYP | penicillin V⁺ | 430 | **27.9 s** | 47.0 s | 45.7 s | 1.6x |
+| UKS B3LYP | taxol⁺ | 1123 | **352 s** | — | — | — |
+
+Reading:
+
+- **Against the GPU node's own host term** (what GPU4PySCF does today),
+  the device GIAO term is 2.5–2.9x at penicillin V and **10x at taxol**
+  (RKS PBE: 885 → 87.5 s); below 150 AOs the host term is kept (the
+  shifted-basis J has a fixed per-class overhead, glycine 1.7 s against
+  1.3 s on the host).
+- **Against a whole CPU node** (pyscf-properties at 128 threads) the GPU
+  shielding is 1.4–4.1x: the GIAO J/K remain direct-integral builds on a
+  3.3x larger basis with l + 1, the costliest integrals GPU4PySCF's
+  engine evaluates. The (shifted, shifted) pairs are already dropped
+  (23 → 13.6 s for the penicillin V J on the login GPU); a J/K kernel
+  specialised to the (original, shifted) bra pairs, or a DF route for the
+  GIAO J, would be the next step.
+- UKS B3LYP at taxol spends 89 s in the coupled solve (two spins, a
+  four-density GIAO K per spin, and the K response).
+
+### 15.7 O2 — NMR spin–spin coupling
+
+**What it is.** `ssc_gpu.SSC(gpu_mf)`: pyscf-properties' RHF/RKS
+`SpinSpinCoupling` (non-relativistic, Chem. Rev. 99, 293) with its options
+(`nuc_pair`, `with_fc`, `with_fcsd`, `cphf`), returning the reduced
+couplings and the isotropic K and J (Hz). GPU4PySCF has none. Per nucleus
+pair: DSO, PSO, and FC or FC+SD.
+
+- **DSO**: −tr D ⟨r_A r_B / r_A³ r_B³⟩ for **all pairs from one GEMM** over
+  the Becke grid, F^T diag(ρw) F with F_g,(A,x) = (r − R_A)_x/|r − R_A|³
+  (`dso='grid'`, default). It agrees with pyscf-properties' 30-point radial
+  quadrature (one 3c1e integral per pair on the host, `dso='exact'`, also
+  available) to that quadrature's own ~1e-5 relative error: grid levels 3,
+  5 and 7 all land at 1.0–1.2e-5 of it, i.e. 3e-5 Hz.
+- **PSO**: the singlet imaginary CPHF (`hermi=2`, only −a_x/2 K survives)
+  for 3·N right-hand sides at once; **FC**: the triplet CPHF for N
+  right-hand sides (h¹ from the AO values at the nuclei); **FC+SD**: the
+  triplet CPHF for 9·N components of `int1e_sa01sp`. All through
+  `mf.gen_response` (J/K and the triplet f_xc on the device), densities in
+  groups of 48 (GPU4PySCF's K failed in cuTENSOR with 339 at once), and
+  `krylov_refined` to a 1e-6 relative residual (pyscf's own level; a third
+  of the cost of 1e-9). The one-electron operators are host libcint, one
+  set per nucleus.
+
+**Found on the way** `[X]`: pyscf-properties' `make_pso` reshapes the PSO
+response by the first atoms of `nuc_pair` while it was solved for the
+second: a pair list whose two atom sets differ in size raises.
+
+**Correctness** (`tests/test_ssc_gpu.py`, 12 checks): water/cc-pVDZ HF,
+B3LYP, PBE and a 3-pair glycine/def2-SVP DF-B3LYP subset, FC and FC+SD,
+against pyscf-properties on the same SCF: ≤ 3.1e-6 relative with the exact
+DSO, ≤ 3.6e-6 with the grid DSO. The 2e-6 is pyscf's: a dense solve of the
+same FC response puts its CPHF at 1.1e-6 and this code's at 2.6e-7.
+
+**Timed** (B3LYP/def2-SVP, all pairs, FC; CPU pyscf-properties 128 threads):
+
+| system | atoms / pairs | nao | **GPU** | CPU | ratio |
+|---|---|---|---|---|---|
+| glycine | 10 / 45 | 95 | **0.47 s** | 7.6 s | 16x |
+| alanine dipeptide | 22 / 231 | 200 | **2.06 s** | 61.5 s | 30x |
+| penicillin V | 42 / 861 | 430 | **22.5 s** | 1507 s | 67x |
+| penicillin V, FC+SD | 42 / 861 | 430 | **99.6 s** | stopped after 57 min | > 34x |
+| taxol | 113 / 6328 | 1123 | **1102 s** | — | — |
+
+The GPU time is the two CPHF solves (penicillin V: PSO 13.9 s, FC
+8.5 s; DSO 0.1 s); per iteration they are 3·N (PSO) and N (FC)
+direct K builds, plus the triplet f_xc for FC. With a DF reference they
+are slower, not faster (penicillin V: 63 s against 22.5 s), as GPU4PySCF's
+DF K costs nocc·nao²·naux per density. The taxol run refines both solves
+once (the first ends above 3e-6); without refinement it was 722 s.
+
+### 15.8 What is left
+
+- **M6/M7/M8 inherit §13.5's host loops.** The SA gradient's and the NAC's
+  Lagrange CG (PySCF's `lagrange.Gradients` with `gen_g_hop` products) is
+  host Python around GPU J/K and σ, hence 5–8x where the single-state
+  gradient is a GPU-only path. CASCI gradients (a Z-vector) and
+  exact-integral CASSCF gradients raise.
+- **NEVPT2** at CAS(14,14) holds 3·n²·N_det vectors (55 GB); CAS(16,16)
+  (N_det 1.6e8) would need the T/V sets blocked over the second index and
+  re-applied, not built. QD-NEVPT2 and the PT2 of a state-averaged CASSCF
+  per root are PySCF's code on the same pieces (not timed).
+- **MC-PDFT**: fully translated (`ft`) and meta-GGA on-top functionals use
+  PySCF's host loop; MC-PDFT gradients are not built.
+- **GW**: only the diagonal analytic-continuation route
+  (`fullsigma=False`, closed shell) is on the device; the Padé fit and QP
+  solve are PySCF's; the contour-deformation and full-frequency GW are not.
+- **X1**: Γ point only, RKS/RHF only (UKS TDA, TDDFT/RPA, oscillator
+  strengths with the GTH velocity-gauge commutator and range-separated
+  hybrids are not built). **X2** (k-points) not started; D10's k-point
+  half now raises instead of returning a wrong response.
+- **O1**: the shifted-basis J costs about 13x a plain J build of the same
+  molecule (penicillin V, login GPU: 23 s against 1.8 s; the concatenated
+  basis is 3.3x larger and carries l + 1); dropping the (shifted, shifted)
+  pairs brought it to 13.6 s, and against a whole CPU node the GPU
+  shielding gains 1.4–2.2x at 42 atoms. A J/K specialised to the
+  (original, shifted) bra pairs, or a fitted GIAO J, is the next step.
+  Range-separated hybrids raise (as GPU4PySCF's RKS path).
+- **O2**: the CPHF solves are 3·N + N direct K builds per iteration; at
+  taxol (339 + 113 right-hand sides) that is the whole 1102 s — a
+  low-rank (occupied-factorised) K for transition densities would be the
+  next step. Spin-dipole-only, UHF/UKS SSC and relativistic SSC are not
+  built.
+
+### 15.9 What §5 takes from Phase 4
+
+| entry | status | measured |
+|---|---|---|
+| **O1** rank 5 | **built** (UKS NMR; the GIAO two-electron term on the GPU without a new kernel) | GIAO J/K equal to `int2e_ig1` to 1e-13; NMR shielding 10x the GPU node's host-term path at taxol, 1.4–4.1x a whole CPU node (pyscf-properties) at 22–42 atoms; UKS shielding (GPU4PySCF has none) |
+| **O2** rank 5 | **built** | spin–spin couplings 16–67x pyscf-properties (penicillin V: 22.5 s against 1507 s), its numbers to its own CPHF accuracy |
+| **X1** rank 6 | **built** (Γ, RKS/RHF TDA; D10 fixed); X2 open | PySCF's excitation energies to 3e-7 eV; C54 diamond in 64 s where PySCF's CPU TDA does not finish (C16: out of memory) |
+| **M6** rank 7 | **built** (single-state, SA, DF NACs PySCF lacks) | 7–9x the CPU node per gradient on the TMCs; SA gradient 8x and NAC 4.8x (host Lagrange CG) |
+| **M8, M7** rank 8 | **built** | MC-PDFT 8–10x; NEVPT2 15–24x, CAS(14,14) in 209 s against 3201 s |
+| **P8, P9** rank 9 | **built** | RPA 6–15x; G0W0 8–13x; both to PySCF's numbers (1e-12 / its Padé conditioning) |
