@@ -213,11 +213,20 @@ def gen_g_hop(casscf, mo, u, casdm1, casdm2, eris):
 
 def _update_jk_in_ah(casscf, mo, mo_core, mo_cas, r, casdm1, ncore, nocc):
     """PySCF ``CASSCF.update_jk_in_ah`` on the device."""
-    dm3 = mo_core @ r[:ncore, ncore:] @ mo[:, ncore:].T
-    dm3 = dm3 + dm3.T
-    dm4 = mo_cas @ casdm1 @ r[ncore:nocc] @ mo.T
-    dm4 = dm4 + dm4.T
-    vj, vk = _jk(casscf, (dm3, dm3 * 2 + dm4))
+    from electrolites.casscf_gpu import _GPUCAS
+    if isinstance(casscf, _GPUCAS) and casscf.with_df._ao_cderi() is not None:
+        # factored densities: dm3 = Xc Yc^T + T, dm4 = Xa Ya^T + T
+        yc = mo[:, ncore:] @ r[:ncore, ncore:].T
+        ya = mo @ (casdm1 @ r[ncore:nocc]).T
+        vj, vk = casscf.with_df.get_jk_factored(
+            [(mo_core, yc),
+             (cp.hstack([2 * mo_core, mo_cas]), cp.hstack([yc, ya]))])
+    else:
+        dm3 = mo_core @ r[:ncore, ncore:] @ mo[:, ncore:].T
+        dm3 = dm3 + dm3.T
+        dm4 = mo_cas @ casdm1 @ r[ncore:nocc] @ mo.T
+        dm4 = dm4 + dm4.T
+        vj, vk = _jk(casscf, (dm3, dm3 * 2 + dm4))
     va = casdm1 @ mo_cas.T @ (vj[0] * 2 - vk[0]) @ mo
     vc = mo_core.T @ (vj[1] * 2 - vk[1]) @ mo[:, ncore:]
     return va, vc

@@ -236,6 +236,31 @@ class GPUDF:
         return (None if vj is None else cp.asnumpy(vj),
                 None if vk is None else cp.asnumpy(vk))
 
+    def get_jk_factored(self, pairs):
+        """J and K (device) of densities D_i = X_i Y_i^T + Y_i X_i^T given
+        by their factors (the AH step's core/active rotation densities):
+        K = sum_P (L_P X)(L_P Y)^T + transpose, no eigen-decomposition and
+        one GEMM shape per call (the eigen path's varying rank made every
+        call a fresh device allocation: 10.6 of 24 s at Ni dithiolene)."""
+        lao = self._ao_cderi()
+        nao, _, naux = lao.shape
+        lt = self._lt
+        if lt is None:
+            lt = self._lt = cp.ascontiguousarray(lao.transpose(0, 2, 1))
+        L2 = lao.reshape(nao * nao, naux)
+        lt2 = lt.reshape(nao * naux, nao)
+        vj, vk = [], []
+        for X, Y in pairs:
+            d = X @ Y.T
+            d = d + d.T
+            vj.append((d.ravel() @ L2 @ L2.T).reshape(nao, nao))
+            r = X.shape[1]
+            mx = (lt2 @ X).reshape(nao, naux * r)
+            my = (lt2 @ Y).reshape(nao, naux * r)
+            k = mx @ my.T
+            vk.append(k + k.T)
+        return cp.stack(vj), cp.stack(vk)
+
     def reset(self, mol=None):
         if mol is not None:
             self.mol = mol
