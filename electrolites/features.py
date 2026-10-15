@@ -218,6 +218,8 @@ register('nevpt2', 'nevpt2_gpu',
          doc='[M7] SC-NEVPT2 with GPU 3-RDM/4-RDM-ERI intermediates (nevpt2_gpu.NEVPT)')
 register('rpa', 'rpa_gpu',
          doc='[P8] direct RPA correlation energy on the GPU (rpa_gpu.RPA)')
+register('gw', 'gw_gpu',
+         doc='[P9] G0W0-AC with the self-energy loop on the GPU (gw_gpu.GWAC)')
 register('ccsd_t', 'ccsd_t',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ccsd_t')],
          doc='[P1] closed-shell (T) on the device')
