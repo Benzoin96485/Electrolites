@@ -1,22 +1,19 @@
 """NMR spin-spin coupling on the GPU (``electrolites.ssc_gpu``,
 FEATURE_TARGETS O2) against pyscf-properties' ``prop.ssc`` on the same SCF.
 
-pyscf-properties is not installed in barw-dev; the reference is a checkout
-reached through PYSCF_EXT_PATH (default ~/vibeqc/_el_jobs/ext/properties).
+The reference needs pyscf-properties (``pip install electrolites[properties]``,
+pinned in pyproject.toml).
 
     python tests/test_ssc_gpu.py
 """
-import os
 import sys
 
-os.environ.setdefault('PYSCF_EXT_PATH', os.path.expanduser(
-    '~/vibeqc/_el_jobs/ext/properties'))
-import numpy as np                                             # noqa: E402
-from pyscf import gto                                          # noqa: E402
-from pyscf.prop import ssc as cpu_ssc                          # noqa: E402
-from gpu4pyscf import dft, scf                                 # noqa: E402
+import numpy as np
+from pyscf import gto
+from pyscf.prop import ssc as cpu_ssc
+from gpu4pyscf import dft, scf
 
-from electrolites.ssc_gpu import SSC                           # noqa: E402
+from electrolites.ssc_gpu import SSC
 
 fails = []
 

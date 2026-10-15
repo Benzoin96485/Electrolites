@@ -1,6 +1,6 @@
 """UKS GIAO NMR shielding timings (FEATURE_TARGETS §15, O1): GPU
 (``electrolites.nmr_uks``) or pyscf-properties on the CPU (``--cpu``;
-PYSCF_EXT_PATH must reach it).
+needs pyscf-properties, ``electrolites[properties]``).
 
     python benchmarks/nmr_uks_bench.py --xyz benchmarks/molecules/glycine.xyz \\
         --charge 1 --spin 1 --basis def2-svp --xc b3lyp [--cpu]
@@ -22,8 +22,6 @@ ap.add_argument('--restricted', action='store_true',
 a = ap.parse_args()
 if a.host2e:
     os.environ['FASTNMR_HOST2E'] = '1'
-os.environ.setdefault('PYSCF_EXT_PATH', os.path.expanduser(
-    '~/vibeqc/_el_jobs/ext/properties'))
 
 import numpy as np                                             # noqa: E402
 

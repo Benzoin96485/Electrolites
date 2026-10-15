@@ -2,8 +2,8 @@
 FEATURE_TARGETS O1) against pyscf-properties' ``prop.nmr.uhf``/``uks`` on
 the same SCF, and a closed-shell UKS against GPU4PySCF's RKS shielding.
 
-pyscf-properties is not installed in barw-dev; the reference is a checkout
-reached through PYSCF_EXT_PATH (default ~/vibeqc/_el_jobs/ext/properties).
+The reference needs pyscf-properties (``pip install electrolites[properties]``,
+pinned in pyproject.toml).
 Its UHF ``gen_vind`` stacks the alpha and beta responses with ``hstack``
 over (nset, nmo, nocc) arrays, which fails whenever nocc_a != nocc_b (every
 open-shell coupled case); the reference here uses the same function with
@@ -20,8 +20,6 @@ import sys
 os.environ['FASTNMR_GPU2E'] = '1'
 from functools import reduce
 
-os.environ.setdefault('PYSCF_EXT_PATH', os.path.expanduser(
-    '~/vibeqc/_el_jobs/ext/properties'))
 import numpy as np                                             # noqa: E402
 import cupy as cp                                              # noqa: E402
 from pyscf import gto                                          # noqa: E402

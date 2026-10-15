@@ -26,6 +26,10 @@ dependencies = ["numpy", "pyscf>=2.8"]
 
 [project.optional-dependencies]
 test = ["pytest"]
+# pyscf-properties (no PyPI release): the CPU reference for the NMR / SSC
+# features (tests/test_ssc_gpu.py, test_nmr_uks.py, benchmarks/ssc_bench.py,
+# nmr_uks_bench.py --cpu).  Pinned to the commit they were validated on.
+properties = ["pyscf-properties @ git+https://github.com/pyscf/properties.git@4eee5a430fb47eca5962f36fdcaf75c2b87e7ede"]
 
 [project.urls]
 Homepage = "https://github.com/Benzoin96485/Electrolites"

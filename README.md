@@ -167,6 +167,8 @@ its coefficients are 0.79 GB where global DF stores 86.4.
 ```bash
 pip install gpu4pyscf-cuda12x      # or gpu4pyscf-cuda11x; 1.7.0 or 1.8.x
 pip install git+https://github.com/Benzoin96485/Electrolites.git
+# optional: pyscf-properties, the CPU reference of the ssc / nmr_uks tests
+pip install "electrolites[properties] @ git+https://github.com/Benzoin96485/Electrolites.git"
 ```
 
 Nothing is compiled at install time: every kernel is built at run time by

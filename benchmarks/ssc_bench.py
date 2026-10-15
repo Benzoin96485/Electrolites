@@ -1,6 +1,6 @@
 """NMR spin-spin coupling timings (FEATURE_TARGETS §15, O2): all nucleus
 pairs, FC (or FC+SD) + PSO + DSO, GPU (``electrolites.ssc_gpu``) or
-pyscf-properties on the CPU (``--cpu``; PYSCF_EXT_PATH must reach it).
+pyscf-properties on the CPU (``--cpu``; needs pyscf-properties, ``electrolites[properties]``).
 
     python benchmarks/ssc_bench.py --xyz benchmarks/molecules/glycine.xyz \\
         --basis def2-svp --xc b3lyp [--fcsd] [--cpu]
@@ -18,8 +18,6 @@ ap.add_argument('--cpu', action='store_true')
 ap.add_argument('--fcsd', action='store_true')
 ap.add_argument('--df', action='store_true')
 a = ap.parse_args()
-os.environ.setdefault('PYSCF_EXT_PATH', os.path.expanduser(
-    '~/vibeqc/_el_jobs/ext/properties'))
 
 import numpy as np                                             # noqa: E402
 

@@ -1651,9 +1651,10 @@ Timings: one A100-SXM4-80GB per process, four processes per node sharing its
 64 host cores (16 OpenMP threads each), after a warm-up run of the same step
 (the cold run is in each log as `*_cold`). The CPU side is the §11 node
 (2× EPYC 7763): 32 threads for the CAS-based methods as §13, 128 for the
-rest. pyscf-properties is not in `barw-dev`; its 2024-11-07 checkout
-(`4eee5a4`) is reached through `PYSCF_EXT_PATH`
-(`~/vibeqc/_el_jobs/ext/properties`), for the tests and the CPU timings.
+rest. pyscf-properties (the 2024-11-07 commit `4eee5a4`) is the reference
+for the tests and the CPU timings; it is installed in `barw-dev` and pinned
+as the `properties` extra in `pyproject.toml` (2026-10-15; during the runs
+above it was reached through `PYSCF_EXT_PATH`, the same commit).
 
 ### 15.1 M6 — DF-CASSCF gradients, SA gradients and non-adiabatic couplings
 
