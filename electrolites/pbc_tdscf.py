@@ -1,5 +1,6 @@
-"""Gamma-point TDA excitation energies for periodic RKS/RHF on the GPU
-(`docs/FEATURE_TARGETS_PYSCF_2.13.md` X1).
+"""Periodic TDA excitation energies for RKS/RHF on the GPU
+(`docs/FEATURE_TARGETS_PYSCF_2.13.md` X1: Gamma point, ``TDA``; X2: k-points
+at kshift 0, ``KTDA``, at the end of the module).
 
 GPU4PySCF 1.8.1 has no periodic TDDFT: ``pyscf.pbc.tdscf.TDA(gpu_mf)`` is an
 AttributeError, the molecular GPU TDA on a Gamma-point object fails (the
@@ -186,3 +187,165 @@ class TDA(lib.StreamObject):
     def run(self, nstates=None):
         self.kernel(nstates)
         return self
+
+
+# ------------------------------------------------- X2: k-point TDA (kshift 0)
+def gen_response_k(mf, singlet=True):
+    """The singlet/triplet response of a GPU KRKS/KRHF for transition
+    densities at kshift = 0, (nset, nkpts, nao, nao) complex:
+    fxc_{s|t}[D/2] + (J[D] if singlet) - hyb/2 K[D], the SCF's exxdiv
+    (the TDA sets None).  PySCF ``pbc.scf.khf`` response, hermi=0."""
+    cell = mf.cell
+    ni = mf._numint
+    kpts = mf.kpts
+    if hasattr(kpts, 'kpts'):
+        kpts = kpts.kpts
+    is_ks = hasattr(mf, 'xc')
+    if is_ks:
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=0)
+        if omega != 0:
+            raise NotImplementedError('PBC response: range-separated hybrids')
+        dm0 = mf.make_rdm1()
+        fxc = ni.cache_xc_kernel1(cell, mf.grids, mf.xc, dm0, 1, kpts,
+                                  is_rhf=True)[2]
+    else:
+        hyb = 1.
+
+    def vresp(dms):
+        v1 = cp.zeros_like(dms)
+        if is_ks:
+            v1 += cp.asarray(ni.nr_rks_fxc_st(
+                cell, mf.grids, mf.xc, dm0, .5 * dms, 0, singlet, fxc,
+                kpts)).reshape(dms.shape)
+        for z, d in enumerate(dms):
+            if singlet:
+                # J of a non-Hermitian D through its Hermitian parts (the
+                # multigrid J takes hermi=1 only): D = H1 + i H2
+                dh = d.conj().transpose(0, 2, 1)
+                h1 = .5 * (d + dh)
+                h2 = -.5j * (d - dh)
+                v1[z] += cp.asarray(mf.get_j(cell, h1, 1, kpts)
+                                    ).reshape(d.shape)
+                v1[z] += 1j * cp.asarray(mf.get_j(cell, h2, 1, kpts)
+                                         ).reshape(d.shape)
+            if hyb != 0:
+                v1[z] -= .5 * hyb * cp.asarray(mf.get_k(cell, d, 0, kpts)
+                                               ).reshape(d.shape)
+        return v1
+    return vresp
+
+
+class KTDA(lib.StreamObject):
+    """k-point TDA at kshift = 0 on a GPU4PySCF KRKS/KRHF (PySCF's
+    ``pbc.tdscf.krhf.TDA`` operator)."""
+
+    def __init__(self, mf, singlet=True):
+        self._scf = mf
+        self.cell = mf.cell
+        self.verbose = mf.verbose
+        self.stdout = mf.stdout
+        self.singlet = singlet
+        self.nstates = 3
+        self.conv_tol = 1e-5
+        self.e = self.xy = None
+
+    def _orbital_energies(self):
+        mf = self._scf
+        with lib.temporary_env(mf, exxdiv=None):
+            dm = mf.make_rdm1()
+            f = cp.asarray(mf.get_fock(dm=dm))
+        C = cp.asarray(mf.mo_coeff)
+        return cp.einsum('kpi,kpq,kqi->ki', C.conj(), f, C).real
+
+    def gen_vind(self):
+        mf = self._scf
+        C = cp.asarray(mf.mo_coeff)                      # (nk, nao, nmo)
+        occ = cp.asnumpy(mf.mo_occ)
+        nk = C.shape[0]
+        no = int((occ[0] == 2).sum())
+        if any(int((o == 2).sum()) != no for o in occ):
+            raise NotImplementedError('k-point TDA: metallic occupations')
+        co = C[:, :, :no]
+        cv = C[:, :, no:]
+        nv = cv.shape[2]
+        e = self._orbital_energies()
+        e_ia = e[:, no:][:, None, :] - e[:, :no][:, :, None]   # (k, o, v)
+        vresp = gen_response_k(mf, singlet=self.singlet)
+
+        def vind(zs):
+            zs = cp.asarray(zs).reshape(-1, nk, no, nv)
+            # dms[z,k] = 2 cv z^T co^H  (PySCF: einsum('ov,pv,qo->pq'))
+            dms = 2 * cp.einsum('kpv,zkov,kqo->zkpq', cv, zs, co.conj())
+            with lib.temporary_env(mf, exxdiv=None):
+                v1 = vresp(dms)
+            out = cp.einsum('zkpq,kqo,kpv->zkov', v1, co, cv.conj())
+            out += zs * e_ia[None]
+            return out.reshape(len(zs), -1)
+        return vind, e_ia.ravel()
+
+    def kernel(self, nstates=None):
+        if nstates is not None:
+            self.nstates = nstates
+        from pyscf.lib import logger as plog
+        log = plog.new_logger(self)
+        vind, hdiag = self.gen_vind()
+        w, x = _davidson_herm(vind, hdiag, self.nstates, self.conv_tol, log)
+        self.e = np.asarray(w)
+        self.xy = x
+        log.note('GPU k-point TDA (%s) excitation energies (eV): %s',
+                 'singlet' if self.singlet else 'triplet',
+                 self.e * 27.211386245988)
+        return self.e
+
+    def run(self, nstates=None):
+        self.kernel(nstates)
+        return self
+
+
+def _davidson_herm(hop, hdiag, nroots, conv_tol, log, max_cycle=100,
+                   max_space=80):
+    """Lowest roots of a complex Hermitian operator (rows in, rows out):
+    block Davidson from the unit vectors on the lowest e_ia, residual
+    sqrt(conv_tol) (PySCF's lr_eigh)."""
+    size = hdiag.size
+    hs = cp.sort(hdiag)
+    cut = float(hs[min(nroots, size) - 1]) + 1e-4
+    # every near-degenerate partner of the nroots-th lowest e_ia, and at
+    # least 3 nroots vectors (fewer converged PBE0 on a 2-k diamond onto a
+    # set missing two roots, 0.35 eV off)
+    ndeg = int((hdiag <= cut).sum())
+    idx = cp.argsort(hdiag)[:min(size, max(3 * nroots, ndeg + nroots))]
+    V = cp.zeros((len(idx), size), dtype=np.complex128)
+    V[cp.arange(len(idx)), idx] = 1
+    AV = hop(V).astype(np.complex128)
+    tol_r = conv_tol ** .5
+    for cycle in range(max_cycle):
+        h = cp.asnumpy(V.conj() @ AV.T)
+        h = (h + h.conj().T) * .5
+        w_all, u_all = np.linalg.eigh(h)
+        w = w_all[:nroots]
+        U = cp.asarray(u_all[:, :nroots])
+        X = U.T @ V
+        AX = U.T @ AV
+        R = AX - cp.asarray(w)[:, None] * X
+        rn = cp.asnumpy(cp.linalg.norm(R, axis=1))
+        log.debug('k-TDA Davidson %d dim %d e %s |r| %s', cycle, len(V),
+                  w, rn)
+        if np.all(rn < tol_r):
+            break
+        d = hdiag[None, :] - cp.asarray(w)[:, None]
+        d[abs(d) < 1e-8] = 1e-8
+        new = (R / d)[rn >= tol_r]
+        if len(V) + len(new) > max_space:
+            V, AV = X, AX
+        for v in new:                      # Gram-Schmidt twice
+            for _ in range(2):
+                v = v - V.T @ (V.conj() @ v)
+            nv = float(cp.linalg.norm(v))
+            if nv > 1e-6:
+                v = v / nv
+                V = cp.vstack([V, v[None]])
+                AV = cp.vstack([AV, hop(v[None]).astype(np.complex128)])
+    else:
+        log.warn('k-TDA Davidson not converged, |r| %s', rn)
+    return w, X

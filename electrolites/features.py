@@ -221,7 +221,8 @@ register('rpa', 'rpa_gpu',
 register('gw', 'gw_gpu',
          doc='[P9] G0W0-AC with the self-energy loop on the GPU (gw_gpu.GWAC)')
 register('pbc_tda', 'pbc_tdscf',
-         doc='[X1] Gamma-point periodic TDA on the GPU (pbc_tdscf.TDA)')
+         doc='[X1, X2] periodic TDA on the GPU: Gamma point (pbc_tdscf.TDA) '
+             'and k-points at kshift 0 (pbc_tdscf.KTDA)')
 register('ssc', 'ssc_gpu',
          doc='[O2] NMR spin-spin coupling (RHF/RKS) on the GPU (ssc_gpu.SSC)')
 register('nmr_uks', 'nmr_uks',
