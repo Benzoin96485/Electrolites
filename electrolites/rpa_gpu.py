@@ -10,8 +10,9 @@ same energy expression,
     Pi_PQ(iw) = sum_ia B^P_ia chi0_ia(w) B^Q_ia,
     chi0 = 2 f e / (w^2 + e^2)   (e = e_i - e_a, f = f_i - f_a),
 
-with the fitted B from GPU4PySCF's bdiv integrals (the mp2fit basis, as
-PySCF's DFMP2-derived class) resident on the device: per frequency one SYRK
+with the fitted B from GPU4PySCF's bdiv integrals (as PySCF's
+DFMP2-derived class: the SCF's own auxiliary basis on a density-fitted
+reference, else mp2fit) resident on the device: per frequency one SYRK
 (1 - Pi = 1 + X^T X, X = |chi0|^1/2 B, positive definite) and a Cholesky
 log-determinant.  E_hf is the exact-exchange (HF) energy of the reference
 orbitals with the same fitting, as PySCF's ``get_e_hf``.
@@ -37,7 +38,13 @@ class RPA(lib.StreamObject):
         self.stdout = mf.stdout
         self.frozen = frozen
         if auxbasis is None:
-            auxbasis = df.make_auxbasis(self.mol, mp2fit=True)
+            # PySCF's DFMP2-derived RPA: the SCF's own fitting basis on a
+            # density-fitted reference, else the mp2fit one
+            gdf = getattr(mf, 'with_df', None)
+            if gdf is not None:
+                auxbasis = gdf.auxbasis or df.make_auxbasis(self.mol)
+            else:
+                auxbasis = df.make_auxbasis(self.mol, mp2fit=True)
         self.auxbasis = auxbasis
         self.e_hf = self.e_corr = None
 

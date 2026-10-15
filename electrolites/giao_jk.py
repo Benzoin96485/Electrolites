@@ -101,7 +101,7 @@ class GIAOJK:
     def _sph(self, m):
         return self.c2s.T @ m @ self.c2s
 
-    def get_jk(self, dm, with_k=True):
+    def get_jk(self, dm, with_k=True, with_j=True):
         """GIAO (J, K) for dm (nao, nao) or (nset, nao, nao), each (3, nao,
         nao) per set, in ``shielding.get_jk``'s convention."""
         from gpu4pyscf.scf import jk
@@ -118,12 +118,14 @@ class GIAOJK:
         n1 = self.n1
         vjs, vks = [], []
         for d in dms:
-            big = self._pad(d[None])
-            vj = jk.get_j(self.cmol, big, hermi=1)[0]
-            J = self._sph(vj[:n1, :n1])
-            Mp = cp.stack([self._sph(vj[:n1, self.idx[k]]) for k in range(3)])
-            raw = -.5 * (_cross(dR, Mp) + dRx * J)
-            vjs.append(-raw)
+            if with_j:
+                big = self._pad(d[None])
+                vj = jk.get_j(self.cmol, big, hermi=1)[0]
+                J = self._sph(vj[:n1, :n1])
+                Mp = cp.stack([self._sph(vj[:n1, self.idx[k]])
+                               for k in range(3)])
+                raw = -.5 * (_cross(dR, Mp) + dRx * J)
+                vjs.append(-raw)
             if not with_k:
                 continue
             dd = cp.stack([d] + [R[a][:, None] * d for a in range(3)])
@@ -141,7 +143,7 @@ class GIAOJK:
             raw = -.5 * (t1 + t2 + t3)
             vks.append(-(raw - raw.transpose(0, 2, 1)))
         shape = dm.shape[:-2] + (3, nao, nao)
-        vj = cp.stack(vjs).reshape(shape)
+        vj = cp.stack(vjs).reshape(shape) if with_j else None
         vk = cp.stack(vks).reshape(shape) if with_k else None
         return vj, vk
 
@@ -154,7 +156,7 @@ def _cross(a, b):
 _CACHE = {}
 
 
-def get_jk(mol, dm, with_k=True):
+def get_jk(mol, dm, with_k=True, with_j=True):
     """GIAO J/K on the GPU for ``mol`` (the shifted basis cached per mol)."""
     key = id(mol)
     obj = _CACHE.get(key)
@@ -162,4 +164,4 @@ def get_jk(mol, dm, with_k=True):
         obj = (mol, GIAOJK(mol))
         _CACHE.clear()
         _CACHE[key] = obj
-    return obj[1].get_jk(dm, with_k)
+    return obj[1].get_jk(dm, with_k, with_j)

@@ -119,8 +119,12 @@ def get_jk_giao(mol, dm, with_k=True, host=False):
     ``electrolites.giao_jk``, or (``host``) from libcint ``int2e_ig1``
     (pyscf-properties' ``rhf.get_jk``)."""
     if not host:
+        # J of the total density once (only vj_a + vj_b enters), K per spin
         from electrolites import giao_jk
-        return giao_jk.get_jk(mol, dm, with_k=with_k)
+        dm = cp.asarray(dm)
+        vj = giao_jk.get_jk(mol, dm[0] + dm[1], with_k=False)[0]
+        vk = giao_jk.get_jk(mol, dm, with_j=False)[1] if with_k else None
+        return cp.stack([vj, 0 * vj]), vk
     intor = mol._add_suffix('int2e_ig1')
     dm = cp.asnumpy(dm)
     if with_k:

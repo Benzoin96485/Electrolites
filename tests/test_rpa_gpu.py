@@ -26,7 +26,9 @@ gly = gto.M(atom='/global/homes/w/weiliang/vibeqc/Electrolites/benchmarks/'
             'molecules/glycine.xyz', basis='def2-svp', verbose=0)
 for label, mol, mk in (('water PBE', water, lambda m: dft.RKS(m, xc='pbe')),
                        ('water HF', water, scf.RHF),
-                       ('glycine PBE', gly, lambda m: dft.RKS(m, xc='pbe'))):
+                       ('glycine PBE', gly, lambda m: dft.RKS(m, xc='pbe')),
+                       ('water DF-PBE (the SCF\'s auxbasis)', water,
+                        lambda m: dft.RKS(m, xc='pbe').density_fit())):
     mf = mk(mol).run(conv_tol=1e-11)
     for frz in (None, 1):
         g = RPA(mf, frozen=frz)
