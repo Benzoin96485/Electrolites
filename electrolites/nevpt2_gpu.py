@@ -347,6 +347,148 @@ def Si(mc, ci, dms, eris=None, verbose=None):
             + _es('pi,pa,ai->i', h1e_v, dm1_h, h1e_v))
     return _norm_to_energy(norm, ener, -mc.mo_energy[:ncore])
 
+# ------------------------------------------- the remaining spaces (eris path)
+# PySCF's Sijr, Srsi, Srs, Sij and Sir (``mrpt/nevpt2.py``) with their
+# core/virtual contractions on the device; the active-space intermediates
+# (a3, k27, a7, a9, a12, a13: ncas^4..6, host numpy) are PySCF's own.
+# On ferrocene CAS(10,10) these host einsums were 3.2 of 3.8 s.
+
+def _act(mc, eris):
+    ncore, ncas = mc.ncore, mc.ncas
+    nocc = ncore + ncas
+    h1e = np.asarray(eris['h1eff'][ncore:nocc, ncore:nocc])
+    h2e = np.asarray(eris['ppaa'][ncore:nocc, ncore:nocc]).transpose(0, 2, 1, 3)
+    return ncore, ncas, nocc, h1e, h2e
+
+
+def _host_dms(dms):
+    return {k: (cp.asnumpy(v) if isinstance(v, cp.ndarray) else v)
+            for k, v in dms.items()}
+
+
+def Sijr(mc, dms, eris, verbose=None):
+    from pyscf.mrpt import nevpt2 as N
+    ncore, ncas, nocc, h1e, h2e = _act(mc, eris)
+    d = _host_dms(dms)
+    hdm1 = d['h1'] if 'h1' in d else N.make_hdm1(d['1'])
+    a3 = cp.asarray(N.make_a3(h1e, h2e, d['1'], d['2'], hdm1))
+    hdm1 = cp.asarray(hdm1)
+    v = cp.asarray(eris['pacv'][:ncore]).transpose(3, 1, 2, 0)   # r p j i
+    vt = v.transpose(0, 1, 3, 2)                                  # r p i j
+
+    def two(m):
+        x = _es('rpji,pa->raji', v, m)
+        out = 2.0 * (x * v).sum(axis=1) - (x * vt).sum(axis=1)
+        return out + out.transpose(0, 2, 1)
+    norm, h = two(hdm1), two(a3)
+    di = np.diag_indices(ncore)
+    norm[:, di[0], di[1]] *= .5
+    h[:, di[0], di[1]] *= .5
+    e = mc.mo_energy
+    diff = e[nocc:, None, None] - e[None, :ncore, None] - e[None, None, :ncore]
+    tri = np.triu_indices(ncore)
+    norm, h = cp.asnumpy(norm), cp.asnumpy(h)
+    return _norm_to_energy(norm[:, tri[0], tri[1]], h[:, tri[0], tri[1]],
+                           diff[:, tri[0], tri[1]])
+
+
+def Srsi(mc, dms, eris, verbose=None):
+    from pyscf.mrpt import nevpt2 as N
+    ncore, ncas, nocc, h1e, h2e = _act(mc, eris)
+    d = _host_dms(dms)
+    nvirt = mc.mo_coeff.shape[1] - nocc
+    k27 = cp.asarray(N.make_k27(h1e, h2e, d['1'], d['2']))
+    dm1 = cp.asarray(d['1'])
+    v = cp.asarray(eris['pacv'][nocc:]).transpose(3, 0, 2, 1)     # r s i p
+    vt = v.transpose(1, 0, 2, 3)                                 # s r i p
+
+    def two(m):
+        x = v @ m                                                # r s i a
+        out = 2.0 * (x * v).sum(axis=3) - (x * vt).sum(axis=3)
+        return out + out.transpose(1, 0, 2)
+    norm, h = two(dm1), two(k27)
+    di = np.arange(nvirt)
+    norm[di, di] *= .5
+    h[di, di] *= .5
+    e = mc.mo_energy
+    diff = e[nocc:, None, None] + e[None, nocc:, None] - e[None, None, :ncore]
+    tri = np.triu_indices(nvirt)
+    norm, h = cp.asnumpy(norm), cp.asnumpy(h)
+    return _norm_to_energy(norm[tri], h[tri], diff[tri])
+
+
+def Srs(mc, dms, eris=None, verbose=None):
+    from pyscf.mrpt import nevpt2 as N
+    ncore, ncas, nocc, h1e, h2e = _act(mc, eris)
+    if mc.mo_coeff.shape[1] == nocc:
+        return 0, 0
+    d = _host_dms(dms)
+    rm2, a7 = N.make_a7(h1e, h2e, d['1'], d['2'], d['3'])
+    v = cp.asarray(eris['papa'][nocc:, :, nocc:]).transpose(0, 2, 1, 3)
+    nv = v.shape[0]
+    n2 = ncas * ncas
+    w = v.reshape(nv * nv, n2)                                   # (rs, qp)
+    # norm_rs = 1/2 sum v[rs,q,p] v[rs,b,a] rm2[p,q,b,a]
+    m1 = cp.asarray(rm2.transpose(1, 0, 2, 3).reshape(n2, n2))   # (qp, ba)
+    m2 = cp.asarray(a7.transpose(1, 0, 3, 2).reshape(n2, n2))    # (qp, ba)
+    norm = .5 * ((w @ m1) * w).sum(axis=1).reshape(nv, nv)
+    h = .5 * ((w @ m2) * w).sum(axis=1).reshape(nv, nv)
+    e = mc.mo_energy
+    diff = e[nocc:, None] + e[None, nocc:]
+    return _norm_to_energy(norm, h, diff)
+
+
+def Sij(mc, dms, eris, verbose=None):
+    from pyscf.mrpt import nevpt2 as N
+    ncore, ncas, nocc, h1e, h2e = _act(mc, eris)
+    if ncore == 0:
+        return 0.0, 0
+    d = _host_dms(dms)
+    hdm1 = d['h1'] if 'h1' in d else N.make_hdm1(d['1'])
+    hdm2 = d['h2'] if 'h2' in d else N.make_hdm2(d['1'], d['2'])
+    hdm3 = d['h3'] if 'h3' in d else N.make_hdm3(d['1'], d['2'], d['3'],
+                                                 hdm1, hdm2)
+    a9 = N.make_a9(h1e, h2e, hdm1, hdm2, hdm3)
+    v = cp.asarray(eris['papa'][:ncore, :, :ncore]).transpose(1, 3, 0, 2)
+    n2 = ncas * ncas
+    w = v.reshape(n2, ncore * ncore).T                           # (ij, qp)
+    # sum v[q,p,ij] v[b,a,ij] m[p,q,a,b]
+    m1 = cp.asarray(hdm2.transpose(1, 0, 3, 2).reshape(n2, n2))
+    m2 = cp.asarray(a9.transpose(1, 0, 3, 2).reshape(n2, n2))
+    norm = .5 * ((w @ m1) * w).sum(axis=1).reshape(ncore, ncore)
+    h = .5 * ((w @ m2) * w).sum(axis=1).reshape(ncore, ncore)
+    e = mc.mo_energy
+    diff = e[:ncore, None] + e[None, :ncore]
+    return _norm_to_energy(norm, h, -diff)
+
+
+def Sir(mc, dms, eris, verbose=None):
+    from pyscf.mrpt import nevpt2 as N
+    ncore, ncas, nocc, h1e, h2e = _act(mc, eris)
+    d = _host_dms(dms)
+    a12 = cp.asarray(N.make_a12(h1e, h2e, d['1'], d['2'], d['3']))
+    a13 = cp.asarray(N.make_a13(h1e, h2e, d['1'], d['2'], d['3']))
+    dm1, dm2 = cp.asarray(d['1']), cp.asarray(d['2'])
+    v1 = cp.asarray(eris['ppaa'][nocc:, :ncore]).transpose(0, 2, 1, 3)
+    v2 = cp.asarray(eris['papa'][nocc:, :, :ncore]).transpose(0, 3, 1, 2)
+    h1v = cp.asarray(eris['h1eff'][nocc:, :ncore])
+    norm = (_es('rpiq,raib,qpab->ir', v1, v1, dm2) * 2.0
+            - _es('rpiq,rabi,qpab->ir', v1, v2, dm2)
+            - _es('rpqi,raib,qpab->ir', v2, v1, dm2)
+            + _es('raqi,rabi,qb->ir', v2, v2, dm1) * 2.0
+            - _es('rpqi,rabi,qbap->ir', v2, v2, dm2)
+            + _es('rpqi,raai,qp->ir', v2, v2, dm1)
+            + _es('rpiq,ri,qp->ir', v1, h1v, dm1) * 4.0
+            - _es('rpqi,ri,qp->ir', v2, h1v, dm1) * 2.0
+            + _es('ri,ri->ir', h1v, h1v) * 2.0)
+    h = (_es('rpiq,raib,pqab->ir', v1, v1, a12) * 2.0
+         - _es('rpiq,rabi,pqab->ir', v1, v2, a12)
+         - _es('rpqi,raib,pqab->ir', v2, v1, a12)
+         + _es('rpqi,rabi,pqab->ir', v2, v2, a13))
+    e = mc.mo_energy
+    diff = e[:ncore, None] - e[None, nocc:]
+    return _norm_to_energy(norm, h, -diff)
+
 
 # ------------------------------------------- integrals and S_ijrs on a DF mc
 def _gpu_eris(mc, mo):
@@ -459,7 +601,8 @@ class _GPUNEVPT:
             return cache['f3'][0 if kern == 'NEVPTkern_cedf_aedf' else 1]
 
         from electrolites.casscf_gpu import GPUDF
-        patches = dict(_contract4pdm=c4, Sr=Sr, Si=Si)
+        patches = dict(_contract4pdm=c4, Sr=Sr, Si=Si, Sijr=Sijr, Srsi=Srsi,
+                       Srs=Srs, Sij=Sij, Sir=Sir)
         if isinstance(getattr(self._mc, 'with_df', None), GPUDF):
             # the GPU CASSCF's fitted integrals; keep PySCF off its own DF
             # branch (that needs a PySCF DF object on mc._scf)
