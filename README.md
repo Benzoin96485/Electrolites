@@ -259,6 +259,7 @@ rather than shadowed (`electrolites/features.py`,
 | `fastjkip1` | `libvhf_rys.RYS_build_jk_ip1` (via `hessian.rhf._get_jk_ip1`), `hessian.{uhf,uks}.make_h1` — the Hessian's h1 two-electron kernels without per-launch device queries, both spins from one integral pass | `docs/README_fastjkip1.md` |
 | `fastsfxc` | `tdscf._uhf_resp_sf.mcfun_eval_xc_adapter_sf` (and `grad.tduks_sf`'s binding) — the spin-flip multi-collinear XC kernel from libxc's raw derivatives, chain rule in the total/spin basis | `docs/README_fastsfxc.md` |
 | `fastpcmbatch` | `gto.int3c1e.int1e_grids` (and where imported), `solvent.hessian.pcm.get_dqsym_dx` — PCM's multi-vector integrals in one pass + GEMM; the charge derivative once per Hessian | `docs/README_fastpcmbatch.md` |
+| `fasttdpcmgrad` | `solvent.grad.pcm.get_dF_dA`/`get_dSii`/`get_dD_dS` within `solvent.tdscf.pcm.WithSolventTDSCFGradient.grad_elec` — the PCM surface derivatives built once per TDDFT-PCM gradient instead of three times | FEATURE_TARGETS §16 (V5) |
 | `fastscfscreen` | `dft.{rks,uks}.{RKS,UKS}.get_veff`, `scf.hf.RHF`, `scf.uhf.UHF` — direct SCF screens at 1e-10 while the density is far off, then rebuilds the Fock matrix tight | `docs/README_fastscfscreen.md` |
 | `fastmp2` | `scf.int4c2e.get_int4c2e_ovov` — conventional RMP2's (ia\|jb) as a blocked half transformation (strided-batched GEMMs into the half-transformed tensor), batched over occupied orbitals to fit the card | `electrolites/fastmp2.py` |
 | `fastccsd` | `cc.ccsd_incore.CCSDBase.ccsd` — closed-shell CCSD iterations with amplitudes, MO integrals, `ao2mo` accumulators and DIIS on the device, AO integral blocks computed once and cached (device or host) | `electrolites/fastccsd.py` |
@@ -299,11 +300,17 @@ first that its slot is still empty upstream
 | `dfmp2_grad` | `DFMP2.Gradients()` and `DFMP2.make_rdm1_relaxed()` on GPU4PySCF's DF-MP2: the RI-MP2 nuclear gradient (PySCF has none) on an RHF or global-hybrid RKS reference, exact or DF SCF, frozen core, spin-component scaling | [P3], §14 |
 | `dhdft` | `electrolites.dhdft.DoubleHybrid(mol, 'B2PLYP')` (also B2GP-PLYP, mPW2PLYP, PBE0-DH, PBE-QIDH, or custom): double-hybrid energies and analytic gradients, absent from both PySCF and GPU4PySCF | [P4], §14 |
 | `casscf` (gradients) | `mc.nuc_grad_method()` of a GPU DF-CASSCF (single state), of a GPU DF-SA-CASSCF (PySCF's Lagrangian, response on the device), and `mc.nac_method()` — DF non-adiabatic couplings, which PySCF has only for exact integrals | [M6], §15 |
+| `casscf` (orbital step) | the CASSCF orbital step on the device: `gen_g_hop`, the AH Hessian product with factored-density J/K, `update_casdm`, `solve_approx_ci`, the newton/SA Lagrangian products, the FCI diagonal and S² (`electrolites.casscf_orb`; `ELECTROLITES_HOST_ORB=1` for PySCF's) | [M4], §16 |
 | `mcpdft` | `electrolites.mcpdft_gpu.MCPDFT(gpu_mc, 'tPBE')` (or `.CASSCF`/`.CASCI`): PySCF's MC-PDFT with the classical energy from the GPU J/K and the on-top energy on the device (translated/fully-translated LDA/GGA, hybrids, state averaging) | [M8], §15 |
 | `nevpt2` | `electrolites.nevpt2_gpu.NEVPT(gpu_mc)`: SC-NEVPT2 with the 3-RDM and the 4-RDM contractions (PySCF's `f3ca`/`f3ac`), the DF integrals and the S_r/S_i/S_ijrs spaces on the device | [M7], §15 |
 | `rpa` | `electrolites.rpa_gpu.RPA(gpu_mf)`: direct RPA correlation energy | [P8], §15 |
 | `gw` | `electrolites.gw_gpu.GWAC(gpu_mf)`: PySCF's G0W0 (analytic continuation) with the integrals, the self-energy loop and V_xc/Σ_x on the device | [P9], §15 |
-| `pbc_tda` | `electrolites.pbc_tdscf.TDA(gpu_cell_mf)`: Γ-point periodic TDA (RKS/RHF, singlet and triplet); the corrected periodic `gen_response` is D10 in `fixes` | [X1], §15 |
+| `pbc_tda` | `electrolites.pbc_tdscf.TDA(gpu_cell_mf)`: Γ-point periodic TDA (RKS/RHF, singlet and triplet); `KTDA(gpu_kmf)`: k-point TDA at kshift 0; the corrected periodic `gen_response` is D10 in `fixes` | [X1], §15; [X2], §16 |
+| `pbc_stability` | `electrolites.pbc_stability.stability(gpu_cell_mf)`: periodic RHF/RKS internal and RHF→UHF stability, Γ point and k-points | [X3], §16 |
+| `polar` | `electrolites.polar_gpu.polarizability(gpu_mf, freq)`: static and frequency-dependent dipole polarizability, RHF/RKS and UHF/UKS | [O3], §16 |
+| `ir_uks` | `electrolites.ir_uks.eval_ir_freq_intensity(mf, mf.Hessian())`: IR intensities for UHF/UKS (and RHF/RKS) | [O3], §16 |
+| `cubegen` | `electrolites.cubegen_gpu.density/orbital/mep`: cube files on the GPU, PySCF's format | [T1], §16 |
+| QM/MM | `mf.Hessian()` of a GPU QM/MM RHF/RKS (`electrolites.qmmm_hess`, point and Gaussian MM charges; it raised since Phase 0); Gaussian MM charges in the QM/MM energy and gradients (`fixes`) | [V2, V3], §16 |
 | `ssc` | `electrolites.ssc_gpu.SSC(gpu_mf)`: NMR spin–spin couplings (DSO, PSO, FC, FC+SD) for RHF/RKS | [O2], §15 |
 | `nmr_uks` | `electrolites.nmr_uks.NMR(gpu_uks)`: GIAO shielding for UHF/UKS (GPU4PySCF's is closed-shell only), with the GIAO two-electron term on the GPU (`electrolites.giao_jk`, shifted-basis J/K) | [O1], §15 |
 
