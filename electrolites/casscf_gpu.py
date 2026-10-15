@@ -300,6 +300,23 @@ class _GPUCAS:
             mo_coeff = self.mo_coeff
         return _ERIS(self, mo_coeff, self.with_df)
 
+    def nuc_grad_method(self):
+        """The GPU DF-CASSCF gradient (``electrolites.casscf_grad``)."""
+        from electrolites.casscf_grad import Gradients
+        return Gradients(self)
+
+    Gradients = nuc_grad_method
+
+    def _state_average_nuc_grad_method(self, state=None):
+        """PySCF's SA hook: the GPU SA-CASSCF gradient."""
+        from electrolites.sacasscf_grad import Gradients
+        return Gradients(self, state=state)
+
+    def _state_average_nac_method(self):
+        """PySCF's SA hook: GPU DF SA-CASSCF non-adiabatic couplings."""
+        from electrolites.sacasscf_grad import NonAdiabaticCouplings
+        return NonAdiabaticCouplings(self)
+
 
 class _DirectERIS(_ERIS):
     """PySCF ``mc_ao2mo._ERIS`` for the exact-integral route.  ppaa and papa
@@ -351,6 +368,13 @@ class _DirectERIS(_ERIS):
 class _GPUDirect:
     """Mixin ahead of PySCF's (exact-integral) CASCI/CASSCF in the MRO."""
     __name_mixin__ = 'GPU'
+
+    def nuc_grad_method(self):
+        raise NotImplementedError(
+            'GPU CASSCF gradient: density-fitted CASSCF only '
+            '(CASSCF(..., density_fit=True))')
+
+    Gradients = nuc_grad_method
 
     def _jk_mf(self):
         mf = self.__dict__.get('_jkmf')

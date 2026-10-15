@@ -60,6 +60,8 @@ ap.add_argument('--nroots', type=int, default=1,
                 help='casscf: state-average over this many roots')
 ap.add_argument('--external', action='store_true',
                 help='stability: also the external (RHF->UHF / UHF->GHF) check')
+ap.add_argument('--grad', action='store_true',
+                help='casscf: also the analytic nuclear gradient')
 ap.add_argument('--max-cycle', type=int, default=100)
 ap.add_argument('--json', default='', help='also write the record here')
 a = ap.parse_args()
@@ -279,6 +281,10 @@ elif a.feature in ('casscf', 'nevpt2'):
         if hasattr(fs, attr):
             wrap_obj(fs, attr, lab)
     timed_stage('CASSCF', mc.kernel)
+    if a.grad:
+        gr = timed_stage('CASSCF gradient',
+                         lambda: mc.nuc_grad_method().kernel())
+        RESULT['grad'] = np.asarray(gr).tolist()
     RESULT.update(e_casscf=mc.e_tot, casscf_converged=bool(mc.converged),
                   e_states=list(np.atleast_1d(getattr(mc, 'e_states',
                                                       mc.e_tot))))

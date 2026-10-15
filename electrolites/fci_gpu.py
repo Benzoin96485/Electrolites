@@ -186,11 +186,16 @@ def _rdm12(bra, ket, norb, nelec, with_dm2=True):
     """Spin-traced (transition) RDMs, PySCF's convention:
     dm1[p,q] = <q+ p>, dm2[p,q,r,s] = <p+ r+ s q>."""
     STATS['rdm'] += 1
+    same = bra is ket
+    # PySCF callers may pass a one-element list (newton_casscf's _pack_ci)
+    if isinstance(ket, (list, tuple)):
+        ket = np.asarray(ket)
+    bra = ket if same else (np.asarray(bra) if isinstance(bra, (list, tuple))
+                            else bra)
     tb = _tables(norb, nelec)
     na, nb = tb.na, tb.nb
     n2 = norb * norb
     ketd = cp.asarray(ket, dtype=np.float64).reshape(na, nb)
-    same = bra is ket
     g1 = cp.zeros(n2)
     g2 = cp.zeros((n2, n2)) if with_dm2 else None
     tbra_iter = _t_blocks(bra, norb, nelec)

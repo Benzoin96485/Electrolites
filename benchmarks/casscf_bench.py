@@ -32,6 +32,7 @@ ap.add_argument('--polish-macro', type=int, default=50)
 ap.add_argument('--polish', action='store_true',
                 help='CPU DF-CASSCF from the GPU solution: same stationary point?')
 ap.add_argument('--max-macro', type=int, default=0)
+ap.add_argument('--grad', action='store_true', help='also the nuclear gradient')
 ap.add_argument('--mc-conv-tol', type=float, default=1e-9)
 ap.add_argument('--cprofile', default='')
 a = ap.parse_args()
@@ -70,6 +71,11 @@ if a.cprofile:
     pstats.Stats(a.cprofile).sort_stats('tottime').print_stats(30)
 cp.cuda.Stream.null.synchronize()
 t3 = time.perf_counter()
+t_grad = None
+if a.grad:
+    gr = mc.nuc_grad_method().kernel()
+    cp.cuda.Stream.null.synchronize()
+    t_grad = time.perf_counter() - t3
 rec = dict(xyz=a.xyz, basis=a.basis, natm=mol.natm, nao=mol.nao,
            cas=[norb, nelec], nroots=a.nroots, scf_s=t1 - t0,
            scf_converged=bool(mf.converged), casscf_s=t3 - t2,
@@ -79,7 +85,8 @@ rec = dict(xyz=a.xyz, basis=a.basis, natm=mol.natm, nao=mol.nao,
            e_states=[float(x) for x in getattr(mc, 'e_states', [mc.e_tot])],
            stats=dict(casscf_gpu.STATS), fci=dict(fci_gpu.STATS),
            auxbasis=str(mc.with_df.auxbasis),
-           gpu=cp.cuda.runtime.getDeviceProperties(0)['name'].decode())
+           gpu=cp.cuda.runtime.getDeviceProperties(0)['name'].decode(),
+           grad_s=t_grad)
 if a.cpu_ref:
     from pyscf import mcscf
     mfc = mf.to_cpu()
@@ -137,6 +144,7 @@ if a.polish:
 print(f"[{os.path.basename(a.xyz)}/{a.basis} CAS{tuple(rec['cas'])} x{a.nroots}] "
       f"nao={mol.nao}  SCF {rec['scf_s']:.1f} s  CASSCF {rec['casscf_s']:.1f} s "
       f"({rec['macro']} macro, {rec['per_macro_s']:.2f} s each)  E={rec['e_casscf']!r}"
+      + (f"  gradient {t_grad:.2f} s" if t_grad is not None else '')
       + (f"  CPU-ref {rec['cpu_ref']['s']:.1f} s ({rec['cpu_ref']['macro']} macro, "
          f"{rec['cpu_ref']['per_macro_s']:.2f} s each) dE={rec['dE']:.1e}" if a.cpu_ref else '')
       + (f"  CASCI-check dE={rec['casci_check']['dE']:.1e}" if a.casci_check else '')
