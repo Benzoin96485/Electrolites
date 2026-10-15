@@ -223,6 +223,9 @@ register('gw', 'gw_gpu',
 register('pbc_tda', 'pbc_tdscf',
          doc='[X1, X2] periodic TDA on the GPU: Gamma point (pbc_tdscf.TDA) '
              'and k-points at kshift 0 (pbc_tdscf.KTDA)')
+register('pbc_stability', 'pbc_stability',
+         doc='[X3] periodic RHF/RKS stability (Gamma and k-points) on the '
+             'GPU (pbc_stability.stability)')
 register('ssc', 'ssc_gpu',
          doc='[O2] NMR spin-spin coupling (RHF/RKS) on the GPU (ssc_gpu.SSC)')
 register('nmr_uks', 'nmr_uks',
