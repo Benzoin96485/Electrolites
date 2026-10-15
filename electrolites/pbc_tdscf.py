@@ -27,6 +27,94 @@ from pyscf import lib
 from pyscf.lib import logger
 
 
+def _fxc_batch(ni, cell, grids, xctype, fxc, dms, kpts):
+    """fxc[D] for a stack of real symmetric Gamma-point densities
+    (nz, nao, nao), LDA/GGA: per grid block one GEMM for all the
+    densities' rho1 and one batched GEMM for the potentials (GPU4PySCF's
+    ``nr_rks_fxc`` loops densities and einsums per block)."""
+    nz, nao = dms.shape[:2]
+    ao_deriv = 0 if xctype == 'LDA' else 1
+    out = cp.zeros_like(dms)
+    dcat = cp.ascontiguousarray(dms.transpose(1, 0, 2)).reshape(nao, -1)
+    p0 = p1 = 0
+    for ao_ks, weight, _ in ni.block_loop(cell, grids, ao_deriv, kpts,
+                                          sort_grids=True):
+        p0, p1 = p1, p1 + weight.size
+        ao = ao_ks[0].real if cp.iscomplexobj(ao_ks) else ao_ks[0]
+        wf = fxc[:, :, p0:p1] * weight
+        if xctype == 'LDA':
+            ao = ao.reshape(1, -1, nao)
+        ng = ao.shape[1]
+        c0 = (ao[0] @ dcat).reshape(ng, nz, nao)
+        rho1 = cp.einsum('xgi,gzi->zxg', ao, c0)
+        if xctype != 'LDA':
+            rho1[:, 1:] *= 2
+        wv = cp.einsum('zxg,xyg->zyg', rho1, wf)
+        wv[:, 0] *= .5
+        aow = cp.einsum('zyg,ygi->zgi', wv, ao)
+        out += cp.matmul(ao[0].T[None], aow)
+    return out + out.transpose(0, 2, 1)
+
+
+def gen_response(mf, singlet=True, hermi=0):
+    """The singlet or triplet linear response of a Gamma-point GPU
+    RKS/RHF for any stack of densities (..., nao, nao):
+    fxc_{singlet|triplet}[D/2] + (J[D] if singlet) - hyb/2 K[D], with
+    the SCF's ``exxdiv`` (the TDA sets None).  Also D10's replacement for
+    GPU4PySCF's own (``electrolites.fixes``)."""
+    cell = mf.cell
+    ni = mf._numint
+    kpts = mf.kpt.reshape(1, 3)
+    is_ks = hasattr(mf, 'xc')
+    if is_ks:
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=0)
+        if omega != 0:
+            raise NotImplementedError('PBC response: range-separated hybrids')
+        dm0 = mf.make_rdm1()
+        fxc = ni.cache_xc_kernel1(cell, mf.grids, mf.xc, dm0[None], 1,
+                                  kpts, is_rhf=True)[2]
+        xctype = ni._xc_type(mf.xc)
+        fast_fxc = xctype in ('LDA', 'GGA')
+        fxc_st = fxc[0, :, 0] + (fxc[0, :, 1] if singlet else -fxc[0, :, 1])
+        if xctype == 'LDA':
+            fxc_st = fxc_st.reshape(1, 1, -1)
+    else:
+        hyb = 1.
+    ngrids = int(np.prod(cell.mesh))
+    free = cp.cuda.runtime.memGetInfo()[0] + \
+        cp.get_default_memory_pool().free_bytes()
+    kblk = max(1, int(.2 * free // (cell.nao * ngrids * 16 * 3)))
+    # fxc: per density 5 (GGA) block-sized AO-shaped buffers
+    zblk = max(1, int(.2 * free // (cell.nao * 20000 * 8 * 6)))
+    nao = cell.nao
+
+    def vresp(dms):
+        shape = dms.shape
+        dms = cp.asarray(dms).reshape(-1, nao, nao)
+        # the density (fxc, J) sees only the symmetric part of D
+        ds = .5 * (dms + dms.transpose(0, 2, 1))
+        v1 = cp.zeros_like(dms)
+        if is_ks and hermi != 2 and fast_fxc:
+            for z0 in range(0, len(dms), zblk):
+                v1[z0:z0 + zblk] += _fxc_batch(
+                    ni, cell, mf.grids, xctype, fxc_st,
+                    .5 * ds[z0:z0 + zblk], kpts)
+        elif is_ks and hermi != 2:
+            v1 += cp.asarray(ni.nr_rks_fxc_st(
+                cell, mf.grids, mf.xc, dm0, (.5 * ds)[:, None], 1,
+                singlet, fxc, kpts)).reshape(dms.shape)
+        if singlet and hermi != 2:
+            v1 += cp.asarray(mf.get_j(cell, ds, 1)).reshape(dms.shape)
+        if hyb != 0:
+            # FFT exchange holds nao x ngrids complex per density
+            for z0 in range(0, len(dms), kblk):
+                z1 = z0 + kblk
+                v1[z0:z1] -= .5 * hyb * cp.asarray(mf.get_k(
+                    cell, dms[z0:z1], hermi)).reshape(dms[z0:z1].shape)
+        return v1.reshape(shape)
+    return vresp
+
+
 class TDA(lib.StreamObject):
     """Gamma-point TDA on a GPU4PySCF periodic RKS/RHF."""
 
@@ -52,8 +140,6 @@ class TDA(lib.StreamObject):
 
     def gen_vind(self):
         mf = self._scf
-        cell = self.cell
-        ni = mf._numint
         C = cp.asarray(mf.mo_coeff)
         occ = cp.asnumpy(mf.mo_occ)
         co = C[:, occ == 2]
@@ -61,41 +147,14 @@ class TDA(lib.StreamObject):
         no, nv = co.shape[1], cv.shape[1]
         e = self._orbital_energies()
         e_ia = (e[occ == 0][None, :] - e[occ == 2][:, None]).ravel()
-        kpts = mf.kpt.reshape(1, 3)
-        is_ks = hasattr(mf, 'xc')
-        if is_ks:
-            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=0)
-            if omega != 0:
-                raise NotImplementedError('PBC TDA: range-separated hybrids')
-            dm0 = mf.make_rdm1()
-            fxc = ni.cache_xc_kernel1(cell, mf.grids, mf.xc, dm0[None], 1,
-                                      kpts, is_rhf=True)[2]
-        else:
-            hyb = 1.
-        singlet = self.singlet
-
-        def vresp(dm):
-            # the density (fxc, J) sees only the symmetric part of D
-            ds = .5 * (dm + dm.T)
-            v1 = cp.zeros_like(dm)
-            if is_ks:
-                v1 += cp.asarray(ni.nr_rks_fxc_st(
-                    cell, mf.grids, mf.xc, dm0, (.5 * ds)[None, None], 1,
-                    singlet, fxc, kpts)).reshape(dm.shape)
-            with lib.temporary_env(mf, exxdiv=None):
-                if singlet:
-                    v1 += cp.asarray(mf.get_j(cell, ds, 1)).reshape(dm.shape)
-                if hyb != 0:
-                    v1 -= .5 * hyb * cp.asarray(
-                        mf.get_k(cell, dm, 0)).reshape(dm.shape)
-            return v1
+        vresp = gen_response(mf, singlet=self.singlet)
 
         def vind(zs):
             zs = cp.asarray(zs).reshape(-1, no, nv)
-            out = cp.empty_like(zs)
-            for k, z in enumerate(zs):
-                dm = 2 * co @ z @ cv.T
-                out[k] = co.T @ vresp(dm) @ cv
+            dms = 2 * cp.einsum('pi,zia,qa->zpq', co, zs, cv)
+            with lib.temporary_env(mf, exxdiv=None):
+                v1 = vresp(dms)
+            out = cp.einsum('pi,zpq,qa->zia', co, v1, cv)
             out += zs * e_ia.reshape(no, nv)[None]
             return out.reshape(len(zs), -1)
         return vind, e_ia
@@ -108,8 +167,15 @@ class TDA(lib.StreamObject):
         vind, hdiag = self.gen_vind()
         x0 = cp.zeros_like(hdiag)
         x0[int(cp.argmin(hdiag))] = 1.
-        w, x = _davidson(vind, hdiag, x0, self.nstates, self.conv_tol ** 2,
-                         log)
+        # residual norm sqrt(conv_tol), PySCF's lr_eigh criterion; start
+        # from every (near-)degenerate partner of the nstates-th lowest
+        # e_ia (a loose residual otherwise converges onto a set missing a
+        # degenerate root)
+        hs = cp.sort(hdiag)
+        cut = float(hs[min(self.nstates, hs.size) - 1]) + 1e-4
+        nguess = max(self.nstates + 1, int((hdiag <= cut).sum()) + 2)
+        w, x = _davidson(vind, hdiag, x0, self.nstates, 100 * self.conv_tol,
+                         log, nguess=nguess)
         self.e = np.asarray(w)
         self.xy = x
         log.note('GPU PBC TDA (%s) excitation energies (eV): %s',

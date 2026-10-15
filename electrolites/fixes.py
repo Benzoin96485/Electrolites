@@ -24,6 +24,15 @@ performance change; each is checked in `tests/test_fixes.py`.
   allocated with the full ``nocc``/``nmo`` (restricted) or ``nao - nocc``
   virtuals (unrestricted) while the driver fills the active block.  t2 is
   now allocated from the active occupied/virtual split.
+* **D10 periodic singlet/triplet response.**  The Gamma-point RKS
+  ``gen_response(singlet=True)`` passed ``singlet`` into ``nr_rks_fxc``'s
+  ``fxc`` slot (an error), ``singlet=False`` dropped the triplet fxc
+  altogether, and both took a single density.  They are now
+  ``electrolites.pbc_tdscf.gen_response`` (fxc_{s|t} + J - hyb/2 K, any
+  number of densities; PySCF's response to 1e-10).  The k-point KRKS
+  version has the same argument-order bug and now raises for
+  ``singlet`` not None (X2 is not built); ``singlet=None`` (SOSCF) is
+  upstream's in both.
 """
 import numpy as np
 import cupy
@@ -224,3 +233,40 @@ def _wrap_unrestricted(orig):
 
 dfmp2.DFMP2._kernel_impl = _wrap_restricted(dfmp2.DFMP2._kernel_impl)
 dfump2.DFUMP2._kernel_impl = _wrap_unrestricted(dfump2.DFUMP2._kernel_impl)
+
+
+# ------------------------------------- D10 periodic singlet/triplet response
+from gpu4pyscf.pbc.dft import rks as pbc_rks, krks as pbc_krks   # noqa: E402
+
+
+def _wrap_pbc_response(orig):
+    def gen_response(mf, mo_coeff=None, mo_occ=None, singlet=None, hermi=0,
+                     max_memory=None, with_nlc=False):
+        if singlet is None or mo_coeff is not None or mo_occ is not None:
+            return orig(mf, mo_coeff, mo_occ, singlet, hermi, max_memory,
+                        with_nlc)
+        from electrolites.pbc_tdscf import gen_response as resp
+        return resp(mf, singlet=singlet, hermi=hermi)
+    gen_response.__wrapped__ = orig
+    return gen_response
+
+
+def _wrap_kpbc_response(orig):
+    def gen_response(mf, mo_coeff=None, mo_occ=None, singlet=None, hermi=0,
+                     max_memory=None, with_nlc=False):
+        if singlet is not None:
+            raise NotImplementedError(
+                'GPU KRKS singlet/triplet response: GPU4PySCF 1.8.1 passes '
+                'singlet into nr_rks_fxc\'s fxc slot (D10); the k-point '
+                'TDDFT (X2) is not built')
+        return orig(mf, mo_coeff, mo_occ, singlet, hermi, max_memory,
+                    with_nlc)
+    gen_response.__wrapped__ = orig
+    return gen_response
+
+
+if not hasattr(pbc_rks.RKS.gen_response, '__wrapped__'):
+    pbc_rks.RKS.gen_response = _wrap_pbc_response(pbc_rks.RKS.gen_response)
+if not hasattr(pbc_krks.KRKS.gen_response, '__wrapped__'):
+    pbc_krks.KRKS.gen_response = _wrap_kpbc_response(
+        pbc_krks.KRKS.gen_response)

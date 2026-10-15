@@ -54,7 +54,7 @@ LAST = {}
 
 
 def _davidson(hop, hdiag, x0_main, nroots, tol, log, max_cycle=200,
-              hermitian=True, max_space=64):
+              hermitian=True, max_space=64, nguess=None):
     """Lowest ``nroots`` eigenpairs of ``hop`` (a batched product: rows in,
     rows out) by a block Davidson on the device.
 
@@ -70,9 +70,11 @@ def _davidson(hop, hdiag, x0_main, nroots, tol, log, max_cycle=200,
     """
     size = hdiag.size
     nroots = min(nroots, size)
+    if nguess is None:
+        nguess = nroots + 1
     guesses = [x0_main / max(float(cp.linalg.norm(x0_main)), 1e-300)]
-    for i in cp.argsort(hdiag)[:nroots + 1].get():
-        if len(guesses) >= nroots + 1:
+    for i in cp.argsort(hdiag)[:nguess].get():
+        if len(guesses) >= nguess:
             break
         u = cp.zeros(size)
         u[i] = 1.

@@ -39,5 +39,20 @@ for xc in ('lda', 'pbe', 'pbe0', 'HF'):
         err = abs(np.sort(g.e) - np.sort(c.e)).max() * HA2EV
         report(f'diamond {xc} {"singlet" if singlet else "triplet"}',
                err < 1e-5, f'max|dE| {err:.1e} eV')
+# D10: the patched Gamma-point gen_response against PySCF's (exxdiv ewald)
+import cupy as cp                                              # noqa: E402
+import electrolites.fixes                                      # noqa: E402,F401
+rng = np.random.default_rng(1)
+for xc in ('pbe', 'pbe0'):
+    mf = dft.RKS(cell, xc=xc).run(conv_tol=1e-10)
+    mc = mf.to_cpu()
+    d = rng.random((2, cell.nao, cell.nao))
+    for singlet in (True, False):
+        vg = cp.asnumpy(mf.gen_response(singlet=singlet, hermi=0)(
+            cp.asarray(d)))
+        vc = mc.gen_response(singlet=singlet, hermi=0)(d)
+        err = abs(vg - vc).max() / abs(vc).max()
+        report(f'D10 gen_response {xc} {"singlet" if singlet else "triplet"}',
+               err < 1e-8, f'rel {err:.1e}')
 print('FAILED: ' + ', '.join(fails) if fails else 'all passed')
 sys.exit(1 if fails else 0)
