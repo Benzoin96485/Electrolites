@@ -38,7 +38,11 @@ rec = dict(what=a.what, xyz=a.xyz, basis=a.basis, nao=mol.nao,
            threads=os.environ.get('OMP_NUM_THREADS'))
 
 
-def timed(label, fn):
+def timed(label, fn, warm=False):
+    """Time fn; with ``warm`` on the GPU, run it once first (kernel
+    compilation and plan caches), the cold time kept as label_cold."""
+    if warm and not a.cpu:
+        timed(label + '_cold', fn)
     if not a.cpu:
         import cupy as cp
         cp.cuda.Stream.null.synchronize()
@@ -49,6 +53,7 @@ def timed(label, fn):
         cp.cuda.Stream.null.synchronize()
     rec[label] = time.perf_counter() - t
     return out
+
 
 
 if a.cpu:
@@ -85,7 +90,7 @@ if a.what in ('nevpt2', 'mcpdft', 'sagrad', 'nac', 'casgrad'):
             else:
                 from electrolites.nevpt2_gpu import NEVPT
                 obj = NEVPT(mc)
-            rec['e'] = float(timed('nevpt2_s', obj.kernel))
+            rec['e'] = float(timed('nevpt2_s', obj.kernel, True))
         else:
             from pyscf.mcpdft.mcpdft import energy_tot
             if a.cpu:
@@ -97,7 +102,7 @@ if a.what in ('nevpt2', 'mcpdft', 'sagrad', 'nac', 'casgrad'):
             mo = mc.mo_coeff
             mo = mo.get() if hasattr(mo, 'get') else np.asarray(mo)
             rec['e'] = float(timed('mcpdft_s', lambda: energy_tot(
-                pd, mo_coeff=mo, ci=mc.ci)[0]))
+                pd, mo_coeff=mo, ci=mc.ci)[0], True))
     elif a.what == 'casgrad':
         mc = CASSCF(mf, norb, nelec)
         mc.conv_tol = 1e-9
@@ -110,7 +115,7 @@ if a.what in ('nevpt2', 'mcpdft', 'sagrad', 'nac', 'casgrad'):
             mo = mc.mo_coeff
             np.save(a.mo, mo.get() if hasattr(mo, 'get') else np.asarray(mo))
         rec['e'] = float(mc.e_tot)
-        g = timed('grad_s', lambda: mc.nuc_grad_method().kernel())
+        g = timed('grad_s', lambda: mc.nuc_grad_method().kernel(), True)
         rec['norm'] = float(np.linalg.norm(g))
     else:
         mc = CASSCF(mf, norb, nelec)
@@ -120,9 +125,11 @@ if a.what in ('nevpt2', 'mcpdft', 'sagrad', 'nac', 'casgrad'):
         mc.conv_tol = 1e-9
         timed('casscf_s', mc.kernel)
         if a.what == 'sagrad':
-            g = timed('grad_s', lambda: mc.nuc_grad_method().kernel(state=0))
+            g = timed('grad_s', lambda: mc.nuc_grad_method().kernel(state=0),
+                      True)
         else:
-            g = timed('nac_s', lambda: mc.nac_method().kernel(state=(0, 1)))
+            g = timed('nac_s', lambda: mc.nac_method().kernel(state=(0, 1)),
+                      True)
         rec['norm'] = float(np.linalg.norm(g))
 elif a.what == 'rpa':
     mf = ks(mol, xc='pbe').density_fit()
@@ -134,7 +141,7 @@ elif a.what == 'rpa':
     else:
         from electrolites.rpa_gpu import RPA
         r = RPA(mf)
-    timed('rpa_s', r.kernel)
+    timed('rpa_s', lambda: (setattr(r, 'e_hf', None), r.kernel()), True)
     rec['e'] = float(r.e_corr)
 elif a.what == 'gw':
     mf = ks(mol, xc='pbe').density_fit()
@@ -148,7 +155,7 @@ elif a.what == 'gw':
         from electrolites.gw_gpu import GWAC
         g = GWAC(mf)
     g.orbs = list(range(nocc - 3, nocc + 3))
-    timed('gw_s', g.kernel)
+    timed('gw_s', g.kernel, True)
     rec['homo'] = float(np.asarray(g.mo_energy)[nocc - 1])
 side = 'CPU' if a.cpu else 'GPU'
 print(f"[{a.what} {side} {os.path.basename(a.xyz)}/{a.basis} CAS{a.cas}] "

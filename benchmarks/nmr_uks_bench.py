@@ -45,6 +45,10 @@ else:
     electrolites.patch_all()
     from gpu4pyscf import dft
     from electrolites.nmr_uks import NMR
+if not a.cpu:
+    from pyscf import gto
+    w = gto.M(atom='O 0 0 0; H 0 0 0.97', spin=1, basis=a.basis, verbose=0)
+    NMR(dft.UKS(w, xc=a.xc).run()).kernel()
 mf = dft.UKS(mol, xc=a.xc)
 mf.conv_tol = 1e-10
 timed('scf_s', mf.kernel)

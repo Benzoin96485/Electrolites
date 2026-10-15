@@ -48,6 +48,16 @@ else:
     electrolites.patch_all()
     from gpu4pyscf import dft
     from electrolites.ssc_gpu import SSC
+if not a.cpu:
+    # warm-up on water (kernel compilation, plan caches)
+    from pyscf import gto
+    w = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587',
+              basis=a.basis, verbose=0)
+    wm = dft.RKS(w, xc=a.xc)
+    wm = (wm.density_fit() if a.df else wm).run()
+    ws = SSC(wm)
+    ws.with_fcsd = a.fcsd
+    ws.kernel()
 mf = dft.RKS(mol, xc=a.xc)
 if a.df:
     mf = mf.density_fit()

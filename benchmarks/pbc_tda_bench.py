@@ -26,6 +26,7 @@ cell = gto.M(a='''0 1.7834 1.7834
 1.7834 0 1.7834
 1.7834 1.7834 0''', atom='C 0 0 0; C 0.8917 0.8917 0.8917',
              basis=a.basis, pseudo='gth-pade', verbose=0)
+prim = cell
 cell = super_cell(cell, [a.n] * 3)
 cell.verbose = 0
 if a.mesh:
@@ -53,6 +54,12 @@ else:
     electrolites.patch_all()
     from gpu4pyscf.pbc import dft, scf
     from electrolites.pbc_tdscf import TDA
+if not a.cpu:
+    # warm-up on the primitive cell (kernel compilation, plan caches)
+    p1 = super_cell(prim, [1] * 3)
+    w = scf.RHF(p1) if a.xc.upper() == 'HF' else dft.RKS(p1, xc=a.xc)
+    w.run()
+    TDA(w).kernel(nstates=a.nstates)
 mf = scf.RHF(cell) if a.xc.upper() == 'HF' else dft.RKS(cell, xc=a.xc)
 mf.conv_tol = 1e-9
 timed('scf_s', mf.kernel)
