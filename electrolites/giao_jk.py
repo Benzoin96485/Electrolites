@@ -24,7 +24,8 @@ basis, with the density on the original block only:
 
 (``-vj``, ``-(vk - vk^T)`` as GPU4PySCF's ``shielding.get_jk`` returns
 them).  One J build and one four-density K build on a basis about 3.5x
-larger (GPU4PySCF's direct J/K, LMAX 4: up to f in the original basis).
+larger (GPU4PySCF's direct J/K, LMAX 4: up to f in the original basis),
+with the (shifted, shifted) shell pairs dropped from their pair lists.
 Agrees with ``int2e_ig1`` to round-off (``tests/test_giao_jk.py``).
 """
 import numpy as np
@@ -68,6 +69,7 @@ class GIAOJK:
         molc = mol.copy()
         molc.cart = True
         molc.build(False, False)
+        self.molc = molc
         m2 = _shifted(molc)
         self.cmol = gto.conc_mol(molc, m2)
         self.cmol.cart = True
@@ -92,15 +94,33 @@ class GIAOJK:
         self.R = cp.asarray(mol.atom_coords()[np.repeat(
             mol._bas[:, ATOM_OF], aoloc[1:] - aoloc[:-1])].T)   # (3, nao)
         self.ntot = self.cmol.nao_cart()
-        self._opt = None
 
-    def _vhfopt(self):
-        # GPU4PySCF's get_j/get_k build their screening/sorting object on
-        # every call otherwise (0.6 s at penicillin V's concatenated basis)
+    def _jopt(self):
+        """GPU4PySCF's direct-J/K screening object for the concatenated
+        basis, built once (0.6 s at penicillin V), with the (shifted, shifted) shell pairs removed
+        from its pair lists: only (original, *) blocks of J and K are used,
+        and those pairs carry the highest angular momenta (penicillin V, login
+        GPU: J 23 -> 13.6 s).  The decontracted,
+        sorted basis keeps the concatenation order before sorting, so a
+        sorted shell is shifted iff its pre-sort index is past the
+        original's primitive shells."""
         from gpu4pyscf.scf import jk
-        if self._opt is None:
-            self._opt = jk._VHFOpt(self.cmol).build()
-        return self._opt
+        from gpu4pyscf.gto.mole import SortedGTO
+        if getattr(self, '_jopt_', None) is None:
+            opt = jk._VHFOpt(self.cmol).build()
+            smol = opt.sorted_mol
+            n1p = len(SortedGTO.from_mol(self.molc, decontract=True,
+                                         diffuse_cutoff=0.3)._bas)
+            shifted = cp.asarray(smol.sorted_idx >= n1p)
+            nbas = smol.nbas
+            for key, (pairs, q, s_) in list(opt.bas_pair_cache.items()):
+                p64 = pairs.astype(cp.int64)
+                keep = ~(shifted[p64 // nbas] & shifted[p64 % nbas])
+                opt.bas_pair_cache[key] = (cp.ascontiguousarray(pairs[keep]),
+                                           cp.ascontiguousarray(q[keep]),
+                                           cp.ascontiguousarray(s_[keep]))
+            self._jopt_ = opt
+        return self._jopt_
 
     def _pad(self, dms):
         big = cp.zeros((len(dms), self.ntot, self.ntot))
@@ -130,7 +150,7 @@ class GIAOJK:
             if with_j:
                 big = self._pad(d[None])
                 vj = jk.get_j(self.cmol, big, hermi=1,
-                              vhfopt=self._vhfopt())[0]
+                              vhfopt=self._jopt())[0]
                 J = self._sph(vj[:n1, :n1])
                 Mp = cp.stack([self._sph(vj[:n1, self.idx[k]])
                                for k in range(3)])
@@ -140,7 +160,7 @@ class GIAOJK:
                 continue
             dd = cp.stack([d] + [R[a][:, None] * d for a in range(3)])
             vk = jk.get_k(self.cmol, self._pad(dd), hermi=0,
-                          vhfopt=self._vhfopt())
+                          vhfopt=self._jopt())
             Kd = [self._sph(vk[i][:n1, :n1]) for i in range(4)]
             Kp = [cp.stack([self._sph(vk[i][self.idx[k], :n1])
                             for k in range(3)]) for i in range(4)]
