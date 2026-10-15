@@ -201,6 +201,7 @@ def gen_response_k(mf, singlet=True):
     if hasattr(kpts, 'kpts'):
         kpts = kpts.kpts
     is_ks = hasattr(mf, 'xc')
+    gamma_only = bool(np.allclose(np.asarray(kpts), 0))
     if is_ks:
         omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=0)
         if omega != 0:
@@ -214,9 +215,16 @@ def gen_response_k(mf, singlet=True):
     def vresp(dms):
         v1 = cp.zeros_like(dms)
         if is_ks:
-            v1 += cp.asarray(ni.nr_rks_fxc_st(
-                cell, mf.grids, mf.xc, dm0, .5 * dms, 0, singlet, fxc,
-                kpts)).reshape(dms.shape)
+            def f(d):
+                return cp.asarray(ni.nr_rks_fxc_st(
+                    cell, mf.grids, mf.xc, dm0, .5 * d, 0, singlet, fxc,
+                    kpts)).reshape(dms.shape)
+            if gamma_only:
+                # real AOs: GPU4PySCF's fxc matrix cannot mix them with a
+                # complex density; fxc is linear, so Re and Im separately
+                v1 += f(dms.real) + 1j * f(dms.imag)
+            else:
+                v1 += f(dms)
         for z, d in enumerate(dms):
             if singlet:
                 # J of a non-Hermitian D through its Hermitian parts (the

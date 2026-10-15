@@ -26,10 +26,10 @@ cell = gto.M(a='''0 1.7834 1.7834
 1.7834 1.7834 0''', atom='C 0 0 0; C 0.8917 0.8917 0.8917',
              basis='gth-dzv', pseudo='gth-pade', verbose=0, mesh=[25] * 3)
 HA2EV = 27.211386245988
-for mesh in ([2, 1, 1], [2, 2, 1]):
+for mesh in ([1, 1, 1], [2, 1, 1], [2, 2, 1]):
     kpts = cell.make_kpts(mesh)
     for xc in ('pbe', 'pbe0', 'HF'):
-        if mesh == [2, 2, 1] and xc != 'pbe0':
+        if mesh != [2, 1, 1] and xc != ('pbe' if mesh == [1, 1, 1] else 'pbe0'):
             continue
         mf = scf.KRHF(cell, kpts) if xc == 'HF' else dft.KRKS(cell, kpts, xc=xc)
         mf.conv_tol = 1e-10
