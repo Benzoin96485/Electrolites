@@ -232,6 +232,9 @@ register('polar', 'polar_gpu',
 register('cubegen', 'cubegen_gpu',
          doc='[T1] density / orbital / MEP cube files on the GPU '
              '(cubegen_gpu.density, orbital, mep)')
+register('ir_uks', 'ir_uks',
+         doc='[O3] IR intensities for UHF/UKS (and RHF/RKS) on the GPU '
+             '(ir_uks.eval_ir_freq_intensity)')
 register('ssc', 'ssc_gpu',
          doc='[O2] NMR spin-spin coupling (RHF/RKS) on the GPU (ssc_gpu.SSC)')
 register('nmr_uks', 'nmr_uks',
