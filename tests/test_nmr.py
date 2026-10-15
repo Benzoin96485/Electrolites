@@ -9,6 +9,10 @@ whole shielding tensor both ways.  Round-off: 1e-11 relative on the matrix,
     python tests/test_nmr.py [--quick]
 """
 import argparse
+import os
+
+# the GIAO two-electron term on the GPU even for these small molecules
+os.environ['FASTNMR_GPU2E'] = '1'
 
 import cupy as cp
 import numpy as np

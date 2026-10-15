@@ -92,6 +92,15 @@ class GIAOJK:
         self.R = cp.asarray(mol.atom_coords()[np.repeat(
             mol._bas[:, ATOM_OF], aoloc[1:] - aoloc[:-1])].T)   # (3, nao)
         self.ntot = self.cmol.nao_cart()
+        self._opt = None
+
+    def _vhfopt(self):
+        # GPU4PySCF's get_j/get_k build their screening/sorting object on
+        # every call otherwise (0.6 s at penicillin V's concatenated basis)
+        from gpu4pyscf.scf import jk
+        if self._opt is None:
+            self._opt = jk._VHFOpt(self.cmol).build()
+        return self._opt
 
     def _pad(self, dms):
         big = cp.zeros((len(dms), self.ntot, self.ntot))
@@ -120,7 +129,8 @@ class GIAOJK:
         for d in dms:
             if with_j:
                 big = self._pad(d[None])
-                vj = jk.get_j(self.cmol, big, hermi=1)[0]
+                vj = jk.get_j(self.cmol, big, hermi=1,
+                              vhfopt=self._vhfopt())[0]
                 J = self._sph(vj[:n1, :n1])
                 Mp = cp.stack([self._sph(vj[:n1, self.idx[k]])
                                for k in range(3)])
@@ -129,7 +139,8 @@ class GIAOJK:
             if not with_k:
                 continue
             dd = cp.stack([d] + [R[a][:, None] * d for a in range(3)])
-            vk = jk.get_k(self.cmol, self._pad(dd), hermi=0)
+            vk = jk.get_k(self.cmol, self._pad(dd), hermi=0,
+                          vhfopt=self._vhfopt())
             Kd = [self._sph(vk[i][:n1, :n1]) for i in range(4)]
             Kp = [cp.stack([self._sph(vk[i][self.idx[k], :n1])
                             for k in range(3)]) for i in range(4)]
@@ -154,6 +165,23 @@ def _cross(a, b):
 
 
 _CACHE = {}
+
+# Below this many AOs the host int2e_ig1 (16 threads, the GPU node's share)
+# is faster than the concatenated-basis J/K, whose cost there is GPU4PySCF's
+# per-angular-momentum-class overhead (glycine/def2-SVP, 95 AOs: 1.7 s on the
+# device, 1.3 s on the host; alanine dipeptide, 200 AOs: 2.8 s against 5.7 s)
+NAO_MIN = 150
+
+
+def use_gpu(mol):
+    """The GIAO two-electron term on the GPU for this molecule?
+    ``FASTNMR_HOST2E=1`` / ``FASTNMR_GPU2E=1`` force either side."""
+    import os
+    if os.environ.get('FASTNMR_HOST2E'):
+        return False
+    if os.environ.get('FASTNMR_GPU2E'):
+        return True
+    return mol.nao >= NAO_MIN
 
 
 def get_jk(mol, dm, with_k=True, with_j=True):

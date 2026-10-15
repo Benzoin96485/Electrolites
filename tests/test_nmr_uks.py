@@ -15,6 +15,9 @@ relative; uncoupled (pure functional) cases agree to round-off.
 """
 import os
 import sys
+
+# the GIAO two-electron term on the GPU even for these small molecules
+os.environ['FASTNMR_GPU2E'] = '1'
 from functools import reduce
 
 os.environ.setdefault('PYSCF_EXT_PATH', os.path.expanduser(

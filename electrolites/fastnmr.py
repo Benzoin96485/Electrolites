@@ -126,13 +126,15 @@ def nr_rks(ni, mol, grids, xc_code, dms):
 def get_vxc(mf, dm0):
     """``shielding.get_vxc`` with the GIAO two-electron term on the GPU
     (``electrolites.giao_jk``: shifted-basis J/K instead of the host
-    ``int2e_ig1``; K only for hybrids).  ``FASTNMR_HOST2E=1`` keeps the
-    host term (J-only for pure functionals)."""
+    ``int2e_ig1``; K only for hybrids) from ``giao_jk.NAO_MIN`` AOs up;
+    below it, and with ``FASTNMR_HOST2E=1``, the host term (J-only for pure
+    functionals)."""
     ni = mf._numint
     mol = mf.mol
     hybrid = ni.libxc.is_hybrid_xc(mf.xc)
     vxc = SH.nr_rks(ni, mol, mf.grids, mf.xc, mf.make_rdm1())
-    if os.environ.get('FASTNMR_HOST2E'):
+    from electrolites import giao_jk
+    if not giao_jk.use_gpu(mol):
         if hybrid:
             return SH._get_vxc_orig(mf, dm0)
         from pyscf.scf import _vhf
@@ -140,7 +142,6 @@ def get_vxc(mf, dm0):
                                'lk->s1ij', cupy.asnumpy(dm0), 3, mol._atm,
                                mol._bas, mol._env)
         return vxc - cupy.asarray(vj)
-    from electrolites import giao_jk
     vj, vk = giao_jk.get_jk(mol, dm0, with_k=hybrid)
     if not hybrid:
         return vxc + vj

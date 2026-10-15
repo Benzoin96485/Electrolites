@@ -117,13 +117,16 @@ def get_vxc_giao(ni, mol, grids, xc_code, mo_coeff, mo_occ):
     return vmat - vmat.transpose(0, 1, 3, 2)
 
 
-def get_jk_giao(mol, dm, with_k=True, host=False):
+def get_jk_giao(mol, dm, with_k=True, host=None):
     """GIAO J (and K) for spin densities dm (2, nao, nao): on the GPU by
     ``electrolites.giao_jk``, or (``host``) from libcint ``int2e_ig1``
-    (pyscf-properties' ``rhf.get_jk``)."""
+    (pyscf-properties' ``rhf.get_jk``); ``host=None``: by size
+    (``giao_jk.use_gpu``)."""
+    from electrolites import giao_jk
+    if host is None:
+        host = not giao_jk.use_gpu(mol)
     if not host:
         # J of the total density once (only vj_a + vj_b enters), K per spin
-        from electrolites import giao_jk
         dm = cp.asarray(dm)
         vj = giao_jk.get_jk(mol, dm[0] + dm[1], with_k=False)[0]
         vk = giao_jk.get_jk(mol, dm, with_j=False)[1] if with_k else None
@@ -154,7 +157,7 @@ class NMR(lib.StreamObject):
         self.max_cycle_cphf = 20
         self.conv_tol = 1e-9
         self.mo10 = None
-        self.host_2e = False
+        self.host_2e = None             # None: by size (giao_jk.NAO_MIN)
         self.timings = {}
 
     def _hyb(self):
