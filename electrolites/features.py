@@ -222,6 +222,11 @@ register('gw', 'gw_gpu',
          doc='[P9] G0W0-AC with the self-energy loop on the GPU (gw_gpu.GWAC)')
 register('pbc_tda', 'pbc_tdscf',
          doc='[X1] Gamma-point periodic TDA on the GPU (pbc_tdscf.TDA)')
+register('ssc', 'ssc_gpu',
+         doc='[O2] NMR spin-spin coupling (RHF/RKS) on the GPU (ssc_gpu.SSC)')
+register('nmr_uks', 'nmr_uks',
+         doc='[O1] GIAO NMR shielding for UHF/UKS (nmr_uks.NMR); '
+             'the int2e_ig1 term stays on the host')
 register('ccsd_t', 'ccsd_t',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ccsd_t')],
          doc='[P1] closed-shell (T) on the device')

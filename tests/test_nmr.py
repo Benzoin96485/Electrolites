@@ -1,6 +1,7 @@
 """`fastnmr` against GPU4PySCF's `shielding.nr_rks` (catalogue C7), one process.
 
-The GIAO XC term element-wise on the same SCF (LDA, GGA, hybrid GGA;
+The GIAO XC term element-wise on the same SCF (and ``get_vxc`` with the
+J-only GIAO two-electron term for pure functionals against upstream's) (LDA, GGA, hybrid GGA;
 organic, a third-row atom, def2-TZVPP which reaches f; a coarse grid), then the
 whole shielding tensor both ways.  Round-off: 1e-11 relative on the matrix,
 1e-8 ppm on the shielding.
@@ -47,10 +48,12 @@ for atom, basis, xc, level in (CASES[:3] if a.quick else CASES):
     s0 = [cp.asnumpy(cp.asarray(x)) for x in SH.eval_shielding(mf)]
     SH.nr_rks = fastnmr.nr_rks
     es = max(np.abs(a_ - b_).max() for a_, b_ in zip(s1, s0))
-    ok = ev < 1e-11 and es < 1e-8
+    # the J-only GIAO two-electron term for pure functionals
+    ej = float(cp.abs(SH.get_vxc(mf, dm) - SH._get_vxc_orig(mf, dm)).max())
+    ok = ev < 1e-11 and es < 1e-8 and ej < 1e-12
     fails += not ok
     print(f'{atom.rsplit("/", 1)[-1][:12]:12s} {basis:10s} {xc:6s} L{level} '
-          f'dV {ev:.1e}  d sigma {es:.1e} ppm  {"ok" if ok else "FAIL"}',
+          f'dV {ev:.1e}  dVxc {ej:.1e}  d sigma {es:.1e} ppm  {"ok" if ok else "FAIL"}',
           flush=True)
 print('\nFAILED' if fails else '\nall passed', f'({fails} failures)')
 raise SystemExit(1 if fails else 0)

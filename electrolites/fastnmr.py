@@ -123,6 +123,23 @@ def nr_rks(ni, mol, grids, xc_code, dms):
     return (vmat - vmat.transpose(0, 2, 1))
 
 
+def get_vxc(mf, dm0):
+    """``shielding.get_vxc`` with the host GIAO two-electron term J-only for
+    pure functionals: upstream always forms J and K from ``int2e_ig1`` and
+    drops K for them (30 % of that term at 22 atoms, 7.7 s -> 5.3 s on the
+    login node)."""
+    ni = mf._numint
+    if ni.libxc.is_hybrid_xc(mf.xc):
+        return SH._get_vxc_orig(mf, dm0)
+    from pyscf.scf import _vhf
+    mol = mf.mol
+    vxc = SH.nr_rks(ni, mol, mf.grids, mf.xc, mf.make_rdm1())
+    vj = _vhf.direct_mapdm(mol._add_suffix('int2e_ig1'), 'a4ij', 'lk->s1ij',
+                           cupy.asnumpy(dm0), 3, mol._atm, mol._bas,
+                           mol._env)
+    return vxc - cupy.asarray(vj)
+
+
 _PATCHED = False
 
 
@@ -133,6 +150,8 @@ def apply_patch():
     SH._nr_rks_orig = SH.nr_rks
     # `get_vxc` calls the module-level name
     SH.nr_rks = nr_rks
+    SH._get_vxc_orig = SH.get_vxc
+    SH.get_vxc = get_vxc
     _PATCHED = True
 
 
