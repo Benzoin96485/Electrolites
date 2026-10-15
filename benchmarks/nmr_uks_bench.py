@@ -51,10 +51,12 @@ else:
     electrolites.patch_all()
     from gpu4pyscf import dft
     from electrolites.nmr_uks import NMR
-if a.restricted:
+if a.restricted and a.cpu:
+    NMR = nmr.rks.NMR
+elif a.restricted:
     from gpu4pyscf.properties import shielding as SH
 
-    class _RNMR:                                  # same interface
+    class NMR:                                    # noqa: F811, same interface
         def __init__(self, mf):
             self.mf = mf
             self.verbose = 0
@@ -62,9 +64,6 @@ if a.restricted:
         def kernel(self):
             d, p = SH.eval_shielding(self.mf)
             return (d + p).get()
-    if a.cpu:
-        _RNMR = nmr.rks.NMR                       # noqa: F811
-    NMR = _RNMR
 if not a.cpu:
     from pyscf import gto
     if a.restricted:
