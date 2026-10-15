@@ -293,6 +293,47 @@ def _davidson(hop, x0, hdiag, level_shift, nroots, tol, tol_residual,
     return conv, e, [cp.asnumpy(x) for x in X]
 
 
+_SS_MAPS = {}
+
+
+def _ss_maps(norb, neleca, nelecb):
+    """Per orbital i, (mask, target address, sign) of a_i / a_i^+ on the
+    alpha and beta strings (PySCF ``spin_op.contract_ss``'s gen_map),
+    device arrays, cached."""
+    key = (norb, neleca, nelecb)
+    m = _SS_MAPS.get(key)
+    if m is not None:
+        return m
+    from pyscf.fci import cistring
+
+    def gen(fstr, ne, des):
+        if (des and ne == 0) or (not des and ne == norb):
+            return None
+        idx = fstr(range(norb), ne)
+        amap = np.zeros((idx.shape[0], norb, 2), dtype=np.int64)
+        for k, tab in enumerate(idx):
+            amap[k, tab[:, 1] if des else tab[:, 0]] = tab[:, 2:]
+        out = []
+        for i in range(norb):
+            sign = amap[:, i, 1]
+            mask = np.flatnonzero(sign != 0)
+            out.append((cp.asarray(mask), cp.asarray(amap[mask, i, 0]),
+                        cp.asarray(sign[mask].astype(np.float64))))
+        return out
+    m = dict(na=cistring.num_strings(norb, neleca),
+             nb=cistring.num_strings(norb, nelecb),
+             ades=gen(cistring.gen_des_str_index, neleca, True),
+             bdes=gen(cistring.gen_des_str_index, nelecb, True),
+             acre=gen(cistring.gen_cre_str_index, neleca, False),
+             bcre=gen(cistring.gen_cre_str_index, nelecb, False),
+             pm=(cistring.num_strings(norb, max(neleca - 1, 0)),
+                 cistring.num_strings(norb, min(nelecb + 1, norb))),
+             mp=(cistring.num_strings(norb, min(neleca + 1, norb)),
+                 cistring.num_strings(norb, max(nelecb - 1, 0))))
+    _SS_MAPS[key] = m
+    return m
+
+
 class FCISolver(direct_spin1.FCISolver):
     """``direct_spin1.FCISolver`` with the sigma build, the Davidson
     vectors and the RDMs on the GPU."""
@@ -340,6 +381,39 @@ class FCISolver(direct_spin1.FCISolver):
 
     def make_rdm1(self, fcivec, norb, nelec, link_index=None):
         return _rdm12(fcivec, fcivec, norb, nelec, with_dm2=False)[0]
+
+    def contract_ss(self, fcivec, norb, nelec):
+        """S^2 |c> (PySCF ``spin_op.contract_ss``) on the device, the
+        alpha/beta creation/annihilation maps built once per (norb, nelec):
+        PySCF regenerates them and its gather/scatter on the host on every
+        call, 3.7 of 7.4 s of a fix_spin_ SA-CASSCF NAC at CAS(10,10)."""
+        neleca, nelecb = direct_spin1._unpack_nelec(nelec, self.spin)
+        maps = _ss_maps(norb, neleca, nelecb)
+        na, nb = maps['na'], maps['nb']
+        c = cp.asarray(fcivec, dtype=np.float64).reshape(na, nb)
+        ci1 = cp.zeros_like(c)
+        for amap, bmap, shape in (('ades', 'bcre', 'pm'), ('acre', 'bdes', 'mp')):
+            A, Bm = maps[amap], maps[bmap]
+            if A is None or Bm is None:
+                continue
+            t1 = cp.zeros(maps[shape])
+            for i in range(norb):
+                ma, aa, sa = A[i]
+                mb, ab, sb = Bm[i]
+                if ma.size == 0 or mb.size == 0:
+                    continue
+                t1[aa[:, None], ab[None, :]] += \
+                    c[ma[:, None], mb[None, :]] * sa[:, None] * sb[None, :]
+            for i in range(norb):
+                ma, aa, sa = A[i]
+                mb, ab, sb = Bm[i]
+                if ma.size == 0 or mb.size == 0:
+                    continue
+                ci1[ma[:, None], mb[None, :]] += \
+                    t1[aa[:, None], ab[None, :]] * sa[:, None] * sb[None, :]
+        ci1 *= .5
+        ci1 += (neleca - nelecb) ** 2 * .25 * c
+        return cp.asnumpy(ci1).reshape(np.shape(fcivec))
 
     def make_hdiag(self, h1e, eri, norb, nelec, compress=False):
         """PySCF ``direct_spin1.make_hdiag`` on the device (host result):
