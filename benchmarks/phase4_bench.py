@@ -5,7 +5,10 @@ after the reference it needs.
     python benchmarks/phase4_bench.py --what nevpt2 --cas 12,12 \\
         --xyz benchmarks/molecules/pbenzyne.xyz --basis def2-svp [--cpu]
 
-what: nevpt2 | mcpdft | rpa | gw | sagrad | nac
+what: nevpt2 | mcpdft | rpa | gw | sagrad | nac | casgrad
+(casgrad: single-state DF-CASSCF gradient; ``--mo`` file: the GPU run
+writes its converged orbitals there, the CPU run starts from them, so the
+CPU CASSCF takes ~1 macro-iteration and only the gradient is compared)
 """
 import json
 import os
@@ -17,7 +20,9 @@ from _common import parser, build_mol                        # noqa: E402
 
 ap = parser(__doc__.splitlines()[0])
 ap.add_argument('--what', required=True,
-                choices=('nevpt2', 'mcpdft', 'rpa', 'gw', 'sagrad', 'nac'))
+                choices=('nevpt2', 'mcpdft', 'rpa', 'gw', 'sagrad', 'nac',
+                         'casgrad'))
+ap.add_argument('--mo', default=None)
 ap.add_argument('--cpu', action='store_true')
 ap.add_argument('--cas', default='10,10')
 ap.add_argument('--nroots', type=int, default=2)
@@ -59,7 +64,7 @@ else:
     hf = (scf.RHF if mol.spin == 0 else scf.ROHF)
     ks = dft.RKS
 
-if a.what in ('nevpt2', 'mcpdft', 'sagrad', 'nac'):
+if a.what in ('nevpt2', 'mcpdft', 'sagrad', 'nac', 'casgrad'):
     mf = hf(mol).density_fit()
     mf.conv_tol = 1e-9
     timed('scf_s', mf.kernel)
@@ -93,6 +98,20 @@ if a.what in ('nevpt2', 'mcpdft', 'sagrad', 'nac'):
             mo = mo.get() if hasattr(mo, 'get') else np.asarray(mo)
             rec['e'] = float(timed('mcpdft_s', lambda: energy_tot(
                 pd, mo_coeff=mo, ci=mc.ci)[0]))
+    elif a.what == 'casgrad':
+        mc = CASSCF(mf, norb, nelec)
+        mc.conv_tol = 1e-9
+        mc.max_cycle_macro = 300
+        mo0 = None
+        if a.cpu and a.mo:
+            mo0 = np.load(a.mo)
+        timed('casscf_s', lambda: mc.kernel(mo0))
+        if not a.cpu and a.mo:
+            mo = mc.mo_coeff
+            np.save(a.mo, mo.get() if hasattr(mo, 'get') else np.asarray(mo))
+        rec['e'] = float(mc.e_tot)
+        g = timed('grad_s', lambda: mc.nuc_grad_method().kernel())
+        rec['norm'] = float(np.linalg.norm(g))
     else:
         mc = CASSCF(mf, norb, nelec)
         if a.what == 'nac':

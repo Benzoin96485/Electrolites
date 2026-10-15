@@ -96,6 +96,10 @@ class SSC(lib.StreamObject):
         self.conv_tol = 1e-9
         self.dso = 'grid'
         self.max_dms = 48
+        # relative CPHF residual the refinement stops at: 1e-6 is pyscf's
+        # own level (~2e-7) at a third of the cost of 1e-9 (each refinement
+        # is another Krylov solve over 3 N_atom right-hand sides)
+        self.refine_tol = 1e-6
         self.e11 = self.k_hz = self.j_hz = None
 
     # ------------------------------------------------------------ helpers
@@ -127,11 +131,11 @@ class SSC(lib.StreamObject):
             # intermediates; 339 at once fail in cuTENSOR at 113 atoms)
             for z0 in range(0, len(x), self.max_dms):
                 z1 = min(len(x), z0 + self.max_dms)
-                dm = 2 * cp.einsum('pa,zai,qi->zpq', cv, x[z0:z1], co)
+                dm = 2 * cv @ x[z0:z1] @ co.T
                 dm = dm - dm.transpose(0, 2, 1) if singlet \
                     else dm + dm.transpose(0, 2, 1)
                 v = cp.asarray(vresp(dm))
-                out[z0:z1] = cp.einsum('pa,zpq,qi->zai', cv, v, co)
+                out[z0:z1] = cv.T @ v @ co
             return out
         # pyscf ``cphf.solve_nos1``: (1 + D^-1 V) x = -D^-1 h1, with the
         # refined Krylov solve (GPU4PySCF's alone stalls near 1e-6)
@@ -142,12 +146,12 @@ class SSC(lib.StreamObject):
         def aop(x):
             return (fx(x) / e_ai).reshape(len(x), -1)
         b = (-h1 / e_ai).reshape(nset, -1)
-        return krylov_refined(aop, b, self.conv_tol,
-                              self.max_cycle_cphf).reshape(h1.shape)
+        return krylov_refined(aop, b, self.conv_tol, self.max_cycle_cphf,
+                              rtol=self.refine_tol).reshape(h1.shape)
 
     def _vo(self, h1ao):
         co, cv = self._mo()[:2]
-        return cp.einsum('pa,zpq,qi->zai', cv, cp.asarray(h1ao), co)
+        return cv.T @ cp.asarray(h1ao) @ co
 
     # ------------------------------------------------------------- terms
     def make_dso(self, mol=None, dm0=None, nuc_pair=None):

@@ -245,7 +245,7 @@ rather than shadowed (`electrolites/features.py`,
 | `fastvnlch` | `hessian.rks._get_vnlc_deriv1` (and its `uks`/DF bindings) — the VV10 Fock derivative's atom loops as one GEMM per block | `docs/README_fastvv10ft.md` §6 |
 | `fastir` | `properties.ir.eval_ir_freq_intensity` — the Hessian's CPHF solution reused for the dipole derivative | `docs/README_fastir.md` |
 | `fastnacms` | `tdscf.rhf.TDBase.force_and_nacv` — the force and all NACs through the batched multi-state solver (restricted singlets) | `docs/README_fastnacms.md` |
-| `fastnmr` | `properties.shielding.nr_rks` — the NMR shielding's GIAO XC term with the GIAO AOs formed on the GPU | `docs/README_fastnmr.md` |
+| `fastnmr` | `properties.shielding.nr_rks` — the NMR shielding's GIAO XC term with the GIAO AOs formed on the GPU; `shielding.get_vxc` — the host GIAO two-electron term J-only for pure functionals | `docs/README_fastnmr.md` |
 | `fasttdejk` | `grad.tdrhf._jk_energies_per_atom` — the TDDFT gradient / NAC two-electron derivative for density pairs, a generated kernel family | `docs/README_fasttdejk.md` |
 | `fastdfmp2` | `mp.dfmp2_addons.get_df{,u}mp2_energy_pair_intra` — the DF-MP2 / DF-UMP2 pair-energy loops as block GEMMs | `docs/README_fastdfmp2.md` |
 | `fastc6` | `properties.c6._solve_full_spectrum`, `calc_c6` — the C6 full-spectrum solve with the ERI and the linear algebra on the device | `docs/README_fastc6.md` |
@@ -296,6 +296,14 @@ first that its slot is still empty upstream
 | `casscf` | `mf.CASSCF` / `mf.CASCI` (and `electrolites.casscf_gpu.CASSCF`): PySCF's CASSCF/CASCI, state averaging included, with the FCI solver (σ, Davidson, RDMs), the `_ERIS`, and every J/K on the device; density-fitted for a DF mean field, exact integrals otherwise | [M1–M5, M2], §13 |
 | `dfmp2_grad` | `DFMP2.Gradients()` and `DFMP2.make_rdm1_relaxed()` on GPU4PySCF's DF-MP2: the RI-MP2 nuclear gradient (PySCF has none) on an RHF or global-hybrid RKS reference, exact or DF SCF, frozen core, spin-component scaling | [P3], §14 |
 | `dhdft` | `electrolites.dhdft.DoubleHybrid(mol, 'B2PLYP')` (also B2GP-PLYP, mPW2PLYP, PBE0-DH, PBE-QIDH, or custom): double-hybrid energies and analytic gradients, absent from both PySCF and GPU4PySCF | [P4], §14 |
+| `casscf` (gradients) | `mc.nuc_grad_method()` of a GPU DF-CASSCF (single state), of a GPU DF-SA-CASSCF (PySCF's Lagrangian, response on the device), and `mc.nac_method()` — DF non-adiabatic couplings, which PySCF has only for exact integrals | [M6], §15 |
+| `mcpdft` | `electrolites.mcpdft_gpu.MCPDFT(gpu_mc, 'tPBE')` (or `.CASSCF`/`.CASCI`): PySCF's MC-PDFT with the classical energy from the GPU J/K and the on-top energy on the device (translated/fully-translated LDA/GGA, hybrids, state averaging) | [M8], §15 |
+| `nevpt2` | `electrolites.nevpt2_gpu.NEVPT(gpu_mc)`: SC-NEVPT2 with the 3-RDM and the 4-RDM contractions (PySCF's `f3ca`/`f3ac`), the DF integrals and the S_r/S_i/S_ijrs spaces on the device | [M7], §15 |
+| `rpa` | `electrolites.rpa_gpu.RPA(gpu_mf)`: direct RPA correlation energy | [P8], §15 |
+| `gw` | `electrolites.gw_gpu.GWAC(gpu_mf)`: PySCF's G0W0 (analytic continuation) with the integrals, the self-energy loop and V_xc/Σ_x on the device | [P9], §15 |
+| `pbc_tda` | `electrolites.pbc_tdscf.TDA(gpu_cell_mf)`: Γ-point periodic TDA (RKS/RHF, singlet and triplet); the corrected periodic `gen_response` is D10 in `fixes` | [X1], §15 |
+| `ssc` | `electrolites.ssc_gpu.SSC(gpu_mf)`: NMR spin–spin couplings (DSO, PSO, FC, FC+SD) for RHF/RKS | [O2], §15 |
+| `nmr_uks` | `electrolites.nmr_uks.NMR(gpu_uks)`: GIAO shielding for UHF/UKS (GPU4PySCF's is closed-shell only); the `int2e_ig1` term stays on the host | [O1], §15 |
 
 ## Tests
 

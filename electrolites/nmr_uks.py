@@ -30,7 +30,7 @@ from pyscf.data import nist
 from pyscf.scf import _vhf
 
 
-def krylov_refined(aop, b, tol=1e-9, max_cycle=20, max_refine=3):
+def krylov_refined(aop, b, tol=1e-9, max_cycle=20, max_refine=3, rtol=None):
     """(1 + A) x = b for rows of b by GPU4PySCF's Krylov solver plus
     iterative refinement.  That solver stops once a new subspace vector's
     squared norm drops below its absolute ``lindep`` (1e-13), i.e. near a
@@ -45,7 +45,7 @@ def krylov_refined(aop, b, tol=1e-9, max_cycle=20, max_refine=3):
     for _ in range(max_refine):
         r = b - x - aop(x)
         rn = cp.linalg.norm(r, axis=1)
-        if float((rn / cp.maximum(bnorm, 1e-300)).max()) < tol:
+        if float((rn / cp.maximum(bnorm, 1e-300)).max()) < (rtol or tol):
             break
         keep = rn > 0
         sc = cp.where(keep, rn, 1.)
@@ -188,9 +188,9 @@ class NMR(lib.StreamObject):
         e = [cp.asarray(mf.mo_energy[s]) for s in (0, 1)]
         co = [C[s][:, occ[s]] for s in (0, 1)]
         nocc = [int(o.sum()) for o in occ]
-        h1 = [cp.einsum('xpq,pi,qj->xij', h1ao[s], C[s], co[s])
+        h1 = [C[s].T @ h1ao[s] @ co[s]
               for s in (0, 1)]
-        s1 = [cp.einsum('xpq,pi,qj->xij', s1ao, C[s], co[s])
+        s1 = [C[s].T @ s1ao @ co[s]
               for s in (0, 1)]
         hs = [h1[s] - s1[s] * e[s][occ[s]] for s in (0, 1)]
         eai = [e[s][~occ[s], None] - e[s][occ[s]][None] for s in (0, 1)]
@@ -208,11 +208,11 @@ class NMR(lib.StreamObject):
 
         def vind(m):
             """the virtual-occupied response to full mo1 (3 x 2 spins)."""
-            dm = cp.stack([cp.einsum('pa,zai,qi->zpq', C[s], m[s], co[s])
+            dm = cp.stack([C[s] @ m[s] @ co[s].T
                            for s in (0, 1)])
             dm = dm - dm.transpose(0, 1, 3, 2)
             v = cp.asarray(vresp(dm))
-            return [cp.einsum('pa,zpq,qi->zai', C[s][:, ~occ[s]], v[s],
+            return [(C[s][:, ~occ[s]].T @ v[s] @
                               co[s]) for s in (0, 1)]
 
         n0 = nv[0] * nocc[0]
@@ -271,7 +271,7 @@ class NMR(lib.StreamObject):
         for s in (0, 1):
             C = cp.asarray(mf.mo_coeff[s])
             co = C[:, cp.asnumpy(mf.mo_occ[s]) > 0]
-            dm10 = dm10 + cp.einsum('pa,xai,qi->xpq', C, mo10[s], co)
+            dm10 = dm10 + C @ mo10[s] @ co.T
         out = []
         for atm_id in self.shielding_nuc:
             with mol.with_rinv_origin(mol.atom_coord(atm_id)):

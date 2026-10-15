@@ -151,10 +151,10 @@ class TDA(lib.StreamObject):
 
         def vind(zs):
             zs = cp.asarray(zs).reshape(-1, no, nv)
-            dms = 2 * cp.einsum('pi,zia,qa->zpq', co, zs, cv)
+            dms = 2 * co @ zs @ cv.T
             with lib.temporary_env(mf, exxdiv=None):
                 v1 = vresp(dms)
-            out = cp.einsum('pi,zpq,qa->zia', co, v1, cv)
+            out = co.T @ v1 @ cv
             out += zs * e_ia.reshape(no, nv)[None]
             return out.reshape(len(zs), -1)
         return vind, e_ia
