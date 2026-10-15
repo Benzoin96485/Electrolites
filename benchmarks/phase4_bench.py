@@ -155,7 +155,8 @@ elif a.what == 'gw':
         from electrolites.gw_gpu import GWAC
         g = GWAC(mf)
     g.orbs = list(range(nocc - 3, nocc + 3))
-    timed('gw_s', g.kernel, True)
+    timed('gw_s', lambda: (setattr(g, 'mo_energy', np.array(
+        g._scf.mo_energy)), g.kernel()), True)
     rec['homo'] = float(np.asarray(g.mo_energy)[nocc - 1])
 side = 'CPU' if a.cpu else 'GPU'
 print(f"[{a.what} {side} {os.path.basename(a.xyz)}/{a.basis} CAS{a.cas}] "
