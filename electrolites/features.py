@@ -220,6 +220,8 @@ register('rpa', 'rpa_gpu',
          doc='[P8] direct RPA correlation energy on the GPU (rpa_gpu.RPA)')
 register('gw', 'gw_gpu',
          doc='[P9] G0W0-AC with the self-energy loop on the GPU (gw_gpu.GWAC)')
+register('pbc_tda', 'pbc_tdscf',
+         doc='[X1] Gamma-point periodic TDA on the GPU (pbc_tdscf.TDA)')
 register('ccsd_t', 'ccsd_t',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ccsd_t')],
          doc='[P1] closed-shell (T) on the device')
