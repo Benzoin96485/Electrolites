@@ -124,20 +124,29 @@ def nr_rks(ni, mol, grids, xc_code, dms):
 
 
 def get_vxc(mf, dm0):
-    """``shielding.get_vxc`` with the host GIAO two-electron term J-only for
-    pure functionals: upstream always forms J and K from ``int2e_ig1`` and
-    drops K for them (30 % of that term at 22 atoms, 7.7 s -> 5.3 s on the
-    login node)."""
+    """``shielding.get_vxc`` with the GIAO two-electron term on the GPU
+    (``electrolites.giao_jk``: shifted-basis J/K instead of the host
+    ``int2e_ig1``; K only for hybrids).  ``FASTNMR_HOST2E=1`` keeps the
+    host term (J-only for pure functionals)."""
     ni = mf._numint
-    if ni.libxc.is_hybrid_xc(mf.xc):
-        return SH._get_vxc_orig(mf, dm0)
-    from pyscf.scf import _vhf
     mol = mf.mol
+    hybrid = ni.libxc.is_hybrid_xc(mf.xc)
     vxc = SH.nr_rks(ni, mol, mf.grids, mf.xc, mf.make_rdm1())
-    vj = _vhf.direct_mapdm(mol._add_suffix('int2e_ig1'), 'a4ij', 'lk->s1ij',
-                           cupy.asnumpy(dm0), 3, mol._atm, mol._bas,
-                           mol._env)
-    return vxc - cupy.asarray(vj)
+    if os.environ.get('FASTNMR_HOST2E'):
+        if hybrid:
+            return SH._get_vxc_orig(mf, dm0)
+        from pyscf.scf import _vhf
+        vj = _vhf.direct_mapdm(mol._add_suffix('int2e_ig1'), 'a4ij',
+                               'lk->s1ij', cupy.asnumpy(dm0), 3, mol._atm,
+                               mol._bas, mol._env)
+        return vxc - cupy.asarray(vj)
+    from electrolites import giao_jk
+    vj, vk = giao_jk.get_jk(mol, dm0, with_k=hybrid)
+    if not hybrid:
+        return vxc + vj
+    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
+    assert omega == 0
+    return vxc + vj - vk * hyb * .5
 
 
 _PATCHED = False

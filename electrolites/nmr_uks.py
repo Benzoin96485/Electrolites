@@ -8,9 +8,9 @@ on a GPU4PySCF UHF/UKS:
 * the spin-resolved GIAO XC matrix on the device, by the regrouped GEMM of
   ``electrolites.fastnmr`` with the spin-polarised kernel (one pass over
   the grid for both spins, the GIAO AO factors built from the block's AOs);
-* the GIAO two-electron term ``int2e_ig1`` on the host, as GPU4PySCF's RKS
-  path (the kernel KT:C6 is the open part of O1), but J-only for pure
-  functionals (GPU4PySCF's RKS path forms K for them too);
+* the GIAO two-electron term on the device through shifted-basis J/K
+  (``electrolites.giao_jk``; ``host_2e=True``: libcint ``int2e_ig1`` on
+  the host as GPU4PySCF's RKS path), K only for hybrids;
 * the coupled equations with the first-order overlap (pyscf ``ucphf``
   ``solve_withs1``: occupied-occupied block -S1/2, Krylov in the
   virtual-occupied block) on the device, the response
@@ -114,9 +114,13 @@ def get_vxc_giao(ni, mol, grids, xc_code, mo_coeff, mo_occ):
     return vmat - vmat.transpose(0, 1, 3, 2)
 
 
-def get_jk_giao(mol, dm, with_k=True):
-    """GIAO J (and K) for spin densities dm (2, nao, nao), host libcint
-    ``int2e_ig1`` (pyscf-properties' ``rhf.get_jk``)."""
+def get_jk_giao(mol, dm, with_k=True, host=False):
+    """GIAO J (and K) for spin densities dm (2, nao, nao): on the GPU by
+    ``electrolites.giao_jk``, or (``host``) from libcint ``int2e_ig1``
+    (pyscf-properties' ``rhf.get_jk``)."""
+    if not host:
+        from electrolites import giao_jk
+        return giao_jk.get_jk(mol, dm, with_k=with_k)
     intor = mol._add_suffix('int2e_ig1')
     dm = cp.asnumpy(dm)
     if with_k:
@@ -143,6 +147,7 @@ class NMR(lib.StreamObject):
         self.max_cycle_cphf = 20
         self.conv_tol = 1e-9
         self.mo10 = None
+        self.host_2e = False
         self.timings = {}
 
     def _hyb(self):
@@ -166,7 +171,8 @@ class NMR(lib.StreamObject):
                                          mf.mo_coeff, mf.mo_occ))
         else:
             h1 = cp.zeros((2, 3, mol.nao, mol.nao))
-        vj, vk = get_jk_giao(mol, dm0, with_k=abs(hyb) > 1e-10)
+        vj, vk = get_jk_giao(mol, dm0, with_k=abs(hyb) > 1e-10,
+                             host=self.host_2e)
         h1 += (vj[0] + vj[1])[None]
         if vk is not None:
             h1 -= hyb * vk

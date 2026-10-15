@@ -225,8 +225,8 @@ register('pbc_tda', 'pbc_tdscf',
 register('ssc', 'ssc_gpu',
          doc='[O2] NMR spin-spin coupling (RHF/RKS) on the GPU (ssc_gpu.SSC)')
 register('nmr_uks', 'nmr_uks',
-         doc='[O1] GIAO NMR shielding for UHF/UKS (nmr_uks.NMR); '
-             'the int2e_ig1 term stays on the host')
+         doc='[O1] GIAO NMR shielding for UHF/UKS (nmr_uks.NMR), the GIAO '
+             'two-electron term on the GPU (giao_jk)')
 register('ccsd_t', 'ccsd_t',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ccsd_t')],
          doc='[P1] closed-shell (T) on the device')

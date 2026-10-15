@@ -245,7 +245,7 @@ rather than shadowed (`electrolites/features.py`,
 | `fastvnlch` | `hessian.rks._get_vnlc_deriv1` (and its `uks`/DF bindings) — the VV10 Fock derivative's atom loops as one GEMM per block | `docs/README_fastvv10ft.md` §6 |
 | `fastir` | `properties.ir.eval_ir_freq_intensity` — the Hessian's CPHF solution reused for the dipole derivative | `docs/README_fastir.md` |
 | `fastnacms` | `tdscf.rhf.TDBase.force_and_nacv` — the force and all NACs through the batched multi-state solver (restricted singlets) | `docs/README_fastnacms.md` |
-| `fastnmr` | `properties.shielding.nr_rks` — the NMR shielding's GIAO XC term with the GIAO AOs formed on the GPU; `shielding.get_vxc` — the host GIAO two-electron term J-only for pure functionals | `docs/README_fastnmr.md` |
+| `fastnmr` | `properties.shielding.nr_rks` — the NMR shielding's GIAO XC term with the GIAO AOs formed on the GPU; `shielding.get_vxc` — the GIAO two-electron term on the GPU through shifted-basis J/K (`electrolites.giao_jk`) instead of the host `int2e_ig1` | `docs/README_fastnmr.md` |
 | `fasttdejk` | `grad.tdrhf._jk_energies_per_atom` — the TDDFT gradient / NAC two-electron derivative for density pairs, a generated kernel family | `docs/README_fasttdejk.md` |
 | `fastdfmp2` | `mp.dfmp2_addons.get_df{,u}mp2_energy_pair_intra` — the DF-MP2 / DF-UMP2 pair-energy loops as block GEMMs | `docs/README_fastdfmp2.md` |
 | `fastc6` | `properties.c6._solve_full_spectrum`, `calc_c6` — the C6 full-spectrum solve with the ERI and the linear algebra on the device | `docs/README_fastc6.md` |
@@ -303,7 +303,7 @@ first that its slot is still empty upstream
 | `gw` | `electrolites.gw_gpu.GWAC(gpu_mf)`: PySCF's G0W0 (analytic continuation) with the integrals, the self-energy loop and V_xc/Σ_x on the device | [P9], §15 |
 | `pbc_tda` | `electrolites.pbc_tdscf.TDA(gpu_cell_mf)`: Γ-point periodic TDA (RKS/RHF, singlet and triplet); the corrected periodic `gen_response` is D10 in `fixes` | [X1], §15 |
 | `ssc` | `electrolites.ssc_gpu.SSC(gpu_mf)`: NMR spin–spin couplings (DSO, PSO, FC, FC+SD) for RHF/RKS | [O2], §15 |
-| `nmr_uks` | `electrolites.nmr_uks.NMR(gpu_uks)`: GIAO shielding for UHF/UKS (GPU4PySCF's is closed-shell only); the `int2e_ig1` term stays on the host | [O1], §15 |
+| `nmr_uks` | `electrolites.nmr_uks.NMR(gpu_uks)`: GIAO shielding for UHF/UKS (GPU4PySCF's is closed-shell only), with the GIAO two-electron term on the GPU (`electrolites.giao_jk`, shifted-basis J/K) | [O1], §15 |
 
 ## Tests
 

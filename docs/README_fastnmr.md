@@ -61,15 +61,19 @@ GIAO XC matrix to ≤ 5.4e-15 relative, the shielding tensors to ≤ 2.8e-12 ppm
 against GPU4PySCF.  Meta-GGA and NLC raise in upstream and fall through to it
 here unchanged.
 
-## The GIAO two-electron term for pure functionals (2026-10-15)
+## The GIAO two-electron term on the GPU (2026-10-15)
 
-`shielding.get_vxc` also forms the host `int2e_ig1` term. Upstream always
-builds J and K there (`_vhf.direct_mapdm` with two contractions) and
-discards K when the functional has no exact exchange. The patched
-`get_vxc` asks for J alone in that case: 7.7 → 5.3 s for that call at
-alanine dipeptide/def2-SVP (login node, 8 threads), bit-identical matrix
-(`tests/test_nmr.py`, `dVxc 0`). Hybrids are upstream's. The kernel itself
-(a GPU `int2e_ig1`, FEATURE_TARGETS O1/KT:C6) is still the open item.
+`shielding.get_vxc` also forms the GIAO two-electron term from libcint's
+`int2e_ig1` on the host (`_vhf.direct_mapdm`), which after the XC fix above
+was the whole remaining cost (FEATURE_TARGETS O1/KT:C6). It is now
+`electrolites.giao_jk`: (g i j|k l) = −½ (R_i − R_j) × (i r j|k l), and
+r χ_j = (r − R_j) χ_j + R_j χ_j with (r − R_j)_k χ_j a Cartesian Gaussian of
+one higher l on the same centre, so the GIAO J and K are blocks of ordinary
+GPU J/K builds on the basis concatenated with its l+1 copy (one J, and a
+four-density K for hybrids). Equal to `int2e_ig1` to 1e-13
+(`tests/test_giao_jk.py`), shieldings to 4e-12 ppm (`tests/test_nmr.py`).
+FEATURE_TARGETS §15 has the timings. `FASTNMR_HOST2E=1` keeps the host term
+(J-only for pure functionals).
 
 | | |
 |---|---|
