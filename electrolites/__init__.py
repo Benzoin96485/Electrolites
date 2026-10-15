@@ -39,7 +39,6 @@ MODULES = (
     'fastxcfxc', 'fastfnlc', 'fastvv10ft', 'fastvnlch', 'fastjk', 'fastejk2', 'fastdf', 'fastdfj',
     'fastdfj3c', 'fastdfgrad', 'fastdfcderi', 'fastdffp32', 'fastdfhess',
     'fastdfhessip', 'fastdfrsh', 'planguard', 'fastcphf', 'fastir', 'fastnacms', 'fastnmr', 'fasttdejk', 'fastdfmp2', 'fastc6', 'fastqmmm', 'fastpbcgrad', 'fastmcfun', 'fastfftk', 'fastgridresp', 'fastjkip1', 'fastsfxc', 'fastpcmbatch', 'fastscfscreen', 'fastmp2', 'fastccsd', 'fastrshresp', 'fastpbcdf',
-    'fasttdpcmgrad',
     # not kernels: correctness guards and small upstream repairs
     # (docs/FEATURE_TARGETS_PYSCF_2.13.md 3.2, 3.3).  Last, so that they wrap
     # whatever the modules above put in place
@@ -245,9 +244,6 @@ _TARGETS = {
     'fastsfxc': (('gpu4pyscf.tdscf._uhf_resp_sf', 'mcfun_eval_xc_adapter_sf'),
                  ('gpu4pyscf.grad.tduks_sf', 'mcfun_eval_xc_adapter_sf')),
     # int1e_grids with many densities / charge vectors in one pass (F9)
-    'fasttdpcmgrad': (('gpu4pyscf.solvent.grad.pcm', 'get_dD_dS'),
-                      ('gpu4pyscf.solvent.tdscf.pcm',
-                       'WithSolventTDSCFGradient.grad_elec')),
     'fastpcmbatch': (('gpu4pyscf.gto.int3c1e', 'int1e_grids'),
                      ('gpu4pyscf.solvent.pcm', 'int1e_grids')),
     # direct SCF: loose screening while the density is far off, then a
