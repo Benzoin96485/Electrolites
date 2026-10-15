@@ -57,6 +57,28 @@ def _rho(ao, dm, nd):
     return out
 
 
+_GRIDS = {}
+
+
+def _grid(grids, mol):
+    """The device coordinates/weights of ``grids``.  PySCF's ``energy_tot``
+    resets the on-top functional (and so its grid) on every call, and the
+    host build was two thirds of a GPU MC-PDFT energy (Ni dithiolene,
+    0.46 of 0.69 s); it is cached per molecule and grid setting."""
+    key = (id(mol), mol.atom_coords().tobytes(), grids.level,
+           str(grids.atom_grid), str(grids.prune), str(grids.radi_method),
+           str(grids.becke_scheme), grids.radii_adjust is None)
+    hit = _GRIDS.get(key)
+    if hit is not None and hit[0] is mol:
+        return hit[1], hit[2]
+    if grids.coords is None:
+        grids.build()
+    out = (mol, cp.asarray(grids.coords), cp.asarray(grids.weights))
+    _GRIDS.clear()
+    _GRIDS[key] = out
+    return out[1], out[2]
+
+
 def energy_ot(ot, casdm1s, casdm2, mo_coeff, ncore, max_memory=2000,
               hermi=1):
     """GPU version of PySCF ``otfnal.energy_ot`` for translated functionals
@@ -79,10 +101,7 @@ def energy_ot(ot, casdm1s, casdm2, mo_coeff, ncore, max_memory=2000,
     ca = cp.asarray(mo_coeff[:, ncore:ncore + ncas])
     cm2 = cp.asarray(cascm2).reshape(ncas * ncas, ncas * ncas)
     grids = ot.grids
-    if grids.coords is None:
-        grids.build()
-    coords = cp.asarray(grids.coords)
-    weights = cp.asarray(grids.weights)
+    coords, weights = _grid(grids, mol)
     nd = 1 if ot.xctype == 'LDA' else 4
     ni = gnumint.NumInt()
     e_ot = 0.
