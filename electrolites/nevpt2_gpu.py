@@ -127,22 +127,24 @@ def make_dm123_f3(civec, eri, norb, nelec, with_dm3=True, with_f3=True,
     if with_f3:
         # W[a, j] = sum_ki (ki|aj) T_ki ; Y[x, a] = sum_j E_xj W[a, j];
         # Z[a, x] = sum_j E_jx W[a, j]
-        g = cp.asarray(eri, dtype=np.float64).reshape(n * n, n * n)
-        w = (g.T @ t2).reshape(n, n, ex.na, ex.nb)               # (a, j)
+        # W one j column at a time (never the full n^2 N_det W)
+        g = cp.asarray(eri, dtype=np.float64).reshape(n * n, n, n)
         y = cp.zeros((n, n, ex.na, ex.nb))                       # (x4, a)
         z = cp.zeros((n, n, ex.na, ex.nb))                       # (a, x5)
         for j in range(n):
-            wj = cp.ascontiguousarray(w[:, j])                   # all a
+            wj = (cp.ascontiguousarray(g[:, :, j]).T @ t2).reshape(
+                n, ex.na, ex.nb)                                 # all a
             for x in range(n):
                 y[x] += ex.apply(x, j, wj)
                 z[:, x] += ex.apply(j, x, wj)
-        w = None
+            wj = None
         sets += [y.reshape(n * n, nd), z.reshape(n * n, nd)]
+        y = z = None
     if not sets:
         return cp.asnumpy(dm1), cp.asnumpy(dm2), None, None, None
-    vstack = cp.concatenate(sets) if len(sets) > 1 else sets[0]
-    sets = y = z = None
-    nv = vstack.shape[0]
+    # the V sets are used in place (no stacked copy: at CAS(14,14) each
+    # is 18 GB)
+    nv = len(sets) * n * n
     res = cp.empty((n * n, n, n, nv))                 # [(x1 x0), r, s, k]
     if max_bytes is None:
         max_bytes = int(0.25 * (cp.cuda.runtime.memGetInfo()[0]
@@ -152,8 +154,10 @@ def make_dm123_f3(civec, eri, norb, nelec, with_dm3=True, with_f3=True,
         for s_ in range(n):
             for b0 in range(0, n * n, blk):
                 b1 = min(n * n, b0 + blk)
-                u = ex.apply(s_, r, t[b0:b1])                    # E_sr T_pq
-                res[b0:b1, r, s_] = u.reshape(b1 - b0, nd) @ vstack.T
+                u = ex.apply(s_, r, t[b0:b1]).reshape(b1 - b0, nd)  # E_sr T
+                for k, v in enumerate(sets):
+                    res[b0:b1, r, s_, k * n * n:(k + 1) * n * n] = u @ v.T
+                u = None
     # res[(p q), r, s, k] = <T_pq| E_rs |V_k>, bra index (x0, x1) = (q, p)
     res = res.reshape(n, n, n, n, nv).transpose(1, 0, 2, 3, 4)
     k = 0
