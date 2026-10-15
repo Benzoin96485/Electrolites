@@ -96,10 +96,11 @@ class SSC(lib.StreamObject):
         self.conv_tol = 1e-9
         self.dso = 'grid'
         self.max_dms = 48
-        # relative CPHF residual the refinement stops at: 1e-6 is pyscf's
-        # own level (~2e-7) at a third of the cost of 1e-9 (each refinement
-        # is another Krylov solve over 3 N_atom right-hand sides)
-        self.refine_tol = 1e-6
+        # relative CPHF residual above which the solve is refined once more
+        # (each refinement is a second Krylov solve of the same cost over
+        # 3 N_atom right-hand sides): the first solve, right-hand sides at
+        # unit norm, ends at 1e-6..1e-5; pyscf-properties' at ~1e-6
+        self.refine_tol = 3e-6
         self.e11 = self.k_hz = self.j_hz = None
 
     # ------------------------------------------------------------ helpers

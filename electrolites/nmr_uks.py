@@ -40,8 +40,11 @@ def krylov_refined(aop, b, tol=1e-9, max_cycle=20, max_refine=3, rtol=None):
     factor."""
     from gpu4pyscf.lib.cupy_helper import krylov
     b = cp.asarray(b)
-    x = krylov(aop, b, tol=tol, max_cycle=max_cycle)
+    # rows at unit norm first: the solver's stop is absolute
     bnorm = cp.linalg.norm(b, axis=1)
+    sc = cp.where(bnorm > 0, bnorm, 1.)
+    x = krylov(aop, b / sc[:, None], tol=tol,
+               max_cycle=max_cycle) * sc[:, None]
     for _ in range(max_refine):
         r = b - x - aop(x)
         rn = cp.linalg.norm(r, axis=1)
