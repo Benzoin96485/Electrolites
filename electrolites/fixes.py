@@ -33,6 +33,12 @@ performance change; each is checked in `tests/test_fixes.py`.
   version has the same argument-order bug and now raises for
   ``singlet`` not None (X2 is not built); ``singlet=None`` (SOSCF) is
   upstream's in both.
+* **V3 Gaussian MM charges in QM/MM.**  The one-electron MM integrals
+  already take the Gaussian exponents, but ``energy_nuc`` and the gradient's
+  ``grad_nuc`` assert point charges, and ``grad_nuc_mm`` silently used the
+  point-charge kernel for Gaussian ones.  All three now use PySCF's
+  erf-screened nucleus-MM interaction (``qmmm/itrf.py``); point charges are
+  unchanged.
 """
 import numpy as np
 import cupy
@@ -270,3 +276,59 @@ if not hasattr(pbc_rks.RKS.gen_response, '__wrapped__'):
 if not hasattr(pbc_krks.KRKS.gen_response, '__wrapped__'):
     pbc_krks.KRKS.gen_response = _wrap_kpbc_response(
         pbc_krks.KRKS.gen_response)
+
+
+# ---------------------------------------------- V3 Gaussian MM charges
+from gpu4pyscf.qmmm import itrf as _qmmm                     # noqa: E402
+
+
+def _nuc_mm_kernel(mol, mm_mol):
+    """(q_A Z_I, R_A - R_I, f(r), g(r)): E = sum q Z f(r), dE/dR_A =
+    sum q Z g(r) (R_A - R_I); f = 1/r or erf(r/a)/r, g = -1/r^3 or
+    -(erf(r/a)/r - 2/(sqrt(pi) a) exp(-r^2/a^2)) / r^2 (PySCF qmmm)."""
+    from scipy.special import erf
+    coords = mm_mol.atom_coords()
+    charges = mm_mol.atom_charges()
+    z = mol.atom_charges()
+    d = mol.atom_coords()[:, None, :] - coords[None, :, :]       # (A, I, 3)
+    r = np.linalg.norm(d, axis=2)
+    qz = z[:, None] * charges[None, :]
+    if mm_mol.charge_model == 'gaussian':
+        expnts = mm_mol.get_zetas()
+        radii = 1 / np.sqrt(expnts)
+        f = erf(r / radii) / r
+        g = -(f - 2 / (np.sqrt(np.pi) * radii) * np.exp(-expnts * r ** 2)) \
+            / r ** 2
+    else:
+        f = 1 / r
+        g = -1 / r ** 3
+    return qz, d, f, g
+
+
+def _energy_nuc(self):
+    nuc = super(_qmmm.QMMMSCF, self).energy_nuc()
+    qz, d, f, g = _nuc_mm_kernel(self.mol, self.mm_mol)
+    return nuc + float((qz * f).sum())
+
+
+def _grad_nuc(self, mol=None, atmlst=None):
+    if mol is None:
+        mol = self.mol
+    g_qm = super(_qmmm.QMMMGrad, self).grad_nuc(mol, atmlst)
+    qz, d, f, g = _nuc_mm_kernel(mol, self.base.mm_mol)
+    g_mm = np.einsum('AI,AIx->Ax', qz * g, d)
+    if atmlst is not None:
+        g_mm = g_mm[atmlst]
+    return g_qm + g_mm
+
+
+def _grad_nuc_mm(self, mol=None):
+    if mol is None:
+        mol = self.mol
+    qz, d, f, g = _nuc_mm_kernel(mol, self.base.mm_mol)
+    return -np.einsum('AI,AIx->Ix', qz * g, d)
+
+
+_qmmm.QMMMSCF.energy_nuc = _energy_nuc
+_qmmm.QMMMGrad.grad_nuc = _grad_nuc
+_qmmm.QMMMGrad.grad_nuc_mm = _grad_nuc_mm

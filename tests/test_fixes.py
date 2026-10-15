@@ -98,5 +98,33 @@ c.kernel()
 report('DF-UMP2 frozen=1 with_t2', abs(pt.e_corr - c.e_corr) < 1e-8,
        f'{abs(pt.e_corr - c.e_corr):.1e}')
 
+print('V3 Gaussian MM charges (QM/MM) against PySCF, B3LYP water + 3 charges')
+from pyscf import qmmm as cqmmm                                 # noqa: E402
+from gpu4pyscf import dft as gdft                               # noqa: E402
+from gpu4pyscf.qmmm import itrf as gitrf                        # noqa: E402
+wat = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587',
+            basis='def2-svp', verbose=0)
+mm_xyz = np.array([[1.5, 0.3, 2.0], [-1.8, 0.4, -1.2], [0.2, 2.5, 0.7]])
+mm_q = np.array([-0.8, 0.4, 0.4])
+for rad in (None, np.array([0.8, 0.5, 0.5])):
+    mf = gitrf.mm_charge(gdft.RKS(wat, xc='b3lyp'), mm_xyz, mm_q, radii=rad,
+                         unit='Angstrom').run(conv_tol=1e-11)
+    gg = mf.nuc_grad_method()
+    gq = cupy.asnumpy(gg.kernel())
+    gm = gg.grad_nuc_mm() + cupy.asnumpy(gg.grad_hcore_mm(mf.make_rdm1()))
+    mc = cqmmm.mm_charge(wat.RKS(xc='b3lyp'), mm_xyz, mm_q, radii=rad,
+                         unit='Angstrom')
+    mc.grids.level = mf.grids.level
+    mc.run(conv_tol=1e-11)
+    gc = mc.nuc_grad_method()
+    gcq = gc.kernel()
+    gcm = gc.grad_nuc_mm() + gc.grad_hcore_mm(mc.make_rdm1())
+    de, dq, dm_ = (abs(mf.e_tot - mc.e_tot), abs(gq - gcq).max(),
+                   abs(gm - gcm).max())
+    # 8e-8 on the QM gradient is the KS grid response, as for point charges
+    report(f'{"Gaussian" if rad is not None else "point"} charges: E, '
+           'QM and MM gradients', de < 1e-9 and dq < 5e-7 and dm_ < 1e-7,
+           f'{de:.1e} {dq:.1e} {dm_:.1e}')
+
 print('FAILED: ' + ', '.join(fails) if fails else 'all passed')
 sys.exit(1 if fails else 0)
