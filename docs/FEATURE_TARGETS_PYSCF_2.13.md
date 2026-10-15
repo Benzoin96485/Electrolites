@@ -714,6 +714,26 @@ J/K on the device, DF and exact. Left: M4's host loops (`gen_g_hop`,
 X1 (with D10), P8 and P9 built and tested against PySCF / pyscf-properties;
 X2 (k-point TDDFT) is not started.
 
+**Phase 5 — the host loops Phase 4 measured, k-points, and the glue**
+(planned 2026-10-15, after §15)
+
+- **M4 proper**: `gen_g_hop`'s per-orbital loops as batched device GEMMs,
+  `solve_approx_ci` and the AH vectors on the device. §13.3 measured the
+  host side as most of a CAS(14,14) macro-iteration, and §15.1 the SA
+  gradient and NACs (PySCF's Lagrange CG over `gen_g_hop`) at 5–8x where
+  the device-only single-state gradient is 7–9x.
+  - *Accept*: CASSCF energies unchanged to 1e-10; per-macro time at
+    p-benzyne (14,14) and Ni (14,13) against §13.3; SA gradient and NAC
+    against §15.1.
+- **X2 → X3**: k-point TDA at kshift = 0 (k-blocked transition densities,
+  multi-density FFT K), then PBC stability on X1/X2.
+- **Glue** (§5.2): V3 Gaussian MM charges, V2 the QM/MM Hessian's MM-charge
+  terms, V5 one TDDFT-PCM gradient build, O3 the UKS IR/Raman/polarizability
+  drivers and the frequency-dependent polarizability, T1 cube files / MEP.
+
+**Phase 6** — §5.1 ranks 10–15 (S5, S6, S7, X4, P6, P10), re-ranked first
+against what Phases 4–5 measured.
+
 §5.2's glue items run alongside every phase. They need no kernel work, and
 each closes a crash or a host-only route that users hit today.
 
