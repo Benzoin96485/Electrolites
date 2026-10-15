@@ -334,6 +334,53 @@ def _ss_maps(norb, neleca, nelecb):
     return m
 
 
+_SS_SPARSE = {}
+SS_SPARSE_MAX_NNZ = 2e8
+
+
+def _ss_sparse(norb, neleca, nelecb):
+    """S^2 as one device CSR matrix over the determinants (built once per
+    (norb, nelec) from the string maps; None when it would exceed
+    SS_SPARSE_MAX_NNZ, e.g. CAS(14,14)): at small CAS the per-orbital
+    gather/scatter is launch-bound (13 ms per call at (10,10), slower than
+    PySCF's host loop), one sparse matvec is not."""
+    key = (norb, neleca, nelecb)
+    if key in _SS_SPARSE:
+        return _SS_SPARSE[key]
+    import scipy.sparse as sp
+    from cupyx.scipy import sparse as csp
+    m = _ss_maps(norb, neleca, nelecb)
+    na, nb = m['na'], m['nb']
+    est = na * nb * (min(neleca, norb - nelecb) * min(nelecb, norb - neleca)
+                     + 1) * 2
+    if est > SS_SPARSE_MAX_NNZ:
+        _SS_SPARSE[key] = None
+        return None
+    total = sp.csr_matrix((na * nb, na * nb))
+    for amap, bmap, shape in (('ades', 'bcre', 'pm'), ('acre', 'bdes', 'mp')):
+        A, Bm = m[amap], m[bmap]
+        if A is None or Bm is None:
+            continue
+        nta, ntb = m[shape]
+        rows, cols, vals = [], [], []
+        for i in range(norb):
+            ma, aa, sa = (cp.asnumpy(x) for x in A[i])
+            mb, ab, sb = (cp.asnumpy(x) for x in Bm[i])
+            if ma.size == 0 or mb.size == 0:
+                continue
+            rows.append((aa[:, None] * ntb + ab[None, :]).ravel())
+            cols.append((ma[:, None] * nb + mb[None, :]).ravel())
+            vals.append((sa[:, None] * sb[None, :]).ravel())
+        M = sp.csr_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(nta * ntb, na * nb))
+        total = total + M.T @ M
+    total = total * .5 + sp.identity(na * nb) * ((neleca - nelecb) ** 2 * .25)
+    op = csp.csr_matrix(total.tocsr())
+    _SS_SPARSE[key] = op
+    return op
+
+
 class FCISolver(direct_spin1.FCISolver):
     """``direct_spin1.FCISolver`` with the sigma build, the Davidson
     vectors and the RDMs on the GPU."""
@@ -390,6 +437,10 @@ class FCISolver(direct_spin1.FCISolver):
         neleca, nelecb = direct_spin1._unpack_nelec(nelec, self.spin)
         maps = _ss_maps(norb, neleca, nelecb)
         na, nb = maps['na'], maps['nb']
+        op = _ss_sparse(norb, neleca, nelecb)
+        if op is not None:
+            v = cp.asarray(np.asarray(fcivec, dtype=np.float64).ravel())
+            return cp.asnumpy(op @ v).reshape(np.shape(fcivec))
         c = cp.asarray(fcivec, dtype=np.float64).reshape(na, nb)
         ci1 = cp.zeros_like(c)
         for amap, bmap, shape in (('ades', 'bcre', 'pm'), ('acre', 'bdes', 'mp')):
