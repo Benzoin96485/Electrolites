@@ -78,7 +78,8 @@ water = gto.M(atom='O 0 0 0.117; H 0 0.757 -0.467; H 0 -0.757 -0.467',
 qm = itrf.add_mm_charges(dft.RKS(water, xc='pbe'),
                          [[3., .5, .2], [.3, 3., -.4]], [.8, -.8],
                          unit='Bohr').run()
-raises('QMMM Hessian() raises', lambda: qm.Hessian(), needle='QM/MM')
+report('QMMM Hessian() is the QM/MM one (V2, electrolites.qmmm_hess)',
+       type(qm.Hessian()).__name__.startswith('QMMM'))
 report('QMMM Gradients() still runs',
        qm.Gradients().kernel().shape == (3, 3))
 report('undo_qmmm().Hessian() still runs',

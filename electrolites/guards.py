@@ -12,7 +12,8 @@
 * **QM/MM Hessian** -- ``QMMMSCF`` defines a gradient but not a Hessian, so
   ``mf.Hessian()`` is the vacuum Hessian with the MM charges' second
   derivatives left out: 0.065 Eh/bohr^2 off with +-0.8 e at 3 bohr.  PySCF
-  has none either, so this raises.
+  has none either.  Phase 0 made it raise; it is now
+  ``electrolites.qmmm_hess`` for RHF/RKS (V2) and still raises otherwise.
 
 and, around them, the ROHF / ROKS entry points that only crashed:
 
@@ -87,4 +88,15 @@ _df_hessian.__wrapped__ = _df_hessian_orig
 df_jk._DFHF.Gradients = _df_gradients
 df_jk._DFHF.Hessian = _df_hessian
 
-itrf.QMMMSCF.Hessian = not_available('QMMMSCF.Hessian', _QMMM_HESS)
+def _qmmm_hessian(self):
+    from gpu4pyscf.scf import hf, uhf
+    if isinstance(self, uhf.UHF) or not isinstance(self, hf.RHF) or \
+            isinstance(self, rohf.ROHF):
+        raise NotImplementedError(f'{type(self).__name__}.Hessian: '
+                                  f'{_QMMM_HESS} (RHF/RKS are electrolites.'
+                                  f'qmmm_hess)')
+    from electrolites import qmmm_hess
+    return qmmm_hess.Hessian(self)
+
+
+itrf.QMMMSCF.Hessian = _qmmm_hessian
