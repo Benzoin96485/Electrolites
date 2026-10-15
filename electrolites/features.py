@@ -212,6 +212,8 @@ register('dfmp2_grad', 'dfmp2_grad',
          doc='[P3] DF-MP2 relaxed density and nuclear gradient (RHF)')
 register('dhdft', 'dhdft',
          doc='[P4] double-hybrid DFT energies and gradients (DoubleHybrid)')
+register('mcpdft', 'mcpdft_gpu',
+         doc='[M8] MC-PDFT energies on the GPU CASSCF (mcpdft_gpu.MCPDFT)')
 register('ccsd_t', 'ccsd_t',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ccsd_t')],
          doc='[P1] closed-shell (T) on the device')
