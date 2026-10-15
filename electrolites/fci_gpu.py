@@ -341,13 +341,62 @@ class FCISolver(direct_spin1.FCISolver):
     def make_rdm1(self, fcivec, norb, nelec, link_index=None):
         return _rdm12(fcivec, fcivec, norb, nelec, with_dm2=False)[0]
 
+    def make_hdiag(self, h1e, eri, norb, nelec, compress=False):
+        """PySCF ``direct_spin1.make_hdiag`` on the device (host result):
+        with occupation matrices O_a, O_b of the strings,
+        H_ab = e_a + e_b + (O_a J O_b^T)_ab,
+        e = O h_ii + 1/2 diag(O (J - K) O^T).  PySCF's C loop was 0.11 s
+        per call at CAS(14,14), twice per CASCI."""
+        if compress or type(self).contract_2e is not FCISolver.contract_2e:
+            return super().make_hdiag(h1e, eri, norb, nelec, compress)
+        from pyscf import ao2mo
+        from pyscf.fci import cistring
+        neleca, nelecb = direct_spin1._unpack_nelec(nelec, self.spin)
+        h1e = np.asarray(h1e)
+        eri = ao2mo.restore(1, np.asarray(eri), norb)
+        jd = cp.asarray(np.einsum('iijj->ij', eri).copy())
+        kd = cp.asarray(np.einsum('ijji->ij', eri).copy())
+        hd = cp.asarray(np.diag(h1e).copy())
+
+        def occ(ne):
+            o = cistring.gen_occslst(range(norb), ne)
+            m = cp.zeros((len(o), norb))
+            m[cp.arange(len(o))[:, None], cp.asarray(o)] = 1
+            return m
+        oa = occ(neleca)
+        ob = oa if nelecb == neleca else occ(nelecb)
+        jk = jd - kd
+
+        def e(o):
+            return o @ hd + .5 * ((o @ jk) * o).sum(axis=1)
+        h = e(oa)[:, None] + e(ob)[None, :] + oa @ jd @ ob.T
+        return cp.asnumpy(h).ravel()
+
     def make_rdm12(self, fcivec, norb, nelec, link_index=None, reorder=True):
-        dm1, dm2 = _rdm12(fcivec, fcivec, norb, nelec)
+        dm1, dm2 = self._rdm12_cached(fcivec, norb, nelec)
         if not reorder:
             # PySCF's un-reordered dm2 is <E_pq E_rs>
             dm2 = dm2.copy()
             for q in range(norb):
                 dm2[:, q, q, :] += dm1.T
+        return dm1, dm2
+
+    def _rdm12_cached(self, fcivec, norb, nelec):
+        """The 1-/2-RDM of the last CI vector asked for again: PySCF's
+        one-step CASSCF takes the RDMs of the same vector in
+        ``update_casdm`` and again in ``gorb_update`` (85 builds in 12
+        macro-iterations at CAS(14,14), a third of the run).  Keyed on a
+        copy of the vector (equality, not identity)."""
+        key = (norb, tuple(np.atleast_1d(nelec)) if not isinstance(
+            nelec, (int, np.integer)) else nelec)
+        c = self.__dict__.get('_rdm_cache')
+        if c is not None and c[0] == key and isinstance(fcivec, np.ndarray) \
+                and c[1].shape == fcivec.shape and np.array_equal(c[1], fcivec):
+            return c[2].copy(), c[3].copy()
+        dm1, dm2 = _rdm12(fcivec, fcivec, norb, nelec)
+        if isinstance(fcivec, np.ndarray):
+            self.__dict__['_rdm_cache'] = (key, fcivec.copy(), dm1.copy(),
+                                           dm2.copy())
         return dm1, dm2
 
     def trans_rdm1(self, cibra, ciket, norb, nelec, link_index=None):
