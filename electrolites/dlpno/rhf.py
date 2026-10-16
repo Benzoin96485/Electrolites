@@ -250,3 +250,8 @@ class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
         self.e_lccsd, self.de_weak = cc.kernel(verbose=self.verbose >= 4)
         self.T = cc.T.to_list()
         self.T1 = [t.ravel() for t in cc.T1.to_list()]
+        # the CC stores are not needed by (T)
+        self.cc = cc = None
+        import gc
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()

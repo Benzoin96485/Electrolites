@@ -1063,6 +1063,11 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         for k, blk in self.T2b.items():
             p = self._sp(k)
             self.T2[k] = self._dense(p, self.so[k[0]][1], self.so[k[1]][1], blk)
+        # the CC stores (overlaps, ring integrals, DF groups) are not needed by (T)
+        self.ucc = g = None
+        import gc
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
 
 
 def _transpose_items(T, src, dst):
