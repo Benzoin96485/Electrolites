@@ -47,19 +47,65 @@ class _Reg:
         return len(self.keys)
 
 
-class _Terms(dict):
+class _Terms:
+    """Column store of a term list.  ``add`` appends a row (all calls use the
+    same keyword order); columns are materialised on first read."""
+
+    def __init__(self):
+        self._keys = None
+        self._rows = []
+        self._cols = None
+        self._np = {}
+
     def add(self, **kw):
-        for k, v in kw.items():
-            self.setdefault(k, []).append(v)
+        if self._keys is None:
+            self._keys = tuple(kw)
+        if self._cols is not None:
+            for k, v in kw.items():
+                self._cols[k].append(v)
+            self._np = {}
+        else:
+            self._rows.append(tuple(kw.values()))
+
+    def _mat(self):
+        if self._cols is None:
+            if self._keys is None:
+                self._cols = {}
+            else:
+                cols = list(zip(*self._rows)) if self._rows else [() for _ in self._keys]
+                self._cols = {k: list(c) for k, c in zip(self._keys, cols)}
+            self._rows = None
+        return self._cols
+
+    def __getitem__(self, k):
+        return self._mat()[k]
+
+    def __setitem__(self, k, v):
+        self._mat()[k] = list(v)
+        self._np = {}
+
+    def __contains__(self, k):
+        return k in self._mat()
+
+    def get(self, k, default=None):
+        return self._mat().get(k, default)
 
     def a(self, k):
-        return np.asarray(self.get(k, []), dtype=np.int64)
+        key = ('a', k)
+        if key not in self._np:
+            self._np[key] = np.asarray(self.get(k, []), dtype=np.int64)
+        return self._np[key]
 
     def f(self, k):
-        return np.asarray(self.get(k, []), dtype=np.float64)
+        key = ('f', k)
+        if key not in self._np:
+            self._np[key] = np.asarray(self.get(k, []), dtype=np.float64)
+        return self._np[key]
 
     def __len__(self):
-        return len(next(iter(self.values()))) if dict.__len__(self) else 0
+        if self._cols is None:
+            return len(self._rows)
+        return len(next(iter(self._cols.values()))) if self._cols else 0
 
 
 def _set_items(rag, items, mats):
@@ -144,6 +190,9 @@ class _SpinPlan:
 
 class UCCSDGPU:
 
+    #: generate the F'_vv and oooo-ladder term lists with numpy (subclasses)
+    KL_NUMPY = False
+
     def __init__(self, u):
         """u: ref_uhf2.RefUDLPNO2 after recompute_pnos() and cc_integrals()."""
         self.u = u
@@ -210,7 +259,7 @@ class UCCSDGPU:
         self.strong_c = [c for c in self.canon_sp if self.strong_sp[c]]
         self.fvpos = {c: r for r, c in enumerate(self.strong_c)}
         self.fv = [_Terms(), _Terms()]
-        for c in self.strong_c:
+        for c in ([] if self.KL_NUMPY else self.strong_c):
             ds = u.dom_so[c]
             for K in ds:
                 for L in ds:
@@ -270,7 +319,7 @@ class UCCSDGPU:
                         self.rg.add(o=o, s1=S(p, kj, a), t=t[0], s2=S(p, kj, b_), f=f,
                                     a=a, b=b_, w=-t[1])
             ds = u.dom_so[p]
-            for K in ds:
+            for K in ([] if self.KL_NUMPY else ds):
                 for L in ds:
                     if K == L:
                         continue
@@ -557,13 +606,16 @@ class UCCSDGPU:
         self.D1 = Ragged(self.LT1, D1)
 
     # ------------------------------------------------------------------
-    def _plans(self):
-        LS, LT, LT1 = self.LS, self.LT, self.LT1
+    def _layouts(self):
         cs = np.array(self.canon_sp, np.int64)
         self.LTn = [Layout(np.array([len(self.rows[c][s]) for c in cs], np.int64), self.nvs[cs, s])
                     for s in (0, 1)]
         sc = np.array(self.strong_c, np.int64)
         self.LF = [Layout(self.nvs[sc, s], self.nvs[sc, s]) for s in (0, 1)]
+
+    def _plans(self):
+        LS, LT, LT1 = self.LS, self.LT, self.LT1
+        self._layouts()
         self.Lfp = Layout(np.ones(len(self.Freg), np.int64), 1)
         self.Lbeta = Layout(np.ones(len(self.breg), np.int64), 1)
         lays = dict(S=LS, T=LT, G=LT, T1=LT1, NP=self.LNP, Z=self.LZ, Kx=self.LKx,

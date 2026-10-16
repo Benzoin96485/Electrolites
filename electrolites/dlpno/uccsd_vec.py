@@ -173,11 +173,16 @@ class _K3:
 
 class UCCSDGPUv(UCCSDGPU):
 
+    KL_NUMPY = True
+
     MAX_DF_CHUNK_BYTES = 1 << 30
 
     def build(self):
         import time
+        # the base plans are built once, after the registries are final
+        self._plans_base, self._plans = self._plans, self._layouts
         super().build()
+        self._plans = self._plans_base
         for name, fn in (('vec_terms', self._vec_terms), ('df_groups', self._df_groups)):
             t0 = time.perf_counter()
             fn()
@@ -347,61 +352,129 @@ class UCCSDGPUv(UCCSDGPU):
     # ------------------------------------------------------------------
     MAX_S_CHUNK_BYTES = 1 << 29
 
+    def _np_kl_terms(self):
+        """F'_vv rows (c, spin, kl, item) and oooo-ladder rows
+        (o, K, L, kl, item, sign) as arrays."""
+        u, pl = self.u, self.pl
+        lmo, sp, ij = self.lmo, self.spin, pl.ij
+        nso = self.nso
+        SIDX = -np.ones((nso, nso), np.int64)
+        for n, (I, J) in enumerate(self.sop):
+            SIDX[I, J] = n
+        fv = []
+        for r, c in enumerate(self.strong_c):
+            ds = np.array(u.dom_so[c], np.int64)
+            K, L = np.meshgrid(ds, ds, indexing='ij')
+            K, L = K.ravel(), L.ravel()
+            kl = ij[lmo[K], lmo[L]]
+            ok = (K != L) & (kl >= 0)
+            K, L, kl = K[ok], L[ok], kl[ok]
+            fv.append(np.stack([np.full(len(K), r), sp[K], kl, SIDX[K, L]], 1))
+            mx = sp[K] != sp[L]
+            fv.append(np.stack([np.full(int(mx.sum()), r), sp[L][mx], kl[mx], SIDX[L[mx], K[mx]]], 1))
+        self._fvnp = np.concatenate(fv) if fv else np.zeros((0, 4), np.int64)
+        rb = []
+        for (I, J) in self.strong:
+            o = self.sidx[(I, J)]
+            p = self.sp_of[o]
+            a, b = sp[I], sp[J]
+            ds = np.array(u.dom_so[p], np.int64)
+            K, L = np.meshgrid(ds, ds, indexing='ij')
+            K, L = K.ravel(), L.ravel()
+            kl = ij[lmo[K], lmo[L]]
+            ok = (K != L) & (kl >= 0)
+            K, L, kl = K[ok], L[ok], kl[ok]
+            d = (sp[K] == a) & (sp[L] == b)
+            x = (a != b) & (sp[K] == b) & (sp[L] == a)
+            it = np.where(d, SIDX[K, L], SIDX[L, K])
+            sg = np.where(d, 1., -1.)
+            k_ = d | x
+            n = int(k_.sum())
+            rb.append(np.stack([np.full(n, o), K[k_], L[k_], kl[k_], it[k_], sg[k_]], 1))
+        self._rbnp = np.concatenate(rb) if rb else np.zeros((0, 6))
+        self.nbeta = len(self._rbnp)
+
     def _split_kl(self):
+        self._np_kl_terms()
         u = self.u
-        nvs = self.nvs
-        Sk = [list(self.Sreg[0].keys), list(self.Sreg[1].keys)]
-        uses = {}
-        for s in (0, 1):
-            for c, s1 in zip(self.fv[s].get('c', []), self.fv[s].get('s1', [])):
-                uses.setdefault(self.strong_c[c], set()).add((s, s1))
-        rb = self.rb
-        for o, s1, s2, a, b in zip(rb.get('o', []), rb.get('s1', []), rb.get('s2', []),
-                                   rb.get('a', []), rb.get('b', [])):
-            c = self.cmap[self.sp_of[o]]
-            uses.setdefault(c, set()).update({(a, s1), (b, s2)})
+        nvs, sp = self.nvs, self.spin
+        fvn, rbn = self._fvnp, self._rbnp
+        fv_c = np.array(self.strong_c, np.int64)[fvn[:, 0]] if len(fvn) else np.zeros(0, np.int64)
+        rb_o = rbn[:, 0].astype(np.int64)
+        rb_c = self.cmap[self.sp_of[rb_o]] if len(rb_o) else np.zeros(0, np.int64)
+        rb_p = self.sp_of[rb_o] if len(rb_o) else np.zeros(0, np.int64)
+        rb_kl = rbn[:, 3].astype(np.int64)
+        rb_a = sp[np.array([self.sop[o][0] for o in rb_o], np.int64)] if len(rb_o) else np.zeros(0, np.int64)
+        rb_b = sp[np.array([self.sop[o][1] for o in rb_o], np.int64)] if len(rb_o) else np.zeros(0, np.int64)
         PP = int(padded(max(len(u.pao[p]) for p in range(self.npair))))
-        chunks, cur, cb, cg = [], [], 0, 0
-        for c in self.strong_c:
-            us = uses.get(c, set())
-            b = sum(8 * nvs[Sk[s][i][0], s] * nvs[Sk[s][i][1], s] for (s, i) in us)
-            g = sum(8 * PP * nvs[Sk[s][i][1], s] for (s, i) in us)
-            if cur and (cb + b > self.MAX_S_CHUNK_BYTES or cg + g > self.MAX_S_CHUNK_BYTES):
+        # chunk the strong pairs by the size of their S(kl, c) and of the gather
+        sc = np.array(self.strong_c, np.int64)
+        cost_b = np.zeros(self.npair)
+        cost_g = np.zeros(self.npair)
+        for cc, s_, kl in ((fv_c, fvn[:, 1] if len(fvn) else [], fvn[:, 2] if len(fvn) else []),
+                           (rb_c, rb_a, rb_kl), (rb_c, rb_b, rb_kl)):
+            if len(cc):
+                key = np.unique(np.stack([cc, s_, kl], 1), axis=0)
+                np.add.at(cost_b, key[:, 0], 8. * nvs[key[:, 2], key[:, 1]] * nvs[key[:, 0], key[:, 1]])
+                np.add.at(cost_g, key[:, 0], 8. * PP * nvs[key[:, 0], key[:, 1]])
+        chunks, cur, cb, cg = [], [], 0., 0.
+        for c in sc:
+            if cur and (cb + cost_b[c] > self.MAX_S_CHUNK_BYTES or cg + cost_g[c] > self.MAX_S_CHUNK_BYTES):
                 chunks.append(cur)
-                cur, cb, cg = [], 0, 0
+                cur, cb, cg = [], 0., 0.
             cur.append(c)
-            cb += b
-            cg += g
+            cb += cost_b[c]
+            cg += cost_g[c]
         if cur:
             chunks.append(cur)
-        cid = {}
+        cid = -np.ones(self.npair, np.int64)
         for n, ch in enumerate(chunks):
-            for c in ch:
-                cid[c] = n
-        fvc = [[_Terms(), _Terms()] for _ in chunks]
-        rbc = [_Terms() for _ in chunks]
-        loc = [[_Reg(), _Reg()] for _ in chunks]
-        for s in (0, 1):
-            f = self.fv[s]
-            for c, s1, it, w in zip(f.get('c', []), f.get('s1', []), f.get('it', []), f.get('w', [])):
-                n = cid[self.strong_c[c]]
-                fvc[n][s].add(c=c, s1=loc[n][s](Sk[s][s1]), it=it, sa=s, w=w)
-        for o, s1, t, s2, beta, a, b, w in zip(rb.get('o', []), rb.get('s1', []), rb.get('t', []), rb.get('s2', []),
-                                               rb.get('beta', []), rb.get('a', []), rb.get('b', []), rb.get('w', [])):
-            n = cid[self.cmap[self.sp_of[o]]]
-            rbc[n].add(o=o, s1=loc[n][a](Sk[a][s1]), t=t, s2=loc[n][b](Sk[b][s2]), beta=beta, a=a, b=b, w=w)
+            cid[ch] = n
         self.klchunks = []
         for n, ch in enumerate(chunks):
-            d = dict(cs=np.array(ch, np.int64), fv=fvc[n], rb=rbc[n], cpl=[])
-            cpos = {c: r for r, c in enumerate(ch)}
+            cpos = -np.ones(self.npair, np.int64)
+            cpos[ch] = np.arange(len(ch))
+            d = dict(cs=np.array(ch, np.int64), cpl=[])
+            fsel = np.where(cid[fv_c] == n)[0] if len(fv_c) else np.zeros(0, np.int64)
+            rsel = np.where(cid[rb_c] == n)[0] if len(rb_c) else np.zeros(0, np.int64)
+            loc_idx = {}
             for s in (0, 1):
-                keys = loc[n][s].keys
-                kl = np.array([k[0] for k in keys], np.int64)
-                cc = np.array([k[1] for k in keys], np.int64)
-                # (p and its transpose share one space)
-                assert all(self.cmap[c] in cpos for c in cc), 'S(kl, c) with c outside the chunk'
-                d['cpl'].append((kl, np.array([cpos[self.cmap[c]] for c in cc], np.int64),
-                                 Layout(nvs[kl, s], nvs[cc, s])))
+                # couples (kl, c) of this chunk and spin
+                fs = fsel[fvn[fsel, 1] == s]
+                ra = rsel[rb_a[rsel] == s]
+                rbs = rsel[rb_b[rsel] == s]
+                kl_all = np.concatenate([fvn[fs, 2], rb_kl[ra], rb_kl[rbs]]).astype(np.int64)
+                c_all = np.concatenate([fv_c[fs], rb_p[ra], rb_p[rbs]]).astype(np.int64)
+                code = kl_all * self.npair + c_all
+                ukey, inv = np.unique(code, return_inverse=True)
+                kl_u, c_u = ukey // self.npair, ukey % self.npair
+                nf, na = len(fs), len(ra)
+                loc_idx[s] = (fs, inv[:nf], ra, inv[nf:nf + na], rbs, inv[nf + na:])
+                d['cpl'].append((kl_u, cpos[self.cmap[c_u]], Layout(nvs[kl_u, s], nvs[c_u, s])))
+            fvt = []
+            for s in (0, 1):
+                fs, li = loc_idx[s][0], loc_idx[s][1]
+                t_ = _Terms()
+                t_._keys = ('c', 's1', 'it', 'sa')
+                t_._rows = list(zip(fvn[fs, 0].tolist(), li.tolist(), fvn[fs, 3].tolist(), [s] * len(fs)))
+                fvt.append(t_)
+            # oooo ladder rows of the chunk: S column of spin a and of spin b
+            s1 = np.zeros(len(rsel), np.int64)
+            s2 = np.zeros(len(rsel), np.int64)
+            pos = {r: q for q, r in enumerate(rsel)}
+            for s in (0, 1):
+                _, _, ra, la, rbs, lb = loc_idx[s]
+                for r_, l_ in zip(ra, la):
+                    s1[pos[r_]] = l_
+                for r_, l_ in zip(rbs, lb):
+                    s2[pos[r_]] = l_
+            rt = _Terms()
+            rt._keys = ('o', 's1', 't', 's2', 'a', 'b')
+            rt._rows = list(zip(rb_o[rsel].tolist(), s1.tolist(), rbn[rsel, 4].astype(np.int64).tolist(),
+                                s2.tolist(), rb_a[rsel].tolist(), rb_b[rsel].tolist()))
+            d['fv'], d['rb'] = fvt, rt
+            d['beta_n'] = rsel
+            d['rb_w'] = .5 * rbn[rsel, 5]
             self.klchunks.append(d)
         self.fv = [_Terms(), _Terms()]
         self.rb = _Terms()
@@ -427,7 +500,7 @@ class UCCSDGPUv(UCCSDGPU):
         cols = self._s_columns()
         used = [set(), set()]
         for t_, col, sc in cols:
-            if not dict.__len__(t_) or col not in t_:
+            if not len(t_) or col not in t_:
                 continue
             spins = [sc] * len(t_[col]) if isinstance(sc, int) else t_[sc]
             for i, s in zip(t_[col], spins):
@@ -440,7 +513,7 @@ class UCCSDGPUv(UCCSDGPU):
                 m[i] = new[s](self.Sreg[s].keys[i])
             mp.append(m)
         for t_, col, sc in cols:
-            if not dict.__len__(t_) or col not in t_:
+            if not len(t_) or col not in t_:
                 continue
             spins = [sc] * len(t_[col]) if isinstance(sc, int) else t_[sc]
             t_[col] = [mp[s][i] for i, s in zip(t_[col], spins)]
@@ -499,6 +572,10 @@ class UCCSDGPUv(UCCSDGPU):
     def _df_groups(self):
         # registries may have grown in _vec_terms: rebuild the dependent stores
         self._rebuild_after_vec()
+        o_ = self._rbnp[:, 0].astype(np.int64)
+        order = np.argsort(o_, kind='stable')
+        uo, st_ = np.unique(o_[order], return_index=True)
+        self._rb_by_o = {int(x): g for x, g in zip(uo, np.split(order, st_[1:]))}
         u, pl = self.u, self.pl
         lmo, sp = self.lmo, self.spin
         sc = self.strong_c
@@ -568,8 +645,8 @@ class UCCSDGPUv(UCCSDGPU):
                          for s in (0, 1)]
             d['p_rb'] = SP(cl, self.LT, d['rb'], 'o', [('Sc', 's1', 'a', True), ('T', 't', None, False),
                                                       ('Sc', 's2', 'b', False)])
-            d['beta'] = cp.asarray(d['rb'].a('beta'))
-            d['w'] = cp.asarray(d['rb'].f('w'))
+            d['beta'] = cp.asarray(d['beta_n'])
+            d['w'] = cp.asarray(d['rb_w'])
         en = self.en_t
         self.p_en1 = VDotPlan([op(self.LPt, en.a('pi'))], [op(self.LT, en.a('o')), op(self.LPt, en.a('pj'))])
         ss = np.where(self.e_same.get() > 0)[0]
@@ -650,18 +727,27 @@ class UCCSDGPUv(UCCSDGPU):
             cid = len(d['combos'])
             d['combos'].append(dict(key=key, m=cp.asarray(mm), o=oo, gT=int(gT[0]),
                                     sT=cp.asarray(self.LT.slot[oo])))
-            # beta entries of these pairs
-            for (m, o, I, J), mh in zip(lst, mm):
-                c = mem[m]
-                for (n, K, L) in self._bkeys().get((I, J), []):
+            # beta entries of these pairs: (n, position in combo, rK, rL)
+            gi = len(self.dfg)
+            for which in (0, 1):
+                parts = []
+                for r_, (m, o, I, J) in enumerate(lst):
+                    ns_ = self._rb_by_o.get(o)
+                    if ns_ is None:
+                        continue
+                    K = self._rbnp[ns_, 1].astype(np.int64)
+                    L = self._rbnp[ns_, 2].astype(np.int64)
                     sK, sL = sp[K], sp[L]
-                    rK = self.rows[c][sK].index(K)
-                    rL = self.rows[c][sL].index(L)
-                    which = 0 if (sK, sL) == (a, b) else 1
-                    if a == b:
-                        assert (sK, sL) == (a, a)
-                        which = 0
-                    bmap.setdefault((len(self.dfg), cid, which), []).append((n, m, rK, rL))
+                    wh = np.where((sK == a) & (sL == b), 0, 1)
+                    q = wh == which
+                    if not q.any():
+                        continue
+                    rp = self._rowpos(mem[m])
+                    parts.append(np.stack([ns_[q], np.full(int(q.sum()), r_), rp[sK[q], K[q]], rp[sL[q], L[q]]], 1))
+                if parts:
+                    arr = np.concatenate(parts)
+                    assert (arr >= 0).all()
+                    bmap[(gi, cid, which)] = tuple(cp.asarray(arr[:, j]) for j in range(4))
         # diagonal pairs: singles Fock
         diag = []
         for m, c in enumerate(mem):
@@ -689,12 +775,12 @@ class UCCSDGPUv(UCCSDGPU):
                                   foo=cp.asarray(foo), gX=gX, sX=self.LT1.slot[Xs]))
         return d
 
-    def _bkeys(self):
-        if not hasattr(self, '_bk'):
-            self._bk = {}
-            for n, (I, J, K, L) in enumerate(self.breg.keys):
-                self._bk.setdefault((I, J), []).append((n, K, L))
-        return self._bk
+    def _rowpos(self, c):
+        """rp[s, K] = row of spin orbital K in pair c's spin-s rows (-1 if absent)."""
+        rp = -np.ones((2, self.nso), np.int64)
+        for s in (0, 1):
+            rp[s, self.rows[c][s]] = np.arange(len(self.rows[c][s]))
+        return rp
 
     # ------------------------------------------------------------------
     def residuals(self, T, T1):
@@ -709,7 +795,7 @@ class UCCSDGPUv(UCCSDGPU):
         Fbov = [Ragged(self.LTn[s]) for s in (0, 1)]
         R = Ragged(self.LT)
         R1 = Ragged(self.LT1)
-        beta = cp.zeros(len(self.breg))
+        beta = cp.zeros(self.nbeta)
         for gi, d in enumerate(self.dfg):
             self._df_run(gi, d, T, T1, Tn, Fv, Fbov, R, R1, beta)
         st['Fv'] = Fv
@@ -834,19 +920,10 @@ class UCCSDGPUv(UCCSDGPU):
                 Q2 = -mm(mm(Qov[b][m], tr(t)[:, None]), tr(Qov[a][m])).sum(axis=1)
                 mats[1] = -W2 + Q2
             for which, Mx in mats.items():
-                lst = self.beta_src.get((gi, cid, which))
-                if not lst:
+                ent = self.beta_src.get((gi, cid, which))
+                if ent is None:
                     continue
-                if 'bidx' not in cb:
-                    cb['bidx'] = {}
-                if which not in cb['bidx']:
-                    arr = np.array(lst, np.int64)
-                    # member index -> position within this combo
-                    pos = {int(x): r for r, x in enumerate(m.get())}
-                    cb['bidx'][which] = (cp.asarray(arr[:, 0]),
-                                         cp.asarray(np.array([pos[x] for x in arr[:, 1]], np.int64)),
-                                         cp.asarray(arr[:, 2]), cp.asarray(arr[:, 3]))
-                n_, r_, k_, l_ = cb['bidx'][which]
+                n_, r_, k_, l_ = ent
                 beta[n_] = Mx[r_, k_, l_]
         # singles Fock of the diagonal pairs
         for dg in d['diag']:
