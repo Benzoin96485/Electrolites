@@ -733,8 +733,8 @@ X2 (k-point TDDFT) is not started.
   drivers and the frequency-dependent polarizability, T1 cube files / MEP.
 
 *Status (2026-10-15)* — Phase 5 done: §16. M4, X2, X3, V2, V3, O3 (α(ω) both
-spins, UKS IR) and T1 built; V5 built, measured without gain, dropped. β
-(hyperpolarizability) and UKS Raman remain.
+spins, UKS IR, β, UKS Raman) and T1 built; V5 built, measured without
+gain, dropped. An analytic dα/dR for Raman goes to §5.4.
 
 **Phase 6** — §5.1 ranks 10–15 (S5, S6, S7, X4, P6, P10), re-ranked first
 against what Phases 4–5 measured.
@@ -2310,13 +2310,59 @@ gradient (login GPU); the time is GPU4PySCF's TDDFT XC-kernel contraction
 was removed; V5 moves to §5.4, and the XC-kernel contraction is the
 TDDFT-gradient entry to look at instead.
 
-### 16.7 What §5 takes from Phase 5
+### 16.7 β and UKS Raman (O3, completed)
+
+**First hyperpolarizability** (`polar_gpu.hyperpolarizability(mf)`): the
+static β by the 2n+1 rule from the three first-order orbital sets of the
+polarizability solve (pyscf-properties' expression: first-order Fock in
+the vv and oo blocks), RHF/RKS and UHF/UKS, plus for LDA/GGA and global
+hybrids the term ∫ k_xc ρ_x ρ_y ρ_z (third XC derivative from
+`eval_xc_eff(deriv=3)`, contracted on the SCF grid). **pyscf-properties
+leaves that term out** `[X]`: 1.6 a.u. of 16 on water/PBE (aug-cc-pVDZ),
+and on alanine dipeptide⁺/SVP UKS B3LYP its β is 3559 a.u. where this
+code gives 1213 and a finite field of the analytic polarizability 1216.
+Correctness (`tests/test_hyperpolar_gpu.py`, 8 checks): RHF against
+pyscf-properties 6e-6; RHF, LDA, PBE, B3LYP, UHF, UKS PBE, UKS B3LYP
+against the finite field ≤ 1.4e-3 a.u. (H2O, H2O⁺; F = 1e-3, O(F²)).
+Range-separated functionals raise. (A first open-shell check on OH failed
+for a reason outside the code: the ²Π state's UHF flips π occupation
+under the field.)
+
+**UKS Raman** (`raman_uks.eval_raman_intensity(mf)`): GPU4PySCF's Raman
+asserts RHF; PySCF and pyscf-properties have none. dα/dR is the second
+field difference of analytic gradients, as GPU4PySCF's, for either spin,
+on 13 field points instead of 19 (the off-diagonal from the (++, −−) pair
+and the diagonals), each field SCF started from dm0 + F·P¹ (P¹ from three
+CPHF solves; 30–40% fewer SCF cycles) and converged to an orbital
+gradient of 1e-8: the second difference divides SCF noise by F² = 6e-6,
+so at GPU4PySCF's default tolerance H2O⁺ UHF's dα/dR is 1e-2 off.
+Correctness (`tests/test_raman_uks.py`): RKS against GPU4PySCF's
+activities 2e-4 relative; closed-shell UKS against RKS 9e-5; H2O⁺ UHF and
+UKS B3LYP dα/dR against central differences of the analytic
+polarizability over nuclear displacements ≤ 3e-4 relative. A Newton
+(second-order) field SCF was tried and was 3–10x slower.
+
+| | system | **GPU** | CPU (128 thr) |
+|---|---|---|---|
+| β, RHF | penicillin V/SVP | **4.2 s** | 14.7 s (pyscf-properties, 3.5x) |
+| β, RKS B3LYP | penicillin V/SVP | **4.8 s** | 201 s (pyscf-properties without the k_xc term, `max_cycle_cphf` 50 — at its default 20 its Krylov solve fails; 42x) |
+| β, UKS B3LYP | alanine dipeptide⁺/SVP | **3.0 s** | 30.8 s (pyscf-properties, 10x, and wrong: see above) |
+| Raman dα/dR, RKS B3LYP | alanine dipeptide/SVP | **17.1 s** (+ Hessian 7.3 s) | none; GPU4PySCF's own 19.1 s |
+| Raman dα/dR, UKS B3LYP | alanine dipeptide⁺/SVP | **62.6 s** (+ Hessian 8.7 s) | none in PySCF or pyscf-properties |
+
+The UKS field SCFs need 32–58 DIIS cycles each to reach the 1e-8 orbital
+gradient; an analytic dα/dR (2n+1 with the Hessian's nuclear U, the
+dipole-derivative integrals, (μν|λσ)^A with D^x D^y, and the nuclear
+derivative of f_xc) would replace the 13 SCF+gradient points and is the
+entry for §5.4.
+
+### 16.8 What §5 takes from Phase 5
 
 | entry | status | measured |
 |---|---|---|
 | **M4** | **built** | CASSCF macro-iteration 1.3–1.9x faster again: 12–60x the CPU node (was 8.8–38x); SA-2 NAC 3.1x, SA-3 gradient 1.6x faster |
 | **X2**, **X3** | **built** (kshift 0; RHF/RKS) | k-TDA 31x (PBE) and 134x (PBE0) PySCF at 2×2×2; stability Hessians to 1e-9 of PySCF's |
 | **V2**, **V3** | **built** | the QM/MM Hessian (was wrong, then raised); Gaussian MM charges |
-| **O3** | **built** (α(ω) both spins; UKS IR); β and UKS Raman open | α(ω) 410x pyscf-properties' route (penicillin V); UKS IR 24x |
+| **O3** | **built** (α(ω) both spins; UKS IR; β with k_xc; UKS Raman) | α(ω) 410x pyscf-properties' route (penicillin V); UKS IR 24x; β 3.5–42x (and correct for KS, which pyscf-properties' is not); Raman both spins (no CPU code) |
 | **T1** | **built** | MEP 345x the CPU node (penicillin V/TZVP, 80³) |
 | **V5** | **dropped → §5.4** | no measurable gain |

@@ -312,6 +312,8 @@ the CPU code, or against finite differences where there is none
 | `pbc_tda` | periodic TDA, Γ point and k-points (kshift 0), RKS/RHF | k-points **31x** (PBE) and **134x** (PBE0), diamond 2×2×2; at Γ, 16- and 54-atom cells run in seconds where PySCF runs out of memory or does not finish |
 | `pbc_stability` | periodic RHF/RKS stability analysis, Γ and k-points | > **44x** (diamond 2×2×2 PBE0: 68 s; PySCF unfinished after 50 min) |
 | `polar` | static and frequency-dependent polarizability, RHF/RKS and UHF/UKS | **410x** (penicillin V, α(ω)); open-shell cases where pyscf-properties fails to converge |
+| `polar` (β) | static first hyperpolarizability, RHF/RKS and UHF/UKS, including the XC kernel-derivative term pyscf-properties omits | **3.5x** (HF) to **42x** (B3LYP) on penicillin V; **10x** alanine dipeptide cation UKS, where pyscf-properties' value is 3x off |
+| `raman_uks` | Raman activities and depolarization ratios for UHF/UKS (and RHF/RKS) | new: PySCF has no Raman code; GPU4PySCF's is closed-shell only (alanine dipeptide cation UKS B3LYP: 71 s with the Hessian) |
 | `ir_uks` | IR intensities for UHF/UKS (and RHF/RKS) | **24x** (alanine dipeptide cation, UKS B3LYP, including the Hessian) |
 | `nmr_uks` | NMR shielding for UHF/UKS; the GIAO two-electron term on the GPU for RKS as well | UKS **1.6–4.1x**, RKS **1.4–3.3x** (22–42 atoms); 10x GPU4PySCF's own host-term path at taxol |
 | `ssc` | NMR spin–spin couplings (DSO, PSO, FC, FC+SD), RHF/RKS | **16–67x** (glycine to penicillin V, B3LYP) |

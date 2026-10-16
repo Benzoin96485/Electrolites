@@ -3,7 +3,7 @@
 
     python benchmarks/phase5_bench.py --what ktda --kmesh 2 --xc pbe [--cpu]
 
-what: ktda | pstab | polar | ir | qmmmhess | tdpcmgrad | mep
+what: ktda | pstab | polar | beta | ir | raman | qmmmhess | tdpcmgrad | mep
 """
 import argparse
 import json
@@ -14,7 +14,7 @@ import numpy as np
 
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 ap.add_argument('--what', required=True,
-                choices=('ktda', 'pstab', 'polar', 'ir', 'qmmmhess',
+                choices=('ktda', 'pstab', 'polar', 'beta', 'ir', 'raman', 'qmmmhess',
                          'tdpcmgrad', 'mep'))
 ap.add_argument('--cpu', action='store_true')
 ap.add_argument('--xyz', default='benchmarks/molecules/glycine.xyz')
@@ -102,7 +102,7 @@ if a.what in ('ktda', 'pstab'):
             from electrolites import pbc_stability
             rec['e'] = timed('step_s', lambda: pbc_stability.internal(mf),
                              True)[2]
-elif a.what in ('polar', 'ir'):
+elif a.what in ('polar', 'beta', 'ir', 'raman'):
     mol = molecule()
     rec['nao'], rec['natm'] = mol.nao, mol.natm
     unrestricted = a.spin != 0
@@ -110,7 +110,14 @@ elif a.what in ('polar', 'ir'):
         from pyscf import dft
     else:
         from gpu4pyscf import dft
-    mf = (dft.UKS if unrestricted else dft.RKS)(mol, xc=a.xc)
+    if a.xc.upper() == 'HF':
+        if a.cpu:
+            from pyscf import scf as S
+        else:
+            from gpu4pyscf import scf as S
+        mf = (S.UHF if unrestricted else S.RHF)(mol)
+    else:
+        mf = (dft.UKS if unrestricted else dft.RKS)(mol, xc=a.xc)
     mf.conv_tol = 1e-10
     timed('scf_s', mf.kernel)
     if a.what == 'polar':
@@ -123,6 +130,28 @@ elif a.what in ('polar', 'ir'):
             from electrolites.polar_gpu import polarizability
             al = timed('step_s', lambda: polarizability(mf, a.freq), True)
         rec['iso'] = float(np.trace(al) / 3)
+    elif a.what == 'beta':
+        if a.cpu:
+            from pyscf.prop.polarizability import rhf as P, uhf as PU
+            M = PU if unrestricted else P
+            p = M.Polarizability(mf)
+            p.max_cycle_cphf = 50       # its default 20 stalls on penicillin V
+            b = timed('step_s', lambda: M.hyper_polarizability(p))
+        else:
+            from electrolites.polar_gpu import hyperpolarizability
+            b = timed('step_s', lambda: hyperpolarizability(mf), True)
+        rec['beta_max'] = float(abs(np.asarray(b)).max())
+    elif a.what == 'raman':
+        from electrolites import raman_uks
+        from gpu4pyscf.properties import raman as gr
+        h = timed('hess_s', lambda: mf.Hessian().kernel())
+        timed('step_s', lambda: raman_uks.polarizability_derivative(mf))
+        rec['scf_cycles'] = raman_uks.polarizability_derivative.cycles
+        timed('step_dm0guess_s', lambda: raman_uks.polarizability_derivative(
+            mf, first_order_guess=False))
+        rec['scf_cycles_dm0guess'] = raman_uks.polarizability_derivative.cycles
+        if not unrestricted:
+            timed('gpu4pyscf_step_s', lambda: gr.polarizability_derivative_numerical_dEdE(mf.copy()))
     else:
         if a.cpu:
             from pyscf.prop.infrared import uks as IR
