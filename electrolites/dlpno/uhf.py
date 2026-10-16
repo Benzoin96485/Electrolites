@@ -541,8 +541,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         sidx = {k: n for n, k in enumerate(sop)}
         sp_of, nvs, LT = self._so_layout()
         spin = np.array([s for (x, s) in self.so])
-        Sreg = [_Reg(), _Reg()]
-        terms = _Terms()
+        Creg = _Reg()
+        rows_ = []
         canon = [k for k in sop if k[0] < k[1]]
         for (I, J) in canon:
             o = sidx[(I, J)]
@@ -553,17 +553,38 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                 ik, kj = pl.ij[x, k], pl.ij[k, y]
                 f = self._fock_oo(K, J)
                 if K != J and K != I and ik >= 0 and abs(f) > opt['F_CUT']:
-                    terms.add(o=o, s=Sreg[a]((p, ik)), t=sidx[(I, K)],
-                              s2=Sreg[b]((p, ik)), a=a, b=b, w=-f)
+                    rows_.append((o, Creg((p, ik)), sidx[(I, K)], a, b, -f))
                 f = self._fock_oo(K, I)
                 if K != I and K != J and kj >= 0 and abs(f) > opt['F_CUT']:
-                    terms.add(o=o, s=Sreg[a]((p, kj)), t=sidx[(K, J)], s2=Sreg[b]((p, kj)),
-                              a=a, b=b, w=-f)
-        LS, Sd = self._pno_overlaps(Sreg)
-        lays = dict(S=LS, T=LT)
-        plan = _SpinPlan(lays, LT, terms, 'o', [('S', 's', 'a', False), ('T', 't', None, False),
-                                                ('S', 's2', 'b', True)])
-        w = cp.asarray(terms.f('w')) if len(terms) else None
+                    rows_.append((o, Creg((p, kj)), sidx[(K, J)], a, b, -f))
+        # S(p, ik) per spin regenerated per chunk of couples every iteration
+        from electrolites.dlpno.ovgen import OverlapGen
+        npair = len(pl)
+        gA = OverlapGen(self.S_pao_d, self.pao, [self.Xa[p] for p in range(npair)])
+        gB = OverlapGen(self.S_pao_d, self.pao, [self.Xb[p] for p in range(npair)], ne=self.ns)
+        pp = np.array([k[0] for k in Creg.keys], np.int64)
+        qq = np.array([k[1] for k in Creg.keys], np.int64)
+        R_ = np.array(rows_, dtype=np.float64).reshape(-1, 6)
+        parts = gB.chunks(pp, qq)
+        PA = gA.prepare(pp, qq, parts=parts)
+        PB = gB.prepare(pp, qq, parts=parts)
+        cpl = R_[:, 1].astype(np.int64)
+        chunk_of = np.zeros(len(pp), np.int64)
+        local = np.zeros(len(pp), np.int64)
+        for ci, (sel, _, _) in enumerate(parts):
+            chunk_of[sel] = ci
+            local[sel] = np.arange(len(sel))
+        lmp2_chunks = []
+        for ci in range(len(parts)):
+            rsel = np.where(chunk_of[cpl] == ci)[0]
+            t_ = _Terms()
+            for r in rsel:
+                o, c_, t, a, b, w_ = R_[r]
+                t_.add(o=int(o), s=int(local[int(c_)]), t=int(t), a=int(a), b=int(b), w=w_)
+            lays = dict(S=[PA[ci]['LS'], PB[ci]['LS']], T=LT)
+            pl_ = _SpinPlan(lays, LT, t_, 'o', [('S', 's', 'a', False), ('T', 't', None, False),
+                                               ('S', 's', 'b', True)])
+            lmp2_chunks.append((PA[ci], PB[ci], pl_, cp.asarray(t_.f('w')) if len(t_) else None))
         Gr = Ragged(LT)
         _set_items(Gr, range(len(sop)), [G[k] for k in sop])
         T = Ragged(LT)
@@ -591,11 +612,11 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         ec, rc = 0.01 * opt['E_CONVERGENCE'], 0.01 * opt['R_CONVERGENCE']
         e_prev = 0.
         gm = [cp.asarray(cmask[m]) for m in LT.members]
-        stores = dict(S=Sd, T=T)
         for it in range(1, opt['MAXITER'] + 1):
-            stores['T'] = T
             R = Gr + D * T
-            plan.run(R, stores, w=w)
+            for Pa, Pb, pl_, w_ in lmp2_chunks:
+                if pl_.n:
+                    pl_.run(R, dict(S=[gA.run(Pa), gB.run(Pb)], T=T), w=w_)
             for g, z in enumerate(gm):
                 R.data[g][~z] = 0.
             rms = float(R.rms_per_item().max())

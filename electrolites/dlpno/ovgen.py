@@ -109,13 +109,13 @@ class OverlapGen:
             out.append((np.array(sel), np.flatnonzero(mask), np.array(sorted(inv))))
         return out
 
-    def prepare(self, pp, qq, out_layout=None, out_idx=None):
+    def prepare(self, pp, qq, out_layout=None, out_idx=None, parts=None):
         """static chunk plans for couples (pp, qq), written to items out_idx
         of a Ragged with out_layout, or (default) to a per-chunk Ragged
         P['LS'] whose item i is couple P['sel'][i]."""
         pp, qq = np.asarray(pp, np.int64), np.asarray(qq, np.int64)
         plans = []
-        for sel, U, inv in self.chunks(pp, qq):
+        for sel, U, inv in (parts if parts is not None else self.chunks(pp, qq)):
             if out_layout is None:
                 LSc = Layout(self.nv[pp[sel]], self.nv[qq[sel]])
                 lay_o, idx_o = LSc, np.arange(len(sel))
