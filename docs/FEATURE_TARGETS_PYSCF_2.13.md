@@ -2579,7 +2579,7 @@ A single-density SCF is unaffected.  `ghf_td_gpu` assembles the blocks
 itself.
 
 Correctness (`tests/test_ghf_td_gpu.py`, cc-pVDZ): TDA on water and H₂O⁺,
-TDHF on H₂O⁺, 6 states, to 2e-11 eV-scale (≤ 1.6e-11 Eh) of PySCF's.
+TDHF on H₂O⁺, 6 states, ≤ 1.6e-11 Eh from PySCF's.
 Closed-shell GHF TDHF is left out of the test: the three spin-rotation
 zero modes make its lowest roots depend on solver noise.
 
