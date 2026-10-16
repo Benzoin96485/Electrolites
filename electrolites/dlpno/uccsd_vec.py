@@ -207,6 +207,104 @@ class _K3:
             cupyx.scatter_add(dst.data[gd], ds, vals[q][:, :pr, :pc])
 
 
+class ChunkedSpinPlan:
+    """A _SpinPlan whose overlap operands ('S') are not stored: its terms
+    are split into chunks (by output item) and each chunk's overlaps are
+    generated on the device right before the chunk runs (ovgen)."""
+
+    MAX_BYTES = 1 << 29
+
+    def __init__(self, owner, layouts, out_layout, terms, out_col, specs, out_row=None,
+                 transpose_out=False, dot_left=None):
+        self.n = n = len(terms)
+        self.chunks = []
+        if n == 0:
+            return
+        nvs = owner.nvs
+        keys = [owner.Sreg[0].keys, owner.Sreg[1].keys]
+        kp = [np.array([k[0] for k in keys[s]], np.int64) for s in (0, 1)]
+        kq = [np.array([k[1] for k in keys[s]], np.int64) for s in (0, 1)]
+        scols = [(c, sc) for (kind, c, sc, tr) in specs if kind == 'S']
+        # per term global couple codes (spin * BIG + index)
+        BIG = 1 << 40
+        codes = []
+        for c, sc in scols:
+            sp = terms.a(sc) if isinstance(sc, str) else np.full(n, sc)
+            codes.append(sp * BIG + terms.a(c))
+        codes = np.stack(codes, 1)
+        order = np.argsort(terms.a(out_col), kind='stable') if out_col is not None else np.arange(n)
+        def nbytes(code):
+            s_, i = int(code // BIG), int(code % BIG)
+            return 8 * int(nvs[kp[s_][i], s_]) * int(nvs[kq[s_][i], s_])
+        bounds, cur, tot = [], set(), 0
+        start = 0
+        for pos, t in enumerate(order):
+            new = [c for c in codes[t] if c not in cur]
+            add = sum(nbytes(c) for c in set(new))
+            if cur and tot + add > self.MAX_BYTES:
+                bounds.append((start, pos))
+                start, cur, tot = pos, set(), 0
+                new = list(codes[t])
+                add = sum(nbytes(c) for c in set(new))
+            cur.update(new)
+            tot += add
+        bounds.append((start, n))
+        gens = owner._ovgens
+        for (a, b) in bounds:
+            sel = order[a:b]
+            loc_terms = _Terms()
+            sub = {k: [v[i] for i in sel] for k, v in terms._mat().items()}
+            lays = dict(layouts)
+            LSc, preps = [], []
+            for s in (0, 1):
+                ids = []
+                for j, (c, sc) in enumerate(scols):
+                    msk = (codes[sel, j] // BIG) == s
+                    ids.append(codes[sel, j][msk] % BIG)
+                uni = np.unique(np.concatenate(ids)) if ids else np.zeros(0, np.int64)
+                LSc.append(Layout(nvs[kp[s][uni], s], nvs[kq[s][uni], s]))
+                preps.append(gens[s].prepare(kp[s][uni], kq[s][uni], out_layout=LSc[s],
+                                             out_idx=np.arange(len(uni))) if len(uni) else [])
+                for j, (c, sc) in enumerate(scols):
+                    msk = (codes[sel, j] // BIG) == s
+                    loc = np.searchsorted(uni, codes[sel, j][msk] % BIG)
+                    col = np.asarray(sub[c])
+                    col[msk] = loc
+                    sub[c] = col.tolist()
+            loc_terms._keys = tuple(sub)
+            loc_terms._cols = {k: list(v) for k, v in sub.items()}
+            loc_terms._rows = None
+            lays['S'] = LSc
+            plan = _SpinPlan(lays, out_layout, loc_terms, out_col, specs, out_row=out_row,
+                             transpose_out=transpose_out, dot_left=dot_left)
+            self.chunks.append(dict(sel=cp.asarray(sel), LS=LSc, preps=preps, plan=plan, nt=len(sel)))
+        self.gens = gens
+
+    def _S(self, ch):
+        S = []
+        for s in (0, 1):
+            R = Ragged(ch['LS'][s])
+            for P in ch['preps'][s]:
+                self.gens[s].run(P, R)
+            S.append(R)
+        return S
+
+    def run(self, out, stores, w=None):
+        for ch in self.chunks:
+            st = dict(stores)
+            st['S'] = self._S(ch)
+            ch['plan'].run(out, st, w=None if w is None else w[ch['sel']])
+        return out
+
+    def dots(self, stores, n):
+        out = cp.zeros(n)
+        for ch in self.chunks:
+            st = dict(stores)
+            st['S'] = self._S(ch)
+            out[ch['sel']] = ch['plan'].dots(st, ch['nt'])
+        return out
+
+
 class UCCSDGPUv(UCCSDGPU):
 
     KL_NUMPY = True
@@ -548,6 +646,18 @@ class UCCSDGPUv(UCCSDGPU):
 
     def _compact_S(self):
         cols = self._s_columns()
+        import os
+        if os.environ.get('DLPNO_DEBUG_S'):
+            names = {}
+            for t_, col, sc in cols:
+                if not len(t_) or col not in t_:
+                    continue
+                spins = [sc] * len(t_[col]) if isinstance(sc, int) else t_[sc]
+                key = id(t_)
+                names.setdefault(key, set()).update(zip(spins, t_[col]))
+            tot = sum(len(v) for v in names.values())
+            print('S couples per term list:', sorted((len(v) for v in names.values()), reverse=True)[:12],
+                  'total refs', tot, 'unique', len(set().union(*names.values())) if names else 0)
         used = [set(), set()]
         for t_, col, sc in cols:
             if not len(t_) or col not in t_:
@@ -629,8 +739,12 @@ class UCCSDGPUv(UCCSDGPU):
                     off += n
                 rags.append(Ragged(lay, data))
             d['Sc'] = rags
-            d['gen'] = [VChainPlan(lay, np.arange(len(kl)), [op(self.LXk[s], kl, True), op(self.LXk[s], cu)])
-                        for s, (kl, cl, lay, cu) in enumerate(d['cpl'])]
+            if getattr(self, '_ovgens', None) is not None:
+                d['gen'] = [self._ovgens[s].prepare(kl, cu, out_layout=lay, out_idx=np.arange(len(kl)))
+                            for s, (kl, cl, lay, cu) in enumerate(d['cpl'])]
+            else:
+                d['gen'] = [VChainPlan(lay, np.arange(len(kl)), [op(self.LXk[s], kl, True), op(self.LXk[s], cu)])
+                            for s, (kl, cl, lay, cu) in enumerate(d['cpl'])]
             d['ws'] = ws[:off]
         self._sws = ws
 
@@ -641,7 +755,11 @@ class UCCSDGPUv(UCCSDGPU):
             self._S_workspace()
         ch['ws'].fill(0.)
         for s in (0, 1):
-            ch['gen'][s].run(ch['Sc'][s], [self.Xk[s], self.MXk[s]])
+            if getattr(self, '_ovgens', None) is not None:
+                for P in ch['gen'][s]:
+                    self._ovgens[s].run(P, ch['Sc'][s])
+            else:
+                ch['gen'][s].run(ch['Sc'][s], [self.Xk[s], self.MXk[s]])
         return ch['Sc']
 
     def _df_groups(self):
@@ -687,6 +805,10 @@ class UCCSDGPUv(UCCSDGPU):
         self.pt = _Terms()
         for r_, (Z, p) in enumerate(self.preg.keys):
             self.pt.add(r=r_, s=self.S(p, self.dii[Z], self.spin[Z]), z=Z, a=self.spin[Z])
+        if self.ONFLY_S and hasattr(self.u, 'S_pao_d'):
+            self._make_ovgens()
+        else:
+            self._ovgens = None
         self._overlaps()
         mats = [self.fix[kl]['Kx'][(self.lmo[K], self.lmo[L], self.spin[K], self.spin[L])]
                 for (kl, K, L) in self.kx_reg.keys]
@@ -703,7 +825,7 @@ class UCCSDGPUv(UCCSDGPU):
         self.K1Z = Ragged(self.LK1Z)
         _set_items(self.K1Z, range(len(k1z_mats)), k1z_mats)
         lays['K1Z'] = self.LK1Z
-        SP = _SpinPlan
+        SP = self._make_spin_plan
         self.p_e1 = SP(lays, self.LT, self._et(), 'o', [('T', 'o', None, False), ('Fv', 'f', 'b', True)])
         self.p_e2 = SP(lays, self.LT, self._et(), 'o', [('Fv', 'f', 'a', False), ('T', 'o', None, False)])
         self.p_zk1 = SP(lays, self.LZ, self.zk1_terms, 'z', [('Tn', 'tn', 'sa', True), ('K1Z', 'k1', None, False)])
@@ -715,7 +837,8 @@ class UCCSDGPUv(UCCSDGPU):
                                  [('Pt', 'pl_', None, False), ('Pt', 'pj', None, True), ('S', 's1', 'a', False),
                                   ('Kx', 'kx', None, tr2), ('S', 's2', 'b', True)]))
         self.p_a1 = SP(lays, self.LT1, self.a1, 'i', [('S', 's', 'a', False), ('V1', 'v', None, False)])
-        self._kl_tables()
+        if getattr(self, '_ovgens', None) is None:
+            self._kl_tables()
         for d in self.klchunks:
             cl = dict(Sc=[c[2] for c in d['cpl']], T=self.LT, G=self.LT)
             d['p_fv'] = [SP(cl, self.LF[s], d['fv'][s], 'c', [('Sc', 's1', 'sa', True), ('T', 'it', None, False),
@@ -740,6 +863,30 @@ class UCCSDGPUv(UCCSDGPU):
         self.k3.build(fetch, host=self.offload)
         for c in self.canon_sp:
             self.fix[c].pop('K3', None)
+
+    #: generate the PNO overlaps of every term on the fly (no stored S)
+    import os as _os
+    ONFLY_S = _os.environ.get('DLPNO_ONFLY_S', '1') == '1'
+
+    def _make_spin_plan(self, layouts, out_layout, terms, out_col, specs, **kw):
+        uses_s = any(k == 'S' for (k, c, sc, tr) in specs)
+        if self.ONFLY_S and uses_s and getattr(self, '_ovgens', None) is not None:
+            return ChunkedSpinPlan(self, layouts, out_layout, terms, out_col, specs, **kw)
+        return _SpinPlan(layouts, out_layout, terms, out_col, specs, **kw)
+
+    def _overlaps(self):
+        if self.ONFLY_S and hasattr(self.u, 'S_pao_d'):
+            self.LS, self.Sd = [None, None], [None, None]
+            return
+        super()._overlaps()
+
+    def _make_ovgens(self):
+        from electrolites.dlpno.ovgen import OverlapGen
+        u = self.u
+        Spao = u.S_pao_d
+        npair = self.npair
+        self._ovgens = [OverlapGen(Spao, u.pao, [u.Xa[p] for p in range(npair)]),
+                        OverlapGen(Spao, u.pao, [u.Xb[p] for p in range(npair)], ne=u.ns)]
 
     def _et(self):
         et = _Terms()

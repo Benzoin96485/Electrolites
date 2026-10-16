@@ -645,6 +645,9 @@ class UCCSDGPU:
         self.D1 = Ragged(self.LT1, D1)
 
     # ------------------------------------------------------------------
+    def _make_spin_plan(self, *args, **kw):
+        return _SpinPlan(*args, **kw)
+
     def _layouts(self):
         cs = np.array(self.canon_sp, np.int64)
         self.LTn = [Layout(np.array([len(self.rows[c][s]) for c in cs], np.int64), self.nvs[cs, s])
@@ -659,7 +662,7 @@ class UCCSDGPU:
         self.Lbeta = Layout(np.ones(len(self.breg), np.int64), 1)
         lays = dict(S=LS, T=LT, G=LT, T1=LT1, NP=self.LNP, Z=self.LZ, Kx=self.LKx,
                     Fk=self.LFk, U=self.LU, Pt=self.LPt)
-        SP = _SpinPlan
+        SP = self._make_spin_plan
         self.p_tn = [SP(lays, self.LTn[s], self.tn[s], 'c', [('S', 's', 'sa', False), ('T1', 'K', None, False)],
                         out_row='row') for s in (0, 1)]
         self.p_fv = [SP(lays, self.LF[s], self.fv[s], 'c', [('S', 's1', 'sa', True), ('T', 'it', None, False),
