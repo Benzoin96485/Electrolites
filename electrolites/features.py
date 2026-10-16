@@ -242,8 +242,16 @@ register('lo', 'lo_gpu',
              'PySCF populations), density-fitted Edmiston-Ruedenberg, IBO '
              '(lo_gpu.Boys, PM, ER, ibo)')
 register('eom', 'eom_gpu',
-         doc='[P6] EOM-IP- and EOM-EA-CCSD on a GPU4PySCF CCSD, no v^4 '
-             'array (eom_gpu.EOMIP, EOMEA)')
+         absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ipccsd'),
+                 ('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.eaccsd'),
+                 ('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.eomee_ccsd_singlet')],
+         doc='[P6] EOM-IP-, EOM-EA- and singlet EOM-EE-CCSD on a GPU4PySCF '
+             'CCSD, no v^4 array (eom_gpu.EOMIP, EOMEA, EOMEESinglet; '
+             'CCSD.ipccsd/eaccsd/eomee_ccsd_singlet)')
+register('cc_lambda', 'ccsd_lambda_gpu',
+         absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.solve_lambda')],
+         doc='[P6] CCSD Lambda equations on the device '
+             '(ccsd_lambda_gpu.kernel; CCSD.solve_lambda)')
 register('adc', 'adc_gpu',
          doc='[P10] ADC(2) EE/IP/EA on the GPU: PySCF\'s ADC algebra on '
              'device arrays (adc_gpu.RADC)')

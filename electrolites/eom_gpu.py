@@ -275,6 +275,15 @@ def _ladder(mycc, x2):
             cache = mycc._fastccsd_eri = {}
         elif total < F._host_avail() / 4:
             cache = mycc._fastccsd_eri = F._HostCache()
+    if isinstance(cache, F._HostCache) and cache:
+        # the CCSD left its integral blocks in host memory (no room beside
+        # its amplitudes); the EOM/Lambda step usually has the room, and
+        # copying the whole cache host->device on every sigma batch was
+        # 93 of 203 s of a ferrocene EOM-EE run
+        total = sum(v.nbytes for v in cache.values())
+        if total < .4 * F._avail():
+            cache = mycc._fastccsd_eri = {k: cp.asarray(v)
+                                          for k, v in cache.items()}
     for cid, log_q_ij in enumerate(log_qs):
         if log_q_ij.size == 0:
             continue
@@ -486,3 +495,417 @@ class EOMIP(eom_rccsd.EOMIP):
         if imds is None:
             imds = self.make_imds()
         return self.gen_matvec(imds)[0]([vector])[0]
+
+
+# ------------------------------------------------------------------ EOM-EE
+
+
+def _make_tau(t2, t1, r1, fac=1.):
+    tau = _ein('ia,jb->ijab', t1, r1)
+    return t2 + (tau + tau.transpose(1, 0, 3, 2)) * (fac * .5)
+
+
+def _virtual_coulomb_diag(mycc, orbv):
+    """(aa|bb) from one batch of GPU J builds on the virtual densities."""
+    mf = mycc._scf
+    if getattr(mf, 'device', 'cpu') != 'gpu':
+        mf = mf.to_gpu()
+    dms = _ein('pa,qa->apq', orbv, orbv)
+    vj = cp.asarray(mf.get_j(mycc.mol, dms, hermi=1))
+    return _ein('apq,pb,qb->ab', vj, orbv, orbv)
+
+
+def _make_ee(imds, mycc):
+    """PySCF's ``_IMDS.make_ee`` (singlet EOM-EE intermediates), unblocked,
+    on the device."""
+    t1, t2 = imds.t1, imds.t2
+    ovvv, ovoo, ovov = imds.ovvv, imds.ovoo, imds.ovov
+    oovv, ovvo, oooo = imds.oovv, imds.ovvo, imds.oooo
+    no = imds.nocc
+    foo, fov, fvv = imds._foo_fov_fvv()
+    tau = _make_tau(t2, t1, t1)
+    theta = t2 * 2 - t2.transpose(0, 1, 3, 2)
+
+    Fvv = _ein('mf,mfae->ae', t1, ovvv) * 2
+    Fvv -= _ein('mf,meaf->ae', t1, ovvv)
+    woVoO = _ein('mebf,ijef->mbij', ovvv, tau)
+    woVvO = _ein('jf,mebf->mbej', t1, ovvv)
+    woVVo = _ein('jf,mfbe->mbej', -t1, ovvv)
+    woOoV = _ein('if,mfne->mnie', t1, ovov) + ovoo.transpose(2, 0, 3, 1)
+    tmp = _ein('njbf,mfne->mbej', t2, ovov)
+    woVvO -= tmp * .5
+    woVVo += tmp
+    x = _ein('menf,jf->menj', ovov, t1)
+    woVvO -= _ein('nb,menj->mbej', t1, x)
+    x = _ein('mfne,jf->menj', ovov, t1)
+    woVVo += _ein('nb,menj->mbej', t1, x)
+    ovov2 = ovov * 2 - ovov.transpose(0, 3, 2, 1)
+    woVvO += _ein('njfb,menf->mbej', theta, ovov2) * .5
+    Fov = _ein('nf,menf->me', t1, ovov2)
+    tilab = _ein('ia,jb->ijab', t1, t1) * .5 + t2
+    Foo = _ein('mief,menf->ni', tilab, ovov2)
+    Fvv -= _ein('mnaf,menf->ae', tilab, ovov2)
+    tilab = None
+    woVvO -= _ein('nb,menj->mbej', t1, ovoo)
+    woVVo += _ein('nb,nemj->mbej', t1, ovoo)
+    woVvO += ovvo.transpose(0, 2, 1, 3)
+    woVVo -= oovv.transpose(0, 2, 3, 1)
+    Fov += fov
+    Foo += foo + .5 * _ein('me,ie->mi', Fov + fov, t1)
+    Fvv += fvv - .5 * _ein('me,ma->ae', Fov + fov, t1)
+
+    woOoO = _ein('je,nemi->mnij', t1, ovoo)
+    woOoO = woOoO + woOoO.transpose(1, 0, 3, 2)
+    woOoO += oooo.transpose(0, 2, 1, 3)
+    tmp = _ein('meni,jneb->mbji', ovoo, t2)
+    woVoO -= tmp.transpose(0, 1, 3, 2) * .5
+    woVoO -= tmp
+    ovooX = ovoo * 2 - ovoo.transpose(2, 1, 0, 3)
+    woVoO += _ein('nemi,njeb->mbij', ovooX, theta) * .5
+    Foo += _ein('ne,nemi->mi', t1, ovooX)
+    ovooX = None
+    woOoO += _ein('ijef,menf->mnij', tau, ovov)
+    woVoO -= _ein('nb,mnij->mbij', t1, woOoO)
+    tmpoovv = _ein('njbf,nemf->ejmb', t2, ovov)
+    tmpovvo = _ein('nifb,menf->eimb', theta, ovov2)
+    ovov2 = None
+    tmpovvo *= -.5
+    tmpovvo += tmpoovv * .5
+    woVoO -= _ein('ie,ejmb->mbij', t1, tmpovvo)
+    woVoO -= _ein('ie,ejmb->mbji', t1, tmpoovv)
+    woVoO += ovoo.transpose(3, 1, 2, 0)
+    tmpovvo -= ovvo.transpose(1, 3, 0, 2)
+    tmpoovv -= oovv.transpose(3, 1, 0, 2)
+    woVoO += _ein('mebj,ie->mbij', ovvo, t1)
+    woVoO += _ein('mjbe,ie->mbji', oovv, t1)
+    woVoO += _ein('me,ijeb->mbij', Fov, t2)
+
+    ebmf = ovvv.transpose(1, 2, 0, 3)                      # (me|bf) -> ebmf
+    w = _ein('ebmf,miaf->eiab', ebmf, t2)
+    wvOvV = -.5 * w.transpose(0, 1, 3, 2) - w
+    w = None
+    wvOvV += ebmf.transpose(1, 2, 3, 0)
+    tmp = -.5 * ebmf + ebmf.transpose(1, 0, 2, 3)
+    wvOvV += _ein('efmb,mifa->eiba', tmp, theta)
+    tmp = None
+    wvOvV += _ein('meni,mnab->eiab', ovoo, tau)
+    wvOvV -= _ein('me,miab->eiab', Fov, t2)
+    wvOvV += _ein('ma,eimb->eiab', t1, tmpovvo)
+    wvOvV += _ein('ma,eimb->eiba', t1, tmpoovv)
+
+    imds.Foo, imds.Fov, imds.Fvv = Foo, Fov, Fvv
+    imds.woOoO, imds.woVoO, imds.woOoV = woOoO, woVoO, woOoV
+    imds.woVvO, imds.woVVo, imds.wvOvV = woVvO, woVVo, wvOvV
+    imds.tau_half = tau * .5
+    mask = mycc.get_frozen_mask()
+    mo = cp.asarray(mycc.mo_coeff)[:, cp.asarray(mask)]
+    imds.orbv = mo[:, no:]
+    imds.orbv_s = _ladder_setup(mycc).coeff @ imds.orbv
+    return imds
+
+
+def _ladder_pairsym(mycc, ov, x):
+    """sum_ef (ae|bf) x[..., i, j, e, f] for x with x[j,i] = x[i,j]^T (the
+    singlet tau2, lambda2): the ladder of X^T is the transpose of the
+    ladder of X, so only the i >= j pairs go through the AO integrals."""
+    lead = x.shape[:-4]
+    no, nv = x.shape[-4], x.shape[-1]
+    x = x.reshape((-1, no, no, nv, nv))
+    i, j = cp.tril_indices(no)
+    xt = x[:, i, j]                                     # (n, npair, v, v)
+    X = _ein('pe,mef,qf->mpq', ov, xt.reshape(-1, nv, nv), ov)
+    Y = _ladder(mycc, X)
+    X = None
+    y = _ein('pa,mpq,qb->mab', ov, Y, ov).reshape(xt.shape)
+    Y = None
+    out = cp.empty_like(x)
+    out[:, i, j] = y
+    out[:, j, i] = y.transpose(0, 1, 3, 2)
+    return out.reshape(lead + (no, no, nv, nv))
+
+
+def _ee_ladder(imds, mycc, x):
+    """sum_ef (ae|bf) x[n,i,j,e,f] for a batch, AO-direct (x is
+    pair-symmetric: tau2 = r2 + r1 t1 + t1 r1)."""
+    return _ladder_pairsym(mycc, imds.orbv_s, x)
+
+
+def _ee_sigma(imds, mycc, r1, r2):
+    """eeccsd_matvec_singlet for a batch: r1 (n, o, v), r2 (n, o, o, v, v)."""
+    t1, t2 = imds.t1, imds.t2
+    ovvv, ovov = imds.ovvv, imds.ovov
+    Hr1 = _ein('ae,nie->nia', imds.Fvv, r1)
+    Hr1 -= _ein('mi,nma->nia', imds.Foo, r1)
+    Hr1 += _ein('me,nimae->nia', imds.Fov, r2) * 2
+    Hr1 -= _ein('me,nimea->nia', imds.Fov, r2)
+
+    rt = _ein('nia,jb->nijab', r1, t1)
+    tau2 = r2 + rt + rt.transpose(0, 2, 1, 4, 3)
+    rt = None
+    Hr2 = _ee_ladder(imds, mycc, tau2)
+    Hr2 += _ein('mnij,kmnab->kijab', imds.woOoO, r2)
+    Hr2 *= .5
+    Hr2 += _ein('be,nijae->nijab', imds.Fvv, r2)
+    Hr2 -= _ein('mj,nimab->nijab', imds.Foo, r2)
+
+    theta = r2 * 2 - r2.transpose(0, 1, 2, 4, 3)
+    Hr1 += _ein('mfae,nmife->nia', ovvv, theta)
+    tmp = _ein('meaf,nijef->nmaij', ovvv, tau2)
+    Hr2 -= _ein('ma,nmbij->nijab', t1, tmp)
+    tmp = _ein('meaf,nme->naf', ovvv, r1) * 2
+    tmp -= _ein('mfae,nme->naf', ovvv, r1)
+    Hr2 += _ein('naf,ijfb->nijab', tmp, t2)
+    Hr2 -= _ein('mbij,nma->nijab', imds.woVoO, r1)
+    Hr2 += _ein('ejab,nie->nijab', imds.wvOvV, r1)
+
+    tmp = _ein('mbej,nimea->njiab', imds.woVVo, r2)
+    Hr2 += tmp
+    Hr2 += tmp.transpose(0, 1, 2, 4, 3) * .5
+    tmp = None
+    woVvO = imds.woVVo * .5 + imds.woVvO
+    Hr1 += _ein('maei,nme->nia', woVvO, r1) * 2
+    Hr2 += _ein('mbej,nimae->nijab', woVvO, theta)
+    woVvO = None
+
+    Hr1 -= _ein('mnie,kmnae->kia', imds.woOoV, theta)
+    tmp = _ein('nmie,kme->kni', imds.woOoV, r1) * 2
+    tmp -= _ein('mnie,kme->kni', imds.woOoV, r1)
+    Hr2 -= _ein('kni,njab->kijab', tmp, t2)
+
+    tmp = _ein('mfne,kmf->ken', ovov, r1) * 2
+    tmp -= _ein('menf,kmf->ken', ovov, r1)
+    tmp = _ein('ken,nb->keb', tmp, t1)
+    tmp += _ein('menf,kmnbf->keb', ovov, theta)
+    Hr2 -= _ein('keb,ijea->kjiab', tmp, t2)
+    tmp = _ein('nemf,kimef->kni', ovov, theta)
+    Hr1 -= _ein('na,kni->kia', t1, tmp)
+    Hr2 -= _ein('kmj,miab->kijba', tmp, t2)
+    theta = None
+
+    tmp = _ein('menf,kijef->kmnij', ovov, tau2)
+    tau2 = None
+    Hr2 += _ein('kmnij,mnab->kijab', tmp, imds.tau_half)
+    Hr2 = Hr2 + Hr2.transpose(0, 2, 1, 4, 3)
+    return Hr1, Hr2
+
+
+def _ee_diag(imds, mycc):
+    """The singlet part of ``eeccsd_diag``: (Hr1aa, Hr2ab)."""
+    t1, t2, ovov, ovvv = imds.t1, imds.t2, imds.ovov, imds.ovvv
+    no, nv = t1.shape
+    tau = _make_tau(t2, t1, t1)
+    Fo, Fv = cp.diag(imds.Foo), cp.diag(imds.Fvv)
+    Wovab = _ein('iaai->ia', imds.woVVo)
+    Wovaa = Wovab + _ein('iaai->ia', imds.woVvO)
+    Hr1 = Fv[None, :] - Fo[:, None] + Wovaa
+    Wvvab = _ein('mnab,manb->ab', tau, ovov)
+    ijb = _ein('iejb,ijeb->ijb', ovov, t2)
+    Hr2 = -ijb[:, :, None, :] + Fv[None, None, :, None]
+    jab = _ein('kajb,kjab->jab', ovov, t2)
+    Hr2 = Hr2 - Fo[:, None, None, None] - jab[None]
+    Hr2 = Hr2 + Wovaa[None, :, None, :] + Wovab[:, None, None, :]
+    Hr2 = Hr2 + Hr2.transpose(1, 0, 3, 2)
+    Hr2 = Hr2 + _ein('ijij->ij', imds.woOoO)[:, :, None, None]
+    tmp = _ein('mb,mbaa->ab', t1, ovvv)
+    Wvvab = Wvvab - tmp - tmp.T + _virtual_coulomb_diag(mycc, imds.orbv)
+    Hr2 = Hr2 + Wvvab[None, None]
+    return Hr1, Hr2
+
+
+def _pack_singlet(r1, r2):
+    """ccsd.amplitudes_to_vector for a batch: t1 + lower triangle of
+    t2[ia,jb]."""
+    n, no, nv = r1.shape
+    nov = no * nv
+    i, j = cp.tril_indices(nov)
+    m = r2.transpose(0, 1, 3, 2, 4).reshape(n, nov, nov)
+    return cp.hstack([r1.reshape(n, -1), m[:, i, j]])
+
+
+def _unpack_singlet(v, no, nv):
+    n = len(v)
+    nov = no * nv
+    i, j = cp.tril_indices(nov)
+    m = cp.zeros((n, nov, nov), dtype=v.dtype)
+    m[:, i, j] = v[:, nov:]
+    m[:, j, i] = v[:, nov:]
+    r2 = m.reshape(n, no, nv, no, nv).transpose(0, 1, 3, 2, 4)
+    return v[:, :nov].reshape(n, no, nv), cp.ascontiguousarray(r2)
+
+
+def _davidson_nosym(matvec, x0, diag, nroots, tol, tol_residual, max_cycle,
+                    max_space, log):
+    """Block Davidson for the lowest roots of a non-symmetric operator on
+    the device, with a batched ``matvec`` ((n, dim) -> (n, dim)); PySCF's
+    convergence test (energy change < tol, residual < tol_residual), real
+    roots only, spare guess vectors kept but not expanded."""
+    def orth(vs, basis):
+        out = []
+        for v in vs:
+            for _ in range(2):
+                if basis is not None and len(basis):
+                    v = v - basis.T @ (basis @ v)
+                for u in out:
+                    v = v - u * (u @ v)
+            nrm = cp.linalg.norm(v)
+            if nrm > 1e-7:
+                out.append(v / nrm)
+        return out
+
+    nwant = len(x0)
+    V = cp.stack(orth(list(x0), None))
+    AV = matvec(V)
+    e_last = None
+    conv = np.zeros(nwant, dtype=bool)
+    for it in range(max_cycle):
+        H = cp.asnumpy(V @ AV.T)
+        w, c = np.linalg.eig(H)
+        real = np.where(abs(w.imag) < 1e-3)[0]
+        w, c = w[real].real, c[:, real].real
+        order = np.argsort(w)[:nwant]
+        w, c = w[order], cp.asarray(c[:, order])
+        X = c.T @ V
+        AX = c.T @ AV
+        nrm = cp.linalg.norm(X, axis=1)
+        X /= nrm[:, None]
+        AX /= nrm[:, None]
+        wd = cp.asarray(w)
+        R = AX - wd[:, None] * X
+        rnorm = cp.asnumpy(cp.linalg.norm(R, axis=1))
+        if e_last is not None and len(e_last) == len(w):
+            de = abs(w - e_last)
+        else:
+            de = np.ones(len(w))
+        conv = (de < tol) & (rnorm < tol_residual)
+        log.debug('EOM Davidson %d  space %d  |r| %s  dE %s', it, len(V),
+                  rnorm[:nroots], de[:nroots])
+        e_last = w
+        if conv[:nroots].all():
+            break
+        new = []
+        for k in np.where(~conv[:nroots])[0]:
+            d = wd[k] - diag
+            d = cp.where(abs(d) < 1e-8, 1e-8, d)
+            new.append(R[k] / d)
+        if len(V) + len(new) > max_space:
+            q, r_ = cp.linalg.qr(X.T)
+            V = q.T
+            AV = cp.linalg.solve(r_.T, AX)
+        new = orth(new, V)
+        if not new:
+            break
+        Vn = cp.stack(new)
+        V = cp.vstack([V, Vn])
+        AV = cp.vstack([AV, matvec(Vn)])
+    return conv[:nroots], e_last[:nroots], X[:nroots]
+
+
+class EOMEESinglet(eom_rccsd.EOMEESinglet):
+    """PySCF's singlet EOM-EE-CCSD (same vector layout and equations) with
+    the intermediates, the sigma vectors (the (ae|bf) ladder AO-direct,
+    batched over each Davidson step's trial vectors) and a non-symmetric
+    block Davidson on the device."""
+
+    def make_imds(self, eris=None):
+        return _make_ee(_Imds(self._cc), self._cc)
+
+    def get_diag(self, imds=None):
+        if imds is None:
+            imds = self.make_imds()
+        h1, h2 = _ee_diag(imds, self._cc)
+        return cp.asnumpy(_pack_singlet(h1[None], h2[None])[0])
+
+    def gen_matvec(self, imds=None, diag=None, **kwargs):
+        if imds is None:
+            imds = self.make_imds()
+        if diag is None:
+            diag = self.get_diag(imds)
+        no, nv = imds.nocc, imds.nvir
+        mycc = self._cc
+
+        def matvec(xs):
+            x = cp.asarray(np.asarray(xs).reshape(len(xs), -1))
+            out = []
+            for p0 in range(0, len(x), _EE_BLK):
+                r1, r2 = _unpack_singlet(x[p0:p0 + _EE_BLK], no, nv)
+                h1, h2 = _ee_sigma(imds, mycc, r1, r2)
+                out.append(_pack_singlet(h1, h2))
+            return list(cp.asnumpy(cp.vstack(out)))
+
+        return matvec, diag
+
+    def matvec(self, vector, imds=None, diag=None):
+        if imds is None:
+            imds = self.make_imds()
+        return self.gen_matvec(imds, diag=np.zeros(1))[0]([vector])[0]
+
+    def kernel(self, nroots=1, koopmans=False, guess=None, eris=None,
+               imds=None, diag=None):
+        log = logger.new_logger(self)
+        if imds is None:
+            imds = self.make_imds()
+        no, nv = imds.nocc, imds.nvir
+        mycc = self._cc
+        h1, h2 = _ee_diag(imds, mycc)
+        d = _pack_singlet(h1[None], h2[None])[0]
+        h1 = h2 = None
+        nwant = min(len(d), nroots + max(3, nroots // 2))
+        if guess is not None:
+            x0 = cp.asarray(np.asarray(guess)).reshape(len(guess), -1)
+            nwant = len(x0)
+        else:
+            idx = cp.argsort(d[:no * nv] if koopmans else d)[:nwant]
+            x0 = cp.zeros((nwant, len(d)))
+            x0[cp.arange(nwant), idx] = 1.
+
+        def matvec(V):
+            out = []
+            for p0 in range(0, len(V), _EE_BLK):
+                r1, r2 = _unpack_singlet(V[p0:p0 + _EE_BLK], no, nv)
+                h1, h2 = _ee_sigma(imds, mycc, r1, r2)
+                out.append(_pack_singlet(h1, h2))
+            return cp.vstack(out)
+
+        conv, e, X = _davidson_nosym(
+            matvec, x0, d, nroots, self.conv_tol,
+            self.conv_tol ** .5, self.max_cycle,
+            self.max_space + nwant, log)
+        self.converged, self.e = conv, e
+        self.v = list(cp.asnumpy(X))
+        for n in range(nroots):
+            log.info('EOM-EE-CCSD singlet root %d E = %.16g  conv = %s', n,
+                     e[n], conv[n])
+        if nroots == 1:
+            return e[0], self.v[0]
+        return e, self.v
+
+
+#: trial vectors per EE sigma batch
+_EE_BLK = 8
+
+
+def _ipccsd(self, nroots=1, left=False, koopmans=False, guess=None,
+            partition=None, eris=None):
+    return EOMIP(self).kernel(nroots, left, koopmans, guess, partition)
+
+
+def _eaccsd(self, nroots=1, left=False, koopmans=False, guess=None,
+            partition=None, eris=None):
+    return EOMEA(self).kernel(nroots, left, koopmans, guess, partition)
+
+
+def _eomee_ccsd_singlet(self, nroots=1, koopmans=False, guess=None,
+                        eris=None, imds=None):
+    return EOMEESinglet(self).kernel(nroots, koopmans, guess)
+
+
+from gpu4pyscf.cc import ccsd_incore as _ci                   # noqa: E402
+from electrolites.features import attach as _attach           # noqa: E402
+
+for _name, _fn in (('ipccsd', _ipccsd), ('eaccsd', _eaccsd),
+                   ('eomee_ccsd_singlet', _eomee_ccsd_singlet),
+                   ('eomip_method', lambda self: EOMIP(self)),
+                   ('eomea_method', lambda self: EOMEA(self)),
+                   ('eomee_method', lambda self: EOMEESinglet(self))):
+    if getattr(_ci.CCSDBase, _name, None) is NotImplemented:
+        _attach(_ci.CCSDBase, _name, _fn)
