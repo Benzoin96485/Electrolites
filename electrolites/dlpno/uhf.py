@@ -36,7 +36,8 @@ from electrolites.dlpno.dfints import DFInts, ExtDomains
 from electrolites.dlpno.ragged import Layout, Ragged, padded, op
 from electrolites.dlpno.linalg import eigh_batched, orthonormal_domain
 from electrolites.dlpno.ccsd_gpu import _DeviceDIIS
-from electrolites.dlpno.uccsd_gpu import UCCSDGPU, _SpinPlan, _Terms, _Reg, _set_items, _get
+from electrolites.dlpno.uccsd_gpu import _SpinPlan, _Terms, _Reg, _set_items, _get
+from electrolites.dlpno.uccsd_vec import UCCSDGPUv as UCCSDGPU
 
 
 def _half(L, x):
@@ -821,27 +822,37 @@ class UDLPNO(RefUDLPNO2):
                         v[:, :, :ne] += cp.matmul(Xbs.T[None], qsu)
                         v[:, :, ne:] += cp.matmul(Xbs.T[None], qss)
                 Vx.append(_half(L, v))
+            T1c, T2c, Xcc = {}, {}, {}
             for n in idx:
                 (_, K, Q, bp, c_, q) = keys[n]
                 k, qo = so[K][0], so[Q][0]
                 sK, sQ = so[K][1], so[Q][1]
-                Z = 0.
+                Z = None
                 if sK == c_ and bp == sQ:
-                    Z = Z + Bm[bp][:, lpos[qo]].T @ Qk[:, lpos[k]]          # (B, u): (k u|B q)
+                    t1 = T1c.get((qo, bp))
+                    if t1 is None:            # (k u|B q) for every domain LMO k
+                        t1 = T1c[(qo, bp)] = cp.einsum('Qb,Qku->kbu', Bm[bp][:, lpos[qo]], Qk)
+                    Z = t1[lpos[k]]
                 if sK == sQ and bp == c_:
-                    Z = Z - cp.einsum('Q,Qbu->bu', Boo[:, lpos[k], lpos[qo]], Vx[bp])
-                npo = len(self.pao[q])
-                if c_ == 0:
-                    Xc = np.zeros((ne + ns, self.nva(q)))
-                    Xc[epos[self.pao[q]]] = self.Xa[q]
-                else:
-                    Xc = np.zeros((ne + ns, self.nvb(q)))
-                    Xc[epos[self.pao[q]]] = self.Xb[q][:npo]
-                    Xc[ne:] = self.Xb[q][npo:]
-                if isinstance(Z, float):
+                    t2 = T2c.get((qo, bp))
+                    if t2 is None:            # (k q|B u) for every domain LMO k
+                        t2 = T2c[(qo, bp)] = cp.einsum('Qk,Qbu->kbu', Boo[:, :, lpos[qo]], Vx[bp])
+                    Z = -t2[lpos[k]] if Z is None else Z - t2[lpos[k]]
+                Xc = Xcc.get((q, c_))
+                if Xc is None:
+                    npo = len(self.pao[q])
+                    if c_ == 0:
+                        Xh = np.zeros((ne + ns, self.nva(q)))
+                        Xh[epos[self.pao[q]]] = self.Xa[q]
+                    else:
+                        Xh = np.zeros((ne + ns, self.nvb(q)))
+                        Xh[epos[self.pao[q]]] = self.Xb[q][:npo]
+                        Xh[ne:] = self.Xb[q][npo:]
+                    Xc = Xcc[(q, c_)] = cp.asarray(Xh)
+                if Z is None:
                     out[n] = cp.zeros((self.nva(p) if bp == 0 else self.nvb(p), Xc.shape[1]))
                 else:
-                    out[n] = Z @ cp.asarray(Xc)
+                    out[n] = Z @ Xc
         return out
 
     # ------------------------------------------------------------------
