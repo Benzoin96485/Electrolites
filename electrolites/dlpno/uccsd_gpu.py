@@ -103,9 +103,20 @@ class _Terms:
         return self._np[key]
 
     def __len__(self):
+        if getattr(self, '_n', None) is not None:
+            return self._n
         if self._cols is None:
             return len(self._rows)
         return len(next(iter(self._cols.values()))) if self._cols else 0
+
+    def compact(self, keep=('w',)):
+        """drop the Python columns once the plans are built; ``keep``
+        columns stay available (as numpy) through f() / a()."""
+        n = len(self)
+        for k in keep:
+            if k in self:
+                self.f(k)
+        self._cols, self._rows, self._n = {}, None, n
 
 
 def _set_items(rag, items, mats):

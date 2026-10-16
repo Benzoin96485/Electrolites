@@ -106,11 +106,17 @@ class _K3:
         for g in range(len(uk)):
             mem = np.where(inv == g)[0]
             self.slot[mem] = np.arange(len(mem))
-            buf = xp.zeros((len(mem),) + tuple(int(x) for x in uk[g]))
+            shape = (len(mem),) + tuple(int(x) for x in uk[g])
+            if host:
+                from electrolites.dlpno.devmem import pinned_empty
+                buf = pinned_empty(shape)
+                buf[...] = 0.
+            else:
+                buf = cp.zeros(shape)
             for s, k in enumerate(mem):
                 Y = Ys[k]
                 buf[s, :Y.shape[0], :Y.shape[1], :Y.shape[2]] = Y
-            self.data.append(to_pinned(buf) if host else buf)
+            self.data.append(buf)
         del Ys
         self.plans = {}
         for key, lst in self.ops.items():
@@ -210,6 +216,15 @@ class UCCSDGPUv(UCCSDGPU):
             for key in ('Qov', 'Qvv', 'Qmz', 'Qaz', 'K3'):
                 self.fix[c].pop(key, None)
         cp.get_default_memory_pool().free_all_blocks()
+        # term lists are only needed through their plans now
+        lists = [self.fp, self.rg, self.zq, self.fkc, self.r1c, self.r1a2, self.uq, self.r1b, self.a1,
+                 *self.ring_np, *self.ring_z, *self.zkx, *self.tn, self.zk1_terms, self.zj1_terms]
+        for t_ in lists:
+            t_.compact()
+        for d in self.klchunks:
+            for t_ in (*d['fv'], d['rb']):
+                t_.compact()
+        self._fvnp = self._rbnp = None
         self.mem_report = self._mem_report()
 
     def _mem_report(self):
@@ -678,6 +693,8 @@ class UCCSDGPUv(UCCSDGPU):
             c, z, s, t = key
             return self.fix[c]['K3'][(z, s, t)].transpose(1, 0, 2)
         self.k3.build(fetch, host=self.offload)
+        for c in self.canon_sp:
+            self.fix[c].pop('K3', None)
 
     def _et(self):
         et = _Terms()
@@ -693,14 +710,21 @@ class UCCSDGPUv(UCCSDGPU):
         g = len(mem)
         d = dict(mem=mem, A=A, R=R, V=V)
         xp = np if self.offload else cp
-        from electrolites.dlpno.devmem import to_pinned
+        from electrolites.dlpno.devmem import pinned_empty
+
+        def zeros(shape):
+            if not self.offload:
+                return cp.zeros(shape)
+            a = pinned_empty(shape)
+            a[...] = 0.
+            return a
         for s in (0, 1):
-            Qov = xp.zeros((g, A, R[s], V[s]))
-            Qvv = xp.zeros((g, A, V[s], V[s]))
+            Qov = zeros((g, A, R[s], V[s]))
+            Qvv = zeros((g, A, V[s], V[s]))
             fov = cp.zeros((g, R[s], V[s]))
             ev = cp.zeros((g, V[s]))
-            Qmz = xp.zeros((g, 2, A, R[s]))
-            Qaz = xp.zeros((g, 2, A, V[s]))
+            Qmz = zeros((g, 2, A, R[s]))
+            Qaz = zeros((g, 2, A, V[s]))
             zrow = np.zeros((g, 2), np.int64)
             zm = np.zeros((g, 2))
             for m, c in enumerate(mem):
@@ -722,10 +746,12 @@ class UCCSDGPUv(UCCSDGPU):
                         zm[m, side] = 1.
             d[('Qov', s)], d[('Qvv', s)], d[('fov', s)], d[('ev', s)] = Qov, Qvv, fov, ev
             d[('Qmz', s)], d[('Qaz', s)] = Qmz, Qaz
-            if self.offload:
-                for key in ('Qov', 'Qvv', 'Qmz', 'Qaz'):
-                    d[(key, s)] = to_pinned(d[(key, s)])
+
             d[('zrow', s)], d[('zm', s)] = cp.asarray(zrow), cp.asarray(zm)
+            if s == 1:
+                for c in mem:                 # assembled: drop the per-pair copies
+                    for key in ('Qov', 'Qvv', 'Qmz', 'Qaz'):
+                        fx[c].pop(key, None)
             d[('tn', s)] = cp.asarray(self.LTn[s].slot[[self.cpos[c] for c in mem]])
             d[('gtn', s)] = int(self.LTn[s].group[self.cpos[mem[0]]])
             d[('fv', s)] = cp.asarray(self.LF[s].slot[[self.fvpos[c] for c in mem]])
