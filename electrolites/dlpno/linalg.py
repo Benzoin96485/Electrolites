@@ -67,7 +67,7 @@ extern "C" __global__ void pivchol(const double* __restrict__ A, double* __restr
         for (int w = blockDim.x / 2; w > 0; w >>= 1) {
             if (threadIdx.x < w) {
                 double o = best[threadIdx.x + w]; int oi = bidx[threadIdx.x + w];
-                if (o > best[threadIdx.x] || (o == best[threadIdx.x] && oi >= 0 && oi < bidx[threadIdx.x])) {
+                if (o > best[threadIdx.x] || (o == best[threadIdx.x] && oi >= 0 && TIEBREAK(oi, bidx[threadIdx.x]))) {
                     best[threadIdx.x] = o; bidx[threadIdx.x] = oi;
                 }
             }
@@ -103,7 +103,9 @@ def pivoted_cholesky_batched(A, nn, tol):
     (stopping at diag < tol), as Psi4's.  Returns a boolean mask (b, n)."""
     global _pc_kern
     if _pc_kern is None:
-        _pc_kern = cp.RawKernel(_PIVCHOL, 'pivchol')
+        import os
+        tb = '#define TIEBREAK(a, b) ((a) > (b))\n' if os.environ.get('DLPNO_TIEBREAK_HIGH') else '#define TIEBREAK(a, b) ((a) < (b))\n'
+        _pc_kern = cp.RawKernel(tb + _PIVCHOL, 'pivchol')
     A = cp.ascontiguousarray(A, dtype=cp.float64)
     b, n = A.shape[0], A.shape[1]
     L = cp.zeros_like(A)
