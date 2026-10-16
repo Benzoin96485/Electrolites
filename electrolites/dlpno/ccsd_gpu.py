@@ -278,7 +278,10 @@ class CCSDGPU:
             for s, p in enumerate(m):
                 buf[s, ref.pao[p], :self.nv[p]] = ref.X[p]
             Xs.data[g] = cp.asarray(buf)
-        SX = Ragged(LX, [cp.matmul(Spao, d) for d in Xs.data])
+        pr = LX.shapes[0][0]
+        Sp = cp.zeros((pr, pr))
+        Sp[:nbf, :nbf] = Spao
+        SX = Ragged(LX, [cp.matmul(Sp, d) for d in Xs.data])
         S = Ragged(self.LS)
         plan = ChainPlan(self.LS, np.arange(len(cp_)), [op(LX, cp_, True), op(LX, cq_)])
         plan.run(S, [Xs, SX])
@@ -296,10 +299,10 @@ class CCSDGPU:
         self.K3 = []
         for g, m in enumerate(LP.members):
             pv = LP.shapes[g][0]
-            buf = np.zeros((len(m), pv, pv, pv))
+            buf = cp.zeros((len(m), pv, pv, pv))
             for s, p in enumerate(m):
                 v = self.nv[p]
-                buf[s, :v, :v, :v] = ref.K_ivvv[p].reshape(v, v, v)
+                buf[s, :v, :v, :v] = cp.asarray(ref.K_ivvv[p]).reshape(v, v, v)
             self.K3.append(cp.asarray(buf))
         # non-projected integrals, per (strong p, k in lmos[p])
         pk_p, pk_k, pk_r = [], [], []
@@ -347,19 +350,19 @@ class CCSDGPU:
             A = int(uk[u][0])
             Lp, Vp = self.LN.shapes[int(uk[u][2])]
             g = len(mem)
-            Qma = np.zeros((g, A, Lp, Vp))
-            Qab = np.zeros((g, A, Vp, Vp))
-            Qk = np.zeros((g, 2, A, Lp))
-            Qa = np.zeros((g, 2, A, Vp))
+            Qma = cp.zeros((g, A, Lp, Vp))
+            Qab = cp.zeros((g, A, Vp, Vp))
+            Qk = cp.zeros((g, 2, A, Lp))
+            Qa = cp.zeros((g, 2, A, Vp))
             for s, p in enumerate(mem):
                 q = self.ji[p]
                 na, nl, nv = ref.Qma[p].shape
-                Qma[s, :na, :nl, :nv] = ref.Qma[p]
-                Qab[s, :na, :nv, :nv] = ref.Qab[p]
-                Qk[s, 0, :na, :nl] = ref.iQk[p]
-                Qk[s, 1, :na, :nl] = ref.iQk[q]
-                Qa[s, 0, :na, :nv] = ref.iQa[p]
-                Qa[s, 1, :na, :nv] = ref.iQa[q]
+                Qma[s, :na, :nl, :nv] = cp.asarray(ref.Qma[p])
+                Qab[s, :na, :nv, :nv] = cp.asarray(ref.Qab[p])
+                Qk[s, 0, :na, :nl] = cp.asarray(ref.iQk[p])
+                Qk[s, 1, :na, :nl] = cp.asarray(ref.iQk[q])
+                Qa[s, 0, :na, :nv] = cp.asarray(ref.iQa[p])
+                Qa[s, 1, :na, :nv] = cp.asarray(ref.iQa[q])
             q = self.ji[mem]
             pos = ref.lmo_pos
             gL = self.LL.group[mem]
