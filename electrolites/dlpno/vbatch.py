@@ -116,6 +116,13 @@ def _kern(name):
     return _mod.get_function(name)
 
 
+def _shapes(lay):
+    sh = getattr(lay, '_shp_arr', None)
+    if sh is None:
+        sh = lay._shp_arr = np.array(lay.shapes, np.int64).reshape(-1, 2)
+    return sh
+
+
 class _Op:
     """Static description of one chain operand over the term list."""
 
@@ -124,8 +131,8 @@ class _Op:
         idx = o.idx
         self.trans = bool(o.trans)
         self.group = lay.group[idx]
-        pr = np.array([lay.shapes[g][0] for g in self.group], np.int64)
-        pc = np.array([lay.shapes[g][1] for g in self.group], np.int64)
+        shp = _shapes(lay)
+        pr, pc = shp[self.group, 0], shp[self.group, 1]
         rows, cols = lay.rows[idx], lay.cols[idx]
         off = lay.slot[idx] * pr * pc
         if o.row is not None:
@@ -173,8 +180,8 @@ class VChainPlan:
         # output
         lay = out_layout
         g = lay.group[out_idx]
-        pr = np.array([lay.shapes[x][0] for x in g], np.int64)
-        pc = np.array([lay.shapes[x][1] for x in g], np.int64)
+        shp = _shapes(lay)
+        pr, pc = shp[g, 0], shp[g, 1]
         off = lay.slot[out_idx] * pr * pc
         if out_row is not None:
             off = off + np.asarray(out_row, np.int64) * pc
@@ -291,7 +298,7 @@ class VDotPlan:
         self.tlay = Layout(r0.m, rl.n)
         self.chain = VChainPlan(self.tlay, np.arange(n), right)
         g = self.tlay.group
-        pc = np.array([self.tlay.shapes[x][1] for x in g], np.int64)
+        pc = _shapes(self.tlay)[g, 1]
         d = np.stack([self.lop.m, self.lop.n, self.lop.ld, pc], 1).astype(np.int32)
         assert self.lop.trans is False
         self.ddims = cp.asarray(d)

@@ -460,9 +460,13 @@ class UCCSDGPUv(UCCSDGPU):
         for cc, s_, kl in ((fv_c, fvn[:, 1] if len(fvn) else [], fvn[:, 2] if len(fvn) else []),
                            (rb_c, rb_a, rb_kl), (rb_c, rb_b, rb_kl)):
             if len(cc):
-                key = np.unique(np.stack([cc, s_, kl], 1), axis=0)
-                np.add.at(cost_b, key[:, 0], 8. * nvs[key[:, 2], key[:, 1]] * nvs[key[:, 0], key[:, 1]])
-                np.add.at(cost_g, key[:, 0], 8. * PP * nvs[key[:, 0], key[:, 1]])
+                npr = self.npair
+                code = np.unique((np.asarray(cc, np.int64) * 2 + np.asarray(s_, np.int64)) * npr
+                                 + np.asarray(kl, np.int64))
+                k0, ks = code // npr // 2, (code // npr) % 2
+                k2 = code % npr
+                np.add.at(cost_b, k0, 8. * nvs[k2, ks] * nvs[k0, ks])
+                np.add.at(cost_g, k0, 8. * PP * nvs[k0, ks])
         chunks, cur, cb, cg = [], [], 0., 0.
         for c in sc:
             if cur and (cb + cost_b[c] > self.MAX_S_CHUNK_BYTES or cg + cost_g[c] > self.MAX_S_CHUNK_BYTES):
