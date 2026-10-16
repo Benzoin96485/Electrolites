@@ -681,6 +681,7 @@ class RefUDLPNO:
         pl = self.pl
         self.cc = [None] * len(pl)
         self._mix = {}
+        self._np = {}
         for p, (x, y) in enumerate(pl.pairs):
             if x > y:
                 continue
@@ -747,6 +748,7 @@ class RefUDLPNO:
         e_prev = 0.
         for it in range(1, opt['MAXITER'] + 1):
             dr = {}
+            self._Z = {}
             for p, (x, y) in enumerate(pl.pairs):
                 if x <= y:
                     dr[p] = dr[pl.ji[p]] = self._dress(p)
@@ -902,35 +904,60 @@ class RefUDLPNO:
             R[(I, J)] = r
         return R
 
+    def _ring_np(self, p, K, J, q):
+        """non-projected, undressed <K B_p || C_q J> = (K C|B J) - (K J|B C),
+        B in pair p's space, C in pair q's, fitted in p's domain (fixed)."""
+        key = (p, K, J, q)
+        v = self._np.get(key)
+        if v is None:
+            d = self.cc[p]
+            o = d['o']
+            Bov_m, Bvv_m = self._mixed(p, q)
+            pk, pj = d['pos'][K], d['pos'][J]
+            B = d['B']
+            v = (np.einsum('Qc,Qb->bc', Bov_m[:, pk], B[:, o:, pj])
+                 - np.einsum('Q,Qbc->bc', B[:, pk, pj], Bvv_m))
+            self._np[key] = v
+        return v
+
+    def _ring_Z(self, dr, Gu, J, K):
+        """Z_JK[B,C] in the space of the pair (j, k): the T1-dressing part of
+        <KB||CJ>~ plus 1/2 sum_{L,D} <KL||CD> t_JL^{BD}."""
+        key = (J, K)
+        if key in self._Z:
+            return self._Z[key]
+        pl = self.pl
+        y, k = self.so[J][0], self.so[K][0]
+        q = pl.ij[y, k]
+        d, dq = self.cc[q], dr[q]
+        o = d['o']
+        B, Bt = d['B'], dq['Bt']
+        pk, pj = d['pos'][K], d['pos'][J]
+        Z = (np.einsum('Qc,Qb->bc', B[:, pk, o:], Bt[:, o:, pj] - B[:, o:, pj])
+             - (np.einsum('Q,Qbc->bc', Bt[:, pk, pj], Bt[:, o:, o:])
+                - np.einsum('Q,Qbc->bc', B[:, pk, pj], B[:, o:, o:])))
+        for l in self.lmos[q]:
+            for L in (self.so_index.get((l, 0)), self.so_index.get((l, 1))):
+                if L is None or L == J or L == K:
+                    continue
+                jl, kl = pl.ij[y, l], pl.ij[k, l]
+                Z += .5 * self.S(q, jl) @ self.T2[(J, L)] @ self.S(jl, kl) @ Gu[(K, L)].T @ self.S(kl, q)
+        self._Z[key] = Z
+        return Z
+
     def _ring_X(self, dr, Gu, p, I, J):
-        """X_IJ[A,B] = sum_{K,C} W_KBCJ t_IK^{AC} in pair p's space."""
+        """X_IJ[A,B] = sum_{K,C} W_KBCJ t_IK^{AC} in pair p's space, with
+        W = <KB||CJ> (non-projected, fixed) + S(p,jk) Z_JK S(jk,ik)."""
         pl = self.pl
         d = self.cc[p]
-        dp = dr[p]
-        o = d['o']
-        Bt, tau = dp['Bt'], dp['tau']
         x, y = self.so[I][0], self.so[J][0]
-        pj = d['pos'][J]
         X = np.zeros((self.nv(p), self.nv(p)))
         for K in d['occ']:
             if K == I:
                 continue
             k = self.so[K][0]
-            ik = pl.ij[x, k]
-            jk = pl.ij[y, k]
-            Bov_m, Bvv_m = self._mixed(p, ik)            # (Q|M C_ik), (Q|B_p C_ik)
-            pk = d['pos'][K]
-            # dressed (Q|B_p C_ik) = B_BC - sum_l tau[B, l] (Q| l C)
-            Bvv_t = Bvv_m - lib.einsum('bl,Qlc->Qbc', tau[o:, :o], Bov_m)
-            W = (np.einsum('Qc,Qb->bc', Bov_m[:, pk], Bt[:, o:, pj])
-                 - np.einsum('Q,Qbc->bc', Bt[:, pk, pj], Bvv_t))
-            # quadratic: 1/2 sum_{L,D} <KL||CD> t_JL^{BD}
-            for l in self.lmos[jk]:
-                for L in (self.so_index.get((l, 0)), self.so_index.get((l, 1))):
-                    if L is None or L == J or L == K:
-                        continue
-                    jl, kl = pl.ij[y, l], pl.ij[k, l]
-                    W += .5 * self.S(p, jl) @ self.T2[(J, L)] @ self.S(jl, kl) @ Gu[(K, L)].T @ self.S(kl, ik)
+            ik, jk = pl.ij[x, k], pl.ij[y, k]
+            W = self._ring_np(p, K, J, ik) + self.S(p, jk) @ self._ring_Z(dr, Gu, J, K) @ self.S(jk, ik)
             X += self.S(p, ik) @ self.T2[(I, K)] @ W.T
         return X
 
