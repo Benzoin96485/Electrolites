@@ -577,8 +577,14 @@ class UTriplesGPU:
                 for q in range(n):
                     t = ch[sb[q]]
                     nf = (int(tn['nfa'][sb[q]]), int(tn['nfb'][sb[q]]))
-                    self.st[(t, pat)] = dict(W=Wt[q], V=Vt[q], T=T3[q], D=Dn[q], O=tuple(O[q]),
-                                             n=float(np.prod([nf[x] for x in pat])))
+                    d0, d1, d2 = (nf[x] for x in pat)
+                    from electrolites.dlpno.devmem import to_pinned
+                    sl3 = (q, slice(0, d0), slice(0, d1), slice(0, d2))
+                    # true-size blocks; W and W+V wait in pinned host memory
+                    ev = [e[pat[r]][q, :(d0, d1, d2)[r]].get() for r in range(3)]
+                    self.st[(t, pat)] = dict(W=to_pinned(Wt[sl3]), U=to_pinned(Wt[sl3] + Vt[sl3]),
+                                             T=cp.ascontiguousarray(T3[sl3]), O=tuple(O[q]),
+                                             e=ev, fs=float(fs[q]), n=float(d0 * d1 * d2))
         if save:
             for s, t in enumerate(ch):
                 na_, nb_ = int(tn['nfa'][s]), int(tn['nfb'][s])
@@ -601,17 +607,48 @@ class UTriplesGPU:
         where = {okey(e['O']): n for n, e in enumerate(ent)}
         bk = {}
         for n, e in enumerate(ent):
-            bk.setdefault(tuple(e['W'].shape), []).append(n)
+            bk.setdefault(tuple(int(padded(x)) for x in e['W'].shape), []).append(n)
         slot = np.zeros(len(keys), np.int64)
         bof = [None] * len(keys)
         for s, mem in bk.items():
             slot[mem] = np.arange(len(mem))
             for m_ in mem:
                 bof[m_] = s
-        W = {s: cp.stack([ent[m_]['W'] for m_ in m]) for s, m in bk.items()}
-        Vv = {s: cp.stack([ent[m_]['V'] for m_ in m]) for s, m in bk.items()}
-        T = {s: cp.stack([ent[m_]['T'] for m_ in m]) for s, m in bk.items()}
-        D = {s: cp.stack([ent[m_]['D'] for m_ in m]) for s, m in bk.items()}
+        from electrolites.dlpno.devmem import pinned_empty, to_dev
+
+        def stack_host(name, s, mem):
+            out = pinned_empty((len(mem),) + s)
+            out[...] = 0.
+            for i, m_ in enumerate(mem):
+                a = ent[m_][name]
+                out[i, :a.shape[0], :a.shape[1], :a.shape[2]] = a
+            return out
+
+        def stack_dev(s, mem):
+            out = cp.zeros((len(mem),) + s)
+            for i, m_ in enumerate(mem):
+                a = ent[m_]['T']
+                out[i, :a.shape[0], :a.shape[1], :a.shape[2]] = a
+            return out
+
+        def d_parts(s, mem):
+            e3 = [np.full((len(mem), s[r]), 1e3) for r in range(3)]
+            fsv = np.zeros(len(mem))
+            for i, m_ in enumerate(mem):
+                for r in range(3):
+                    v = ent[m_]['e'][r]
+                    e3[r][i, :len(v)] = v
+                fsv[i] = ent[m_]['fs']
+            return cp.asarray(fsv), [cp.asarray(x) for x in e3]
+
+        def stack_D(s, mem):
+            fsv, e3 = Dp[s]
+            return (fsv[:, None, None, None] - e3[0][:, :, None, None]
+                    - e3[1][:, None, :, None] - e3[2][:, None, None, :])
+        Dp = {s: d_parts(s, m) for s, m in bk.items()}
+        W = {s: stack_host('W', s, m) for s, m in bk.items()}
+        Vv = {s: stack_host('U', s, m) for s, m in bk.items()}
+        T = {s: stack_dev(s, m) for s, m in bk.items()}
         mult = {s: cp.asarray(np.array([1. if len({so[I][1] for I in ent[m_]['O']}) == 1 else 3.
                                         for m_ in m])) for s, m in bk.items()}
         trip_of = {s: np.array([keys[m_][0] for m_ in m]) for s, m in bk.items()}
@@ -687,7 +724,11 @@ class UTriplesGPU:
         e_prev = 0.
         ntrip = len(self.trip)
         for it in range(1, opt['MAXITER'] + 1):
-            R = {s: W[s] - D[s] * T[s] for s in bk}
+            D = {}
+            R = {}
+            for s in bk:
+                D[s] = stack_D(s, bk[s])
+                R[s] = to_dev(W[s]) - D[s] * T[s]
             for g in plan:
                 Au = T[g['su']][g['suo']].transpose((0,) + tuple(1 + p for p in g['perm']))
                 S0, S1, S2 = g['S']
@@ -704,7 +745,7 @@ class UTriplesGPU:
                 rms = max(rms, float(r.max()))
             self.e_ijk = np.zeros(ntrip)
             for s in bk:
-                e = (mult[s] / 6.) * cp.sum(T[s] * (W[s] + Vv[s]), axis=(1, 2, 3))
+                e = (mult[s] / 6.) * cp.sum(T[s] * to_dev(Vv[s]), axis=(1, 2, 3))
                 np.add.at(self.e_ijk, trip_of[s], e.get())
             E = float(self.e_ijk.sum())
             self.log(f'  GPU U(T) iter {it:3d} {E:.12f} {E - e_prev:.3e} {rms:.3e}')
