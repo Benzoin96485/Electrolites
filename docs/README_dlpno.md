@@ -51,13 +51,25 @@ keyword (`T_CUT_PNO=1e-8`, ...).
 | LCCSD residual | every projected term is a static list of GEMM chains replayed per iteration; DF dressing of strong pairs batched in coarse size buckets; 3-external contractions as batched GEMMs; persistent work buffers so no host<->device synchronisation inside an iteration |
 | (T0) / (T) | triplets batched by padded TNO size; 3-external triples tensors accumulated per auxiliary atom without forming the fitted (Q|ab); fused CUDA kernel for the six-permutation energy; iterative (T) as batched three-mode transformations |
 
-Memory: the (kl, ij) PNO overlaps of the F'_vv and oooo-ladder terms are
-regenerated per chunk of pairs each iteration (one variable-size GEMM) instead
-of being stored; when the strong pairs' DF tensors and the 3-external tensors
-would exceed a third of the free device memory they live in pinned host
-memory and stream per bucket (`DLPNO_OFFLOAD=0/1` forces); the CuPy pool
-allocator is used inside the kernels (GPU4PySCF routes >100 MB allocations to
-cudaMalloc).
+Memory (what grows with system size, and what is done about it):
+
+* PNO overlaps S(p, q) -- millions of couples.  `ovgen.OverlapGen` keeps
+  only each pair's compact PAO-domain coefficients on the device and, for a
+  chunk of couples, scatters them into the union of their PAO domains and
+  evaluates the chunk with one variable-size GEMM.  The (kl, ij) overlaps of
+  the F'_vv / oooo-ladder terms are always regenerated per chunk; all other
+  overlaps are stored when they fit in a quarter of the free device memory
+  and otherwise regenerated chunk by chunk inside every plan
+  (`DLPNO_ONFLY_S=auto|0|1`).
+* DF tensors of the strong pairs and the 3-external tensors: pinned host
+  memory, streamed per size bucket, when they exceed a third of the free
+  device memory (`DLPNO_OFFLOAD=auto|0|1`).
+* iterative (T): W and W+V at their true sizes in pinned host memory, D
+  rebuilt from the orbital energies; the triples' 3-external tensors are
+  accumulated per auxiliary atom without the fitted (Q|ab).
+* every variable-size GEMM chain runs in memory-bounded term chunks; the CC
+  stores are released before the triples; the CuPy pool allocator is used
+  inside the kernels (GPU4PySCF routes >100 MB allocations to cudaMalloc).
 
 ## Validation
 
