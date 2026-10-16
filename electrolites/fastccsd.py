@@ -129,7 +129,10 @@ def _direct_ovvv_vvvv(mycc, t1, t2):
         mycc._fastccsd_eri = None
     mol = vhfopt.mol
 
-    mo = vhfopt.coeff.dot(cp.asarray(mycc.mo_coeff))
+    # the active orbitals: GPU4PySCF's own loop takes mycc.mo_coeff whole,
+    # so any frozen orbital crashes it (orbv's width is off by nfrozen)
+    mask = cp.asarray(mycc.get_frozen_mask())
+    mo = vhfopt.coeff.dot(cp.asarray(mycc.mo_coeff)[:, mask])
     orbo = cp.asarray(mo[:, :nocc])
     orbv = cp.asarray(mo[:, nocc:])
     t1po = orbv.dot(t1.T)

@@ -1,0 +1,148 @@
+"""Phase 6 timings: one step of each item, GPU (after a warm-up) or the CPU
+reference (``--cpu``).
+
+    python benchmarks/phase6_bench.py --what lo --method boys [--cpu]
+
+what: lo (method: boys | pm | ibo | er) | eom (method: ip | ea) | adc (method: ee | ip | ea)
+"""
+import argparse
+import json
+import os
+import time
+
+import numpy as np
+
+ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+ap.add_argument('--what', required=True, choices=('lo', 'eom', 'adc'))
+ap.add_argument('--method', default='boys')
+ap.add_argument('--cpu', action='store_true')
+ap.add_argument('--xyz', default='benchmarks/molecules/glycine.xyz')
+ap.add_argument('--basis', default='def2-svp')
+ap.add_argument('--xc', default='hf')
+ap.add_argument('--charge', type=int, default=0)
+ap.add_argument('--spin', type=int, default=0)
+ap.add_argument('--nroots', type=int, default=4)
+a = ap.parse_args()
+rec = dict(vars(a), threads=os.environ.get('OMP_NUM_THREADS'))
+
+
+def sync():
+    if not a.cpu:
+        import cupy
+        cupy.cuda.Stream.null.synchronize()
+
+
+def timed(label, fn, warm=False):
+    if warm and not a.cpu:
+        timed(label + '_cold', fn)
+    sync()
+    t = time.perf_counter()
+    out = fn()
+    sync()
+    rec[label] = time.perf_counter() - t
+    return out
+
+
+if not a.cpu:
+    import electrolites
+    electrolites.patch_all()
+
+
+def molecule():
+    from pyscf import gto
+    return gto.M(atom=a.xyz, basis=a.basis, charge=a.charge, spin=a.spin,
+                 verbose=0)
+
+
+if a.what == 'lo':
+    mol = molecule()
+    if a.cpu:
+        from pyscf import scf
+    else:
+        from gpu4pyscf import scf
+    mf = scf.RHF(mol)
+    mf.conv_tol = 1e-10
+    timed('scf_s', mf.kernel)
+    from pyscf.data import elements
+    ncore = elements.chemcore(mol)
+    occ = np.asarray(mf.mo_occ.get() if hasattr(mf.mo_occ, 'get')
+                     else mf.mo_occ) > 0
+    mo = mf.mo_coeff[:, ncore:int(occ.sum())]
+    rec['nao'], rec['nloc'] = mol.nao, mo.shape[1]
+    if a.cpu:
+        from pyscf import lo
+        L = {'boys': lambda: lo.Boys(mol, mo).kernel(),
+             'pm': lambda: lo.PM(mol, mo, mf).kernel(),
+             'ibo': lambda: lo.ibo.ibo(mol, mo, locmethod='IBO'),
+             'er': lambda: lo.ER(mol, mo).kernel()}[a.method]
+    else:
+        from electrolites import lo_gpu
+        L = {'boys': lambda: lo_gpu.Boys(mol, mo).kernel(),
+             'pm': lambda: lo_gpu.PM(mol, mo, mf).kernel(),
+             'ibo': lambda: lo_gpu.ibo(mol, mo),
+             'er': lambda: lo_gpu.ER(mol, mo).kernel()}[a.method]
+    c = timed('step_s', L, warm=True)
+    c = c.get() if hasattr(c, 'get') else np.asarray(c)
+    s = mol.intor_symmetric('int1e_ovlp')
+    with mol.with_common_orig(np.einsum('z,zx->x', mol.atom_charges(),
+                                        mol.atom_coords())
+                              / mol.atom_charges().sum()):
+        r = mol.intor_symmetric('int1e_r', comp=3)
+    dip = np.einsum('pi,xpq,qi->xi', c, r, c)
+    rec['boys_cost'] = float((dip ** 2).sum())
+elif a.what == 'eom':
+    from pyscf.data import elements
+    mol = molecule()
+    fc = elements.chemcore(mol)
+    if a.cpu:
+        from pyscf import scf, cc
+        from pyscf.cc import eom_rccsd as E
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-10
+        timed('scf_s', mf.kernel)
+        mycc = cc.CCSD(mf, frozen=fc)
+        timed('ccsd_s', mycc.kernel)
+        eom = (E.EOMIP if a.method == 'ip' else E.EOMEA)(mycc)
+    else:
+        from gpu4pyscf import scf
+        from gpu4pyscf.cc import ccsd_incore
+        from electrolites import eom_gpu as E
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-10
+        timed('scf_s', mf.kernel)
+        mycc = ccsd_incore.CCSD(mf, frozen=fc)
+        timed('ccsd_s', mycc.kernel)
+        eom = (E.EOMIP if a.method == 'ip' else E.EOMEA)(mycc)
+    eom.conv_tol = 1e-7
+    e = timed('step_s', lambda: eom.kernel(nroots=a.nroots)[0])
+    rec['e_eV'] = (np.asarray(e) * 27.211386).tolist()
+    rec['nao'], rec['nfrozen'] = mol.nao, fc
+elif a.what == 'adc':
+    from pyscf.data import elements
+    mol = molecule()
+    fc = elements.chemcore(mol)
+    if a.cpu:
+        from pyscf import scf, adc
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-10
+        timed('scf_s', mf.kernel)
+        my = adc.ADC(mf, frozen=fc)
+        my.method_type = a.method
+        my.compute_properties = False
+        my.approx_trans_moments = True
+    else:
+        from gpu4pyscf import scf
+        from electrolites import adc_gpu
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-10
+        timed('scf_s', mf.kernel)
+        my = adc_gpu.RADC(mf, frozen=fc, method_type=a.method)
+    my.conv_tol = 1e-7
+    e = timed('step_s', lambda: my.kernel(nroots=a.nroots)[0])
+    rec['e_eV'] = (np.asarray(e) * 27.211386).tolist()
+    rec['nao'], rec['nfrozen'] = mol.nao, fc
+side = 'CPU' if a.cpu else 'GPU'
+print(f"[{a.what} {a.method} {side} {os.path.basename(a.xyz)}/{a.basis}] "
+      + '  '.join(f'{k} {v:.2f}' for k, v in rec.items()
+                  if k.endswith('_s') and isinstance(v, float)))
+print('RESULT ' + json.dumps(rec, default=str))

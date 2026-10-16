@@ -237,6 +237,16 @@ register('cubegen', 'cubegen_gpu',
 register('ir_uks', 'ir_uks',
          doc='[O3] IR intensities for UHF/UKS (and RHF/RKS) on the GPU '
              '(ir_uks.eval_ir_freq_intensity)')
+register('lo', 'lo_gpu',
+         doc='[S7] orbital localisation on the GPU: Boys, Pipek-Mezey (all '
+             'PySCF populations), density-fitted Edmiston-Ruedenberg, IBO '
+             '(lo_gpu.Boys, PM, ER, ibo)')
+register('eom', 'eom_gpu',
+         doc='[P6] EOM-IP- and EOM-EA-CCSD on a GPU4PySCF CCSD, no v^4 '
+             'array (eom_gpu.EOMIP, EOMEA)')
+register('adc', 'adc_gpu',
+         doc='[P10] ADC(2) EE/IP/EA on the GPU: PySCF\'s ADC algebra on '
+             'device arrays (adc_gpu.RADC)')
 register('raman_uks', 'raman_uks',
          doc='[O3] Raman activities for UHF/UKS (and RHF/RKS) on the GPU '
              '(raman_uks.eval_raman_intensity)')
