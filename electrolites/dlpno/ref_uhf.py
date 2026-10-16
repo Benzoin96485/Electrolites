@@ -262,8 +262,10 @@ class RefUDLPNO:
                 occ_pno += occ[a]
                 nfin += 1
         # directions with zero occupation (the null space of a rank-deficient
-        # density, e.g. a pair of SOMOs) carry no amplitude and are arbitrary
-        nfin = min(nfin, int(np.count_nonzero(occ > 1e-12 * occ.max())))
+        # density, e.g. a pair of SOMOs) are arbitrary: take all or none
+        nnz = int(np.count_nonzero(occ > 1e-12 * occ.max()))
+        if nfin > nnz:
+            nfin = len(occ)
         nfin = max(1, nfin)
         # never split a degenerate set of PNOs: the density of a pair of
         # SOMOs (same-spin amplitudes only) has pairwise degenerate
