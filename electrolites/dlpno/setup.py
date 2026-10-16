@@ -162,20 +162,32 @@ def compute_doi(mol, C_lmo, C_pao, grid=(25, 50), blksize=4096, need_uv=True):
         coords, weights = g[:, :3], g[:, 3]
     else:
         coords, weights = doi_grid(mol, grid)
+    import cupy as cp
+    try:
+        from gpu4pyscf.dft import numint as gnum
+        ev = lambda c: gnum.eval_ao(mol, cp.asarray(c))
+    except ImportError:
+        ev = lambda c: cp.asarray(numint.eval_ao(mol, c))
     nl, nu = C_lmo.shape[1], C_pao.shape[1]
-    ij = np.zeros((nl, nl))
-    iu = np.zeros((nl, nu))
-    uv = np.zeros((nu, nu)) if need_uv else None
+    L, P = cp.asarray(C_lmo), cp.asarray(C_pao)
+    ij = cp.zeros((nl, nl))
+    iu = cp.zeros((nl, nu))
+    uv = cp.zeros((nu, nu)) if need_uv else None
+    wd = cp.asarray(weights)
     for p0 in range(0, len(weights), blksize):
         p1 = min(p0 + blksize, len(weights))
-        ao = numint.eval_ao(mol, coords[p0:p1])
-        li = (ao @ C_lmo) ** 2
-        lu = (ao @ C_pao) ** 2
-        w = weights[p0:p1, None]
+        ao = ev(coords[p0:p1])
+        if ao.shape[0] != p1 - p0:
+            ao = ao.T
+        li = (ao @ L) ** 2
+        lu = (ao @ P) ** 2
+        w = wd[p0:p1, None]
         ij += (li * w).T @ li
         iu += (li * w).T @ lu
         if need_uv:
             uv += (lu * w).T @ lu
+    ij, iu = ij.get(), iu.get()
+    uv = uv.get() if need_uv else None
     return (np.sqrt(np.maximum(ij, 0)), np.sqrt(np.maximum(iu, 0)),
             np.sqrt(np.maximum(uv, 0)) if need_uv else None)
 
