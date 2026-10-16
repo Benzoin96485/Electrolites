@@ -35,7 +35,14 @@ class UTriplesGPU:
     """Mixin for uhf.UDLPNO replacing tno_transform / lccsd_t0 /
     lccsd_t_iterations of the host reference."""
 
-    MAX_CHUNK_BYTES = 1 << 30
+    MAX_CHUNK_BYTES = None
+
+    def _chunk_bytes(self):
+        """batch budget of the triplet chunks: an eighth of the free device memory (>= 1 GB)."""
+        if self.MAX_CHUNK_BYTES:
+            return self.MAX_CHUNK_BYTES
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        return max(1 << 30, int(free // 8))
 
     # ------------------------------------------------------------------
     # pair tables on the device
@@ -266,7 +273,7 @@ class UTriplesGPU:
             sel = sel[np.argsort(self._naux_t[sel], kind='stable')]
             Pv = int(Pv)
             per = 8 * (12 * Pv * Pv + 2 * nbf * Pv)
-            step = max(1, int(self.MAX_CHUNK_BYTES // per))
+            step = max(1, int(self._chunk_bytes() // per))
             for c0 in range(0, len(sel), step):
                 ch = sel[c0:c0 + step]
                 tn = self._tno_chunk(ch, Pv, self._t_cut_tno)
@@ -276,7 +283,7 @@ class UTriplesGPU:
                 Vm = max(Va, Vb)
                 per = 8 * (2 * A * A + 14 * A * Vm + 18 * Vm ** 3
                            + 8 * L * Vm * Vm + 2 * nbf * Vm + 4 * A * Pv)
-                sub = max(1, int(self.MAX_CHUNK_BYTES // per))
+                sub = max(1, int(self._chunk_bytes() // per))
                 for s0 in range(0, len(ch), sub):
                     sl = slice(s0, s0 + sub)
                     part = {k: (v[sl] if k not in ('nfa', 'nfb', 'pidx', 'pm') else v[sl])

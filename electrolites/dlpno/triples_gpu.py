@@ -119,7 +119,14 @@ class TriplesGPU:
     """Mixin for rhf.DLPNO replacing the reference's tno_transform /
     lccsd_t0 / lccsd_t_iterations."""
 
-    MAX_CHUNK_BYTES = 1 << 30
+    MAX_CHUNK_BYTES = None
+
+    def _chunk_bytes(self):
+        """batch budget of the triplet chunks: an eighth of the free device memory (>= 1 GB)."""
+        if self.MAX_CHUNK_BYTES:
+            return self.MAX_CHUNK_BYTES
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        return max(1 << 30, int(free // 8))
 
     # ---- pair tables --------------------------------------------------
     def _pair_tables(self):
@@ -252,7 +259,7 @@ class TriplesGPU:
             sel = sel[np.argsort(self._naux_t[sel], kind='stable')]
             Pv = int(Pv)
             per = 8 * (10 * Pv * Pv + 2 * nbf * Pv + 3 * PP * Pv)
-            step = max(1, int(self.MAX_CHUNK_BYTES // per))
+            step = max(1, int(self._chunk_bytes() // per))
             for c0 in range(0, len(sel), step):
                 ch = sel[c0:c0 + step]
                 Xt, et, nfin, pidx, pm = self._tno_chunk(ch, Pv, self._t_cut_tno)
@@ -266,7 +273,7 @@ class TriplesGPU:
                 L = int(padded(max(1, self._nl_t[ch].max())))
                 per = 8 * (A * V * V + 3 * A * Pv + A * A + 14 * V ** 3
                            + 3 * L * V * V + nbf * V + 3 * A * V)
-                sub = max(1, int(self.MAX_CHUNK_BYTES // per))
+                sub = max(1, int(self._chunk_bytes() // per))
                 for s0 in range(0, len(ch), sub):
                     sl = slice(s0, s0 + sub)
                     Xs = Xt[sl]
