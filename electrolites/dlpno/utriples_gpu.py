@@ -664,7 +664,13 @@ class UTriplesGPU:
                     perm = tuple(ck.index(new[q]) for q in range(3))
                     groups.setdefault((bof[n], bof[u], perm), []).append((n, u, f))
         plan = []
-        for (sn, su, perm), lst in groups.items():
+        split = []
+        for (sn, su, perm), lst0 in groups.items():
+            per = 8 * 4 * max(int(np.prod(sn)), int(np.prod(su)))
+            step = max(1, int((1 << 28) // per))
+            for i0 in range(0, len(lst0), step):
+                split.append(((sn, su, perm), lst0[i0:i0 + step]))
+        for (sn, su, perm), lst in split:
             c = len(lst)
             Ss = []
             for q in range(3):
