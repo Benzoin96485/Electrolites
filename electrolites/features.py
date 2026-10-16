@@ -228,7 +228,9 @@ register('pbc_stability', 'pbc_stability',
              'GPU (pbc_stability.stability)')
 register('polar', 'polar_gpu',
          doc='[O3] static and frequency-dependent polarizability, RHF/RKS '
-             'and UHF/UKS (polar_gpu.polarizability)')
+             'and UHF/UKS (polar_gpu.polarizability); static first '
+             'hyperpolarizability with the XC kernel derivative '
+             '(polar_gpu.hyperpolarizability)')
 register('cubegen', 'cubegen_gpu',
          doc='[T1] density / orbital / MEP cube files on the GPU '
              '(cubegen_gpu.density, orbital, mep)')
