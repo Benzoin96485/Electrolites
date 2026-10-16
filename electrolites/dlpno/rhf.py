@@ -118,6 +118,37 @@ class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
         return X, e, K, T
 
     # ------------------------------------------------------------------
+    def _xtab(self):
+        """device table of every pair's PNO coefficients in its PAO domain."""
+        if getattr(self, '_xt', None) is None or self._xt[0] is not self.X:
+            npair = len(self.X)
+            P = max(len(self.pao[p]) for p in range(npair))
+            V = max(x.shape[1] for x in self.X)
+            tab = np.zeros((npair, P, V))
+            for p in range(npair):
+                tab[p, :len(self.pao[p]), :self.X[p].shape[1]] = self.X[p]
+            self._xt = (self.X, cp.asarray(tab), P)
+        return self._xt[1], self._xt[2]
+
+    def _proj_batch(self, Kxo, Kovx, pairs, pos):
+        """[Kxo[k][:, ext(pair_k)] X_k] and [(X_k^T Kovx[k][ext(pair_k)])^T] for all k."""
+        tab, P = self._xtab()
+        n = len(pairs)
+        cols = np.zeros((n, P), np.int64)
+        msk = np.zeros((n, P))
+        for r, q in enumerate(pairs):
+            c = pos[self.pao[q]]
+            cols[r, :len(c)] = c
+            msk[r, :len(c)] = 1.
+        gc, gm = cp.asarray(cols), cp.asarray(msk)
+        X = tab[cp.asarray(np.asarray(pairs, np.int64))]                     # (n, P, V)
+        A = cp.take_along_axis(Kxo, gc[:, None, :], axis=2) * gm[:, None, :]   # (n, nv, P)
+        J = cp.matmul(A, X)
+        Bk = cp.take_along_axis(Kovx, gc[:, :, None], axis=1) * gm[:, :, None]  # (n, P, nv)
+        K = cp.matmul(X.transpose(0, 2, 1), Bk).transpose(0, 2, 1)
+        nv = [self.X[q].shape[1] for q in pairs]
+        return [J[r, :, :v] for r, v in enumerate(nv)], [K[r, :, :v] for r, v in enumerate(nv)]
+
     def pno_integrals(self):
         pl = self.pl
         dfi = self.dfi
@@ -158,15 +189,11 @@ class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
                                 cp.asarray(ext)[None, None, :]]
                 Koviv = (q_ovx.reshape(na, -1).T @ q_iv_c).reshape(nl, len(ext), nv)
                 Kovjv = (q_ovx.reshape(na, -1).T @ q_jv_c).reshape(nl, len(ext), nv)
-                Jp, Kp, Jq, Kq = [], [], [], []
-                for kk, k in enumerate(lm):
-                    kj, ik = pl.ij[k, j], pl.ij[i, k]
-                    Xkj, Xik = cp.asarray(self.X[kj]), cp.asarray(self.X[ik])
-                    ckj, cik = cp.asarray(pos[self.pao[kj]]), cp.asarray(pos[self.pao[ik]])
-                    Jp.append(Kio[kk][:, ckj] @ Xkj)
-                    Kp.append((Xkj.T @ Koviv[kk][ckj]).T)
-                    Jq.append(Kjo[kk][:, cik] @ Xik)
-                    Kq.append((Xik.T @ Kovjv[kk][cik]).T)
+                # projections into the (k, j) / (i, k) spaces, batched over k
+                lm_a = np.asarray(lm, np.int64)
+                kjs, iks = pl.ij[lm_a, j], pl.ij[i, lm_a]
+                Jp, Kp = self._proj_batch(Kio, Koviv, kjs, pos)
+                Jq, Kq = self._proj_batch(Kjo, Kovjv, iks, pos)
                 self.J_ikac[p], self.K_iakc[p] = Jp, Kp
                 if q != p:
                     self.J_ikac[q], self.K_iakc[q] = Jq, Kq
