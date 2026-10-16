@@ -324,6 +324,7 @@ the CPU code, or against finite differences where there is none
 | `adc` | ADC(2) excitation (singlet), ionisation and attachment energies | EE **19x**, IP **2–7x**, EA **5–14x** (alanine dipeptide, penicillin V) |
 | `kmp2` | k-point MP2 (KRHF, GDF) | **11–39x** (diamond, 3×3×3 and 4×4×4 meshes); 3x on an 8-atom cell at 2×2×2 |
 | `x2c_grad` | spin-free X2C (sfX2C1e) nuclear gradients, RHF/RKS/UHF/UKS; also makes GPU4PySCF's X2C SCF run | **22x** (Pt(II) complex, UKS PBE, all-electron) |
+| `ghf_td` | GHF TDA and TDHF (Hartree–Fock) | TDA **4–6x**, TDHF **2x** (alanine dipeptide and penicillin V cations) |
 
 ## Tests
 

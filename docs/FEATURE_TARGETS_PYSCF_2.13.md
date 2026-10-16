@@ -481,12 +481,12 @@ as KT's was.
 | 7 **done** | **M6** DF-(SA-)CASSCF gradients and NACs | geometry optimisation, conical intersections | Nearly a hook on G's DF gradient machinery, which `fastdfgrad` already speeds up. After rank 2 **Built (§15.1)**: 7–9x per gradient on the TMCs; DF NACs, which PySCF lacks |
 | 8 **done** | **M8** MC-PDFT, then **M7** NEVPT2 | dynamic correlation on CASSCF | MC-PDFT is about one XC evaluation once CASSCF is on the GPU. NEVPT2 is the cleanest high-value greenfield kernel (4-RDM contraction) and the cvcv half is `fastmp2`'s. After rank 2 **Built (§15.2–15.3)**: MC-PDFT 8–10x; NEVPT2 15–24x, CAS(14,14) in 209 s against 3201 s |
 | 9 **done** | **P8 → P9** RPA, then G0W0 | correlation energies; quasiparticle energies | Pure cuBLAS/cuSOLVER on G's device `cderi_ovl`. The design rule is never to build the full Lpq **Built (§15.4)**: RPA 6–15x, G0W0 8–13x |
-| 10 | **S5** sfX2C1e gradient (Hessian after) | all-electron heavy-element geometries | Per-atom dense linear algebra, which maps to strided-batched GEMM; needs GPU `pnucp`-type ip integrals |
-| 11 | **S6** GHF/GKS TDDFT | spin–orbit and non-collinear excitations | A new complex four-component `fxc` grid kernel; GHF-TDHF is nearly glue |
-| 12 | **S7** IBO / PM / ER localisation | local correlation, embedding, analysis | Host-bound Python sweeps (IBO's triple loop, PM's uncached `orth_ao`), and ER via DF |
-| 13 | **X4** k-point MP2 | periodic correlation | GEMM-bound O(nk³); extends `fastdfmp2` and `fastpbcdf`; the `Lov` memory wall is the interesting part |
-| 14 | **P6** EOM-CCSD + Λ; **P10** ADC(2) | excited / ionised states at CC quality | On `fastccsd`'s ladder and the shared Davidson (Z4) |
-| 15 | **O3** frequency-dependent α, β | NLO, dispersion | The Krylov solver exists; β needs `kxc` |
+| 10 **done** (§17.5; Hessian open) | **S5** sfX2C1e gradient (Hessian after) | all-electron heavy-element geometries | Per-atom dense linear algebra, which maps to strided-batched GEMM; needs GPU `pnucp`-type ip integrals |
+| 11 **done** (GHF; §17.6) | **S6** GHF/GKS TDDFT | spin–orbit and non-collinear excitations | A new complex four-component `fxc` grid kernel; GHF-TDHF is nearly glue |
+| 12 **done** (§17.1) | **S7** IBO / PM / ER localisation | local correlation, embedding, analysis | Host-bound Python sweeps (IBO's triple loop, PM's uncached `orth_ao`), and ER via DF |
+| 13 **done** (§17.4) | **X4** k-point MP2 | periodic correlation | GEMM-bound O(nk³); extends `fastdfmp2` and `fastpbcdf`; the `Lov` memory wall is the interesting part |
+| 14 **done** (IP/EA, ADC(2); §17.2–17.3) | **P6** EOM-CCSD + Λ; **P10** ADC(2) | excited / ionised states at CC quality | On `fastccsd`'s ladder and the shared Davidson (Z4) |
+| 15 **done** (§16.4, §16.7) | **O3** frequency-dependent α, β | NLO, dispersion | The Krylov solver exists; β needs `kxc` |
 
 ### 5.2 Glue — no new kernel, do alongside
 
@@ -738,6 +738,13 @@ gain, dropped. An analytic dα/dR for Raman goes to §5.4.
 
 **Phase 6** — §5.1 ranks 10–15 (S5, S6, S7, X4, P6, P10), re-ranked first
 against what Phases 4–5 measured.
+
+*Status (2026-10-16)* — Phase 6 done: §17. Re-ranked S7, P6, P10, X4, S5,
+S6; built localisation (all four methods), EOM-IP/EA-CCSD, ADC(2)
+EE/IP/EA, k-point MP2, sfX2C1e gradients and GHF TDA/TDHF. Three upstream
+defects found and worked around (frozen-core CCSD, X2C SCF eigensolver,
+batched GHF J/K). EOM-EE, Λ, ADC(2)-x/(3), the X2C Hessian and GKS TDDFT
+remain.
 
 §5.2's glue items run alongside every phase. They need no kernel work, and
 each closes a crash or a host-only route that users hit today.
@@ -2366,3 +2373,239 @@ entry for §5.4.
 | **O3** | **built** (α(ω) both spins; UKS IR; β with k_xc; UKS Raman) | α(ω) 410x pyscf-properties' route (penicillin V); UKS IR 24x; β 3.5–42x (and correct for KS, which pyscf-properties' is not); Raman both spins (no CPU code) |
 | **T1** | **built** | MEP 345x the CPU node (penicillin V/TZVP, 80³) |
 | **V5** | **dropped → §5.4** | no measurable gain |
+
+---
+
+## 17. Phase 6, built (2026-10-15/16): §5.1 ranks 10–15
+
+### 17.0 The re-rank
+
+§9 left Phase 6 as ranks 10–15 "re-ranked first against what Phases 4–5
+measured".  What those phases measured that bears on the order:
+
+* the host-bound PySCF routes are where the large ratios came from
+  (Phase 5: α(ω) 410x, MEP 345x, β 42x), not the GEMM-bound ones the GPU
+  merely accelerates (CCSD(T) 7–19x, NEVPT2 15–24x) -- so a host-bound
+  entry outranks a GEMM-bound one of similar demand;
+* `fastccsd` already holds the CCSD amplitudes and the AO-direct ladder on
+  the device, and `fastmp2` gives any (ia|pq) block exactly -- everything an
+  EOM or ADC needs except the v⁴ term, which the ladder covers;
+* the k-point GDF tensor is already device-resident (`fastpbcdf`) and read
+  per momentum transfer by GPU4PySCF's own K build.
+
+| new order | entry | why |
+|---|---|---|
+| 1 | **S7** localisation | the most host-bound of the six (PySCF rebuilds AO quantities on every CIAH call; ER is nmo direct J/K builds per call; IBO a Python triple loop); broad use (AVAS/CASSCF set-up, local correlation, analysis); easy |
+| 2 | **P6** EOM-IP/EA-CCSD | highest demand; the CCSD is on the device; EA stores v⁴ in PySCF |
+| 3 | **P10** ADC(2) | photochemistry; no v⁴ at second order; PySCF's code is einsum-only |
+| 4 | **X4** k-point MP2 | the cderi is on the device; PySCF loops nk³ host contractions |
+| 5 | **S5** sfX2C1e gradient | per-atom (2n)³ linear algebra; moderate demand |
+| 6 | **S6** GHF TDA/TDHF | low demand; GHF response is glue on GPU4PySCF's GHF J/K |
+
+EOM-EE and the CCSD Λ equations (rest of P6), ADC(2)-x/ADC(3) (rest of
+P10) and GKS TDDFT (rest of S6) stay open; §17.7 lists them.
+
+### 17.1 S7 — orbital localisation (`lo_gpu`)
+
+`lo_gpu.Boys`, `PM` (every PySCF population: meta-Löwdin, Löwdin,
+Mulliken, IAO, Becke), `ER`, `ibo`.  Each CIAH localiser's cost function,
+gradient and Hessian-vector product depend on the rotation u only through
+a congruence of a fixed tensor -- dipole matrices u^T d0 u, atomic
+projectors u^T P_A u, DF tensors u^T B^P u -- so the AO work is done once
+on the device and every CIAH step is batched orbital-size GEMMs; PySCF's
+CIAH driver runs unchanged on top (PySCF recomputes `int1e_r`, all `natm`
+projectors with `orth_ao`, or nmo rank-one direct J/K builds on *every*
+call).  ER is density-fitted (PySCF's is exact J/K).  IBO's 2×2 sweeps run
+as parallel Jacobi rounds (round-robin pairing, all n/2 disjoint pairs at
+once, populations from one segmented reduction).
+
+Correctness (`tests/test_lo_gpu.py`, glycine and alanine dipeptide/SVP,
+valence occupied space): Boys and the three PM populations land on
+PySCF's orbitals to 1e-13; ER equals PySCF's ER with the same DF J/K to
+1e-13, and its objective is 8e-5 (7e-6 relative) from the exact one at the
+same orbitals; IBO equals PySCF's to 1e-13 (orbitals) with the same IAO⁴
+objective.  Found on the way `[X]`: the ER landscape has several maxima --
+exact ER and DF-ER from the same start land on different ones, and the
+Boys orbitals score higher on the ER objective than either.
+
+| step (valence occupied) | system | **GPU** | CPU node |
+|---|---|---|---|
+| Boys | penicillin V/SVP | **0.72 s** | 2.72 s (3.8x) |
+| PM (meta-Löwdin) | penicillin V/SVP | **0.47 s** | 6.78 s (14x) |
+| IBO | penicillin V/SVP | **0.89 s** | 5.39 s (6.1x) |
+| ER | penicillin V/SVP | **0.68 s** | 1942 s (2860x) |
+| Boys | taxol/SVP | **1.21 s** | 6.91 s (5.7x) |
+| PM | taxol/SVP | **1.34 s** | 30.7 s (23x) |
+| IBO | taxol/SVP | **2.53 s** | 92.5 s (37x) |
+| ER | taxol/SVP | **10.1 s** | not finished in 40 min |
+
+### 17.2 P6 — EOM-IP- and EOM-EA-CCSD (`eom_gpu`)
+
+`eom_gpu.EOMIP(mycc)`, `EOMEA(mycc)` on a GPU4PySCF (`fastccsd`) CCSD.
+PySCF's EOM classes keep their Davidson, guesses and vector layout; the MO
+integrals come from `fastmp2` (exact), the intermediates of
+`rintermediates` are computed term for term in CuPy, and each Davidson
+step's trial vectors are applied in one batch.  **No v⁴ array**: PySCF's
+EA stores Wvvvv (110 GB at penicillin V/SVP); here sum_cd Wvvvv[abcd] r[jcd]
+is applied in pieces -- the (ac|bd) ladder AO-direct through `fastccsd`'s
+integral blocks and cache (an exchange-type contraction of C_v X C_v^T),
+the τ and t1 parts through `ovov`/`ovvv` -- and Wvvvo's Wvvvv·t1 term uses
+(ac|b j̃) with j̃ = C_v t1[j], one more `ovvv`-shaped transformation.
+
+Found on the way `[X]`: **frozen-core CCSD crashes in GPU4PySCF 1.8.1**
+(`_direct_ovvv_vvvv` takes `mycc.mo_coeff` whole, so `orbv` is nfrozen too
+wide); `fastccsd` now takes the active orbitals, and the frozen-core energy
+is 4e-10 from PySCF's.
+
+Correctness (`tests/test_eom_gpu.py`, water/cc-pVDZ and frozen-core
+glycine/SVP, 4 roots): IP and EA energies equal PySCF's to 3e-12 Eh;
+sigma vectors and diagonals to 1.5e-10 relative (the GPU integrals).
+
+| EOM step (4 roots, frozen core) | system | **GPU** | CPU node |
+|---|---|---|---|
+| IP | alanine dipeptide/SVP | **2.3 s** | 41.6 s (18x) |
+| EA | alanine dipeptide/SVP | **10.7 s** | 407 s (38x) |
+| IP | ferrocene/SVP | **9.3 s** | 70.7 s (7.6x) |
+| EA | ferrocene/SVP | **41.7 s** | 340 s (8.2x) |
+| IP | glycine/TZVP | **2.2 s** | 15.9 s (7.1x) |
+| EA | glycine/TZVP | **20.1 s** | 217 s (11x) |
+
+(The CCSD before it: 8.7 / 26 / 4.8 s on the GPU against 190 / 324 / 41.5 s.)
+Penicillin V/SVP's CCSD does not fit one A100 in `fastccsd`, and GPU4PySCF's
+own driver fails there on a negative memory estimate.
+
+### 17.3 P10 — ADC(2) for EE, IP and EA (`adc_gpu`)
+
+`adc_gpu.RADC(gpu_mf, method_type='ee'|'ip'|'ea')`.  PySCF's restricted
+ADC is a few thousand lines of `lib.einsum` over NumPy arrays; its own
+source (`radc_amplitudes`, `radc_ee`, `radc_ip`, `radc_ea`) is compiled
+again into private namespaces whose `np` is CuPy, whose `lib.einsum` is
+`cupy.einsum` and whose `unpack_eri_1` is the identity (unpacked `ovvv`),
+so the algebra -- the MP2 amplitudes, M_ab, every sigma term -- is PySCF's
+term for term on device arrays; the integrals come from `fastmp2`.
+
+The first build kept PySCF's host Davidson and was hardly faster than the
+CPU (alanine dipeptide ADC(2)-EE: 425 s on the GPU node, 873 s on the CPU
+node).  A profile `[X]` put 400 of the 425 s in `davidson_nosym1`'s
+subspace projections on host vectors of o²v² = 1.8e7 elements, 17 s in the
+sigma vectors.  The eigensolver is now a device block Davidson with
+PySCF's convergence test and preconditioner.  Two things learned on the
+way: PySCF's ADC matrix is **not symmetric** in its spin-adapted doubles
+basis (a symmetric Davidson converges to spurious zero roots), so the
+projected matrix is diagonalised as a general one on the host, as
+`davidson_nosym1` does; and a nonsymmetric Davidson started on exactly
+nroots unit vectors can settle on a higher root (water EA, 4th root), so
+3 spare guesses stay in the space without being expanded.  The trial space
+is capped by free device memory (penicillin V ADC(2)-EE vectors are 3.6 GB
+each and do not fit 4 roots).  ADC(2)-x/ADC(3) (the vvvv ladder) and the
+transition properties are not enabled.
+
+Correctness (`tests/test_adc_gpu.py`, water/cc-pVDZ and frozen-core
+glycine/SVP, 4 roots, EE/IP/EA): MP2 energies 1e-13 from PySCF's;
+excitation energies ≤ 3.2e-8 Eh at a residual tolerance of 1e-7.
+
+| ADC(2), 4 roots, frozen core | system | **GPU** | CPU node |
+|---|---|---|---|
+| EE | alanine dipeptide/SVP | **45.2 s** | 873 s (19x) |
+| IP | alanine dipeptide/SVP | **3.4 s** | 7.3 s (2.2x) |
+| EA | alanine dipeptide/SVP | **15.2 s** | 69.8 s (4.6x) |
+| IP | penicillin V/SVP | **24.5 s** | 168 s (6.9x) |
+| EA | penicillin V/SVP | **198 s** | 2731 s (14x) |
+| EE | penicillin V/SVP | does not fit (vectors 3.6 GB) | not finished in 60 min |
+
+### 17.4 X4 — k-point MP2 (`kmp2_gpu`)
+
+`kmp2_gpu.kernel(gpu_krhf)` for a GPU4PySCF KRHF with a GPU GDF.  The cderi
+is read the way GPU4PySCF's own K build reads it (`GDF.loop`: per
+momentum transfer q, the dense L(k, k+q) for every k on the device; the
+(q, −q) partner from L(k_a, k_i) = L(k_i, k_a)^H), transformed to
+L_ov(k_i, k_a), and for each (k_i, k_j) the integrals of every k_a are one
+batched complex contraction; PySCF's expression (direct and exchange)
+reduced on the device.  Insulators with the same nocc at every k; no frozen
+orbitals.
+
+Correctness (`tests/test_kmp2_gpu.py`, diamond/GTH-DZVP): PySCF's KMP2 on
+the same orbitals, with the cderi rebuilt on the host, to 2.2e-8 (2×2×2)
+and 2.4e-7 (3×3×3); the two GDF builds already differ by 5–7e-7 in the HF
+energy of the same density.
+
+| kMP2 step (after the SCF) | cell, mesh | **GPU** | CPU node |
+|---|---|---|---|
+| diamond (2 atoms) | 3×3×3 | **1.8 s** | 20.2 s (11x) |
+| diamond (2 atoms) | 4×4×4 | **5.6 s** | 221 s (39x) |
+| diamond (8 atoms, cubic) | 2×2×2 | **14.9 s** | 46.5 s (3.1x) |
+
+### 17.5 S5 — sfX2C1e nuclear gradients (`x2c_grad`)
+
+`x2c_grad.Gradients(mf)` for a GPU4PySCF `sfx2c1e()` RHF/RKS/UHF/UKS.
+Only dh/dR_A of the one-electron Foldy–Wouthuysen Hamiltonian is X2C;
+PySCF builds it per atom from the response of the (2n × 2n) one-electron
+Dirac problem on the uncontracted basis.  The same algebra (first-order
+MO coefficients and X, R^(1), h_FW^(1)) runs on the device batched over
+the three directions; the rest of the gradient is GPU4PySCF's.
+
+Found on the way `[X]`: **no sfX2C1e SCF runs in GPU4PySCF 1.8.1 here**
+(water/cc-pVDZ included): the one-electron Dirac problem goes through
+`gpu4pyscf.lib.cusolver.eigh` (ctypes sygvd), which fails in this
+environment for every size, and the fallback catches
+`cupy.linalg.LinAlgError`, not the class that is raised.  `fixes` (D14)
+now falls back to a Cholesky reduction and CuPy's `eigh`; X2C energies
+then match PySCF's to 2e-11 (water), 5e-10 (HBr), 5e-9 (HI, Dyall v2z).
+
+Correctness (`tests/test_x2c_grad.py`, HBr RHF/RKS-PBE, BrO UKS-B3LYP,
+cc-pVDZ-DK): gradients 1.7e-10 from PySCF's sfx2c1e gradients; a finite
+difference of the GPU X2C energy to 2.7e-7.
+
+| sfX2C1e gradient (after the SCF) | system | **GPU** | CPU node |
+|---|---|---|---|
+| UKS PBE, triplet | Pt(II) amine complex (PtC₈Cl₂H₁₁N; Dyall v2z on Pt, cc-pVDZ-DK) | **1.33 s** | 28.9 s (22x) |
+
+(SCF 7.6 s against 130 s; the two X2C energies agree to 4e-8.)
+
+### 17.6 S6 — GHF TDA and TDHF (`ghf_td_gpu`)
+
+`ghf_td_gpu.TDA(gpu_ghf)`, `TDHF(gpu_ghf)`.  GPU4PySCF has a GHF SCF but no
+GHF response; PySCF's `tdscf.ghf` classes keep their guesses and
+eigensolvers here, and the products with A (and B) run on the device in
+batches of 32 trial vectors: transition densities by two GEMMs, J − K on
+the batch, and the transformation back.  Hartree–Fock only (GKS needs a
+non-collinear XC kernel).
+
+Found on the way `[X]`: **GPU4PySCF 1.8.1's GHF J/K is wrong for a batch
+of real densities**: its adapter stacks the four spin blocks of all
+densities and reads back only the first four exchange matrices, so every
+density but the first gets the first one's K (water GHF TDA 0.4 eV off).
+A single-density SCF is unaffected.  `ghf_td_gpu` assembles the blocks
+itself.
+
+Correctness (`tests/test_ghf_td_gpu.py`, cc-pVDZ): TDA on water and H₂O⁺,
+TDHF on H₂O⁺, 6 states, to 2e-11 eV-scale (≤ 1.6e-11 Eh) of PySCF's.
+Closed-shell GHF TDHF is left out of the test: the three spin-rotation
+zero modes make its lowest roots depend on solver noise.
+
+| GHF, 6 states | system | **GPU** | CPU node |
+|---|---|---|---|
+| TDA | alanine dipeptide⁺/SVP | **13.8 s** | 57.8 s (4.2x) |
+| TDHF | alanine dipeptide⁺/SVP | **529 s** | 1067 s (2.0x) |
+| TDA | penicillin V⁺/SVP | **130 s** | 759 s (5.8x) |
+
+The TDHF time is PySCF's non-Hermitian solver iterating on near-zero
+roots (the lowest are 0.2 eV); the first build, which batched all trial
+vectors through `einsum`, ran penicillin V⁺ out of memory and was no
+faster than the CPU on alanine dipeptide⁺.
+
+### 17.7 What §5 takes from Phase 6
+
+| entry | status | measured |
+|---|---|---|
+| **S7** | **built** (Boys, PM, DF-ER, IBO) | PM 14–23x, IBO 6–37x, Boys 4–6x; ER 0.7 s against 32 min |
+| **P6** | **IP and EA built**; EE-EOM and Λ open | IP 7–18x, EA 8–38x; no v⁴ array |
+| **P10** | **ADC(2) EE/IP/EA built**; ADC(2)-x, ADC(3), properties open | EE 19x, IP 2–7x, EA 5–14x |
+| **X4** | **built** (KRHF, GDF, no frozen orbitals) | 11–39x the CPU node (2-atom diamond), 3x (8-atom, 2×2×2) |
+| **S5** | **built** (gradient; Hessian open) | 22x on a Pt(II) complex; GPU4PySCF's X2C SCF fixed (D14) |
+| **S6** | **GHF TDA/TDHF built**; GKS open | TDA 4–6x, TDHF 2x |
+
+Left for §5.4 or a later phase: EOM-EE-CCSD and the CCSD Λ equations (the
+EE sigma needs the same AO-direct ladder as EA, on o²v² vectors);
+ADC(2)-x/ADC(3) (the ladder on the doubles); ADC transition properties;
+the sfX2C1e Hessian; GKS TDDFT (non-collinear f_xc).
