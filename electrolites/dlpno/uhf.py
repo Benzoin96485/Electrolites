@@ -473,6 +473,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         self._so_pairs()
         letter = 'ab'
         self.T2b = {}
+        tcache = {}
         for (I, J) in self.sop:
             x, s = self.so[I]
             y, t = self.so[J]
@@ -480,10 +481,12 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             flip = x > y
             c = pl.ji[p] if flip else p
             amps, Xa_sc, Xb_sc = sc[c]
-            paos = self.pao[p]
-            Sd = self.orb.S_pao[np.ix_(paos, paos)]
-            npo = len(paos)
-            T = {0: Xa_sc.T @ Sd @ self.Xa[p], 1: Xb_sc.T @ Sd @ self.Xb[p][:npo]}
+            T = tcache.get(c)
+            if T is None:          # semicanonical -> PNO-space maps, once per spatial pair
+                paos = self.pao[c]
+                Sd = self.orb.S_pao[np.ix_(paos, paos)]
+                npo = len(paos)
+                T = tcache[c] = {0: Xa_sc.T @ Sd @ self.Xa[c], 1: Xb_sc.T @ Sd @ self.Xb[c][:npo]}
             s1, s2 = (t, s) if flip else (s, t)
             key = letter[s1] + letter[s2]
             blk = T[s1].T @ amps[key] @ T[s2]
@@ -720,13 +723,17 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         oldXa, oldXb = list(self.Xa), list(self.Xb)
         plist = list(newX)
         self._store_all(plist, [newX[p] for p in plist])
+        rcache = {}
         for k in list(self.T2b):
-            p = self._sp(k)
-            paos = self.pao[p]
-            npo = len(paos)
-            Sd = self.orb.S_pao[np.ix_(paos, paos)]
-            R = (oldXa[p].T @ Sd @ self.Xa[p],
-                 oldXb[p][:npo].T @ Sd @ self.Xb[p][:npo] + oldXb[p][npo:].T @ self.Xb[p][npo:])
+            p = self.pl.ji[self._sp(k)] if self.pl.pairs[self._sp(k)][0] > self.pl.pairs[self._sp(k)][1] \
+                else self._sp(k)
+            R = rcache.get(p)
+            if R is None:          # old -> new space maps, once per spatial pair
+                paos = self.pao[p]
+                npo = len(paos)
+                Sd = self.orb.S_pao[np.ix_(paos, paos)]
+                R = rcache[p] = (oldXa[p].T @ Sd @ self.Xa[p],
+                                 oldXb[p][:npo].T @ Sd @ self.Xb[p][:npo] + oldXb[p][npo:].T @ self.Xb[p][npo:])
             self.T2b[k] = R[self.so[k[0]][1]].T @ self.T2b[k] @ R[self.so[k[1]][1]]
         self._S = {}
         self.de_pno_total = self.de_pno.sum()
