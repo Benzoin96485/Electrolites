@@ -612,6 +612,7 @@ class RefUDLPNO:
         opt, pl = self.opt, self.pl
         G_old = {k: self._G(self._sp(k), *k) for k in self.sop}
         newX = {}
+        dens = {}
         for p, (x, y) in enumerate(pl.pairs):
             if x > y:
                 continue
@@ -642,6 +643,7 @@ class RefUDLPNO:
             D = .5 * (A @ A.T + Bm @ Bm.T) + .5 * (O @ O.T + O.T @ O + Op @ Op.T + Op.T @ Op)
             if x == y:
                 D *= .5
+            dens[p] = (Xo, D)
             occ, V = np.linalg.eigh(D)
             occ, V = occ[::-1], V[:, ::-1]
             scale = opt['T_CUT_PNO_DIAG_SCALE'] if x == y else 1.
@@ -675,6 +677,7 @@ class RefUDLPNO:
                 self.de_pno[q] = self.de_pno[p]
             newX[p] = Xnew
         # new spaces and amplitudes projected into them
+        self._somo_singles_spaces(dens, newX)
         oldXa, oldXb = list(self.Xa), list(self.Xb)
         for p, Xnew in newX.items():
             self._store_spaces(p, Xnew)
@@ -689,6 +692,37 @@ class RefUDLPNO:
             self.T2[k] = R.T @ self.T2[k] @ R
         self._S = {}
         self.de_pno_total = self.de_pno.sum()
+
+    def _somo_singles_spaces(self, dens, newX):
+        """Virtual space of the diagonal pair of a SOMO, which carries only
+        that SOMO's singles: the natural orbitals of the averaged pair
+        density of every pair the SOMO belongs to, in its PAO domain,
+        truncated at T_CUT_PNO * T_CUT_PNO_DIAG_SCALE (the diagonal-pair cut)."""
+        opt, pl = self.opt, self.pl
+        S = self.orb.S_pao
+        for p, (x, y) in enumerate(pl.pairs):
+            if x != y or not self.is_somo[x]:
+                continue
+            paos = self.pao[p]
+            X0, _ = su.orthocanonicalize(S[np.ix_(paos, paos)], self.Fa_pao[np.ix_(paos, paos)], opt['S_CUT'])
+            acc, cnt = 0., 0
+            for q, (a, b) in enumerate(pl.pairs):
+                if a > b or q == p or x not in (a, b) or q not in dens:
+                    continue
+                Xo, D = dens[q]
+                s = Xo.T @ S[np.ix_(self.pao[q], paos)] @ X0
+                acc = acc + s.T @ D @ s
+                cnt += 1
+            if cnt == 0:
+                newX[p] = X0
+                continue
+            occ, V = np.linalg.eigh(acc / cnt)
+            occ, V = occ[::-1], V[:, ::-1]
+            cut = opt['T_CUT_PNO'] * opt['T_CUT_PNO_DIAG_SCALE']
+            nfin = max(int(np.count_nonzero(occ >= cut)), min(opt['MIN_PNOS'], len(occ)), 1)
+            while nfin < len(occ) and abs(occ[nfin] - occ[nfin - 1]) <= 1e-9 * abs(occ[nfin - 1]):
+                nfin += 1
+            newX[p] = X0 @ V[:, :nfin]
 
     # ------------------------------------------------------------------
     # CC integrals on each spatial pair's (occupied domain + virtual) space

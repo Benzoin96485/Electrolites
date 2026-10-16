@@ -91,7 +91,9 @@ class _K3:
            kind 'a'  : out[a]    += w sum_dc Y[a,d,c] M[c,d]  (M: matrix item)"""
         self.ops.setdefault((kind, src, dst), []).append((self.reg(k3key), src_item, dst_item, w))
 
-    def build(self, fetch):
+    def build(self, fetch, host=False):
+        from electrolites.dlpno.devmem import to_pinned
+        xp = np if host else cp
         keys = self.reg.keys
         Ys = [fetch(k) for k in keys]
         shp = np.array([Y.shape for Y in Ys], np.int64).reshape(-1, 3)
@@ -104,11 +106,11 @@ class _K3:
         for g in range(len(uk)):
             mem = np.where(inv == g)[0]
             self.slot[mem] = np.arange(len(mem))
-            buf = cp.zeros((len(mem),) + tuple(int(x) for x in uk[g]))
+            buf = xp.zeros((len(mem),) + tuple(int(x) for x in uk[g]))
             for s, k in enumerate(mem):
                 Y = Ys[k]
                 buf[s, :Y.shape[0], :Y.shape[1], :Y.shape[2]] = Y
-            self.data.append(buf)
+            self.data.append(to_pinned(buf) if host else buf)
         del Ys
         self.plans = {}
         for key, lst in self.ops.items():
@@ -130,10 +132,26 @@ class _K3:
                                 w=cp.asarray(np.array([lst[i][3] for i in sel]))))
             self.plans[key] = per
 
+    def run_all(self, jobs):
+        """jobs: (kind, src_name, dst_name, src, dst); every tensor group is
+        brought to the device once (it may wait in pinned host memory)."""
+        from electrolites.dlpno.devmem import to_dev
+        for g in range(len(self.data)):
+            Y = None
+            for (kind, sn, dn, src, dst) in jobs:
+                for P in self.plans.get((kind, sn, dn), []):
+                    if P['g'] != g:
+                        continue
+                    if Y is None:
+                        Y = to_dev(self.data[g])
+                    self._apply(kind, P, Y, src, dst)
+
     def run(self, kind, src_name, dst_name, src, dst):
-        """src, dst: Raggeds (column items, or matrix items for 'a' sources)."""
-        for P in self.plans.get((kind, src_name, dst_name), []):
-            Y = self.data[P['g']]
+        self.run_all([(kind, src_name, dst_name, src, dst)])
+        return dst
+
+    def _apply(self, kind, P, Y, src, dst):
+        if True:
             N, d0, d1, d2 = Y.shape
             m = P['m']
             # vectors per (slot, rank)
@@ -168,7 +186,6 @@ class _K3:
                 pr, pc = dlay.shapes[gd]
                 blk = vals[cp.asarray(q)][:, :pr, :pc]
                 cupyx.scatter_add(dst.data[gd], cp.asarray(dlay.slot[P['dst'][q]]), blk)
-        return dst
 
 
 class UCCSDGPUv(UCCSDGPU):
@@ -215,8 +232,9 @@ class UCCSDGPUv(UCCSDGPU):
         rep['NP'] = rag(self.NP) / 1e9
         rep['Kx'] = rag(self.Kx) / 1e9
         rep['T'] = rag(Ragged(self.LT)) / 1e9 if False else self.LT.nbytes() / 1e9
-        rep['K3'] = sum(d.nbytes for d in self.k3.data) / 1e9
-        rep['dfg'] = sum(v.nbytes for d in self.dfg for v in d.values() if hasattr(v, 'nbytes')) / 1e9
+        rep['K3'] = sum(d.nbytes for d in self.k3.data if isinstance(d, cp.ndarray)) / 1e9
+        rep['dfg'] = sum(v.nbytes for d in self.dfg for v in d.values() if isinstance(v, cp.ndarray)) / 1e9
+        rep['offload'] = float(self.offload)
         rep['pool_used'] = cp.get_default_memory_pool().used_bytes() / 1e9
         return {k: round(v, 3) for k, v in rep.items()}
 
@@ -659,7 +677,7 @@ class UCCSDGPUv(UCCSDGPU):
         def fetch(key):
             c, z, s, t = key
             return self.fix[c]['K3'][(z, s, t)].transpose(1, 0, 2)
-        self.k3.build(fetch)
+        self.k3.build(fetch, host=self.offload)
 
     def _et(self):
         et = _Terms()
@@ -674,13 +692,15 @@ class UCCSDGPUv(UCCSDGPU):
         lmo, sp, si = self.lmo, self.spin, u.so_index
         g = len(mem)
         d = dict(mem=mem, A=A, R=R, V=V)
+        xp = np if self.offload else cp
+        from electrolites.dlpno.devmem import to_pinned
         for s in (0, 1):
-            Qov = cp.zeros((g, A, R[s], V[s]))
-            Qvv = cp.zeros((g, A, V[s], V[s]))
+            Qov = xp.zeros((g, A, R[s], V[s]))
+            Qvv = xp.zeros((g, A, V[s], V[s]))
             fov = cp.zeros((g, R[s], V[s]))
             ev = cp.zeros((g, V[s]))
-            Qmz = cp.zeros((g, 2, A, R[s]))
-            Qaz = cp.zeros((g, 2, A, V[s]))
+            Qmz = xp.zeros((g, 2, A, R[s]))
+            Qaz = xp.zeros((g, 2, A, V[s]))
             zrow = np.zeros((g, 2), np.int64)
             zm = np.zeros((g, 2))
             for m, c in enumerate(mem):
@@ -692,7 +712,7 @@ class UCCSDGPUv(UCCSDGPU):
                 Qvv[m, :na, :nv, :nv] = f['Qvv'][s]
                 fov[m, :nr, :nv] = f['fov'][s]
                 ev[m, :nv] = f['ev'][s]
-                rp = cp.asarray(np.asarray(f['rowsp'][s], np.int64))
+                rp = xp.asarray(np.asarray(f['rowsp'][s], np.int64))
                 for side, z in enumerate((x, y)):
                     if nr:
                         Qmz[m, side, :na, :nr] = f['Qmz'][z][:, rp]
@@ -702,6 +722,9 @@ class UCCSDGPUv(UCCSDGPU):
                         zm[m, side] = 1.
             d[('Qov', s)], d[('Qvv', s)], d[('fov', s)], d[('ev', s)] = Qov, Qvv, fov, ev
             d[('Qmz', s)], d[('Qaz', s)] = Qmz, Qaz
+            if self.offload:
+                for key in ('Qov', 'Qvv', 'Qmz', 'Qaz'):
+                    d[(key, s)] = to_pinned(d[(key, s)])
             d[('zrow', s)], d[('zm', s)] = cp.asarray(zrow), cp.asarray(zm)
             d[('tn', s)] = cp.asarray(self.LTn[s].slot[[self.cpos[c] for c in mem]])
             d[('gtn', s)] = int(self.LTn[s].group[self.cpos[mem[0]]])
@@ -829,14 +852,14 @@ class UCCSDGPUv(UCCSDGPU):
             self.p_rg.run(R, st, w=Fpp[self.rg_f] * cp.asarray(self.rg.f('w')))
         # ring
         Z = Ragged(self.LZ)
+        V1 = Ragged(self.LV1)
+        self.k3.run_all([('c3', 'Pt', 'Z', Pt, Z), ('c2', 'Pt', 'Z', Pt, Z), ('a', 'T', 'V1', T, V1)])
         st['K1Z'] = self.K1Z
         self.p_zk1.run(Z, st, w=cp.full(self.p_zk1.n, -1.) if self.p_zk1.n else None)
         self.p_zj1.run(Z, st)
         for p_, t_ in zip(self.p_zkx, self.zkx):
             if p_.n:
                 p_.run(Z, st, w=cp.asarray(t_.f('w')))
-        self.k3.run('c3', 'Pt', 'Z', Pt, Z)
-        self.k3.run('c2', 'Pt', 'Z', Pt, Z)
         if self.p_zq.n:
             self.p_zq.run(Z, st, w=cp.asarray(self.zq.f('w')))
         st['Z'] = Z
@@ -852,7 +875,6 @@ class UCCSDGPUv(UCCSDGPU):
             self.p_fkc.run(Fk, st, w=cp.asarray(self.fkc.f('w')))
         if self.p_r1c.n:
             self.p_r1c.run(R1, st, w=cp.asarray(self.r1c.f('w')))
-        V1 = self.k3.run('a', 'T', 'V1', T, Ragged(self.LV1))
         st['V1'] = V1
         if self.p_a1.n:
             self.p_a1.run(R1, st)
@@ -870,6 +892,12 @@ class UCCSDGPUv(UCCSDGPU):
         return R1, R
 
     def _df_run(self, gi, d, T, T1, Tn, Fv, Fbov, R, R1, beta):
+        if self.offload:
+            from electrolites.dlpno.devmem import to_dev
+            d = dict(d)
+            for s in (0, 1):
+                for key in ('Qov', 'Qvv', 'Qmz', 'Qaz'):
+                    d[(key, s)] = to_dev(d[(key, s)])
         mm = cp.matmul
         tr = lambda X: X.swapaxes(-1, -2)
         Tc, Qov, Qvv, Fbo, Fbv, Qvt, Bk, Ba = {}, {}, {}, {}, {}, {}, {}, {}

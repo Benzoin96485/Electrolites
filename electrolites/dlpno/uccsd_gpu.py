@@ -225,6 +225,30 @@ class UCCSDGPU:
         self.Sreg = [_Reg(), _Reg()]
         self.t_build = {}
 
+    offload = False
+
+    def _decide_offload(self):
+        """keep the strong pairs' DF tensors and the 3-external tensors in
+        pinned host memory when they would take more than a third of the
+        free device memory (env DLPNO_OFFLOAD=0/1 forces it)."""
+        import os
+        env = os.environ.get('DLPNO_OFFLOAD')
+        if env is not None:
+            return env == '1'
+        u = self.u
+        nb = 0.
+        for c in self.canon_sp:
+            na, nb_ = self.nvs[c]
+            nz = 2 if self.pl.pairs[c][0] != self.pl.pairs[c][1] else 1
+            nb += 8. * nz * 2 * (na ** 3 + nb_ ** 3 + na * nb_ * (na + nb_)) / 2
+            if self.strong_sp[c]:
+                A = len(u.ribfs[c])
+                R = [len(self.rows[c][s]) for s in (0, 1)]
+                nb += 8. * A * (na * na + nb_ * nb_ + R[0] * na + R[1] * nb_)
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        self.offload_bytes = nb
+        return nb > free / 3.
+
     def tb(self, K, L, a, b):
         sK, sL = self.spin[K], self.spin[L]
         if (a, b) == (sK, sL):
@@ -479,8 +503,9 @@ class UCCSDGPU:
         si = u.so_index
         self.fix = [None] * self.npair
         if hasattr(u, 'gpu_pair_ints'):
+            self.offload = self._decide_offload()
             for c in self.canon_sp:
-                ent = u.gpu_pair_ints(c, self.rows[c], bool(self.strong_sp[c]))
+                ent = u.gpu_pair_ints(c, self.rows[c], bool(self.strong_sp[c]), host=self.offload)
                 self.fix[c] = self.fix[pl.ji[c]] = ent
         for c in ([] if hasattr(u, 'gpu_pair_ints') else self.canon_sp):
             x, y = pl.pairs[c]

@@ -528,7 +528,9 @@ class UTriplesGPU:
             if save:
                 for q in range(n):
                     t = ch[sb[q]]
-                    self.st[(t, pat)] = dict(W=Wt[q], V=Vt[q], T=T3[q], D=Dn[q], O=tuple(O[q]))
+                    nf = (int(tn['nfa'][sb[q]]), int(tn['nfb'][sb[q]]))
+                    self.st[(t, pat)] = dict(W=Wt[q], V=Vt[q], T=T3[q], D=Dn[q], O=tuple(O[q]),
+                                             n=float(np.prod([nf[x] for x in pat])))
         if save:
             for s, t in enumerate(ch):
                 na_, nb_ = int(tn['nfa'][s]), int(tn['nfb'][s])
@@ -565,6 +567,7 @@ class UTriplesGPU:
         mult = {s: cp.asarray(np.array([1. if len({so[I][1] for I in ent[m_]['O']}) == 1 else 3.
                                         for m_ in m])) for s, m in bk.items()}
         trip_of = {s: np.array([keys[m_][0] for m_ in m]) for s, m in bk.items()}
+        cnt = {s: cp.asarray(np.array([ent[m_]['n'] for m_ in m])) for s, m in bk.items()}
         Os = [e['O'] for e in ent]
         del ent
         S_d = self.S_pao_d
@@ -643,7 +646,7 @@ class UTriplesGPU:
             rms = 0.
             for s in bk:
                 T[s] = T[s] + R[s] / D[s]
-                r = cp.sqrt(cp.mean(R[s] ** 2, axis=(1, 2, 3)))
+                r = cp.sqrt(cp.sum(R[s] ** 2, axis=(1, 2, 3)) / cnt[s])
                 rms = max(rms, float(r.max()))
             self.e_ijk = np.zeros(ntrip)
             for s in bk:

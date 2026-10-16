@@ -259,6 +259,12 @@ register('ccsd_t', 'ccsd_t',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ccsd_t')],
          doc='[P1] closed-shell (T) on the device')
 
+register('dlpno', 'dlpno_ccsd_t',
+         absent=[('gpu4pyscf.scf.hf', 'SCF.DLPNO_CCSD_T')],
+         doc='[P1x] DLPNO-CCSD(T0)/(T) on the GPU, closed shell (Psi4 1.11 '
+             'algorithm) and high-spin open shell (ROHF / QRO), Loose / Normal '
+             '/ Tight PNO (dlpno_ccsd_t.DLPNO_CCSD_T, mf.DLPNO_CCSD_T)')
+
 __all__ = ['FEATURES', 'register', 'check_absent', 'enable', 'enable_all',
            'enabled', 'attach', 'register_gpu_module', 'cpu_fallback',
            'not_available', 'is_absent']

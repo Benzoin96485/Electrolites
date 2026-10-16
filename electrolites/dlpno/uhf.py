@@ -653,6 +653,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         si = self.so_index
         ns = self.ns
         newX = {}
+        dens = {}
         for p, (x, y) in enumerate(pl.pairs):
             if x > y:
                 continue
@@ -681,6 +682,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             D = .5 * (A @ A.T + Bm @ Bm.T) + .5 * (O @ O.T + O.T @ O + Op @ Op.T + Op.T @ Op)
             if x == y:
                 D *= .5
+            dens[p] = (Xo, D)
             occ, V = np.linalg.eigh(D)
             occ, V = occ[::-1], V[:, ::-1]
             scale = opt['T_CUT_PNO_DIAG_SCALE'] if x == y else 1.
@@ -707,6 +709,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             if q != p:
                 self.de_pno[q] = self.de_pno[p]
             newX[p] = Xo @ V[:, :nfin]
+        self._somo_singles_spaces(dens, newX)
         oldXa, oldXb = list(self.Xa), list(self.Xb)
         plist = list(newX)
         self._store_all(plist, [newX[p] for p in plist])
@@ -727,7 +730,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
     def cc_integrals(self):
         self.cc = None        # the dense host tensors of the reference are not built
 
-    def gpu_pair_ints(self, c, rows, strong):
+    def gpu_pair_ints(self, c, rows, strong, host=False):
         """fixed integrals of canonical spatial pair c for UCCSDGPU."""
         pl, si = self.pl, self.so_index
         x, y = pl.pairs[c]
@@ -767,6 +770,15 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             ent['Qvv'] = Qvv
             ent['Qmz'] = {z: Boo[:, :, lpos[z]] for z in {x, y}}
             ent['Qaz'] = {(z, s): Bm[s][:, lpos[z]] for z in {x, y} for s in (0, 1) if (z, s) in si}
+        if host:
+            # the large DF / 3-external blocks wait in pinned host memory
+            from electrolites.dlpno.devmem import to_pinned
+            for key in ('Qov', 'Qvv'):
+                if key in ent:
+                    ent[key] = [to_pinned(v) for v in ent[key]]
+            for key in ('Qmz', 'Qaz', 'K3'):
+                if key in ent:
+                    ent[key] = {k: to_pinned(v) for k, v in ent[key].items()}
         return ent
 
     def _f_ov_rows(self, p, lm, s):
@@ -876,7 +888,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                 else:
                     res = cp.matmul(Z, cp.asarray(Xs))
                 for r_, n in enumerate(lst):
-                    out[n] = res[r_, :, :ws[r_]]
+                    out[n] = res[r_, :, :ws[r_]].copy()
         return out
 
     # ------------------------------------------------------------------
