@@ -66,6 +66,10 @@ def _vresp(mf, dms):
     return out[0]
 
 
+#: trial vectors per J/K batch
+_BLK = 32
+
+
 class _GPUTD:
     def __init__(self, mf):
         if getattr(mf, 'device', 'cpu') != 'gpu':
@@ -83,12 +87,17 @@ class TDA(_GPUTD, _ghf.TDA):
         hdiag = cp.asnumpy(e_ia).ravel().real
 
         def vind(zs):
-            zs = cp.asarray(np.asarray(zs)).reshape(-1, no, nv)
-            dms = cp.einsum('xov,pv,qo->xpq', zs, orbv, orbo.conj())
-            v1 = _vresp(mf, dms)
-            v1mo = cp.einsum('xpq,qo,pv->xov', v1, orbo, orbv.conj())
-            v1mo += zs * e_ia
-            return cp.asnumpy(v1mo.reshape(len(zs), -1))
+            zs = np.asarray(zs).reshape(-1, no, nv)
+            out = np.empty((len(zs), no * nv), dtype=np.result_type(
+                zs.dtype, orbo.dtype))
+            for p0 in range(0, len(zs), _BLK):
+                z = cp.asarray(zs[p0:p0 + _BLK])
+                dms = orbv @ z.transpose(0, 2, 1) @ orbo.conj().T
+                v1 = _vresp(mf, dms)
+                v1mo = (orbv.conj().T @ v1 @ orbo).transpose(0, 2, 1)
+                v1mo = v1mo + z * e_ia
+                out[p0:p0 + _BLK] = cp.asnumpy(v1mo.reshape(len(z), -1))
+            return out
 
         return vind, hdiag
 
@@ -104,18 +113,23 @@ class TDHF(_GPUTD, _ghf.TDHF):
         hdiag = np.hstack((d, -d))
 
         def vind(xys):
-            xys = cp.asarray(np.asarray(xys)).reshape(-1, 2, no, nv)
-            xs, ys = xys[:, 0], xys[:, 1]
-            dms = cp.einsum('xov,pv,qo->xpq', xs, orbv, orbo.conj())
-            dms += cp.einsum('xov,qv,po->xpq', ys, orbv.conj(), orbo)
-            v1 = _vresp(mf, dms)
-            top = cp.einsum('xpq,qo,pv->xov', v1, orbo, orbv.conj())
-            bot = cp.einsum('xpq,po,qv->xov', v1, orbo.conj(), orbv)
-            top += xs * e_ia
-            bot += ys * e_ia
-            nz = len(xys)
-            return cp.asnumpy(cp.hstack((top.reshape(nz, -1),
-                                         -bot.reshape(nz, -1))))
+            xys = np.asarray(xys).reshape(-1, 2, no, nv)
+            out = np.empty((len(xys), 2 * no * nv), dtype=np.result_type(
+                xys.dtype, orbo.dtype))
+            for p0 in range(0, len(xys), _BLK):
+                xy = cp.asarray(xys[p0:p0 + _BLK])
+                xs, ys = xy[:, 0], xy[:, 1]
+                dms = orbv @ xs.transpose(0, 2, 1) @ orbo.conj().T
+                dms += orbo @ ys @ orbv.conj().T
+                v1 = _vresp(mf, dms)
+                top = (orbv.conj().T @ v1 @ orbo).transpose(0, 2, 1)
+                bot = orbo.conj().T @ v1 @ orbv
+                top = top + xs * e_ia
+                bot = bot + ys * e_ia
+                nz = len(xy)
+                out[p0:p0 + _BLK] = cp.asnumpy(cp.hstack(
+                    (top.reshape(nz, -1), -bot.reshape(nz, -1))))
+            return out
 
         return vind, hdiag
 

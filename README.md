@@ -319,6 +319,11 @@ the CPU code, or against finite differences where there is none
 | `ssc` | NMR spin–spin couplings (DSO, PSO, FC, FC+SD), RHF/RKS | **16–67x** (glycine to penicillin V, B3LYP) |
 | `cubegen` | density, orbital and electrostatic-potential cube files | **345x** (electrostatic potential, penicillin V/def2-TZVP, 80³ grid) |
 | QM/MM | QM/MM Hessian (RHF/RKS) and Gaussian-smeared MM charges | new: PySCF has no QM/MM Hessian; GPU4PySCF returned the vacuum one |
+| `lo` | orbital localisation: Foster–Boys, Pipek–Mezey (all PySCF populations), density-fitted Edmiston–Ruedenberg, intrinsic bond orbitals | Boys **4–6x**, PM **14–23x**, IBO **6–37x** (penicillin V, taxol); ER 0.7 s against 32 min on penicillin V |
+| `eom` | EOM-IP- and EOM-EA-CCSD on the GPU CCSD, without the v⁴ intermediate | IP **7–18x**, EA **8–38x** (alanine dipeptide, ferrocene, glycine/TZVP) |
+| `adc` | ADC(2) excitation (singlet), ionisation and attachment energies | EE **19x**, IP **2–7x**, EA **5–14x** (alanine dipeptide, penicillin V) |
+| `kmp2` | k-point MP2 (KRHF, GDF) | **11–39x** (diamond, 3×3×3 and 4×4×4 meshes); 3x on an 8-atom cell at 2×2×2 |
+| `x2c_grad` | spin-free X2C (sfX2C1e) nuclear gradients, RHF/RKS/UHF/UKS; also makes GPU4PySCF's X2C SCF run | **22x** (Pt(II) complex, UKS PBE, all-electron) |
 
 ## Tests
 
