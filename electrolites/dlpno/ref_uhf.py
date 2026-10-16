@@ -249,6 +249,10 @@ class RefUDLPNO:
 
     def _truncate(self, occ, ecum, e_tot, cut, trace, energy, lag):
         occ_total = occ.sum()
+        if not occ_total > 1e-12:
+            # a pair without amplitudes (the diagonal pair of a SOMO): its
+            # space carries only the SOMO's singles -- keep the whole domain
+            return len(occ)
         occ_pno = 0.
         nfin = 0
         for a in range(len(occ)):
@@ -1295,8 +1299,10 @@ class RefUDLPNO:
         mask = ((self.doi_ij > opt['T_CUT_DO_IJ']) | (np.abs(self.dip_b) > opt['T_CUT_PRE'])
                 | np.eye(n, dtype=bool))
         self.de_dipole = float(np.sum(self.dip_e[~mask]))
+        t = time.perf_counter()
         self.set_pairs(mask, self.domains(opt['T_CUT_MKN'] * 100, opt['T_CUT_DO'] * 2))
         e_crude = self.sc_mp2_pair_energies()
+        t = self._tick('crude_prescreen', t)
         keep = np.zeros((n, n), bool)
         self.de_lmp2_eliminated = 0.
         for p, (i, j) in enumerate(self.pl.pairs):
@@ -1306,13 +1312,17 @@ class RefUDLPNO:
                 self.de_lmp2_eliminated += e_crude[p]
         self.set_pairs(keep, self.domains(opt['T_CUT_MKN'], opt['T_CUT_DO']))
         self.lmp2_pnos()
+        t = self._tick('lmp2_pnos', t)
         e_ij = self.lmp2_iterations()
+        t = self._tick('lmp2_iter', t)
         pl = self.pl
         self.strong = np.array([abs(e_ij[p]) >= opt['T_CUT_PAIRS'] or i == j
                                 for p, (i, j) in enumerate(pl.pairs)])
         self.e['lmp2'] = self.e_lmp2 + self.de_lmp2_eliminated + self.de_dipole + self.de_pno_total
         self.recompute_pnos()
+        t = self._tick('recompute_pnos', t)
         self.lccsd_iterations()
+        t = self._tick('lccsd', t)
         e_corr = (self.e_lccsd + self.de_weak + self.de_lmp2_eliminated
                   + self.de_dipole + self.de_pno_total)
         self.e.update(ccsd=e_corr, lccsd=self.e_lccsd, weak=self.de_weak,
@@ -1336,6 +1346,7 @@ class RefUDLPNO:
                 self.e.update(t0_crude=e_t0_crude, t_iter=e_titer)
             self.e['t'] = e_t
             e_corr += e_t
+            t = self._tick('triples', t)
         self.e['corr'] = e_corr
         self.e['tot'] = self.e_ref + e_corr
         return self.e['tot']

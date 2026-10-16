@@ -429,7 +429,11 @@ class UCCSDGPU:
         u, pl = self.u, self.pl
         si = u.so_index
         self.fix = [None] * self.npair
-        for c in self.canon_sp:
+        if hasattr(u, 'gpu_pair_ints'):
+            for c in self.canon_sp:
+                ent = u.gpu_pair_ints(c, self.rows[c], bool(self.strong_sp[c]))
+                self.fix[c] = self.fix[pl.ji[c]] = ent
+        for c in ([] if hasattr(u, 'gpu_pair_ints') else self.canon_sp):
             x, y = pl.pairs[c]
             d = u.cc[c]
             B = cp.asarray(d['B'])
@@ -495,8 +499,8 @@ class UCCSDGPU:
                 M = M - self.fix[p]['Kx'][(y, x, a, a)]
             mats.append(M)
         _set_items(self.G, range(len(self.sop)), mats)
-        mats = []
-        for (p, K, Q, bp, c_, pk) in self.np_reg.keys:
+        mats = u.gpu_ring_np(self.np_reg.keys) if hasattr(u, 'gpu_ring_np') else []
+        for (p, K, Q, bp, c_, pk) in ([] if hasattr(u, 'gpu_ring_np') else self.np_reg.keys):
             Nd = cp.asarray(u._ring_np(p, K, Q, pk))
             ra = slice(0, u.nva(p)) if bp == 0 else slice(u.nva(p), u.nv(p))
             ca = slice(0, u.nva(pk)) if c_ == 0 else slice(u.nva(pk), u.nv(pk))
@@ -895,10 +899,13 @@ class UCCSDGPU:
         u = self.u
         opt = u.opt
         T = Ragged(self.LT)
-        _set_items(T, range(len(self.sop)),
-                   [cp.asarray(u.T2[k][u._vslice(self.sp_of[n], self.spin[k[0]]),
+        if hasattr(u, 'T2b'):
+            init = [cp.asarray(u.T2b[k]) for k in self.sop]
+        else:
+            init = [cp.asarray(u.T2[k][u._vslice(self.sp_of[n], self.spin[k[0]]),
                                        u._vslice(self.sp_of[n], self.spin[k[1]])])
-                    for n, k in enumerate(self.sop)])
+                    for n, k in enumerate(self.sop)]
+        _set_items(T, range(len(self.sop)), init)
         T1 = Ragged(self.LT1)
         diis = _DeviceDIIS(opt['DIIS_MAX_VECS'])
         e_prev = 0.
