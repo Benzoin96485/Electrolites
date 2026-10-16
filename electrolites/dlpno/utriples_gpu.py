@@ -48,6 +48,22 @@ class UTriplesGPU:
             return self._tsidx.get((L, K)), -1.
         return None, 0.
 
+    def _sidx_tables(self):
+        """SIDX[I, J]: row of spin-orbital pair (I, J) in the amplitude table
+        (-1 if absent); SOF[lmo, spin]: spin orbital (-1 if absent)."""
+        cached = getattr(self, '_sidx_cache', None)
+        if cached is not None and cached[0] is self._tsidx:
+            return cached[1], cached[2]
+        nso = len(self.so)
+        SIDX = -np.ones((nso, nso), np.int64)
+        for k, n in self._tsidx.items():
+            SIDX[k[0], k[1]] = n
+        SOF = -np.ones((self.n, 2), np.int64)
+        for I, (x, s) in enumerate(self.so):
+            SOF[x, s] = I
+        self._sidx_cache = (self._tsidx, SIDX, SOF)
+        return SIDX, SOF
+
     def _upair_tables(self):
         pl, ns = self.pl, self.ns
         npair = len(pl)
@@ -386,18 +402,25 @@ class UTriplesGPU:
             O = [[si[(int(lm3[q, r]), pat[r])] for r in range(3)] for q in range(n)]
             cache = {}
 
+            Oarr = np.array(O, np.int64).reshape(n, 3)
+            SIDX, SOF = self._sidx_tables()
+
             def tproj(rB, rC, s1, s2):
                 key = ('t', rB, rC, s1, s2)
                 if key in cache:
                     return cache[key]
-                items, signs = [], []
-                for q in range(n):
-                    it, sg = self._so_tb(O[q][rB], O[q][rC], s1, s2)
-                    items.append(0 if it is None else it)
-                    signs.append(0. if it is None else sg)
-                if not any(signs):
+                sB, sC = pat[rB], pat[rC]
+                KB, KC = Oarr[:, rB], Oarr[:, rC]
+                if (s1, s2) == (sB, sC):
+                    items, sg = SIDX[KB, KC], 1.
+                elif sB != sC and (s1, s2) == (sC, sB):
+                    items, sg = SIDX[KC, KB], -1.
+                else:
                     cache[key] = None
                     return None
+                ok = items >= 0
+                signs = np.where(ok, sg, 0.)
+                items = np.where(ok, items, 0)
                 pp = pl.ij[lm3[:, rB], lm3[:, rC]]
                 S1 = self._proj(Zt, s1, gsb, pp)                       # (n, VP1, V1)
                 S2 = self._proj(Zt, s2, gsb, pp)
@@ -410,23 +433,27 @@ class UTriplesGPU:
                 key = ('l', rA, sm, s1, s2)
                 if key in cache:
                     return cache[key]
-                items = np.zeros((n, L), np.int64)
-                signs = np.zeros((n, L))
-                pil = np.zeros((n, L), np.int64)
-                for q in range(n):
-                    t = ch[sb[q]]
-                    for c, l in enumerate(self.t_lmos[t]):
-                        M = si.get((int(l), sm))
-                        if M is None or M == O[q][rA]:
-                            continue
-                        it, sg = self._so_tb(O[q][rA], M, s1, s2)
-                        if it is None:
-                            continue
-                        items[q, c], signs[q, c] = it, sg
-                        pil[q, c] = pl.ij[lm3[q, rA], l]
-                if not signs.any():
+                sA = pat[rA]
+                if (s1, s2) == (sA, sm):
+                    rev, sg = False, 1.
+                elif sA != sm and (s1, s2) == (sm, sA):
+                    rev, sg = True, -1.
+                else:
                     cache[key] = None
                     return None
+                lmo_l = lidx[sb]                                       # (n, L)
+                M = SOF[lmo_l, sm]
+                Ain = Oarr[:, rA][:, None]
+                ok = (lmk[sb] > 0) & (M >= 0) & (M != Ain)
+                Mc = np.where(ok, M, 0)
+                items = SIDX[Mc, np.broadcast_to(Ain, Mc.shape)] if rev else SIDX[np.broadcast_to(Ain, Mc.shape), Mc]
+                ok &= items >= 0
+                if not ok.any():
+                    cache[key] = None
+                    return None
+                signs = np.where(ok, sg, 0.)
+                items = np.where(ok, items, 0)
+                pil = np.where(ok, pl.ij[lm3[:, rA][:, None], lmo_l], 0)
                 bb = np.repeat(sb, L)
                 S1 = self._proj(Zt, s1, bb, pil.reshape(-1))
                 S2 = self._proj(Zt, s2, bb, pil.reshape(-1))
