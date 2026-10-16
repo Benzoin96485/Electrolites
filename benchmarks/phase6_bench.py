@@ -3,7 +3,7 @@ reference (``--cpu``).
 
     python benchmarks/phase6_bench.py --what lo --method boys [--cpu]
 
-what: lo (method: boys | pm | ibo | er) | eom (method: ip | ea | ee) | lambda | adc (method: ee | ip | ea) | kmp2 (--kmesh, --cell diamond|diamond8) | x2cgrad | ghftd (method: tda | tdhf)
+what: lo (method: boys | pm | ibo | er) | eom (method: ip | ea | ee | et | sf | lip | lea) | lambda | rdm | adc (method: ee | ip | ea) | kmp2 (--kmesh, --cell diamond|diamond8) | x2cgrad | ghftd (method: tda | tdhf)
 """
 import argparse
 import json
@@ -13,7 +13,8 @@ import time
 import numpy as np
 
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-ap.add_argument('--what', required=True, choices=('lo', 'eom', 'adc', 'kmp2', 'x2cgrad', 'ghftd', 'lambda'))
+ap.add_argument('--what', required=True, choices=('lo', 'eom', 'adc', 'kmp2', 'x2cgrad', 'ghftd', 'lambda',
+                         'rdm'))
 ap.add_argument('--method', default='boys')
 ap.add_argument('--cpu', action='store_true')
 ap.add_argument('--xyz', default='benchmarks/molecules/glycine.xyz')
@@ -104,8 +105,9 @@ elif a.what == 'eom':
         timed('scf_s', mf.kernel)
         mycc = cc.CCSD(mf, frozen=fc)
         timed('ccsd_s', mycc.kernel)
-        eom = {'ip': E.EOMIP, 'ea': E.EOMEA,
-               'ee': E.EOMEESinglet}[a.method](mycc)
+        eom = {'ip': E.EOMIP, 'ea': E.EOMEA, 'ee': E.EOMEESinglet,
+               'et': E.EOMEETriplet, 'sf': E.EOMEESpinFlip,
+               'lip': E.EOMIP, 'lea': E.EOMEA}[a.method](mycc)
     else:
         from gpu4pyscf import scf
         from gpu4pyscf.cc import ccsd_incore
@@ -115,10 +117,12 @@ elif a.what == 'eom':
         timed('scf_s', mf.kernel)
         mycc = ccsd_incore.CCSD(mf, frozen=fc)
         timed('ccsd_s', mycc.kernel)
-        eom = {'ip': E.EOMIP, 'ea': E.EOMEA,
-               'ee': E.EOMEESinglet}[a.method](mycc)
+        eom = {'ip': E.EOMIP, 'ea': E.EOMEA, 'ee': E.EOMEESinglet,
+               'et': E.EOMEETriplet, 'sf': E.EOMEESpinFlip,
+               'lip': E.EOMIP, 'lea': E.EOMEA}[a.method](mycc)
     eom.conv_tol = 1e-7
-    e = timed('step_s', lambda: eom.kernel(nroots=a.nroots)[0])
+    kw = {'left': True} if a.method in ('lip', 'lea') else {}
+    e = timed('step_s', lambda: eom.kernel(nroots=a.nroots, **kw)[0])
     rec['e_eV'] = (np.asarray(e) * 27.211386).tolist()
     rec['nao'], rec['nfrozen'] = mol.nao, fc
 elif a.what == 'lambda':
@@ -145,6 +149,33 @@ elif a.what == 'lambda':
         timed('step_s', lambda: ccsd_lambda_gpu.kernel(
             mycc, tol=mycc.conv_tol_normt))
     rec['l1_norm'] = float(np.linalg.norm(mycc.l1))
+    rec['nao'], rec['nfrozen'] = mol.nao, fc
+elif a.what == 'rdm':
+    from pyscf.data import elements
+    mol = molecule()
+    fc = elements.chemcore(mol)
+    if a.cpu:
+        from pyscf import scf, cc
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-10
+        timed('scf_s', mf.kernel)
+        mycc = cc.CCSD(mf, frozen=fc)
+        timed('ccsd_s', mycc.kernel)
+        timed('lambda_s', mycc.solve_lambda)
+        timed('rdm1_s', mycc.make_rdm1)
+        timed('rdm2_s', mycc.make_rdm2)
+    else:
+        from gpu4pyscf import scf
+        from gpu4pyscf.cc import ccsd_incore
+        from electrolites import ccsd_lambda_gpu, ccsd_rdm_gpu  # noqa
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-10
+        timed('scf_s', mf.kernel)
+        mycc = ccsd_incore.CCSD(mf, frozen=fc)
+        timed('ccsd_s', mycc.kernel)
+        timed('lambda_s', mycc.solve_lambda)
+        timed('rdm1_s', mycc.make_rdm1, True)
+        timed('rdm2_s', mycc.make_rdm2, True)
     rec['nao'], rec['nfrozen'] = mol.nao, fc
 elif a.what == 'adc':
     from pyscf.data import elements

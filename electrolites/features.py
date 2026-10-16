@@ -245,9 +245,15 @@ register('eom', 'eom_gpu',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.ipccsd'),
                  ('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.eaccsd'),
                  ('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.eomee_ccsd_singlet')],
-         doc='[P6] EOM-IP-, EOM-EA- and singlet EOM-EE-CCSD on a GPU4PySCF '
-             'CCSD, no v^4 array (eom_gpu.EOMIP, EOMEA, EOMEESinglet; '
-             'CCSD.ipccsd/eaccsd/eomee_ccsd_singlet)')
+         doc='[P6] EOM-IP/EA (right and left) and singlet, triplet and '
+             'spin-flip EOM-EE-CCSD on a GPU4PySCF CCSD, no v^4 array '
+             '(eom_gpu.EOMIP, EOMEA, EOMEESinglet, EOMEETriplet, '
+             'EOMEESpinFlip; CCSD.ipccsd/eaccsd/eomee_ccsd_*/eomsf_ccsd)')
+register('cc_rdm', 'ccsd_rdm_gpu',
+         absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.make_rdm1'),
+                 ('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.make_rdm2')],
+         doc='[P6] CCSD 1- and 2-RDMs from Lambda on the device '
+             '(CCSD.make_rdm1/make_rdm2)')
 register('cc_lambda', 'ccsd_lambda_gpu',
          absent=[('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.solve_lambda')],
          doc='[P6] CCSD Lambda equations on the device '

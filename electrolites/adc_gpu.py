@@ -69,10 +69,40 @@ def _einsum(subscripts, *ops, **kw):
     return cp.einsum(subscripts, *ops)
 
 
+def _direct_sum(subscripts, *ops):
+    """``lib.direct_sum`` on device arrays ('-i+jab->ijab' & co.)."""
+    import re
+    lhs, rhs = subscripts.replace(' ', '').split('->')
+    terms = re.findall(r'([+-]?)([A-Za-z]+)', lhs)
+    out = 0
+    for (sign, sub), op in zip(terms, ops):
+        op = cp.asarray(op)
+        order = ''.join(c for c in rhs if c in sub)
+        arr = cp.einsum(sub + '->' + order, op)
+        shape = [arr.shape[order.index(c)] if c in sub else 1 for c in rhs]
+        arr = arr.reshape(shape)
+        out = out - arr if sign == '-' else out + arr
+    return out
+
+
+class _DictH5(dict):
+    """``lib.H5TmpFile`` stand-in holding device arrays."""
+
+    def create_dataset(self, name, shape=None, dtype='d', data=None, **kw):
+        arr = cp.zeros(shape, dtype) if data is None else cp.asarray(data)
+        self[name] = arr
+        return arr
+
+    def flush(self):
+        pass
+
+
 class _Lib(types.ModuleType):
     def __init__(self):
         super().__init__('pyscf_lib_on_cupy')
         self.einsum = _einsum
+        self.direct_sum = _direct_sum
+        self.H5TmpFile = _DictH5
 
     def __getattr__(self, name):
         return getattr(_pylib, name)

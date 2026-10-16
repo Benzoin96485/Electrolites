@@ -431,19 +431,18 @@ class EOMEA(eom_rccsd.EOMEA):
         return np.hstack([cp.asnumpy(Hr1), cp.asnumpy(Hr2).ravel()])
 
     def gen_matvec(self, imds=None, left=False, **kwargs):
-        if left:
-            raise NotImplementedError('left EOM-EA on the GPU')
         if imds is None:
             imds = self.make_imds()
         diag = self.get_diag(imds)
         no, nv = imds.nocc, imds.nvir
         mycc = self._cc
+        sigma = _lea_sigma if left else _ea_sigma
 
         def matvec(xs):
             x = cp.asarray(np.asarray(xs).reshape(len(xs), -1))
             r1 = x[:, :nv]
             r2 = x[:, nv:].reshape(-1, no, nv, nv)
-            h1, h2 = _ea_sigma(imds, mycc, r1, r2)
+            h1, h2 = sigma(imds, mycc, r1, r2)
             out = cp.hstack([h1, h2.reshape(len(x), -1)])
             return list(cp.asnumpy(out))
 
@@ -453,6 +452,11 @@ class EOMEA(eom_rccsd.EOMEA):
         if imds is None:
             imds = self.make_imds()
         return self.gen_matvec(imds)[0]([vector])[0]
+
+    def l_matvec(self, vector, imds=None, diag=None):
+        if imds is None:
+            imds = self.make_imds()
+        return self.gen_matvec(imds, left=True)[0]([vector])[0]
 
 
 class EOMIP(eom_rccsd.EOMIP):
@@ -474,18 +478,17 @@ class EOMIP(eom_rccsd.EOMIP):
         return np.hstack([cp.asnumpy(Hr1), cp.asnumpy(Hr2).ravel()])
 
     def gen_matvec(self, imds=None, left=False, **kwargs):
-        if left:
-            raise NotImplementedError('left EOM-IP on the GPU')
         if imds is None:
             imds = self.make_imds()
         diag = self.get_diag(imds)
         no, nv = imds.nocc, imds.nvir
+        sigma = _lip_sigma if left else _ip_sigma
 
         def matvec(xs):
             x = cp.asarray(np.asarray(xs).reshape(len(xs), -1))
             r1 = x[:, :no]
             r2 = x[:, no:].reshape(-1, no, no, nv)
-            h1, h2 = _ip_sigma(imds, r1, r2)
+            h1, h2 = sigma(imds, r1, r2)
             out = cp.hstack([h1, h2.reshape(len(x), -1)])
             return list(cp.asnumpy(out))
 
@@ -495,6 +498,11 @@ class EOMIP(eom_rccsd.EOMIP):
         if imds is None:
             imds = self.make_imds()
         return self.gen_matvec(imds)[0]([vector])[0]
+
+    def l_matvec(self, vector, imds=None, diag=None):
+        if imds is None:
+            imds = self.make_imds()
+        return self.gen_matvec(imds, left=True)[0]([vector])[0]
 
 
 # ------------------------------------------------------------------ EOM-EE
@@ -907,5 +915,338 @@ for _name, _fn in (('ipccsd', _ipccsd), ('eaccsd', _eaccsd),
                    ('eomip_method', lambda self: EOMIP(self)),
                    ('eomea_method', lambda self: EOMEA(self)),
                    ('eomee_method', lambda self: EOMEESinglet(self))):
+    if getattr(_ci.CCSDBase, _name, None) is NotImplemented:
+        _attach(_ci.CCSDBase, _name, _fn)
+
+
+# ------------------------------------------- triplet, spin-flip, left IP/EA
+#
+# The triplet and spin-flip sigma vectors and the EE diagonals are PySCF's
+# own functions (``eom_rccsd.eeccsd_matvec_triplet``, ``eeccsd_matvec_sf``,
+# ``eeccsd_diag``) compiled again with CuPy as the array module (as
+# ``adc_gpu`` does for ADC); the vvvv ladder they call through
+# ``_cc._add_vvvv`` is the AO-direct one, with PySCF's t2sym symmetries.
+
+
+def _ladder_sym(mycc, ov, x, t2sym=None):
+    """sum_ef (ae|bf) x[i,j,e,f] (PySCF ``_add_vvvv`` with ``t1=None``):
+    't2sym' 'jiba' (x[j,i] = x[i,j]^T), '-jiba' (= -x[i,j]^T) and '-jiab'
+    (x[j,i] = -x[i,j]) go through the i >= j pairs only."""
+    no, nv = x.shape[0], x.shape[-1]
+    if t2sym not in ('jiba', '-jiba', '-jiab'):
+        X = _ein('pe,mef,qf->mpq', ov, x.reshape(-1, nv, nv), ov)
+        Y = _ladder(mycc, X)
+        return _ein('pa,mpq,qb->mab', ov, Y, ov).reshape(x.shape)
+    i, j = cp.tril_indices(no)
+    xt = x[i, j]
+    X = _ein('pe,mef,qf->mpq', ov, xt, ov)
+    Y = _ladder(mycc, X)
+    X = None
+    y = _ein('pa,mpq,qb->mab', ov, Y, ov)
+    out = cp.empty_like(x)
+    out[i, j] = y
+    if t2sym == 'jiba':
+        out[j, i] = y.transpose(0, 2, 1)
+    elif t2sym == '-jiba':
+        out[j, i] = -y.transpose(0, 2, 1)
+    else:
+        out[j, i] = -y
+    return out
+
+
+class _CCShim:
+    """What the transplanted EOM functions read from ``eom._cc``."""
+
+    def __init__(self, mycc, imds):
+        self.mycc, self.imds = mycc, imds
+
+    def _add_vvvv(self, t1, t2, eris, out=None, with_ovvv=False,
+                  t2sym=None):
+        assert t1 is None and not with_ovvv
+        return _ladder_sym(self.mycc, self.imds.orbv_s, t2, t2sym)
+
+
+class _ERIShim:
+    def __init__(self, imds):
+        self.fock = imds.fock
+        self.ovov, self.ovoo, self.ovvo = imds.ovov, imds.ovoo, imds.ovvo
+        self.oovv, self.oooo = imds.oovv, imds.oooo
+        self._ovvv = imds.ovvv
+        self.vvvv = None              # AO-direct: no (aa|bb) in the diagonal
+
+    def get_ovvv(self, *slices):
+        return self._ovvv[slices]
+
+
+def _otril(n, k=-1):
+    return cp.tril_indices(n, k=k)
+
+
+def _pack_triplet(r1, r2):
+    r2aa, r2ab = r2
+    no, nv = r1.shape
+    nov = no * nv
+    oi, oj = _otril(no)
+    vi, vj = _otril(nv)
+    aa = r2aa[oi, oj][:, vi, vj]
+    i, j = cp.tril_indices(nov)
+    ab = r2ab.transpose(0, 2, 1, 3).reshape(nov, nov)[i, j]
+    return cp.hstack([r1.ravel(), aa.ravel(), ab])
+
+
+def _unpack_triplet(vec, nmo, no):
+    nv = nmo - no
+    nov = no * nv
+    oi, oj = _otril(no)
+    vi, vj = _otril(nv)
+    npo, npv = len(oi), len(vi)
+    r1 = vec[:nov].reshape(no, nv)
+    aa = vec[nov:nov + npo * npv].reshape(npo, npv)
+    r2aa = cp.zeros((no, no, nv, nv), dtype=vec.dtype)
+    r2aa[oi[:, None], oj[:, None], vi, vj] = aa
+    r2aa[oj[:, None], oi[:, None], vj, vi] = aa
+    r2aa[oi[:, None], oj[:, None], vj, vi] = -aa
+    r2aa[oj[:, None], oi[:, None], vi, vj] = -aa
+    i, j = cp.tril_indices(nov)
+    m = cp.zeros((nov, nov), dtype=vec.dtype)
+    # PySCF's unpack_tril(filltriu=ANTIHERMI): the upper triangle *and the
+    # diagonal* are minus the packed lower triangle
+    m[i, j] = vec[nov + npo * npv:]
+    m[j, i] = -vec[nov + npo * npv:]
+    r2ab = m.reshape(no, nv, no, nv).transpose(0, 2, 1, 3)
+    return r1, (r2aa, cp.ascontiguousarray(r2ab))
+
+
+def _pack_sf(r1, r2):
+    baaa, aaba = r2
+    no, nv = r1.shape
+    vi, vj = _otril(nv)
+    oi, oj = _otril(no)
+    b = baaa.reshape(no * no, nv, nv)[:, vi, vj]
+    a = aaba[oi, oj]
+    return cp.hstack([r1.ravel(), b.ravel(), a.ravel()])
+
+
+def _unpack_sf(vec, nmo, no):
+    nv = nmo - no
+    nov = no * nv
+    vi, vj = _otril(nv)
+    oi, oj = _otril(no)
+    nb = no * no * len(vi)
+    na = len(oi) * nv * nv
+    r1 = vec[:nov].reshape(no, nv)
+    v = vec[nov:nov + nb].reshape(no * no, len(vi))
+    baaa = cp.zeros((no * no, nv, nv), dtype=vec.dtype)
+    baaa[:, vi, vj] = v
+    baaa[:, vj, vi] = -v
+    v = vec[nov + nb:nov + nb + na].reshape(len(oi), nv, nv)
+    aaba = cp.zeros((no, no, nv, nv), dtype=vec.dtype)
+    aaba[oi, oj] = v
+    aaba[oj, oi] = -v
+    return r1, (baaa.reshape(no, no, nv, nv), aaba)
+
+
+def _eom_module():
+    from pyscf.cc import eom_rccsd as _m
+    from electrolites.adc_gpu import _transplant
+    mod = _transplant(_m)
+    g = mod.eeccsd_diag.__globals__
+    g['amplitudes_to_vector_singlet'] = lambda r1, r2: _pack_singlet(
+        r1[None], r2[None])[0]
+    g['amplitudes_to_vector_triplet'] = _pack_triplet
+    g['amplitudes_to_vector_eomsf'] = _pack_sf
+    return mod
+
+
+_EOMT = None
+
+
+def _eomt():
+    global _EOMT
+    if _EOMT is None:
+        _EOMT = _eom_module()
+    return _EOMT
+
+
+class _EOMShim:
+    def __init__(self, eom, imds, mycc, kind):
+        self.nocc, self.nmo = imds.nocc, imds.nocc + imds.nvir
+        self.max_memory = eom.max_memory
+        self.partition = getattr(eom, 'partition', None)
+        self._cc = _CCShim(mycc, imds)
+        pack, unpack = {'triplet': (_pack_triplet, _unpack_triplet),
+                        'sf': (_pack_sf, _unpack_sf)}[kind]
+        self.amplitudes_to_vector = pack
+        self.vector_to_amplitudes = unpack
+
+
+class _EEOtherBase:
+    """Triplet / spin-flip EOM-EE: PySCF's equations, device Davidson."""
+    _kind = None
+
+    def make_imds(self, eris=None):
+        imds = _make_ee(_Imds(self._cc), self._cc)
+        imds.eris = _ERIShim(imds)
+        return imds
+
+    def get_diag(self, imds=None):
+        if imds is None:
+            imds = self.make_imds()
+        d = _eomt().eeccsd_diag(self, imds)
+        return cp.asnumpy(d[1] if self._kind == 'triplet' else d[2])
+
+    def _sigma_fn(self, imds):
+        shim = _EOMShim(self, imds, self._cc, self._kind)
+        f = (_eomt().eeccsd_matvec_triplet if self._kind == 'triplet'
+             else _eomt().eeccsd_matvec_sf)
+
+        def matvec(V):
+            return cp.stack([f(shim, v.copy(), imds) for v in V])
+        return matvec
+
+    def gen_matvec(self, imds=None, diag=None, **kwargs):
+        if imds is None:
+            imds = self.make_imds()
+        if diag is None:
+            diag = self.get_diag(imds)
+        mv = self._sigma_fn(imds)
+
+        def matvec(xs):
+            return list(cp.asnumpy(mv(cp.asarray(np.asarray(xs)))))
+        return matvec, diag
+
+    def matvec(self, vector, imds=None, diag=None):
+        if imds is None:
+            imds = self.make_imds()
+        return cp.asnumpy(self._sigma_fn(imds)(
+            cp.asarray(np.asarray(vector))[None])[0])
+
+    def kernel(self, nroots=1, koopmans=False, guess=None, eris=None,
+               imds=None, diag=None):
+        log = logger.new_logger(self)
+        if imds is None:
+            imds = self.make_imds()
+        no, nv = imds.nocc, imds.nvir
+        d = _eomt().eeccsd_diag(self, imds)
+        d = d[1] if self._kind == 'triplet' else d[2]
+        mask = None
+        if self._kind == 'triplet':
+            # the packed (ia, ia) diagonal of the triplet ab block is not a
+            # degree of freedom (the antisymmetrised sigma is zero there):
+            # keep the trial space out of it
+            nov = no * nv
+            npair = no * (no - 1) // 2 * (nv * (nv - 1) // 2)
+            i, j = cp.tril_indices(nov)
+            mask = cp.ones(len(d))
+            mask[nov + npair + cp.where(i == j)[0]] = 0
+            d = cp.where(mask > 0, d, 1e9)
+        nwant = min(len(d), nroots + max(3, nroots // 2))
+        if guess is not None:
+            x0 = cp.asarray(np.asarray(guess)).reshape(len(guess), -1)
+        else:
+            idx = cp.argsort(d[:no * nv] if koopmans else d)[:nwant]
+            x0 = cp.zeros((nwant, len(d)))
+            x0[cp.arange(nwant), idx] = 1.
+        sigma = self._sigma_fn(imds)
+        if mask is not None:
+            raw = sigma
+
+            def sigma(V):
+                return raw(V * mask) * mask
+        conv, e, X = _davidson_nosym(
+            sigma, x0, d, nroots, self.conv_tol, self.conv_tol ** .5,
+            self.max_cycle, self.max_space + len(x0), log)
+        self.converged, self.e = conv, e
+        self.v = list(cp.asnumpy(X))
+        for n in range(nroots):
+            log.info('EOM-EE-CCSD %s root %d E = %.16g  conv = %s',
+                     self._kind, n, e[n], conv[n])
+        if nroots == 1:
+            return e[0], self.v[0]
+        return e, self.v
+
+
+class EOMEETriplet(_EEOtherBase, eom_rccsd.EOMEETriplet):
+    """Triplet EOM-EE-CCSD on the device."""
+    _kind = 'triplet'
+
+
+class EOMEESpinFlip(_EEOtherBase, eom_rccsd.EOMEESpinFlip):
+    """Spin-flip EOM-EE-CCSD on the device."""
+    _kind = 'sf'
+
+
+# left IP / EA (PySCF ``lipccsd_matvec`` / ``leaccsd_matvec``), batched
+
+def _lip_sigma(imds, r1, r2):
+    Hr1 = -_ein('ki,ni->nk', imds.Loo, r1)
+    Hr1 -= _ein('kbij,nijb->nk', imds.Wovoo, r2)
+    Hr2 = -_ein('kd,nl->nkld', imds.Fov, r1)
+    Hr2 += 2 * _ein('ld,nk->nkld', imds.Fov, r1)
+    W = 2 * imds.Wooov - imds.Wooov.transpose(1, 0, 2, 3)
+    Hr2 -= _ein('klid,ni->nkld', W, r1)
+    Hr2 += _ein('bd,nklb->nkld', imds.Lvv, r2)
+    Hr2 -= _ein('ki,nild->nkld', imds.Loo, r2)
+    Hr2 -= _ein('lj,nkjd->nkld', imds.Loo, r2)
+    W = 2 * imds.Wovvo - imds.Wovov.transpose(0, 1, 3, 2)
+    Hr2 += _ein('lbdj,nkjb->nkld', W, r2)
+    Hr2 -= _ein('kbdj,nljb->nkld', imds.Wovvo, r2)
+    Hr2 += _ein('klij,nijd->nkld', imds.Woooo, r2)
+    Hr2 -= _ein('kbid,nilb->nkld', imds.Wovov, r2)
+    tmp = _ein('ijcb,nijb->nc', imds.t2, r2)
+    W = 2 * imds.Woovv - imds.Woovv.transpose(1, 0, 2, 3)
+    Hr2 -= _ein('lkdc,nc->nkld', W, tmp)
+    return Hr1, Hr2
+
+
+def _lea_sigma(imds, mycc, r1, r2):
+    t1 = imds.t1
+    n, no, nv = r2.shape[0], imds.nocc, imds.nvir
+    Hr1 = _ein('ac,na->nc', imds.Lvv, r1)
+    Hr1 += _ein('abcj,njab->nc', imds.Wvvvo, r2)
+    Hr2 = 2 * _ein('nc,ld->nlcd', r1, imds.Fov)
+    Hr2 -= _ein('nd,lc->nlcd', r1, imds.Fov)
+    W = 2 * imds.Wvovv - imds.Wvovv.transpose(0, 1, 3, 2)
+    Hr2 += _ein('na,alcd->nlcd', r1, W)
+    Hr2 += _ein('nlad,ac->nlcd', r2, imds.Lvv)
+    Hr2 += _ein('nlcb,bd->nlcd', r2, imds.Lvv)
+    Hr2 -= _ein('njcd,lj->nlcd', r2, imds.Loo)
+    W = 2 * imds.Wovvo - imds.Wovov.transpose(0, 1, 3, 2)
+    Hr2 += _ein('njcb,lbdj->nlcd', r2, W)
+    Hr2 -= _ein('lajc,njab->nlcb', imds.Wovov, r2)
+    Hr2 -= _ein('lbcj,njab->nlca', imds.Wovvo, r2)
+    # sum_ab r[l,a,b] Wvvvv[a,b,c,d]: the ladder ((ac|bd) = (ca|db)) and
+    # the tau / t1 pieces of Wvvvv
+    ov = imds.orbv_s
+    x = _ein('pc,mcd,qd->mpq', ov, r2.reshape(n * no, nv, nv), ov)
+    y = _ladder(mycc, x)
+    x = None
+    Hr2 += _ein('pa,mpq,qb->mab', ov, y, ov).reshape(n, no, nv, nv)
+    y = None
+    g = _ein('nlab,kmab->nlkm', r2, imds.tau)
+    Hr2 += _ein('nlkm,kcmd->nlcd', g, imds.ovov)
+    u = _ein('nlab,mb->nlam', r2, t1)
+    Hr2 -= _ein('nlam,mdac->nlcd', u, imds.ovvv)
+    u = _ein('nlab,ka->nlkb', r2, t1)
+    Hr2 -= _ein('nlkb,kcbd->nlcd', u, imds.ovvv)
+    u = None
+    tmp = _ein('ijcb,nibc->nj', imds.t2, r2)
+    W = 2 * imds.Woovv - imds.Woovv.transpose(0, 1, 3, 2)
+    Hr2 -= _ein('kjfe,nj->nkef', W, tmp)
+    return Hr1, Hr2
+
+
+def _eomee_ccsd_triplet(self, nroots=1, koopmans=False, guess=None,
+                        eris=None, imds=None):
+    return EOMEETriplet(self).kernel(nroots, koopmans, guess)
+
+
+def _eomsf_ccsd(self, nroots=1, koopmans=False, guess=None, eris=None,
+                imds=None):
+    return EOMEESpinFlip(self).kernel(nroots, koopmans, guess)
+
+
+for _name, _fn in (('eomee_ccsd_triplet', _eomee_ccsd_triplet),
+                   ('eomsf_ccsd', _eomsf_ccsd)):
     if getattr(_ci.CCSDBase, _name, None) is NotImplemented:
         _attach(_ci.CCSDBase, _name, _fn)
