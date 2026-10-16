@@ -1239,7 +1239,8 @@ class RefUDLPNO:
                 return None
             perm = [key.index(x) for x in ids]       # position of each index in the key
             sign = np.linalg.det(np.eye(3)[perm])
-            T = self.T3[key].transpose(perm)
+            # antisymmetry in the occupied indices alone (virtuals stay put)
+            T = self.T3[key]
             qk = self.tp[self._sot_trip[key]]
             s = self.S(q, qk)
             T = lib.einsum('aA,bB,cC,ABC->abc', s, s, s, T)
