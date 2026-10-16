@@ -3,7 +3,7 @@ reference (``--cpu``).
 
     python benchmarks/phase6_bench.py --what lo --method boys [--cpu]
 
-what: lo (method: boys | pm | ibo | er) | eom (method: ip | ea) | adc (method: ee | ip | ea)
+what: lo (method: boys | pm | ibo | er) | eom (method: ip | ea) | adc (method: ee | ip | ea) | kmp2 (--kmesh, --cell diamond|diamond8) | x2cgrad | ghftd (method: tda | tdhf)
 """
 import argparse
 import json
@@ -13,7 +13,7 @@ import time
 import numpy as np
 
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-ap.add_argument('--what', required=True, choices=('lo', 'eom', 'adc'))
+ap.add_argument('--what', required=True, choices=('lo', 'eom', 'adc', 'kmp2', 'x2cgrad', 'ghftd'))
 ap.add_argument('--method', default='boys')
 ap.add_argument('--cpu', action='store_true')
 ap.add_argument('--xyz', default='benchmarks/molecules/glycine.xyz')
@@ -22,6 +22,8 @@ ap.add_argument('--xc', default='hf')
 ap.add_argument('--charge', type=int, default=0)
 ap.add_argument('--spin', type=int, default=0)
 ap.add_argument('--nroots', type=int, default=4)
+ap.add_argument('--kmesh', type=int, default=2)
+ap.add_argument('--cell', default='diamond')
 a = ap.parse_args()
 rec = dict(vars(a), threads=os.environ.get('OMP_NUM_THREADS'))
 
@@ -141,8 +143,82 @@ elif a.what == 'adc':
     e = timed('step_s', lambda: my.kernel(nroots=a.nroots)[0])
     rec['e_eV'] = (np.asarray(e) * 27.211386).tolist()
     rec['nao'], rec['nfrozen'] = mol.nao, fc
+elif a.what == 'kmp2':
+    from pyscf.pbc import gto as pgto
+    if a.cell == 'diamond8':
+        cell = pgto.M(a=np.eye(3) * 3.5668, atom='''C 0 0 0; C 0 1.7834 1.7834
+C 1.7834 0 1.7834; C 1.7834 1.7834 0; C 0.8917 0.8917 0.8917
+C 0.8917 2.6751 2.6751; C 2.6751 0.8917 2.6751; C 2.6751 2.6751 0.8917''',
+                      basis='gth-dzvp', pseudo='gth-pade', verbose=0)
+    else:
+        cell = pgto.M(a='''0 1.7834 1.7834
+1.7834 0 1.7834
+1.7834 1.7834 0''', atom='C 0 0 0; C 0.8917 0.8917 0.8917',
+                      basis='gth-dzvp', pseudo='gth-pade', verbose=0)
+    kpts = cell.make_kpts([a.kmesh] * 3)
+    if a.cpu:
+        from pyscf.pbc import scf, mp
+        mf = scf.KRHF(cell, kpts).density_fit()
+        mf.conv_tol = 1e-9
+        timed('scf_s', mf.kernel)
+        m = mp.KMP2(mf)
+        m.max_memory = 400000
+        e = timed('step_s', lambda: m.kernel(with_t2=False)[0])
+    else:
+        from gpu4pyscf.pbc import scf
+        from gpu4pyscf.pbc.df.df import GDF
+        from electrolites import kmp2_gpu
+        mf = scf.KRHF(cell, kpts)
+        mf.with_df = GDF(cell, kpts)
+        mf.conv_tol = 1e-9
+        timed('scf_s', mf.kernel)
+        e = timed('step_s', lambda: kmp2_gpu.kernel(mf), True)
+    rec['e_corr'] = float(e)
+    rec['nao'], rec['nk'] = cell.nao, len(kpts)
+elif a.what == 'x2cgrad':
+    from pyscf import gto
+    heavy = {'Pt': 'dyall-v2z', 'I': 'dyall-v2z', 'Br': 'cc-pvdz-dk'}
+    mol = gto.M(atom=a.xyz, charge=a.charge, spin=a.spin, verbose=0,
+                basis={**{e: 'cc-pvdz-dk' for e in ('H', 'C', 'N', 'O', 'Cl',
+                                                   'S')}, **heavy})
+    if a.cpu:
+        from pyscf import dft, grad  # noqa: F401 (registers Gradients)
+        mf = (dft.UKS if a.spin else dft.RKS)(mol, xc='pbe').x2c()
+        mf.conv_tol = 1e-9
+        timed('scf_s', mf.kernel)
+        g = mf.Gradients()
+        timed('step_s', g.kernel)
+    else:
+        from gpu4pyscf import dft
+        from gpu4pyscf.x2c.sfx2c1e import sfx2c1e
+        from electrolites import x2c_grad
+        mf = sfx2c1e((dft.UKS if a.spin else dft.RKS)(mol, xc='pbe'))
+        mf.conv_tol = 1e-9
+        timed('scf_s', mf.kernel)
+        g = x2c_grad.Gradients(mf)
+        timed('step_s', g.kernel, True)
+    rec['nao'] = mol.nao
+    rec['e_tot'] = float(mf.e_tot)
+elif a.what == 'ghftd':
+    mol = molecule()
+    if a.cpu:
+        from pyscf import scf
+        from pyscf.tdscf import ghf as T
+        mf = scf.GHF(mol)
+    else:
+        from gpu4pyscf import scf
+        from electrolites import ghf_td_gpu as T
+        mf = scf.GHF(mol)
+    mf.conv_tol = 1e-9
+    timed('scf_s', mf.kernel)
+    td = (T.TDA if a.method == 'tda' else T.TDHF)(mf)
+    td.nstates = a.nroots
+    e = timed('step_s', lambda: td.kernel()[0])
+    rec['e_eV'] = (np.asarray(e) * 27.211386).tolist()
+    rec['nao'] = mol.nao
 side = 'CPU' if a.cpu else 'GPU'
-print(f"[{a.what} {a.method} {side} {os.path.basename(a.xyz)}/{a.basis}] "
+label = (f"{a.cell} k{a.kmesh}" if a.what == "kmp2" else f"{os.path.basename(a.xyz)}/{a.basis}")
+print(f"[{a.what} {a.method} {side} {label}] "
       + '  '.join(f'{k} {v:.2f}' for k, v in rec.items()
                   if k.endswith('_s') and isinstance(v, float)))
 print('RESULT ' + json.dumps(rec, default=str))

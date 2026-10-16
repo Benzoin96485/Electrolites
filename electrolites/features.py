@@ -247,6 +247,14 @@ register('eom', 'eom_gpu',
 register('adc', 'adc_gpu',
          doc='[P10] ADC(2) EE/IP/EA on the GPU: PySCF\'s ADC algebra on '
              'device arrays (adc_gpu.RADC)')
+register('kmp2', 'kmp2_gpu',
+         doc='[X4] k-point RMP2 on the GPU from the GDF cderi '
+             '(kmp2_gpu.kernel)')
+register('x2c_grad', 'x2c_grad',
+         doc='[S5] sfX2C1e nuclear gradients (RHF/RKS/UHF/UKS) on the GPU '
+             '(x2c_grad.Gradients)')
+register('ghf_td', 'ghf_td_gpu',
+         doc='[S6] GHF TDA and TDHF on the GPU (ghf_td_gpu.TDA, TDHF)')
 register('raman_uks', 'raman_uks',
          doc='[O3] Raman activities for UHF/UKS (and RHF/RKS) on the GPU '
              '(raman_uks.eval_raman_intensity)')

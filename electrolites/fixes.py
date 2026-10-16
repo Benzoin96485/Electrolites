@@ -39,6 +39,10 @@ performance change; each is checked in `tests/test_fixes.py`.
   point-charge kernel for Gaussian ones.  All three now use PySCF's
   erf-screened nucleus-MM interaction (``qmmm/itrf.py``); point charges are
   unchanged.
+* **D14 sfX2C1e SCF.**  The X2C one-electron Hamiltonian's generalised
+  eigensolver raises a ``LinAlgError`` class its own fallback does not
+  catch, so no sfX2C1e SCF ran; it now falls back to a Cholesky reduction
+  and CuPy's ``eigh``.
 """
 import numpy as np
 import cupy
@@ -332,3 +336,36 @@ def _grad_nuc_mm(self, mol=None):
 _qmmm.QMMMSCF.energy_nuc = _energy_nuc
 _qmmm.QMMMGrad.grad_nuc = _grad_nuc
 _qmmm.QMMMGrad.grad_nuc_mm = _grad_nuc_mm
+
+
+# ------------------------------------------------- D14 X2C one-electron eigh
+# ``gpu4pyscf.x2c.x2c._x2c1e_get_hcore`` diagonalises the (2n x 2n)
+# one-electron Dirac problem with ``gpu4pyscf.lib.cusolver.eigh`` (sygvd
+# through ctypes).  Where that call fails it raises
+# ``gpu4pyscf.lib.cusolver.LinAlgError``, which is not the
+# ``cupy.linalg.LinAlgError`` its fallback catches, so every sfX2C1e SCF
+# dies (water/cc-pVDZ included).  The X2C module's ``eigh`` now falls back
+# to a Cholesky reduction and CuPy's own ``eigh`` (``cupy_helper.eigh``
+# calls the same ctypes sygvd).
+
+from gpu4pyscf.x2c import x2c as _x2c_gpu                     # noqa: E402
+from gpu4pyscf.lib import cusolver as _cusolver               # noqa: E402
+
+
+def _x2c_eigh(h, s=None, *args, **kwargs):
+    try:
+        return _cusolver.eigh(h, s, *args, **kwargs)
+    except _cusolver.LinAlgError:
+        if s is None:
+            return cupy.linalg.eigh(h)
+        # Cholesky reduction with CuPy's own solvers
+        L = cupy.linalg.cholesky(s)
+        Li = cupy.linalg.inv(L)
+        e, y = cupy.linalg.eigh(Li @ h @ Li.conj().T)
+        return e, Li.conj().T @ y
+
+
+if not getattr(_x2c_gpu.eigh, '_electrolites', False):
+    _x2c_eigh._electrolites = True
+    _x2c_eigh.__wrapped__ = _x2c_gpu.eigh
+    _x2c_gpu.eigh = _x2c_eigh

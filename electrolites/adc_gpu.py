@@ -9,9 +9,10 @@ as the array module: ``radc_amplitudes``, ``radc_ee``, ``radc_ip`` and
 CuPy, whose ``lib.einsum`` is ``cupy.einsum`` and whose ``unpack_eri_1`` is
 the identity (``ovvv`` is kept unpacked).  The algebra is then PySCF's
 term for term -- the same intermediates, the same M_ab, the same sigma
-vector -- with every array on the device; PySCF's Davidson
-(``lib.linalg_helper.davidson_nosym1``) runs unchanged on the host with
-the sigma vectors converted at the boundary.  The MO integrals come from
+vector -- with every array on the device.  The eigensolver is a device
+block Davidson with PySCF's convergence test and preconditioner: PySCF's
+host ``davidson_nosym1`` on o^2 v^2-long vectors was 95 % of an ADC(2)-EE
+run (alanine dipeptide: 400 of 425 s in its subspace projections).  The MO integrals come from
 ``fastmp2``'s half transformation (exact, as PySCF's incore ones).
 
 ADC(2) for EE (singlets), IP and EA.  ADC(2)-x and ADC(3) need the vvvv
@@ -50,9 +51,21 @@ class _CuPyAsNumPy(types.ModuleType):
         return getattr(cp, name)
 
 
+PROF = {}
+
+
 def _einsum(subscripts, *ops, **kw):
     kw.pop('optimize', None)
     ops = [cp.asarray(o) for o in ops]
+    if PROF.get('on'):
+        import time
+        cp.cuda.Stream.null.synchronize()
+        t = time.perf_counter()
+        out = cp.einsum(subscripts, *ops)
+        cp.cuda.Stream.null.synchronize()
+        key = (subscripts, tuple(o.shape for o in ops))
+        PROF[key] = PROF.get(key, 0.) + time.perf_counter() - t
+        return out
     return cp.einsum(subscripts, *ops)
 
 
@@ -130,36 +143,131 @@ def _es_class(kind):
     class GPU(base):
         compute_properties = False
 
-        def gen_matvec(self, imds=None, eris=None):
-            if imds is None:
-                imds = self.get_imds(eris)
-            diag = self.get_diag(imds, eris)
-            sigma = self.matvec(imds, eris)
-
-            def matvec(x):
-                return cp.asnumpy(sigma(cp.asarray(x)))
-
-            return matvec, cp.asnumpy(diag)
-
-        def get_init_guess(self, nroots=1, diag=None, ascending=True,
-                           type=None, eris=None, ini=None):
-            if type not in (None, 'read'):
-                raise NotImplementedError(f'ADC guess {type!r} on the GPU')
-            return _radc_init_guess(self, nroots, diag, ascending, type, ini)
+        def kernel(self, nroots=1, guess=None, eris=None):
+            return _es_kernel(self, nroots, guess, eris)
 
     GPU.__name__ = base.__name__
     return GPU
 
 
-def _radc_init_guess(es, nroots, diag, ascending, type, ini):
-    """PySCF's default guess (lowest diagonal elements) on host arrays."""
-    if type == 'read':
-        return list(numpy.asarray(ini))
-    diag = numpy.asarray(diag)
-    idx = numpy.argsort(diag) if ascending else numpy.argsort(diag)[::-1]
-    guess = numpy.zeros((len(diag), nroots))
-    guess[idx[:nroots], numpy.arange(nroots)] = 1.
-    return list(guess.T)
+def _davidson(matvec, x0, diag, nroots, tol, tol_residual, max_cycle,
+              max_space, log):
+    """Block Davidson for the lowest roots of the ADC matrix on the device.
+    PySCF's ADC matrix is not symmetric in its spin-adapted doubles basis,
+    so, as ``davidson_nosym1``: the projected matrix is diagonalised as a
+    general one (on the host: it is at most max_space wide), complex pairs
+    are dropped, the right Ritz vectors are kept, PySCF's convergence test
+    (energy change < tol and residual < tol_residual) and diagonal
+    preconditioner."""
+    def orth(vs, basis):
+        out = []
+        for v in vs:
+            for _ in range(2):
+                if basis is not None and len(basis):
+                    v = v - basis.T @ (basis @ v)
+                for u in out:
+                    v = v - u * (u @ v)
+            nrm = cp.linalg.norm(v)
+            if nrm > 1e-7:
+                out.append(v / nrm)
+        return out
+
+    nwant = len(x0)              # roots tracked (nroots + spare guesses)
+    V = cp.stack(orth(list(x0), None))
+    # PySCF's sigma functions may work in place on their argument: copies
+    AV = cp.stack([matvec(v.copy()) for v in V])
+    e_last = None
+    conv = numpy.zeros(nroots, dtype=bool)
+    X = V[:nroots]
+    for it in range(max_cycle):
+        H = cp.asnumpy(V @ AV.T)
+        w, c = numpy.linalg.eig(H)
+        real = numpy.where(abs(w.imag) < 1e-3)[0]
+        w, c = w[real].real, c[:, real].real
+        order = numpy.argsort(w)[:nwant]
+        w, c = w[order], cp.asarray(c[:, order])
+        X = c.T @ V
+        AX = c.T @ AV
+        nrm = cp.linalg.norm(X, axis=1)
+        X /= nrm[:, None]
+        AX /= nrm[:, None]
+        wd = cp.asarray(w)
+        R = AX - wd[:, None] * X
+        rnorm = cp.asnumpy(cp.linalg.norm(R, axis=1))
+        if e_last is not None and len(e_last) == len(w):
+            de = abs(w - e_last)
+        else:
+            de = numpy.ones(len(w))
+        conv = (de < tol) & (rnorm < tol_residual)
+        log.debug('ADC Davidson %d  space %d  |r| %s  dE %s', it, len(V),
+                  rnorm, de)
+        e_last = w
+        if conv[:nroots].all():
+            break
+        new = []
+        # corrections for the wanted roots only; the spare Ritz vectors stay
+        # in the space (and survive restarts) so that a lower root missed
+        # by the guess can still enter
+        for k in numpy.where(~conv[:nroots])[0]:
+            d = wd[k] - diag
+            d = cp.where(abs(d) < 1e-8, 1e-8, d)
+            new.append(R[k] / d)
+        if len(V) + len(new) > max_space:
+            # restart on the Ritz vectors, orthonormalised
+            q, r_ = cp.linalg.qr(X.T)
+            V = q.T
+            AV = cp.linalg.solve(r_.T, AX)
+        new = orth(new, V)
+        if not new:
+            break
+        Vn = cp.stack(new)
+        AVn = cp.stack([matvec(v.copy()) for v in Vn])
+        V = cp.vstack([V, Vn])
+        AV = cp.vstack([AV, AVn])
+    return conv[:nroots], e_last[:nroots], cp.asnumpy(X[:nroots])
+
+
+def _es_kernel(es, nroots, guess, eris):
+    """``radc.kernel`` with the device Davidson (PySCF's host Davidson on
+    o^2 v^2 vectors was 95 % of an ADC(2)-EE run)."""
+    from pyscf.data.nist import HARTREE2EV
+    log = logger.new_logger(es)
+    imds = es.get_imds(eris)
+    diag = cp.asarray(es.get_diag(imds, eris))
+    sigma = es.matvec(imds, eris)
+    # spare guesses: a nonsymmetric Davidson started on exactly nroots unit
+    # vectors can converge onto a higher root (water EA, 4th root)
+    nwant = min(len(diag), nroots + max(3, nroots // 2))
+    if guess is None:
+        idx = cp.argsort(diag)[:nwant]
+        x0 = cp.zeros((nwant, len(diag)))
+        x0[cp.arange(nwant), idx] = 1.
+    else:
+        x0 = cp.asarray(numpy.asarray(guess)).reshape(nroots, -1)
+    # trial vectors and their products live on the device: cap the space
+    # by the free memory (two arrays of max_space vectors)
+    free = cp.cuda.runtime.memGetInfo()[0] + \
+        cp.get_default_memory_pool().free_bytes()
+    room = int(.5 * free // (2 * 8 * len(diag)))
+    max_space = max(es.max_space, 4 * nroots) + nwant
+    if room < max_space:
+        if room < 2 * nwant:
+            raise MemoryError(f'ADC Davidson: {room} trial vectors of '
+                              f'{len(diag)} fit on the device')
+        log.warn('ADC Davidson: subspace capped at %d vectors (memory)', room)
+        max_space = room
+    conv, e, U = _davidson(sigma, x0, diag, nroots, es.conv_tol,
+                           es.tol_residual, es.max_cycle, max_space, log)
+    es.E, es.U = e, U.T.copy()
+    es.P = es.X = None
+    for n in range(nroots):
+        log.info('%s root %d  |  Energy (Eh) = %14.10f  |  Energy (eV) = '
+                 '%12.8f  |  conv = %s', es.method, n, e[n],
+                 e[n] * HARTREE2EV, conv[n])
+    if not conv.all():
+        log.warn('ADC Davidson: %d root(s) did not converge',
+                 int((~conv).sum()))
+    return es.E, es.U, es.P, es.X
 
 
 class RADC(_radc.RADC):
