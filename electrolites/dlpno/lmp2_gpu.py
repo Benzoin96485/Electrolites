@@ -13,7 +13,7 @@ import numpy as np
 import cupy as cp
 
 from electrolites.dlpno.ragged import Layout, Ragged, ChainPlan, op, padded
-from electrolites.dlpno.linalg import eigh_batched
+from electrolites.dlpno.linalg import eigh_batched, orthonormal_domain
 
 
 def pno_overlaps(X, pao, S_pao_d, nbf, cp_, cq_, LS, nv):
@@ -83,6 +83,8 @@ class LMP2GPU:
     """Mixin for rhf.DLPNO."""
 
     MAX_PAIR_CHUNK_BYTES = 1 << 30
+    #: 'pivchol' (Psi4's partial Cholesky selection) or 'eig'
+    PAO_ORTHO = 'pivchol'
 
     def _canon_pairs(self):
         return [p for p, (i, j) in enumerate(self.pl.pairs) if i <= j]
@@ -142,11 +144,7 @@ class LMP2GPU:
         mm = gpm[:, :, None] * gpm[:, None, :]
         S = self.S_pao_d[gp[:, :, None], gp[:, None, :]] * mm
         F = self.F_pao_d[gp[:, :, None], gp[:, None, :]] * mm
-        dg = cp.diagonal(S, axis1=1, axis2=2)
-        dn = cp.where(gpm > 0, 1. / cp.sqrt(cp.where(gpm > 0, dg, 1.)), 0.)
-        w, U = eigh_batched(S * dn[:, :, None] * dn[:, None, :])
-        keep = w > opt['S_CUT']
-        X0 = dn[:, :, None] * U * cp.where(keep, 1. / cp.sqrt(cp.where(keep, w, 1.)), 0.)[:, None, :]
+        X0, keep = orthonormal_domain(S, npao, opt['S_CUT'], self.PAO_ORTHO)
         Fo = cp.matmul(X0.transpose(0, 2, 1), cp.matmul(F, X0))
         Fo += 1e6 * cp.eye(P)[None] * (~keep)[:, :, None]
         e, Vf = eigh_batched(Fo)

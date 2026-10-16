@@ -38,6 +38,119 @@ def _load():
     return _lib
 
 
+_PIVCHOL = r'''
+// one thread block per matrix: Psi4's Matrix::pivoted_cholesky selection.
+// A: (b, n, n) row-major, L: scratch (b, n, n); out: piv (b, n) (-1 padded)
+extern "C" __global__ void pivchol(const double* __restrict__ A, double* __restrict__ L,
+                                   double* __restrict__ dwork, int* __restrict__ piv,
+                                   const int* __restrict__ nn, const int n, const double tol)
+{
+    const int b = blockIdx.x;
+    const int nb = nn[b];
+    const double* a = A + (long long)b * n * n;
+    double* l = L + (long long)b * n * n;
+    double* d = dwork + (long long)b * n;
+    int* pv = piv + (long long)b * n;
+    __shared__ double best[256];
+    __shared__ int bidx[256];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        d[i] = (i < nb) ? a[(long long)i * n + i] : -1.;
+        pv[i] = -1;
+    }
+    __syncthreads();
+    for (int m = 0; m < nb; ++m) {
+        double bv = -2.; int bi = -1;
+        for (int i = threadIdx.x; i < nb; i += blockDim.x)
+            if (d[i] > bv) { bv = d[i]; bi = i; }
+        best[threadIdx.x] = bv; bidx[threadIdx.x] = bi;
+        __syncthreads();
+        for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+            if (threadIdx.x < w) {
+                double o = best[threadIdx.x + w]; int oi = bidx[threadIdx.x + w];
+                if (o > best[threadIdx.x] || (o == best[threadIdx.x] && oi >= 0 && oi < bidx[threadIdx.x])) {
+                    best[threadIdx.x] = o; bidx[threadIdx.x] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        const int p = bidx[0];
+        const double dp = best[0];
+        __syncthreads();
+        if (dp < tol) break;
+        const double s = 1. / sqrt(dp);
+        for (int i = threadIdx.x; i < nb; i += blockDim.x) {
+            double v = a[(long long)i * n + p];
+            for (int q = 0; q < m; ++q) v -= l[(long long)i * n + q] * l[(long long)p * n + q];
+            v *= s;
+            l[(long long)i * n + m] = v;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < nb; i += blockDim.x) {
+            double v = l[(long long)i * n + m];
+            d[i] -= v * v;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) { d[p] = -1.; pv[m] = p; }
+        __syncthreads();
+    }
+}
+'''
+_pc_kern = None
+
+
+def pivoted_cholesky_batched(A, nn, tol):
+    """Pivot selection of a pivoted Cholesky of each A[b, :nn[b], :nn[b]]
+    (stopping at diag < tol), as Psi4's.  Returns a boolean mask (b, n)."""
+    global _pc_kern
+    if _pc_kern is None:
+        _pc_kern = cp.RawKernel(_PIVCHOL, 'pivchol')
+    A = cp.ascontiguousarray(A, dtype=cp.float64)
+    b, n = A.shape[0], A.shape[1]
+    L = cp.zeros_like(A)
+    d = cp.empty((b, n))
+    piv = cp.empty((b, n), dtype=cp.int32)
+    _pc_kern((b,), (256,), (A, L, d, piv, cp.asarray(nn, dtype=cp.int32), np.int32(n),
+                            np.float64(tol)))
+    mask = cp.zeros((b, n), dtype=bool)
+    rows = cp.repeat(cp.arange(b), n).reshape(b, n)
+    ok = piv >= 0
+    mask[rows[ok], piv[ok]] = True
+    return mask
+
+
+def orthonormal_domain(S, nn, s_cut, method='pivchol'):
+    """Orthonormal basis of the span of each (redundant) function set:
+    S (b, n, n) zero-padded overlap, nn true sizes.  Psi4's
+    orthocanonicalizer: normalise, pivoted-Cholesky selection at S_CUT,
+    canonical orthogonalisation of the selected functions.  Returns X
+    (b, n, n) with zero columns for dropped directions, and the keep mask."""
+    b, n = S.shape[0], S.shape[1]
+    m = cp.arange(n)[None, :] < cp.asarray(nn)[:, None]
+    dg = cp.diagonal(S, axis1=1, axis2=2)
+    dn = cp.where(m, 1. / cp.sqrt(cp.where(m, dg, 1.)), 0.)
+    Sn = S * dn[:, :, None] * dn[:, None, :]
+    if method == 'pivchol':
+        # Psi4 orders the functions by increasing off-diagonal overlap before
+        # LAPACK's dpstrf (ties go to the first in that order)
+        od = cp.sum(cp.abs(Sn), axis=2) - cp.abs(cp.diagonal(Sn, axis1=1, axis2=2))
+        od = cp.where(m, od, cp.inf)
+        order = cp.argsort(od, axis=1)
+        bi = cp.arange(b)[:, None]
+        Sp = Sn[bi[:, :, None], order[:, :, None], order[:, None, :]]
+        selp = pivoted_cholesky_batched(Sp, nn, s_cut)
+        sel = cp.zeros_like(selp)
+        sel[bi, order] = selp
+        sm = sel[:, :, None] & sel[:, None, :]
+        Ss = cp.where(sm, Sn, 0.)
+        w, U = eigh_batched(Ss)
+        keep = w > 1e-12
+    else:
+        w, U = eigh_batched(Sn)
+        keep = w > s_cut
+    X = dn[:, :, None] * U * cp.where(keep, 1. / cp.sqrt(cp.where(keep, w, 1.)), 0.)[:, None, :]
+    return X, keep
+
+
 CUDA_R_64F = 1
 CUSOLVER_EIG_MODE_VECTOR = 1
 CUBLAS_FILL_MODE_LOWER = 0

@@ -12,9 +12,10 @@ largest pair (PP PAOs, VP PNOs).
 """
 import numpy as np
 import cupy as cp
+import cupyx
 
 from electrolites.dlpno.ragged import padded
-from electrolites.dlpno.linalg import eigh_batched
+from electrolites.dlpno.linalg import eigh_batched, orthonormal_domain
 
 # the six orders of (i, j, k) in W (Jiang Eq. 109) and the transpose that
 # brings each partial W back to (a, b, c)
@@ -138,12 +139,7 @@ class TriplesGPU:
         mm = m[:, :, None] * m[:, None, :]
         St = S_d[gi[:, :, None], gi[:, None, :]] * mm
         Ft = F_d[gi[:, :, None], gi[:, None, :]] * mm
-        dg = cp.diagonal(St, axis1=1, axis2=2)
-        dn = cp.where(m > 0, 1. / cp.sqrt(cp.where(m > 0, dg, 1.)), 0.)
-        Sn = St * dn[:, :, None] * dn[:, None, :]
-        w, U = eigh_batched(Sn)
-        keep = w > opt['S_CUT']
-        X = dn[:, :, None] * U * cp.where(keep, 1. / cp.sqrt(cp.where(keep, w, 1.)), 0.)[:, None, :]
+        X, keep = orthonormal_domain(St, npao, opt['S_CUT'], getattr(self, 'PAO_ORTHO', 'pivchol'))
         Z = cp.matmul(S_d[:, gi].transpose(1, 0, 2) * m[:, None, :], X)   # (b, nbf, Pv)
         Dt = cp.zeros((b, Pv, Pv))
         tr = trip[ch]
@@ -367,61 +363,92 @@ class TriplesGPU:
 
     # ---- iterative (T) --------------------------------------------------
     def lccsd_t_iterations(self):
+        """Iterative (T) (Jiang Eq. 111-112), batched: triplets live in
+        padded buckets of equal TNO count; every coupling t <- u of a bucket
+        pair and permutation case is one batched 3-mode transformation."""
         opt, f, n = self.opt, self.orb.F_lmo, self.n
         ntrip = len(self.trip)
         S_d = self.S_pao_d
-        e_old = np.zeros(ntrip)
-        e_prev = 0.
-        coup = [[] for _ in range(ntrip)]
+        nv = np.array([x.shape[1] for x in self.X_tno], dtype=np.int64)
+        Vp = padded(nv)
+        buckets = {int(v): np.where(Vp == v)[0] for v in np.unique(Vp)}
+        bslot = np.zeros(ntrip, np.int64)
+        for v, mem in buckets.items():
+            bslot[mem] = np.arange(len(mem))
+
+        def pack(lst, v, mem, fill=0.):
+            out = cp.full((len(mem), v, v, v), fill)
+            for s, t in enumerate(mem):
+                m = nv[t]
+                out[s, :m, :m, :m] = lst[t]
+            return out
+        W = {v: pack(self.W3, v, m) for v, m in buckets.items()}
+        Vv = {v: pack(self.V3, v, m) for v, m in buckets.items()}
+        T = {v: pack(self.T3, v, m) for v, m in buckets.items()}
+        D = {}
+        coef = {}
+        fd = np.diag(f)
+        for v, mem in buckets.items():
+            e = np.full((len(mem), v), 1e3)
+            for s, t in enumerate(mem):
+                e[s, :nv[t]] = cp.asnumpy(self.e_tno[t])
+            e = cp.asarray(e)
+            fs = cp.asarray(fd[self._trip_arr[mem]].sum(axis=1))
+            D[v] = (e[:, :, None, None] + e[:, None, :, None] + e[:, None, None, :]
+                    - fs[:, None, None, None])
+            coef[v] = cp.asarray(np.array([_energy_coeffs(*self.trip[t]) for t in mem]))
+        self.W3 = self.V3 = self.T3 = None
+        # couplings, grouped by (V_t, V_u, case)
+        groups = {}
         for t, (i, j, k) in enumerate(self.trip):
             for l in range(n):
                 for key, fl, ok in (((i, j, l), f[l, k], l != k),
                                     ((i, l, k), f[l, j], l != j),
                                     ((l, j, k), f[l, i], l != i)):
                     if ok and key in self.trip_idx and abs(fl) >= opt['F_CUT_T']:
-                        coup[t].append((self.trip_idx[key], fl, _perm_case(*key)))
-        Sxs = {}
-
-        def s_tt(t, u):
-            v = Sxs.get((t, u))
-            if v is None:
+                        u = self.trip_idx[key]
+                        g = groups.setdefault((int(Vp[t]), int(Vp[u]), _perm_case(*key)), [])
+                        g.append((t, u, fl))
+        # TNO overlaps of every coupling, padded: S_tu = X_t^T S_pao[d_t, d_u] X_u
+        plan = []
+        for (vt, vu, case), lst in groups.items():
+            tt = np.array([c[0] for c in lst])
+            uu = np.array([c[1] for c in lst])
+            S = cp.zeros((len(lst), vt, vu))
+            for c, (t, u, fl) in enumerate(lst):
                 pt_, pu = cp.asarray(self.t_paos[t]), cp.asarray(self.t_paos[u])
-                v = self.X_tno[t].T @ S_d[pt_[:, None], pu[None, :]] @ self.X_tno[u]
-                Sxs[(t, u)] = v
-            return v
-
-        Dn = []
-        for t, (i, j, k) in enumerate(self.trip):
-            e = self.e_tno[t]
-            Dn.append(e[:, None, None] + e[None, :, None] + e[None, None, :]
-                      - (f[i, i] + f[j, j] + f[k, k]))
-        coefs = [cp.asarray(_energy_coeffs(*t)) for t in self.trip]
+                S[c, :nv[t], :nv[u]] = self.X_tno[t].T @ S_d[pt_[:, None], pu[None, :]] @ self.X_tno[u]
+            plan.append(dict(vt=vt, vu=vu, case=case, S=S,
+                             st=cp.asarray(bslot[tt]), su=cp.asarray(bslot[uu]),
+                             w=cp.asarray(np.array([c[2] for c in lst]))))
+        e_old = np.zeros(ntrip)
+        e_prev = 0.
+        ax = lambda c: (0,) + tuple(a + 1 for a in _CASES[c])
         for it in range(1, opt['MAXITER'] + 1):
-            rms = np.zeros(ntrip)
-            for t in range(ntrip):
-                if abs(self.e_ijk[t] - e_old[t]) < abs(e_old[t] * opt['T_CUT_ITER']):
-                    continue
-                R = self.W3[t] + self.T3[t] * Dn[t]
-                for u, fl, case in coup[t]:
-                    s = s_tt(t, u)
-                    A = self.T3[u].transpose(_CASES[case])
-                    v = s.shape[0]
-                    A = (s @ A.reshape(A.shape[0], -1)).reshape(v, A.shape[1], A.shape[2])
-                    A = (A.reshape(-1, A.shape[2]) @ s.T).reshape(v, -1, v)
-                    A = cp.einsum('bB,aBc->abc', s, A)
-                    R -= fl * A
-                self.T3[t] = self.T3[t] - R / Dn[t]
-                rms[t] = float(cp.sqrt(cp.mean(R * R)))
+            R = {v: W[v] + T[v] * D[v] for v in buckets}
+            for g in plan:
+                A = T[g['vu']][g['su']].transpose(ax(g['case']))      # (c, Vu, Vu, Vu)
+                S = g['S']
+                c_, vt, vu = A.shape[0], g['vt'], g['vu']
+                A = cp.matmul(S, A.reshape(c_, vu, vu * vu)).reshape(c_, vt, vu, vu)
+                A = cp.matmul(A.reshape(c_, vt * vu, vu), S.transpose(0, 2, 1)).reshape(c_, vt, vu, vt)
+                A = cp.matmul(S[:, None], A).reshape(c_, vt, vt, vt)
+                cupyx.scatter_add(R[vt], g['st'], -g['w'][:, None, None, None] * A)
+            rms = 0.
+            # every triplet is updated every sweep: Psi4 freezes triplets whose
+            # energy changed by less than T_CUT_ITER, which saves nothing in a
+            # batched sweep and, with Jacobi updates, stops ~1e-7 Eh short
+            for v, mem in buckets.items():
+                T[v] = T[v] - R[v] / D[v]
+                cnt = cp.asarray(np.maximum(nv[mem], 1) ** 3, dtype=cp.float64)
+                r = cp.sqrt(cp.sum(R[v] ** 2, axis=(1, 2, 3)) / cnt)
+                rms = max(rms, float(r.max()))
             e_old = self.e_ijk.copy()
-            E = 0.
-            for t in range(ntrip):
-                V = self.V3[t]
-                e = sum(float(coefs[t][c]) * float(cp.vdot(V.transpose(_CASES[c]), self.T3[t]))
-                        for c in range(6) if float(coefs[t][c]) != 0)
-                self.e_ijk[t] = e
-                E += e
-            self.log(f'  GPU LCCSD(T) iter {it:3d} {E:.12f} {E - e_prev:.3e} {rms.max():.3e}')
-            if rms.max() < opt['R_CONVERGENCE'] and abs(E - e_prev) < opt['E_CONVERGENCE']:
+            for v, mem in buckets.items():
+                self.e_ijk[mem] = _batched_energy(Vv[v], T[v], coef[v]).get()
+            E = float(self.e_ijk.sum())
+            self.log(f'  GPU LCCSD(T) iter {it:3d} {E:.12f} {E - e_prev:.3e} {rms:.3e}')
+            if rms < opt['R_CONVERGENCE'] and abs(E - e_prev) < opt['E_CONVERGENCE']:
                 break
             e_prev = E
         else:
