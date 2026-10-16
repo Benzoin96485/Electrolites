@@ -330,11 +330,16 @@ class LMP2GPU:
                 if ik >= 0 and j != k and abs(f[k, j]) > opt['F_CUT']:
                     cps.append(p); cqs.append(ik); outs.append(ik); ws.append(-f[k, j])
         cps, cqs = np.array(cps, np.int64), np.array(cqs, np.int64)
-        LS = Layout(nv[cps], nv[cqs])
-        S = pno_overlaps(self.X, self.pao, self.S_pao_d, self.orb.nbf, cps, cqs, LS, nv)
-        cid = np.arange(len(cps))
-        plan = ChainPlan(LP, cps, [op(LS, cid), op(LP, cqs), op(LS, cid, True)])
-        w = cp.asarray(np.array(ws))
+        # the overlaps S(ij, kj) are regenerated per chunk every iteration
+        from electrolites.dlpno.ovgen import OverlapGen
+        from electrolites.dlpno.vbatch import VChainPlan
+        gen = OverlapGen(self.S_pao_d, self.pao, self.X)
+        wall = np.array(ws)
+        chunks = gen.prepare(cps, cqs)
+        for P in chunks:
+            ar = np.arange(len(P['sel']))
+            P['res'] = VChainPlan(LP, cps[P['sel']], [op(P['LS'], ar), op(LP, cqs[P['sel']]), op(P['LS'], ar, True)])
+            P['w'] = cp.asarray(wall[P['sel']])
         K = Ragged.from_list(LP, self.K)
         T = Ragged.from_list(LP, self.T)
         fd = np.diag(f)
@@ -355,7 +360,9 @@ class LMP2GPU:
         e_prev = 0.
         for it in range(1, opt['MAXITER'] + 1):
             R = K + D * T
-            plan.run(R, [S, T, S], w=w)
+            for P in chunks:
+                Sc = gen.run(P)
+                P['res'].run(R, [Sc, T, Sc], w=P['w'])
             rms = float(R.rms_per_item().max())
             T = T - R / D
             T.set_flat(diis.update(T.flat(), R.flat()))
