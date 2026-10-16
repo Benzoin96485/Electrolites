@@ -34,7 +34,7 @@ def pinned_empty(shape, dtype=np.float64):
 def to_pinned(x):
     out = pinned_empty(x.shape, x.dtype)
     if isinstance(x, cp.ndarray):
-        x.get(out=out)
+        cp.ascontiguousarray(x).get(out=out)
     else:
         out[...] = x
     return out

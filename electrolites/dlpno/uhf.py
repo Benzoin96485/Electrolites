@@ -737,18 +737,143 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
     def cc_integrals(self):
         self.cc = None        # the dense host tensors of the reference are not built
 
-    def gpu_pair_ints(self, c, rows, strong, host=False):
+    MAX_INT_CHUNK_BYTES = 1 << 30
+
+    def _pair_core_chunk(self, ch):
+        """half-fitted (Q|m A^s) for the domain LMOs m, (Q|m n) and (Q|A^s B^s)
+        of a chunk of canonical pairs, batched; per pair views of true size."""
+        dfi, ns, ext = self.dfi, self.ns, self.dfi.ext
+        B = len(ch)
+        npao = np.array([len(self.pao[c]) for c in ch])
+        nla = np.array([len(self.lmos[c]) for c in ch])
+        auxs = [self.ribfs[c] for c in ch]
+        P, Lm = int(padded(npao.max())), int(padded(nla.max()))
+        A = int(-(-max(len(a) for a in auxs) // 32) * 32)
+        Va = int(padded(max(self.nva(c) for c in ch)))
+        Vb = int(padded(max(self.nvb(c) for c in ch)))
+        pidx, pm = np.zeros((B, P), np.int64), np.zeros((B, P))
+        lidx, lmk = np.zeros((B, Lm), np.int64), np.zeros((B, Lm))
+        aidx, am = np.zeros((B, A), np.int64), np.zeros((B, A))
+        Xa, Xbp, Xbs = np.zeros((B, P, Va)), np.zeros((B, P, Vb)), np.zeros((B, ns, Vb))
+        offs = []
+        for s_, c in enumerate(ch):
+            n_ = npao[s_]
+            pidx[s_, :n_], pm[s_, :n_] = self.pao[c], 1.
+            lidx[s_, :nla[s_]], lmk[s_, :nla[s_]] = self.lmos[c], 1.
+            aidx[s_, :len(auxs[s_])], am[s_, :len(auxs[s_])] = auxs[s_], 1.
+            Xa[s_, :n_, :self.nva(c)] = self.Xa[c]
+            Xbp[s_, :n_, :self.nvb(c)] = self.Xb[c][:n_]
+            Xbs[s_, :, :self.nvb(c)] = self.Xb[c][n_:]
+            o, at = 0, {}
+            for a in np.unique(self.ribf_atom[auxs[s_]]):
+                at[int(a)] = o
+                o += len(dfi.atom_ribfs[a])
+            offs.append(at)
+        gp, gpm = cp.asarray(pidx), cp.asarray(pm)
+        gl, glm = cp.asarray(lidx), cp.asarray(lmk)
+        ga, gam = cp.asarray(aidx), cp.asarray(am)
+        Xa_d, Xbp_d, Xbs_d = cp.asarray(Xa), cp.asarray(Xbp), cp.asarray(Xbs)
+        J = dfi.J2c[ga[:, :, None], ga[:, None, :]] * (gam[:, :, None] * gam[:, None, :])
+        J += cp.eye(A)[None] * (1 - gam)[:, :, None]
+        Linv = cp.linalg.inv(cp.linalg.cholesky(J))
+        del J
+        mq = (gam[:, :, None, None] * glm[:, None, :, None]) * gpm[:, None, None, :]
+        q = dfi.qia[ga[:, :, None, None], gl[:, None, :, None], gp[:, None, None, :]] * mq     # (B,A,L,P)
+        qa = cp.matmul(q, Xa_d[:, None])
+        qb = cp.matmul(q, Xbp_d[:, None])
+        del q
+        so = cp.asarray(self.somo_idx)
+        if ns:
+            qs = dfi.qij[ga[:, :, None, None], gl[:, None, :, None], so[None, None, None, :]]
+            qb += cp.matmul(qs * (gam[:, :, None, None] * glm[:, None, :, None]), Xbs_d[:, None])
+        Bm = [cp.matmul(Linv, x.reshape(B, A, -1)).reshape(x.shape) for x in (qa, qb)]
+        del qa, qb
+        qoo = dfi.qij[ga[:, :, None, None], gl[:, None, :, None], gl[:, None, None, :]]
+        qoo *= gam[:, :, None, None] * glm[:, None, :, None] * glm[:, None, None, :]
+        Boo = cp.matmul(Linv, qoo.reshape(B, A, -1)).reshape(B, A, Lm, Lm)
+        del qoo
+        qvv = [cp.zeros((B, A, Va, Va)), cp.zeros((B, A, Vb, Vb))]
+        atoms = sorted({a for o_ in offs for a in o_})
+        tr = lambda Y: Y.swapaxes(-1, -2)
+        for a in atoms:
+            qa_ = dfi.qab[a]
+            if qa_ is None:
+                continue
+            na = qa_.shape[0]
+            rows = np.array([r for r in range(B) if a in offs[r]], np.int64)
+            off = np.array([offs[r][a] for r in rows], np.int64)
+            pos = ext.pao_pos[a][pidx[rows]]
+            pos = np.where(pm[rows] > 0, pos, 0)
+            assert (pos >= 0).all(), 'pair PAO outside the extended domain'
+            gr, gpos = cp.asarray(rows), cp.asarray(pos)
+            mrow = gpm[gr]
+            step = max(1, int((1 << 28) // (8 * na * P * P)))
+            for r0 in range(0, len(rows), step):
+                sl = slice(r0, r0 + step)
+                blk = qa_[:, gpos[sl][:, :, None], gpos[sl][:, None, :]].transpose(1, 0, 2, 3)
+                blk = blk * (mrow[sl][:, :, None] * mrow[sl][:, None, :])[:, None]
+                oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
+                for s, Xs in ((0, Xa_d), (1, Xbp_d)):
+                    xr = Xs[gr[sl]]
+                    qvv[s][gr[sl][:, None], oo] = cp.matmul(cp.matmul(tr(xr)[:, None], blk), xr[:, None])
+        if ns:
+            qsu = dfi.qia[ga[:, :, None, None], so[None, None, :, None], gp[:, None, None, :]]
+            qsu = qsu * (gam[:, :, None, None] * gpm[:, None, None, :])
+            qss = dfi.qij[ga[:, :, None, None], so[None, None, :, None], so[None, None, None, :]]
+            qss = qss * gam[:, :, None, None]
+            m1 = cp.matmul(cp.matmul(tr(Xbp_d)[:, None], tr(qsu)), Xbs_d[:, None])
+            qvv[1] += m1 + tr(m1) + cp.matmul(cp.matmul(tr(Xbs_d)[:, None], qss), Xbs_d[:, None])
+        Qvv = [cp.matmul(Linv, x.reshape(B, A, -1)).reshape(x.shape) for x in qvv]
+        del qvv
+        out = {}
+        for s_, c in enumerate(ch):
+            na_, nl_ = len(auxs[s_]), nla[s_]
+            va, vb = self.nva(c), self.nvb(c)
+            out[c] = ([Bm[0][s_, :na_, :nl_, :va], Bm[1][s_, :na_, :nl_, :vb]],
+                      Boo[s_, :na_, :nl_, :nl_],
+                      [Qvv[0][s_, :na_, :va, :va], Qvv[1][s_, :na_, :vb, :vb]])
+        return out
+
+    def gpu_pair_ints_many(self, clist, rows_of, strong_of, host=False):
+        """(c, entry) for every canonical pair, the expensive parts batched over
+        chunks of pairs with equal padded PAO-domain size."""
+        clist = list(clist)
+        npao = np.array([len(self.pao[c]) for c in clist])
+        P = padded(npao)
+        for Pv in np.unique(P):
+            sel = [c for c, pv in zip(clist, P) if pv == Pv]
+            sel.sort(key=lambda c: len(self.ribfs[c]))
+            ch = []
+            for c in sel + [None]:
+                if c is not None:
+                    A = -(-len(self.ribfs[c]) // 32) * 32
+                    per = 8 * A * (int(padded(len(self.lmos[c]))) * (int(Pv) + 2 * self.nvb(c))
+                                   + 3 * self.nvb(c) ** 2 + A)
+                    if ch and (len(ch) + 1) * per <= self.MAX_INT_CHUNK_BYTES:
+                        ch.append(c)
+                        continue
+                if ch:
+                    core = self._pair_core_chunk(ch)
+                    for c2 in ch:
+                        yield c2, self.gpu_pair_ints(c2, rows_of[c2], strong_of[c2], host, core=core[c2])
+                    del core
+                ch = [c] if c is not None else []
+
+    def gpu_pair_ints(self, c, rows, strong, host=False, core=None):
         """fixed integrals of canonical spatial pair c for UCCSDGPU."""
         pl, si = self.pl, self.so_index
         x, y = pl.pairs[c]
         lm = list(self.lmos[c])
         lpos = {m: r for r, m in enumerate(lm)}
-        aux = self.ribfs[c]
-        L = self._halfL(c)
-        Bm = self._pair_B(c, lm)                       # [(A, nl, nva), (A, nl, nvb)]
-        ga, gl = cp.asarray(aux), cp.asarray(np.asarray(lm, np.int64))
-        Boo = _half(L, self.dfi.qij[ga[:, None, None], gl[None, :, None], gl[None, None, :]])
-        Qvv = [_half(L, v) for v in self._q_vv_blocks(c, c, c)]
+        if core is not None:
+            Bm, Boo, Qvv = core
+        else:
+            aux = self.ribfs[c]
+            L = self._halfL(c)
+            Bm = self._pair_B(c, lm)                       # [(A, nl, nva), (A, nl, nvb)]
+            ga, gl = cp.asarray(aux), cp.asarray(np.asarray(lm, np.int64))
+            Boo = _half(L, self.dfi.qij[ga[:, None, None], gl[None, :, None], gl[None, None, :]])
+            Qvv = [_half(L, v) for v in self._q_vv_blocks(c, c, c)]
         ent = dict(lm=lm, lpos=lpos, Kx={}, K1={}, K3={}, J1={})
         for (z1, z2) in {(x, y), (y, x)}:
             for s in (0, 1):

@@ -523,8 +523,14 @@ class UCCSDGPU:
         self.fix = [None] * self.npair
         if hasattr(u, 'gpu_pair_ints'):
             self.offload = self._decide_offload()
-            for c in self.canon_sp:
-                ent = u.gpu_pair_ints(c, self.rows[c], bool(self.strong_sp[c]), host=self.offload)
+            rows_of = {c: self.rows[c] for c in self.canon_sp}
+            strong_of = {c: bool(self.strong_sp[c]) for c in self.canon_sp}
+            if hasattr(u, 'gpu_pair_ints_many'):
+                it = u.gpu_pair_ints_many(self.canon_sp, rows_of, strong_of, host=self.offload)
+            else:
+                it = ((c, u.gpu_pair_ints(c, rows_of[c], strong_of[c], host=self.offload))
+                      for c in self.canon_sp)
+            for c, ent in it:
                 self.fix[c] = self.fix[pl.ji[c]] = ent
         for c in ([] if hasattr(u, 'gpu_pair_ints') else self.canon_sp):
             x, y = pl.pairs[c]
