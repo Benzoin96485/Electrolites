@@ -26,6 +26,78 @@ else:
     ChainPlan, DotPlan = _ChainPlan, _DotPlan
 
 
+class _ChunkedPlan:
+    """A chain (or dot) plan whose PNO-overlap operands (layout ``LS``) are
+    generated on the device per chunk of terms (``ovgen``) instead of being
+    stored for every couple."""
+
+    MAX_BYTES = 1 << 29
+
+    def __init__(self, gen, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=None, left=None):
+        n = len(out_idx) if left is None else len(left[0].idx)
+        self.n = self.nterms = n
+        self.gen = gen
+        self.chunks = []
+        if n == 0:
+            return
+        s_ops = [i for i, o in enumerate(operands) if o.layout is LS]
+        self.s_ops = s_ops
+        cid = np.stack([np.asarray(operands[i].idx, np.int64) for i in s_ops], 1)
+        byt = 8 * nv[cp_] * nv[cq_]
+        order = (np.argsort(np.asarray(out_idx), kind='stable') if out_idx is not None else np.arange(n))
+        bounds, cur, tot, start = [], set(), 0, 0
+        for pos, t in enumerate(order):
+            new = {int(c) for c in cid[t]} - cur
+            add = int(sum(byt[c] for c in new))
+            if cur and tot + add > self.MAX_BYTES:
+                bounds.append((start, pos))
+                start, cur, tot = pos, set(), 0
+                new = {int(c) for c in cid[t]}
+                add = int(sum(byt[c] for c in new))
+            cur |= new
+            tot += add
+        bounds.append((start, n))
+        for a, b in bounds:
+            sel = order[a:b]
+            uni = np.unique(cid[sel])
+            LSc = Layout(nv[cp_[uni]], nv[cq_[uni]])
+            preps = gen.prepare(cp_[uni], cq_[uni], out_layout=LSc, out_idx=np.arange(len(uni)))
+            ops = []
+            for i, o in enumerate(operands):
+                row = None if o.row is None else o.row[sel]
+                if i in s_ops:
+                    ops.append(op(LSc, np.searchsorted(uni, o.idx[sel]), o.trans, row))
+                else:
+                    ops.append(op(o.layout, o.idx[sel], o.trans, row))
+            if left is None:
+                plan = ChainPlan(out_layout, np.asarray(out_idx)[sel], ops,
+                                 out_row=None if out_row is None else np.asarray(out_row)[sel])
+            else:
+                lo = left[0]
+                plan = DotPlan([op(lo.layout, lo.idx[sel], lo.trans)], ops)
+            self.chunks.append(dict(sel=cp.asarray(sel), LS=LSc, preps=preps, plan=plan))
+
+    def _S(self, ch):
+        S = Ragged(ch['LS'])
+        for P in ch['preps']:
+            self.gen.run(P, S)
+        return S
+
+    def run(self, out, rags, w=None, alpha=1.):
+        if isinstance(out, list):              # dot plan: run(lrags, rrags)
+            outv = cp.zeros(self.n)
+            for ch in self.chunks:
+                S = self._S(ch)
+                r = [S if i in self.s_ops else x for i, x in enumerate(rags)]
+                outv[ch['sel']] = ch['plan'].run(out, r)
+            return outv
+        for ch in self.chunks:
+            S = self._S(ch)
+            r = [S if i in self.s_ops else x for i, x in enumerate(rags)]
+            ch['plan'].run(out, r, w=None if w is None else w[ch['sel']], alpha=alpha)
+        return out
+
+
 class _Couples:
     """Registry of the PNO overlap blocks S(p, q) the equations need."""
 
@@ -212,12 +284,28 @@ class CCSDGPU:
         # ---- PNO overlaps --------------------------------------------------
         cp_, cq_ = np.array(C.p, np.int64), np.array(C.q, np.int64)
         LS = self.LS = Layout(nv[cp_], nv[cq_])
-        self.S = self._overlaps(cp_, cq_)
+        onfly = os.environ.get('DLPNO_ONFLY_S', '1') == '1'
+        if onfly:
+            # no stored overlaps: every plan reading LS regenerates its chunk's S
+            from electrolites.dlpno.ovgen import OverlapGen
+            gen = OverlapGen(cp.asarray(ref.orb.S_pao), ref.pao, ref.X)
+            self.S = None
+        else:
+            self.S = self._overlaps(cp_, cq_)
         self.t_build['overlaps'] = time.perf_counter() - t0
         t0 = time.perf_counter()
 
         # ---- plans ---------------------------------------------------------
-        P = ChainPlan
+        def P(out_layout, out_idx, operands, out_row=None):
+            if onfly and any(o.layout is LS for o in operands):
+                return _ChunkedPlan(gen, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=out_row)
+            return ChainPlan(out_layout, out_idx, operands, out_row=out_row)
+
+        def DotPlan_(left, right):
+            if onfly and any(o.layout is LS for o in right):
+                return _ChunkedPlan(gen, LS, cp_, cq_, nv, None, None, right, left=left)
+            return DotPlan(left, right)
+        self._P = P
         self.p_tn = P(LN, tn['p'], [op(LS, tn['s']), op(LT1, tn['n'])], out_row=tn['row'])
         self.p_ti = P(LV, ti['p'], [op(LS, ti['s']), op(LT1, ti['i'])])
         self.p_tj = P(LV, tj['p'], [op(LS, tj['s']), op(LT1, tj['j'])])
@@ -241,12 +329,12 @@ class CCSDGPU:
         self.p_d4 = P(LP, d4['p'], [op(LS, d4['s1']), op(LP, d4['il']), op(LS, d4['s2']),
                                     op(LP, d4['lk']), op(LS, d4['s3'])])
         # Fkj''
-        self.p_fdd = DotPlan([op(LP, fdd['li'])],
+        self.p_fdd = DotPlan_([op(LP, fdd['li'])],
                              [op(LS, fdd['s1']), op(LP, fdd['lj']), op(LS, fdd['s2'])])
         self.fdd_flat = cp.asarray(fdd['flat'])
         # R1
         self.p_r1a = P(LT1, r1a['i'], [op(LS, r1a['s'], True), op(LV, r1a['q'])])
-        self.p_r1b_w = DotPlan([op(LP, r1b['kl'])],
+        self.p_r1b_w = DotPlan_([op(LP, r1b['kl'])],
                                [op(LS, r1b['sa']), op(LP, r1b['q']), op(LS, r1b['sb'])])
         self.p_r1b = P(LT1, r1b['i'], [op(LS, r1b['s']), op(LT1, r1b['l'])])
         self.p_r1c = P(LT1, r1c['i'], [op(LS, r1c['s'], True), op(LP, r1c['p']), op(LV, r1c['q'])])
@@ -329,7 +417,7 @@ class CCSDGPU:
         self.Jikac = Ragged.from_list(LJ, [ref.J_ikac[p][r] for p, r in zip(pk_p, pk_r)])
         self.Kiakc = Ragged.from_list(LJ, [ref.K_iakc[p][r] for p, r in zip(pk_p, pk_r)])
         cid = np.arange(len(pk_p))
-        P = ChainPlan
+        P = self._P
         LS = self.LS
         # C: -J(p,k) T[kj]^T S(kj,p) ; D: (2K - J)(p,k) Tt[jk]^T S(jk,p)
         self.p_rc1 = P(LP, pk_p, [op(LJ, cid), op(LP, rc['kj'], True), op(LS, rc['s3'])])
