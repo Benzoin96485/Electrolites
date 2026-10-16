@@ -668,19 +668,6 @@ class UTriplesGPU:
             d['Xb'] = cp.concatenate([d['Xb'][:npao], d['Xb'][P:]], axis=0)
             d['Xa_rows'] = npao
 
-        def ovl2(t, u, sg):
-            key = (t, u, sg)
-            v = Scache.get(key)
-            if v is None:
-                a, b = self.tno[t], self.tno[u]
-                Sm = S_d[cp.asarray(a['pidx'])[:, None], cp.asarray(b['pidx'])[None, :]]
-                if sg == 0:
-                    v = a['Xa'].T @ Sm @ b['Xa']
-                else:
-                    pa, pb = a['Xa_rows'], b['Xa_rows']
-                    v = a['Xb'][:pa].T @ Sm @ b['Xb'][:pb] + a['Xb'][pa:].T @ b['Xb'][pb:]
-                Scache[key] = v
-            return v
         groups = {}
         for n, O in enumerate(Os):
             for r in range(3):
@@ -699,28 +686,70 @@ class UTriplesGPU:
                     if u is None:
                         continue
                     perm = tuple(ck.index(new[q]) for q in range(3))
-                    groups.setdefault((bof[n], bof[u], perm), []).append((n, u, f))
+                    pat_n = tuple(so[I][1] for I in O)
+                    groups.setdefault((bof[n], bof[u], perm, pat_n), []).append((n, u, f))
+        # the TNO overlaps S_s(t, u) once per distinct (t, u, spin), from the
+        # device overlap generator over the triplets' compact TNO coefficients
+        from electrolites.dlpno.ovgen import OverlapGen
+        from electrolites.dlpno.ragged import Layout, Ragged
+        ntr = len(self.trip)
+        tpao = [np.asarray(self.tno[t]['pidx']) if self.tno[t] is not None else np.zeros(0, np.int64)
+                for t in range(ntr)]
+        Xs_ = [[self.tno[t]['Xa'] if self.tno[t] is not None else cp.zeros((0, 1)) for t in range(ntr)],
+               [self.tno[t]['Xb'] if self.tno[t] is not None else cp.zeros((self.ns, 1)) for t in range(ntr)]]
+        need = [dict(), dict()]
+        for (sn, su, perm, _), lst in groups.items():
+            for (n, u, f) in lst:
+                for q in range(3):
+                    sg = so[Os[n][q]][1]
+                    need[sg].setdefault((keys[n][0], keys[u][0]), len(need[sg]))
+        SU, LU = [], []
+        for sg in (0, 1):
+            kk = list(need[sg])
+            tt = np.array([k[0] for k in kk], np.int64)
+            uu = np.array([k[1] for k in kk], np.int64)
+            gen = OverlapGen(S_d, tpao, Xs_[sg], ne=(self.ns if sg == 1 else 0))
+            nvt = gen.nv
+            lay = Layout(nvt[tt], nvt[uu]) if len(kk) else Layout(np.zeros(0, np.int64), 1)
+            R_ = Ragged(lay)
+            if len(kk):
+                for P_ in gen.prepare(tt, uu, out_layout=lay, out_idx=np.arange(len(kk))):
+                    gen.run(P_, R_)
+            SU.append(R_)
+            LU.append(lay)
+            del gen
         plan = []
         split = []
-        for (sn, su, perm), lst0 in groups.items():
-            per = 8 * 4 * max(int(np.prod(sn)), int(np.prod(su)))
+        for (sn, su, perm, _), lst0 in groups.items():
+            per = 8 * 6 * max(int(np.prod(sn)), int(np.prod(su)))
             step = max(1, int((1 << 28) // per))
             for i0 in range(0, len(lst0), step):
                 split.append(((sn, su, perm), lst0[i0:i0 + step]))
         for (sn, su, perm), lst in split:
-            c = len(lst)
-            Ss = []
+            axes = []
             for q in range(3):
-                Sq = cp.zeros((c, sn[q], su[perm[q]]))
-                for k_, (n, u, f) in enumerate(lst):
-                    sg = so[Os[n][q]][1]
-                    v = ovl2(keys[n][0], keys[u][0], sg)
-                    Sq[k_, :v.shape[0], :v.shape[1]] = v
-                Ss.append(Sq)
-            plan.append(dict(sn=sn, su=su, perm=perm, S=Ss,
+                sg = so[Os[lst[0][0]][q]][1]
+                ids = np.array([need[sg][(keys[n][0], keys[u][0])] for (n, u, f) in lst], np.int64)
+                lay = LU[sg]
+                gg = lay.group[ids]
+                parts = []
+                for g_ in np.unique(gg):
+                    sel_ = np.where(gg == g_)[0]
+                    pr, pc = lay.shapes[g_]
+                    parts.append((int(g_), cp.asarray(sel_), cp.asarray(lay.slot[ids[sel_]]), pr, pc))
+                axes.append((sg, parts, sn[q], su[perm[q]]))
+            plan.append(dict(sn=sn, su=su, perm=perm, axes=axes, c=len(lst),
                              st=cp.asarray(slot[[l[0] for l in lst]]), suo=cp.asarray(slot[[l[1] for l in lst]]),
                              w=cp.asarray(np.array([l[2] for l in lst]))))
-        Scache.clear()
+
+        def gather_S(g):
+            out = []
+            for sg, parts, a_, b_ in g['axes']:
+                M = cp.zeros((g['c'], a_, b_))
+                for g_, sel_, sl_, pr, pc in parts:
+                    M[sel_, :min(pr, a_), :min(pc, b_)] = SU[sg].data[g_][sl_, :min(pr, a_), :min(pc, b_)]
+                out.append(M)
+            return out
         e_prev = 0.
         ntrip = len(self.trip)
         for it in range(1, opt['MAXITER'] + 1):
@@ -731,7 +760,7 @@ class UTriplesGPU:
                 R[s] = to_dev(W[s]) - D[s] * T[s]
             for g in plan:
                 Au = T[g['su']][g['suo']].transpose((0,) + tuple(1 + p for p in g['perm']))
-                S0, S1, S2 = g['S']
+                S0, S1, S2 = gather_S(g)
                 c_, a0, a1, a2 = Au.shape
                 t0, t1, t2 = S0.shape[1], S1.shape[1], S2.shape[1]
                 A1 = cp.matmul(S0, Au.reshape(c_, a0, a1 * a2)).reshape(c_, t0, a1, a2)
