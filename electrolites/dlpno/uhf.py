@@ -866,7 +866,11 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         lm = list(self.lmos[c])
         lpos = {m: r for r, m in enumerate(lm)}
         if core is not None:
+            # own copies: views would keep the whole padded chunk alive
             Bm, Boo, Qvv = core
+            Bm = [cp.ascontiguousarray(b) for b in Bm]
+            Boo = cp.ascontiguousarray(Boo)
+            Qvv = [cp.ascontiguousarray(q) for q in Qvv]
         else:
             aux = self.ribfs[c]
             L = self._halfL(c)
