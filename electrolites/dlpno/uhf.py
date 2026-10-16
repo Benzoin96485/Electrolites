@@ -620,37 +620,22 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
 
     def _pno_overlaps(self, Sreg):
         """per spin the PNO overlaps of the registered (p, q) couples."""
-        nbf, ns = self.orb.nbf, self.ns
+        from electrolites.dlpno.lmp2_gpu import overlaps_chunked
         npair = len(self.pl)
         nvs = np.array([[self.nva(p), self.nvb(p)] for p in range(npair)], np.int64)
-        from electrolites.dlpno.vbatch import VChainPlan
+        Xa = [self.Xa[p] for p in range(npair)]
+        Xbp = [self.Xb[p][:len(self.pao[p])] for p in range(npair)]
+        Xbs = [self.Xb[p][len(self.pao[p]):] for p in range(npair)]
         LSs, Ss = [], []
         for s in (0, 1):
             keys = Sreg[s].keys
             pp = np.array([k[0] for k in keys], np.int64)
             qq = np.array([k[1] for k in keys], np.int64)
             LS = Layout(nvs[pp, s], nvs[qq, s])
-            Sr = Ragged(LS)
-            if keys:
-                nrow = nbf + (ns if s == 1 else 0)
-                LX = Layout(np.full(npair, nrow), nvs[:, s])
-                X = Ragged(LX)
-                for p in np.unique(np.concatenate([pp, qq])):
-                    npo = len(self.pao[p])
-                    M = np.zeros((nrow, nvs[p, s]))
-                    if s == 0:
-                        M[self.pao[p]] = self.Xa[p]
-                    else:
-                        M[self.pao[p]] = self.Xb[p][:npo]
-                        M[nbf:] = self.Xb[p][npo:]
-                    _set_items(X, [p], [cp.asarray(M)])
-                pr = LX.shapes[0][0]
-                Mt = cp.zeros((pr, pr))
-                Mt[:nbf, :nbf] = self.S_pao_d
-                if s == 1 and ns:
-                    Mt[nbf:nbf + ns, nbf:nbf + ns] = cp.eye(ns)
-                MX = Ragged(LX, [cp.matmul(Mt, d) for d in X.data])
-                VChainPlan(LS, np.arange(len(keys)), [op(LX, pp, True), op(LX, qq)]).run(Sr, [X, MX])
+            if s == 0:
+                Sr = overlaps_chunked(self.S_pao_d, self.pao, Xa, pp, qq, LS)
+            else:
+                Sr = overlaps_chunked(self.S_pao_d, self.pao, Xbp, pp, qq, LS, Xs=Xbs if self.ns else None)
             LSs.append(LS)
             Ss.append(Sr)
         return LSs, Ss

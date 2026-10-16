@@ -483,36 +483,25 @@ class UCCSDGPU:
 
     # ------------------------------------------------------------------
     def _overlaps(self):
+        from electrolites.dlpno.lmp2_gpu import overlaps_chunked
         u = self.u
-        nbf, ns = u.orb.nbf, u.ns
-        Spao = cp.asarray(u.orb.S_pao)
+        Spao = getattr(u, 'S_pao_d', None)
+        if Spao is None:
+            Spao = cp.asarray(u.orb.S_pao)
+        npair = self.npair
+        Xa = [u.Xa[p] for p in range(npair)]
+        Xbp = [u.Xb[p][:len(u.pao[p])] for p in range(npair)]
+        Xbs = [u.Xb[p][len(u.pao[p]):] for p in range(npair)]
         self.LS, self.Sd = [], []
         for s in (0, 1):
             keys = self.Sreg[s].keys
             pp = np.array([k[0] for k in keys], np.int64)
             qq = np.array([k[1] for k in keys], np.int64)
             LS = Layout(self.nvs[pp, s], self.nvs[qq, s])
-            S = Ragged(LS)
-            if keys:
-                nrow = nbf + (ns if s == 1 else 0)
-                LX = Layout(np.full(self.npair, nrow), self.nvs[:, s])
-                X = Ragged(LX)
-                for p in np.unique(np.concatenate([pp, qq])):
-                    npo = len(u.pao[p])
-                    M = np.zeros((nrow, self.nvs[p, s]))
-                    if s == 0:
-                        M[u.pao[p]] = u.Xa[p]
-                    else:
-                        M[u.pao[p]] = u.Xb[p][:npo]
-                        M[nbf:] = u.Xb[p][npo:]
-                    _set_items(X, [p], [cp.asarray(M)])
-                pr = LX.shapes[0][0]
-                Mt = cp.zeros((pr, pr))
-                Mt[:nbf, :nbf] = Spao
-                if s == 1 and ns:
-                    Mt[nbf:nbf + ns, nbf:nbf + ns] = cp.eye(ns)
-                MX = Ragged(LX, [cp.matmul(Mt, d) for d in X.data])
-                VChainPlan(LS, np.arange(len(keys)), [op(LX, pp, True), op(LX, qq)]).run(S, [X, MX])
+            if s == 0:
+                S = overlaps_chunked(Spao, u.pao, Xa, pp, qq, LS)
+            else:
+                S = overlaps_chunked(Spao, u.pao, Xbp, pp, qq, LS, Xs=Xbs if u.ns else None)
             self.LS.append(LS)
             self.Sd.append(S)
 

@@ -16,7 +16,80 @@ from electrolites.dlpno.ragged import Layout, Ragged, ChainPlan, op, padded
 from electrolites.dlpno.linalg import eigh_batched, orthonormal_domain
 
 
+def overlaps_chunked(S_pao_d, pao, Xp, cp_, cq_, LS, Xs=None, max_bytes=1 << 29):
+    """S(p, q) = Xp_p^T S_pao[pao_p, pao_q] Xp_q (+ Xs_p^T Xs_q) for every
+    couple, into a new Ragged(LS) (item c = couple c).
+
+    Memory-lean: couples are processed in chunks (sorted by q); a chunk works
+    in the union of its pairs' PAO domains only (plus the extra identity-metric
+    rows Xs, e.g. SOMOs), so nothing of size npair x nbf is ever formed."""
+    from electrolites.dlpno.vbatch import VChainPlan
+    cp_ = np.asarray(cp_, np.int64)
+    cq_ = np.asarray(cq_, np.int64)
+    S = Ragged(LS)
+    if len(cp_) == 0:
+        return S
+    nbf = S_pao_d.shape[0]
+    ns = 0 if Xs is None else Xs[0].shape[0]
+    nv = np.array([x.shape[1] for x in Xp], np.int64)
+    order = np.argsort(cq_, kind='stable')
+    Vm = int(nv.max())
+
+    def flush(sel, inv):
+        inv = np.array(sorted(inv), np.int64)
+        U = np.unique(np.concatenate([pao[r] for r in inv]))
+        posU = -np.ones(nbf, np.int64)
+        posU[U] = np.arange(len(U))
+        nr = len(U) + ns
+        loc = -np.ones(len(Xp), np.int64)
+        loc[inv] = np.arange(len(inv))
+        LX = Layout(np.full(len(inv), nr), nv[inv])
+        X = Ragged(LX)
+        for g, m in enumerate(LX.members):
+            pr_, pc_ = LX.shapes[g]
+            buf = np.zeros((len(m), pr_, pc_))
+            for s_, r in enumerate(inv[m]):
+                buf[s_, posU[pao[r]], :nv[r]] = Xp[r]
+                if ns:
+                    buf[s_, len(U):nr, :nv[r]] = Xs[r]
+            X.data[g] = cp.asarray(buf)
+        pr = LX.shapes[0][0]
+        M = cp.zeros((pr, pr))
+        gU = cp.asarray(U)
+        M[:len(U), :len(U)] = S_pao_d[gU[:, None], gU[None, :]]
+        if ns:
+            M[len(U):nr, len(U):nr] = cp.eye(ns)
+        W = Ragged(LX, [cp.matmul(M, d) for d in X.data])
+        sel = np.asarray(sel, np.int64)
+        VChainPlan(LS, sel, [op(LX, loc[cp_[sel]], True), op(LX, loc[cq_[sel]])]).run(S, [X, W])
+
+    sel, inv, mask = [], set(), np.zeros(nbf, bool)
+    for c in order:
+        p, q = int(cp_[c]), int(cq_[c])
+        new = [r for r in (p, q) if r not in inv]
+        if new and sel:
+            m2 = mask.copy()
+            for r in new:
+                m2[pao[r]] = True
+            est = 16 * (len(inv) + len(new)) * (int(m2.sum()) + ns) * Vm
+            if est > max_bytes:
+                flush(sel, inv)
+                sel, inv, mask = [], set(), np.zeros(nbf, bool)
+        for r in (p, q):
+            if r not in inv:
+                inv.add(r)
+                mask[pao[r]] = True
+        sel.append(c)
+    if sel:
+        flush(sel, inv)
+    return S
+
+
 def pno_overlaps(X, pao, S_pao_d, nbf, cp_, cq_, LS, nv):
+    return overlaps_chunked(S_pao_d, pao, X, cp_, cq_, LS)
+
+
+def _pno_overlaps_full(X, pao, S_pao_d, nbf, cp_, cq_, LS, nv):
     """S(p,q) = X_p^T S_pao[d_p, d_q] X_q for couples (cp_, cq_) -> Ragged(LS)."""
     npair = len(X)
     LX = Layout(np.full(npair, nbf), nv)

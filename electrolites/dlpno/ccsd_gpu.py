@@ -277,6 +277,8 @@ class CCSDGPU:
         """S(p,q) = X_p^T S_pao[dom_p, dom_q] X_q for all registered couples,
         as one batched GEMM through PAO-embedded PNO coefficients."""
         ref = self.ref
+        from electrolites.dlpno.lmp2_gpu import overlaps_chunked
+        return overlaps_chunked(cp.asarray(ref.orb.S_pao), ref.pao, ref.X, cp_, cq_, self.LS)
         nbf = ref.orb.nbf
         npair = self.npair
         Spao = cp.asarray(ref.orb.S_pao)
