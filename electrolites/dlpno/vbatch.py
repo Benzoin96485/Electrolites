@@ -168,6 +168,9 @@ def _ptrs(rag, op):
 
 
 class VChainPlan:
+    #: largest total of chain intermediates per launch (doubles)
+    MAX_TMP = 1 << 27
+
     def __init__(self, out_layout, out_idx, operands, out_row=None, order=None):
         self.out_layout = out_layout
         out_idx = np.asarray(out_idx, np.int64)
@@ -217,9 +220,21 @@ class VChainPlan:
                 self.steps.append((s, nm, nn, kk))
                 cur_m = nm
         sizes = [st[1] * st[2] for st in self.steps[:-1]]
-        self.tmp_off = [np.concatenate([[0], np.cumsum(sz)[:-1]]).astype(np.int64)
-                        for sz in sizes]
-        self.tmp_tot = [int(sz.sum()) for sz in sizes]
+        # terms run in chunks whose intermediates fit MAX_TMP doubles
+        per = np.sum(sizes, axis=0) if sizes else np.zeros(nt, np.int64)
+        bounds = [0]
+        acc = 0
+        for t_, v in enumerate(per):
+            if acc + v > self.MAX_TMP and t_ > bounds[-1]:
+                bounds.append(t_)
+                acc = 0
+            acc += int(v)
+        bounds.append(nt)
+        self.chunks = []
+        for t0, t1 in zip(bounds[:-1], bounds[1:]):
+            offs = [cp.asarray(np.concatenate([[0], np.cumsum(sz[t0:t1])[:-1]]).astype(np.int64) * 8)
+                    for sz in sizes]
+            self.chunks.append((t0, t1, offs, [int(sz[t0:t1].sum()) for sz in sizes]))
         self.dims = []
         self.tiles = []
         last = len(self.steps) - 1
@@ -262,24 +277,26 @@ class VChainPlan:
         if getattr(self, '_ones', None) is None:
             self._ones = cp.ones(nt)
         ones = self._ones
-        tmps = [cp.empty(max(t, 1)) for t in self.tmp_tot]
-        tptr = [tmps[q].data.ptr + cp.asarray(self.tmp_off[q]) * 8 for q in range(len(tmps))]
         k = len(self.ops)
         last = len(self.steps) - 1
-        for q, (s, nm, nn, kk) in enumerate(self.steps):
-            if self.order == 'l2r':
-                A = ptrs[0] if q == 0 else tptr[q - 1]
-                ta = self.ops[0].trans if q == 0 else False
-                B, tb = ptrs[s], self.ops[s].trans
-            else:
-                A, ta = ptrs[s], self.ops[s].trans
-                B = ptrs[k - 1] if q == 0 else tptr[q - 1]
-                tb = self.ops[k - 1].trans if q == 0 else False
-            C = optr if q == last else tptr[q]
-            tm, tn = self.tiles[q]
-            kern((nt, tm * tn), (16, 16),
-                 (A, B, C, self.dims[q], al if q == last else ones, np.int32(tn),
-                  np.int32(ta), np.int32(tb), np.int32(1 if q == last else 0)))
+        for t0, t1, offs, tots in self.chunks:
+            tmps = [cp.empty(max(t, 1)) for t in tots]
+            tptr = [tmps[q].data.ptr + offs[q] for q in range(len(tmps))]
+            sl = slice(t0, t1)
+            for q, (s, nm, nn, kk) in enumerate(self.steps):
+                if self.order == 'l2r':
+                    A = ptrs[0][sl] if q == 0 else tptr[q - 1]
+                    ta = self.ops[0].trans if q == 0 else False
+                    B, tb = ptrs[s][sl], self.ops[s].trans
+                else:
+                    A, ta = ptrs[s][sl], self.ops[s].trans
+                    B = ptrs[k - 1][sl] if q == 0 else tptr[q - 1]
+                    tb = self.ops[k - 1].trans if q == 0 else False
+                C = optr[sl] if q == last else tptr[q]
+                tm, tn = self.tiles[q]
+                kern((t1 - t0, tm * tn), (16, 16),
+                     (A, B, C, self.dims[q][sl], (al if q == last else ones)[sl], np.int32(tn),
+                      np.int32(ta), np.int32(tb), np.int32(1 if q == last else 0)))
         return out
 
 
