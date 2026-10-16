@@ -113,71 +113,65 @@ class TriplesGPU:
 
     # ---- TNOs ------------------------------------------------------------
     def tno_transform(self, t_cut):
+        """Deferred: the TNOs of a chunk are built right before its (T0)
+        evaluation in ``lccsd_t0`` and dropped afterwards (kept only when the
+        iterative (T) needs them)."""
+        self._t_cut_tno = t_cut
+
+    def _tno_chunk(self, ch, Pv, t_cut):
+        """TNOs of the triplets ``ch`` (all with padded PAO domain Pv).
+        Returns X (b, Pv, Nt) in each triplet's PAO domain, e (b, Nt) host,
+        nfin (b,) host, and the PAO index tables."""
         opt, pl = self.opt, self.pl
-        self._pair_tables()
         pt = self._pt
-        S_d = self.S_pao_d
-        F_d = getattr(self, 'F_pao_d', None)
-        if F_d is None:
-            F_d = self.F_pao_d = cp.asarray(self.orb.F_pao)
-        ntrip = len(self.trip)
-        npao = np.array([len(p) for p in self.t_paos], dtype=np.int64)
-        P = padded(npao)
-        self.X_tno = [None] * ntrip
-        self.e_tno = [None] * ntrip
-        min_tnos = opt['MIN_TNOS']
-        s_cut = opt['S_CUT']
-        trip = np.array(self.trip, dtype=np.int64).reshape(-1, 3)
-        nbf = self.orb.nbf
-        for Pv in np.unique(P):
-            sel = np.where(P == Pv)[0]
-            per = 8 * (10 * Pv * Pv + 2 * nbf * Pv + 3 * pt['PP'] * Pv)
-            step = max(1, int(self.MAX_CHUNK_BYTES // per))
-            for c0 in range(0, len(sel), step):
-                ch = sel[c0:c0 + step]
-                b = len(ch)
-                idx = np.zeros((b, Pv), np.int64)
-                msk = np.zeros((b, Pv))
-                for s, t in enumerate(ch):
-                    idx[s, :npao[t]] = self.t_paos[t]
-                    msk[s, :npao[t]] = 1.
-                gi = cp.asarray(idx)
-                m = cp.asarray(msk)
-                mm = m[:, :, None] * m[:, None, :]
-                St = S_d[gi[:, :, None], gi[:, None, :]] * mm
-                Ft = F_d[gi[:, :, None], gi[:, None, :]] * mm
-                dg = cp.diagonal(St, axis1=1, axis2=2)
-                dn = cp.where(m > 0, 1. / cp.sqrt(cp.where(m > 0, dg, 1.)), 0.)
-                Sn = St * dn[:, :, None] * dn[:, None, :]
-                w, U = eigh_batched(Sn)
-                keep = w > s_cut
-                X = dn[:, :, None] * U * cp.where(keep, 1. / cp.sqrt(cp.where(keep, w, 1.)), 0.)[:, None, :]
-                Z = cp.matmul(S_d[:, gi].transpose(1, 0, 2) * m[:, None, :], X)   # (b, nbf, Pv)
-                Dt = cp.zeros((b, Pv, Pv))
-                tr = trip[ch]
-                for (a, c) in ((0, 1), (1, 2), (0, 2)):
-                    pp = cp.asarray(pl.ij[tr[:, a], tr[:, c]])
-                    sp = self._project(Z, cp.arange(b), pp)              # (b, VP, Pv)
-                    Dt += cp.matmul(sp.transpose(0, 2, 1), cp.matmul(pt['D'][pp], sp))
-                Dt /= 3.
-                Dt -= cp.eye(Pv)[None] * (~keep)[:, :, None]
-                occ, Vt = eigh_batched(Dt)
-                occ, Vt = occ[:, ::-1], Vt[:, :, ::-1]
-                nkeep = keep.sum(axis=1).get()
-                cut = cp.asarray(self.tno_scale[ch] * t_cut)
-                cnt = cp.sum((cp.abs(occ) >= cut[:, None])
-                             & (cp.arange(Pv)[None, :] < cp.asarray(nkeep)[:, None]), axis=1).get()
-                nfin = np.maximum(1, np.maximum(cnt, np.minimum(min_tnos, nkeep)))
-                Nt = int(nfin.max())
-                cm = (cp.arange(Nt)[None, :] < cp.asarray(nfin)[:, None]).astype(cp.float64)
-                Uq = cp.matmul(X, Vt[:, :, :Nt]) * cm[:, None, :]
-                Fq = cp.matmul(Uq.transpose(0, 2, 1), cp.matmul(Ft, Uq))
-                Fq += 1e6 * cp.eye(Nt)[None] * (1 - cm)[:, :, None]
-                et, Wt = eigh_batched(Fq)
-                Xt = cp.matmul(Uq, Wt)
-                for s, t in enumerate(ch):
-                    self.X_tno[t] = Xt[s, :npao[t], :nfin[s]]
-                    self.e_tno[t] = et[s, :nfin[s]]
+        S_d, F_d = self.S_pao_d, self.F_pao_d
+        trip = self._trip_arr
+        b = len(ch)
+        npao = self._npao_t[ch]
+        idx = np.zeros((b, Pv), np.int64)
+        msk = np.zeros((b, Pv))
+        for s, t in enumerate(ch):
+            idx[s, :npao[s]] = self.t_paos[t]
+            msk[s, :npao[s]] = 1.
+        gi = cp.asarray(idx)
+        m = cp.asarray(msk)
+        mm = m[:, :, None] * m[:, None, :]
+        St = S_d[gi[:, :, None], gi[:, None, :]] * mm
+        Ft = F_d[gi[:, :, None], gi[:, None, :]] * mm
+        dg = cp.diagonal(St, axis1=1, axis2=2)
+        dn = cp.where(m > 0, 1. / cp.sqrt(cp.where(m > 0, dg, 1.)), 0.)
+        Sn = St * dn[:, :, None] * dn[:, None, :]
+        w, U = eigh_batched(Sn)
+        keep = w > opt['S_CUT']
+        X = dn[:, :, None] * U * cp.where(keep, 1. / cp.sqrt(cp.where(keep, w, 1.)), 0.)[:, None, :]
+        Z = cp.matmul(S_d[:, gi].transpose(1, 0, 2) * m[:, None, :], X)   # (b, nbf, Pv)
+        Dt = cp.zeros((b, Pv, Pv))
+        tr = trip[ch]
+        ar = cp.arange(b)
+        for (a, c) in ((0, 1), (1, 2), (0, 2)):
+            pp = cp.asarray(pl.ij[tr[:, a], tr[:, c]])
+            sp = self._project(Z, ar, pp)                         # (b, VP, Pv)
+            Dt += cp.matmul(sp.transpose(0, 2, 1), cp.matmul(pt['D'][pp], sp))
+        del Z
+        Dt /= 3.
+        Dt -= cp.eye(Pv)[None] * (~keep)[:, :, None]
+        occ, Vt = eigh_batched(Dt)
+        del Dt
+        occ, Vt = occ[:, ::-1], Vt[:, :, ::-1]
+        nkeep = keep.sum(axis=1)
+        cut = cp.asarray(self.tno_scale[ch] * t_cut)
+        cnt = cp.sum((cp.abs(occ) >= cut[:, None])
+                     & (cp.arange(Pv)[None, :] < nkeep[:, None]), axis=1)
+        nkeep, cnt = nkeep.get(), cnt.get()
+        nfin = np.maximum(1, np.maximum(cnt, np.minimum(opt['MIN_TNOS'], nkeep)))
+        Nt = int(nfin.max())
+        cm = (cp.arange(Nt)[None, :] < cp.asarray(nfin)[:, None]).astype(cp.float64)
+        Uq = cp.matmul(X, Vt[:, :, :Nt]) * cm[:, None, :]
+        Fq = cp.matmul(Uq.transpose(0, 2, 1), cp.matmul(Ft, Uq))
+        Fq += 1e6 * cp.eye(Nt)[None] * (1 - cm)[:, :, None]
+        et, Wt = eigh_batched(Fq)
+        Xt = cp.matmul(Uq, Wt) * cm[:, None, :]
+        return Xt, et.get(), nfin, idx, msk
 
     # ---- (T0) ----------------------------------------------------------
     def _trip_riatoms(self, prescreen):
@@ -190,84 +184,88 @@ class TriplesGPU:
         super().triples_sparsity(prescreen)
         self.t_riatoms = self._trip_riatoms(prescreen)
 
-    def _chunks(self):
-        """Group triplets by padded (V, P) and split by memory."""
-        nt = np.array([x.shape[1] for x in self.X_tno])
-        npao = np.array([len(p) for p in self.t_paos])
-        nl = np.array([len(l) for l in self.t_lmos])
-        naux = np.array([len(self.dfi.aux_index(a)) for a in self.t_riatoms])
-        Vp, Pp = padded(nt), padded(npao)
-        key = Vp * 100000 + Pp
-        order = np.lexsort((naux, key))
-        nbf = self.orb.nbf
-        chunks = []
-        cur = []
-        for t in order:
-            if cur and key[t] != key[cur[0]]:
-                chunks.append(cur)
-                cur = []
-            cur.append(t)
-            V, P = int(Vp[t]), int(Pp[t])
-            A = int(-(-max(naux[c] for c in cur) // 32) * 32)
-            L = int(padded(max(nl[c] for c in cur)))
-            per = 8 * (A * V * V + 3 * A * P + A * A + 14 * V ** 3
-                       + 3 * L * V * V + nbf * V + 3 * A * V)
-            if len(cur) * per > self.MAX_CHUNK_BYTES and len(cur) > 1:
-                cur.pop()
-                chunks.append(cur)
-                cur = [t]
-        if cur:
-            chunks.append(cur)
-        return chunks, nt, npao, nl, naux
-
     def lccsd_t0(self, save=False):
-        pl, f = self.pl, self.orb.F_lmo
-        dfi = self.dfi
+        """TNOs and (T0) energy of every triplet, chunk by chunk."""
         self._pair_tables()
-        pt = self._pt
+        if getattr(self, 'F_pao_d', None) is None:
+            self.F_pao_d = cp.asarray(self.orb.F_pao)
+        dfi = self.dfi
         ntrip = len(self.trip)
         self.e_ijk = np.zeros(ntrip)
         if save:
             self.W3, self.V3, self.T3 = [None] * ntrip, [None] * ntrip, [None] * ntrip
+            self.X_tno, self.e_tno = [None] * ntrip, [None] * ntrip
+        self._trip_arr = np.array(self.trip, dtype=np.int64).reshape(-1, 3)
+        self._npao_t = np.array([len(p) for p in self.t_paos], dtype=np.int64)
+        self._nl_t = np.array([len(l) for l in self.t_lmos], dtype=np.int64)
+        self._naux_t = np.array([sum(len(dfi.atom_ribfs[a]) for a in at)
+                                 for at in self.t_riatoms], dtype=np.int64)
+        P = padded(self._npao_t)
+        nbf = self.orb.nbf
+        PP = self._pt['PP']
+        for Pv in np.unique(P):
+            sel = np.where(P == Pv)[0]
+            sel = sel[np.argsort(self._naux_t[sel], kind='stable')]
+            Pv = int(Pv)
+            per = 8 * (10 * Pv * Pv + 2 * nbf * Pv + 3 * PP * Pv)
+            step = max(1, int(self.MAX_CHUNK_BYTES // per))
+            for c0 in range(0, len(sel), step):
+                ch = sel[c0:c0 + step]
+                Xt, et, nfin, pidx, pm = self._tno_chunk(ch, Pv, self._t_cut_tno)
+                if save:
+                    for s, t in enumerate(ch):
+                        self.X_tno[t] = Xt[s, :self._npao_t[t], :nfin[s]]
+                        self.e_tno[t] = cp.asarray(et[s, :nfin[s]])
+                # (T0) in memory-bounded pieces of the chunk
+                V = int(padded(nfin.max()))
+                A = int(-(-self._naux_t[ch].max() // 32) * 32)
+                L = int(padded(max(1, self._nl_t[ch].max())))
+                per = 8 * (A * V * V + 3 * A * Pv + A * A + 14 * V ** 3
+                           + 3 * L * V * V + nbf * V + 3 * A * V)
+                sub = max(1, int(self.MAX_CHUNK_BYTES // per))
+                for s0 in range(0, len(ch), sub):
+                    sl = slice(s0, s0 + sub)
+                    Xs = Xt[sl]
+                    if Xs.shape[2] < V:
+                        Xs = cp.concatenate([Xs, cp.zeros(Xs.shape[:2] + (V - Xs.shape[2],))], axis=2)
+                    ev = np.full((len(ch[sl]), V), 1e3)
+                    for s, t in enumerate(ch[sl]):
+                        ev[s, :nfin[sl][s]] = et[sl][s, :nfin[sl][s]]
+                    self._t0_chunk(ch[sl], Xs, ev, nfin[sl], pidx[sl], pm[sl], save)
+        return float(self.e_ijk.sum())
+
+    def _t0_chunk(self, ch, X, ev, ntv, pidx, pm, save):
+        pl, f = self.pl, self.orb.F_lmo
+        dfi = self.dfi
+        pt = self._pt
         fd = np.diag(f)
-        trip = np.array(self.trip, dtype=np.int64).reshape(-1, 3)
-        chunks, ntv, npao, nlv, naux = self._chunks()
         ext = dfi.ext
         S_d = self.S_pao_d
-        for ch in chunks:
-            ch = np.asarray(ch)
-            B = len(ch)
-            V = int(padded(ntv[ch].max()))
-            P = int(padded(npao[ch].max()))
-            L = int(padded(max(1, nlv[ch].max())))
-            A = int(-(-naux[ch].max() // 32) * 32)
-            # ---- index tables ------------------------------------------
-            pidx = np.zeros((B, P), np.int64)
-            pm = np.zeros((B, P))
-            lidx = np.zeros((B, L), np.int64)
-            lmk = np.zeros((B, L))
-            aidx = np.zeros((B, A), np.int64)
-            amk = np.zeros((B, A))
-            ev = np.full((B, V), 1e3)
-            coef = np.zeros((B, 6))
-            offs = []
-            X = cp.zeros((B, P, V))
-            for s, t in enumerate(ch):
-                pidx[s, :npao[t]] = self.t_paos[t]
-                pm[s, :npao[t]] = 1.
-                lidx[s, :nlv[t]] = self.t_lmos[t]
-                lmk[s, :nlv[t]] = 1.
-                ax = dfi.aux_index(self.t_riatoms[t])
-                aidx[s, :len(ax)] = ax
-                amk[s, :len(ax)] = 1.
-                ev[s, :ntv[t]] = self.e_tno[t].get() if hasattr(self.e_tno[t], 'get') else self.e_tno[t]
-                X[s, :npao[t], :ntv[t]] = self.X_tno[t]
-                coef[s] = _energy_coeffs(*trip[t])
-                o, at_off = 0, {}
-                for a in self.t_riatoms[t]:
-                    at_off[int(a)] = o
-                    o += len(dfi.atom_ribfs[a])
-                offs.append(at_off)
+        trip = self._trip_arr
+        B = len(ch)
+        P, V = X.shape[1], X.shape[2]
+        nlv = self._nl_t
+        L = int(padded(max(1, nlv[ch].max())))
+        A = int(-(-self._naux_t[ch].max() // 32) * 32)
+        lidx = np.zeros((B, L), np.int64)
+        lmk = np.zeros((B, L))
+        aidx = np.zeros((B, A), np.int64)
+        amk = np.zeros((B, A))
+        coef = np.zeros((B, 6))
+        offs = []
+        for s, t in enumerate(ch):
+            lidx[s, :nlv[t]] = self.t_lmos[t]
+            lmk[s, :nlv[t]] = 1.
+            ax = dfi.aux_index(self.t_riatoms[t])
+            aidx[s, :len(ax)] = ax
+            amk[s, :len(ax)] = 1.
+            coef[s] = _energy_coeffs(*trip[t])
+            o, at_off = 0, {}
+            for a in self.t_riatoms[t]:
+                at_off[int(a)] = o
+                o += len(dfi.atom_ribfs[a])
+            offs.append(at_off)
+        if True:
             gp, gpm = cp.asarray(pidx), cp.asarray(pm)
             gl, glm = cp.asarray(lidx), cp.asarray(lmk)
             ga, gam = cp.asarray(aidx), cp.asarray(amk)
@@ -361,7 +359,7 @@ class TriplesGPU:
             self.e_ijk[ch] = eb
             if save:
                 for s, t in enumerate(ch):
-                    v = ntv[t]
+                    v = ntv[s]
                     self.W3[t] = W[s, :v, :v, :v].copy()
                     self.V3[t] = Vt[s, :v, :v, :v].copy()
                     self.T3[t] = T3[s, :v, :v, :v].copy()

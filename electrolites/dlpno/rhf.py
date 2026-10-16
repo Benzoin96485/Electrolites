@@ -27,6 +27,7 @@ from electrolites.dlpno.ref_rhf import RefDLPNO
 from electrolites.dlpno.dfints import DFInts, ExtDomains
 from electrolites.dlpno.ccsd_gpu import CCSDGPU
 from electrolites.dlpno.triples_gpu import TriplesGPU
+from electrolites.dlpno.lmp2_gpu import LMP2GPU
 
 
 def _cho_solve(L, x):
@@ -41,7 +42,7 @@ def _half(L, x):
     return cpla.solve_triangular(L, x.reshape(L.shape[0], -1), lower=True).reshape(s)
 
 
-class DLPNO(TriplesGPU, RefDLPNO):
+class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
     """GPU DLPNO-CCSD(T).  Same interface as RefDLPNO."""
 
     def setup(self):

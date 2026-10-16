@@ -14,7 +14,16 @@ import numpy as np
 import cupy as cp
 import cupyx
 
-from electrolites.dlpno.ragged import Layout, Ragged, ChainPlan, DotPlan, op
+import os
+from electrolites.dlpno.ragged import Layout, Ragged, ChainPlan as _ChainPlan, DotPlan as _DotPlan, op
+from electrolites.dlpno.vbatch import VChainPlan, VDotPlan
+
+#: DLPNO_VBATCH=0 runs the shape-grouped cupy batches instead of the
+#: variable-size kernels (kept for A/B and as a cross-check)
+if os.environ.get("DLPNO_VBATCH", "1") == "1":
+    ChainPlan, DotPlan = VChainPlan, VDotPlan
+else:
+    ChainPlan, DotPlan = _ChainPlan, _DotPlan
 
 
 class _Couples:
