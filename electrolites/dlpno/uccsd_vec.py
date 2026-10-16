@@ -496,7 +496,7 @@ class UCCSDGPUv(UCCSDGPU):
                 kl_u, c_u = ukey // self.npair, ukey % self.npair
                 nf, na = len(fs), len(ra)
                 loc_idx[s] = (fs, inv[:nf], ra, inv[nf:nf + na], rbs, inv[nf + na:])
-                d['cpl'].append((kl_u, cpos[self.cmap[c_u]], Layout(nvs[kl_u, s], nvs[c_u, s])))
+                d['cpl'].append((kl_u, cpos[self.cmap[c_u]], Layout(nvs[kl_u, s], nvs[c_u, s]), c_u))
             fvt = []
             for s in (0, 1):
                 fs, li = loc_idx[s][0], loc_idx[s][1]
@@ -566,24 +566,34 @@ class UCCSDGPUv(UCCSDGPU):
         self.Sreg = new
 
     def _kl_tables(self):
-        """pair PNO coefficients in their PAO domains (beta: PAO rows, then SOMO rows)."""
+        """pair virtual coefficients over all PAOs (beta: + SOMO rows), and the
+        same multiplied by the PAO (+SOMO) metric, as Raggeds per spin."""
         u, ns = self.u, self.u.ns
-        npair = self.npair
-        npo = np.array([len(u.pao[p]) for p in range(npair)])
-        PP = int(padded(npo.max()))
-        VA, VB = int(padded(self.nvs[:, 0].max())), int(padded(self.nvs[:, 1].max()))
-        XA = np.zeros((npair, PP, VA))
-        XB = np.zeros((npair, PP + ns, VB))
-        dom = np.zeros((npair, PP), np.int64)
-        dmk = np.zeros((npair, PP))
-        for p in range(npair):
-            n_ = npo[p]
-            XA[p, :n_, :self.nvs[p, 0]] = u.Xa[p]
-            XB[p, :n_, :self.nvs[p, 1]] = u.Xb[p][:n_]
-            XB[p, PP:, :self.nvs[p, 1]] = u.Xb[p][n_:]
-            dom[p, :n_] = u.pao[p]
-            dmk[p, :n_] = 1.
-        self._klt = dict(PP=PP, X=[cp.asarray(XA), cp.asarray(XB)], dom=cp.asarray(dom), dmk=cp.asarray(dmk))
+        nbf = u.orb.nbf
+        self.LXk, self.Xk, self.MXk = [], [], []
+        for s in (0, 1):
+            nrow = nbf + (ns if s == 1 else 0)
+            LX = Layout(np.full(self.npair, nrow), self.nvs[:, s])
+            X = Ragged(LX)
+            mats = []
+            for p in range(self.npair):
+                npo = len(u.pao[p])
+                M = np.zeros((nrow, self.nvs[p, s]))
+                if s == 0:
+                    M[u.pao[p]] = u.Xa[p]
+                else:
+                    M[u.pao[p]] = u.Xb[p][:npo]
+                    M[nbf:] = u.Xb[p][npo:]
+                mats.append(cp.asarray(M))
+            _set_items(X, range(self.npair), mats)
+            pr = LX.shapes[0][0]
+            Mt = cp.zeros((pr, pr))
+            Mt[:nbf, :nbf] = u.S_pao_d
+            if s == 1 and ns:
+                Mt[nbf:nbf + ns, nbf:nbf + ns] = cp.eye(ns)
+            self.LXk.append(LX)
+            self.Xk.append(X)
+            self.MXk.append(Ragged(LX, [cp.matmul(Mt, d) for d in X.data]))
 
     def _tmp(self, name, layout):
         """persistent zeroed work Ragged (stable addresses: the plans' pointer
@@ -607,7 +617,7 @@ class UCCSDGPUv(UCCSDGPU):
         for d in self.klchunks:
             off = 0
             rags = []
-            for kl, cl, lay in d['cpl']:
+            for kl, cl, lay, cu in d['cpl']:
                 data = []
                 for m, (r, c) in zip(lay.members, lay.shapes):
                     n = len(m) * r * c
@@ -615,44 +625,21 @@ class UCCSDGPUv(UCCSDGPU):
                     off += n
                 rags.append(Ragged(lay, data))
             d['Sc'] = rags
-            d['dev'] = [(cp.asarray(kl), cp.asarray(cl), [cp.asarray(m) for m in lay.members])
-                        for kl, cl, lay in d['cpl']]
+            d['gen'] = [VChainPlan(lay, np.arange(len(kl)), [op(self.LXk[s], kl, True), op(self.LXk[s], cu)])
+                        for s, (kl, cl, lay, cu) in enumerate(d['cpl'])]
+            d['ws'] = ws[:off]
         self._sws = ws
 
     def _gen_S(self, ch):
-        """the S(kl, c) of one chunk, per spin, as Raggeds."""
-        kt = self._klt
-        S_d = self.u.S_pao_d
-        PP, ns = kt['PP'], self.u.ns
-        cs = ch.get('gcs')
-        if cs is None:
-            cs = ch['gcs'] = cp.asarray(ch['cs'])
-        dom, dmk = kt['dom'][cs], kt['dmk'][cs]
-        SP_ = S_d[:, dom].transpose(1, 0, 2) * dmk[:, None, :]          # (nc, nbf, PP)
+        """the S(kl, c) of one chunk, per spin: X_kl^T (S X_c) over full PAO
+        (+SOMO) rows, one variable-size batched GEMM per spin."""
         if 'Sc' not in ch:
             self._S_workspace()
-        out = []
+        ch['ws'].fill(0.)
         for s in (0, 1):
-            kl, cl, lay = ch['cpl'][s]
-            R = ch['Sc'][s]
-            gkl, gcl, gm = ch['dev'][s]
-            if len(kl):
-                X = kt['X'][s]
-                Xc = X[cs]
-                Z = cp.matmul(SP_, Xc[:, :PP])                              # (nc, nbf, V)
-                rows = kt['dom'][gkl]
-                G = Z[gcl[:, None], rows] * kt['dmk'][gkl][:, :, None]
-                if s == 1 and ns:
-                    G = cp.concatenate([G, Xc[gcl, PP:]], axis=1)
-                Sv = cp.matmul(X[gkl].transpose(0, 2, 1), G)               # (n, VPkl, Vc)
-                for g, m in enumerate(gm):
-                    if len(m):
-                        pr, pc = lay.shapes[g]
-                        R.data[g][...] = Sv[m, :pr, :pc]
-            out.append(R)
-        return out
+            ch['gen'][s].run(ch['Sc'][s], [self.Xk[s], self.MXk[s]])
+        return ch['Sc']
 
-    # ------------------------------------------------------------------
     def _df_groups(self):
         # registries may have grown in _vec_terms: rebuild the dependent stores
         self._rebuild_after_vec()
