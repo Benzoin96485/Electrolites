@@ -407,12 +407,15 @@ class CCSDGPU:
         return Ragged(R.layout, [d[s] for d, s in zip(R.data, ps)])
 
     def masked(self, R, sel):
-        """zero all items not in boolean mask sel (over pairs)."""
-        out = R.copy()
-        for g, m in enumerate(R.layout.members):
-            z = cp.asarray(~sel[m])
-            out.data[g][z] = 0.
-        return out
+        """zero all items not in boolean mask sel (over pairs); float masks
+        are cached (boolean indexing would synchronise the stream)."""
+        cache = self.__dict__.setdefault('_mcache', {})
+        key = (id(R.layout), id(sel))
+        mk = cache.get(key)
+        if mk is None:
+            mk = cache[key] = [cp.asarray(sel[m].astype(np.float64))[:, None, None]
+                               for m in R.layout.members]
+        return Ragged(R.layout, [d * k for d, k in zip(R.data, mk)])
 
     # ------------------------------------------------------------------
     # iterations

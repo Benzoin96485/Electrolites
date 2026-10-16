@@ -195,8 +195,10 @@ def dipole_pair_energies(orb, doi_iu, t_cut_do_pre, s_cut, bf_atom, atom_bfs):
         r = mol.intor_symmetric('int1e_r')
     L, P = orb.C_lmo, orb.C_pao
     n = orb.naocc
-    R = np.einsum('xmi,mi->ix', np.einsum('xmn,ni->xmi', r, L), L)
-    lp = cp.asarray(np.einsum('mi,xmn,nu->xiu', L, r, P))
+    rd, Ld, Pd = cp.asarray(r), cp.asarray(L), cp.asarray(P)
+    rL = cp.matmul(rd, Ld[None])                                          # (3, nao, n)
+    R = cp.einsum('xmi,mi->ix', rL, Ld).get()
+    lp = cp.matmul(rL.transpose(0, 2, 1), Pd[None])                       # (3, n, npao)
     doms = [contract_to_atoms(np.where(np.abs(doi_iu[i]) > t_cut_do_pre)[0], bf_atom, atom_bfs)
             for i in range(n)]
     nn = np.array([len(d) for d in doms])

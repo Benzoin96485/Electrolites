@@ -56,14 +56,62 @@ def _energy_coeffs(i, j, k):
     return pref * c
 
 
+_EKERN = r'''
+// out[b] += sum_{ijk} T[b,i,j,k] * sum_c coef[b,c] * V[b, perm_c(i,j,k)]
+// perm_c: V transposed by _CASES[c] (axis n of the transpose is axis cs[c][n] of V)
+extern "C" __global__ void tri_energy(const double* __restrict__ V, const double* __restrict__ T,
+                                      const double* __restrict__ coef, double* out, const int n)
+{
+    const int cs[6][3] = {{0,1,2},{0,2,1},{1,0,2},{2,0,1},{1,2,0},{2,1,0}};
+    const int b = blockIdx.y;
+    const long long n3 = (long long)n * n * n;
+    const double* Vb = V + b * n3;
+    const double* Tb = T + b * n3;
+    double cf[6];
+    for (int c = 0; c < 6; ++c) cf[c] = coef[6 * b + c];
+    double acc = 0.;
+    for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x; e < n3;
+         e += (long long)gridDim.x * blockDim.x) {
+        const double t = Tb[e];
+        if (t == 0.) continue;
+        int idx[3] = {(int)(e / ((long long)n * n)), (int)((e / n) % n), (int)(e % n)};
+        double v = 0.;
+        for (int c = 0; c < 6; ++c) {
+            if (cf[c] == 0.) continue;
+            int j[3];
+            j[cs[c][0]] = idx[0]; j[cs[c][1]] = idx[1]; j[cs[c][2]] = idx[2];
+            v += cf[c] * Vb[((long long)j[0] * n + j[1]) * n + j[2]];
+        }
+        acc += t * v;
+    }
+    __shared__ double red[256];
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int w = 128; w > 0; w >>= 1) {
+        if (threadIdx.x < w) red[threadIdx.x] += red[threadIdx.x + w];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(out + b, red[0]);
+}
+'''
+_ek = None
+
+
 def _batched_energy(V, T3, coef):
-    """per triplet sum_c coef[b, c] <V_b transposed by case c, T3_b>."""
-    out = cp.zeros(V.shape[0])
-    for c, ax in enumerate(_CASES):
-        if not cp.any(coef[:, c] != 0):
-            continue
-        d = cp.sum(V.transpose((0,) + tuple(a + 1 for a in ax)) * T3, axis=(1, 2, 3))
-        out += coef[:, c] * d
+    """per triplet sum_c coef[b, c] <V_b transposed by case c, T3_b>: one fused
+    pass over T3 (V read at the six permuted positions)."""
+    global _ek
+    if _ek is None:
+        _ek = cp.RawKernel(_EKERN, 'tri_energy')
+    B, n = V.shape[0], V.shape[1]
+    out = cp.zeros(B)
+    if B == 0:
+        return out
+    V = cp.ascontiguousarray(V)
+    T3 = cp.ascontiguousarray(T3)
+    coef = cp.ascontiguousarray(cp.asarray(coef, dtype=cp.float64))
+    nblk = int(min(64, max(1, (n ** 3 + 255) // 256)))
+    _ek((nblk, B), (256,), (V, T3, coef, out, np.int32(n)))
     return out
 
 
