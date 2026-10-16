@@ -284,7 +284,15 @@ class CCSDGPU:
         # ---- PNO overlaps --------------------------------------------------
         cp_, cq_ = np.array(C.p, np.int64), np.array(C.q, np.int64)
         LS = self.LS = Layout(nv[cp_], nv[cq_])
-        onfly = os.environ.get('DLPNO_ONFLY_S', '1') == '1'
+        mode = os.environ.get('DLPNO_ONFLY_S', 'auto')
+        if mode == 'auto':
+            # store the overlaps when they fit comfortably, else regenerate them
+            need = float(np.sum(8. * nv[cp_] * nv[cq_]))
+            free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+            onfly = need > 0.25 * free
+        else:
+            onfly = mode == '1'
+        self.onfly_s = onfly
         if onfly:
             # no stored overlaps: every plan reading LS regenerates its chunk's S
             from electrolites.dlpno.ovgen import OverlapGen

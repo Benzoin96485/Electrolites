@@ -335,7 +335,19 @@ class LMP2GPU:
         from electrolites.dlpno.vbatch import VChainPlan
         gen = OverlapGen(self.S_pao_d, self.pao, self.X)
         wall = np.array(ws)
-        chunks = gen.prepare(cps, cqs)
+        import os
+        mode = os.environ.get('DLPNO_ONFLY_S', 'auto')
+        need = float(np.sum(8. * nv[cps] * nv[cqs]))
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        onfly = (need > 0.25 * free) if mode == 'auto' else mode == '1'
+        if onfly:
+            chunks = gen.prepare(cps, cqs)
+        else:                       # one chunk whose S is generated once and kept
+            LSall = Layout(nv[cps], nv[cqs])
+            Sall = Ragged(LSall)
+            for P_ in gen.prepare(cps, cqs, out_layout=LSall, out_idx=np.arange(len(cps))):
+                gen.run(P_, Sall)
+            chunks = [dict(sel=np.arange(len(cps)), LS=LSall, S=Sall)]
         for P in chunks:
             ar = np.arange(len(P['sel']))
             P['res'] = VChainPlan(LP, cps[P['sel']], [op(P['LS'], ar), op(LP, cqs[P['sel']]), op(P['LS'], ar, True)])
@@ -361,7 +373,7 @@ class LMP2GPU:
         for it in range(1, opt['MAXITER'] + 1):
             R = K + D * T
             for P in chunks:
-                Sc = gen.run(P)
+                Sc = P['S'] if 'S' in P else gen.run(P)
                 P['res'].run(R, [Sc, T, Sc], w=P['w'])
             rms = float(R.rms_per_item().max())
             T = T - R / D

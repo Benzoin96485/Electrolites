@@ -137,15 +137,34 @@ class OverlapGen:
                               off=cp.asarray(self.off[inv])))
         return plans
 
+    def _views(self, LXu, ws, off=0):
+        data = []
+        for m, (r, c) in zip(LXu.members, LXu.shapes):
+            n = len(m) * r * c
+            data.append(ws[off:off + n].reshape(len(m), r, c))
+            off += n
+        return Ragged(LXu, data), off
+
     def run(self, P, out=None):
         """evaluate one prepared chunk into ``out`` (accumulates: zero it first),
         by default a new Ragged(P['LS']), which is returned."""
         if out is None:
             out = Ragged(P['LS'])
         LXu = P['LXu']
-        XU = Ragged(LXu)
-        base = np.array([d.data.ptr for d in XU.data], np.int64)
-        dst = cp.asarray(base[LXu.group] + P['d_off'] * 8)
+        need = LXu.nbytes() // 8
+        ws = getattr(self, '_ws', None)
+        if ws is None or ws.size < 2 * need:
+            # persistent workspace (stable addresses -> cached pointer tables)
+            self._ws = ws = cp.empty(2 * need)
+        if P.get('_ws') != ws.data.ptr:
+            XU, o = self._views(LXu, ws)
+            base = np.array([d.data.ptr for d in XU.data], np.int64)
+            P['_dst'] = cp.asarray(base[LXu.group] + P['d_off'] * 8)
+            P['_ws'] = ws.data.ptr
+        XU, o = self._views(LXu, ws)
+        WU, _ = self._views(LXu, ws, o)
+        ws[:need].fill(0.)
+        dst = P['_dst']
         posU = cp.full(self.nbf, -1, dtype=cp.int32)
         posU[P['U']] = cp.arange(P['nU'], dtype=cp.int32)
         _scatter_kernel()((len(P['inv']),), (256,),
@@ -158,6 +177,7 @@ class OverlapGen:
         M[:nU, :nU] = self.S[U[:, None], U[None, :]]
         if self.ne:
             M[nU:nU + self.ne, nU:nU + self.ne] = cp.eye(self.ne)
-        WU = Ragged(LXu, [cp.matmul(M, d) for d in XU.data])
+        for d, wd in zip(XU.data, WU.data):
+            cp.matmul(M, d, out=wd)
         P['plan'].run(out, [XU, WU])
         return out

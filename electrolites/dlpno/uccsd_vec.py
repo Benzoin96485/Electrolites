@@ -805,7 +805,8 @@ class UCCSDGPUv(UCCSDGPU):
         self.pt = _Terms()
         for r_, (Z, p) in enumerate(self.preg.keys):
             self.pt.add(r=r_, s=self.S(p, self.dii[Z], self.spin[Z]), z=Z, a=self.spin[Z])
-        if self.ONFLY_S and hasattr(self.u, 'S_pao_d'):
+        self.ONFLY_S = hasattr(self.u, 'S_pao_d') and self._decide_onfly()
+        if self.ONFLY_S:
             self._make_ovgens()
         else:
             self._ovgens = None
@@ -866,7 +867,21 @@ class UCCSDGPUv(UCCSDGPU):
 
     #: generate the PNO overlaps of every term on the fly (no stored S)
     import os as _os
-    ONFLY_S = _os.environ.get('DLPNO_ONFLY_S', '1') == '1'
+    ONFLY_MODE = _os.environ.get('DLPNO_ONFLY_S', 'auto')
+    ONFLY_S = None
+
+    def _decide_onfly(self):
+        if self.ONFLY_MODE != 'auto':
+            return self.ONFLY_MODE == '1'
+        need = 0.
+        for s in (0, 1):
+            keys = self.Sreg[s].keys
+            if keys:
+                pp = np.array([k[0] for k in keys], np.int64)
+                qq = np.array([k[1] for k in keys], np.int64)
+                need += float(np.sum(8. * self.nvs[pp, s] * self.nvs[qq, s]))
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        return need > 0.25 * free
 
     def _make_spin_plan(self, layouts, out_layout, terms, out_col, specs, **kw):
         uses_s = any(k == 'S' for (k, c, sc, tr) in specs)
@@ -875,7 +890,10 @@ class UCCSDGPUv(UCCSDGPU):
         return _SpinPlan(layouts, out_layout, terms, out_col, specs, **kw)
 
     def _overlaps(self):
-        if self.ONFLY_S and hasattr(self.u, 'S_pao_d'):
+        if self.ONFLY_S is None:            # base build: the decision comes after _vec_terms
+            self.LS, self.Sd = [None, None], [None, None]
+            return
+        if self.ONFLY_S:
             self.LS, self.Sd = [None, None], [None, None]
             return
         super()._overlaps()
