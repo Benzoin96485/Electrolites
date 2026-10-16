@@ -140,10 +140,24 @@ class _Op:
         self.gg = cp.asarray(self.group)
 
 
+_BASE = {}
+
+
+def _base(rag):
+    """device array of the group buffer addresses of a Ragged (cached by
+    address tuple: a host->device copy synchronises the stream)."""
+    key = tuple(d.data.ptr for d in rag.data)
+    b = _BASE.get(key)
+    if b is None:
+        if len(_BASE) > 4096:
+            _BASE.clear()
+        b = _BASE[key] = cp.asarray(np.array(key, np.int64))
+    return b
+
+
 def _ptrs(rag, op):
     """device array of element pointers for an operand."""
-    base = cp.asarray(np.array([d.data.ptr for d in rag.data], np.int64))
-    return base[op.gg] + op.goff * 8
+    return _base(rag)[op.gg] + op.goff * 8
 
 
 class VChainPlan:
@@ -231,13 +245,16 @@ class VChainPlan:
         nt = self.nterms
         ptrs = [_ptrs(r, o) for r, o in zip(rags, self.ops)]
         og, ooff, _ = self.out
-        obase = cp.asarray(np.array([d.data.ptr for d in out.data], np.int64))
-        optr = obase[og] + ooff * 8
+        optr = _base(out)[og] + ooff * 8
         if w is None:
-            al = cp.full(nt, float(alpha))
+            if getattr(self, '_al', None) is None or self._al[0] != alpha:
+                self._al = (alpha, cp.full(nt, float(alpha)))
+            al = self._al[1]
         else:
             al = (w * alpha).astype(cp.float64)
-        ones = cp.ones(nt)
+        if getattr(self, '_ones', None) is None:
+            self._ones = cp.ones(nt)
+        ones = self._ones
         tmps = [cp.empty(max(t, 1)) for t in self.tmp_tot]
         tptr = [tmps[q].data.ptr + cp.asarray(self.tmp_off[q]) * 8 for q in range(len(tmps))]
         k = len(self.ops)

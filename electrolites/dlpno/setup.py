@@ -96,7 +96,13 @@ def localize(mol, c_act, method='boys', conv_tol=1e-12, mf=None):
     if c_act.shape[1] == 0:
         return c_act
     if method.lower() in ('boys', 'fb'):
-        loc = lo.Boys(mol, c_act)
+        # PySCF's CIAH Boys with the dipole tensors on the device
+        # (electrolites.lo_gpu): same objective and driver, no per-step AO work
+        try:
+            from electrolites.lo_gpu import Boys
+        except ImportError:
+            Boys = lo.Boys
+        loc = Boys(mol, c_act)
     elif method.lower() in ('pm', 'pipek', 'pipek_mezey'):
         loc = lo.PM(mol, c_act, mf)
         loc.pop_method = 'mulliken'
@@ -150,7 +156,12 @@ def doi_grid(mol, grid=(25, 50)):
 
 def compute_doi(mol, C_lmo, C_pao, grid=(25, 50), blksize=4096, need_uv=True):
     """sqrt(int |i|^2 |u|^2): DOI_ij, DOI_iu and (optionally) DOI_uv."""
-    coords, weights = doi_grid(mol, grid)
+    import os
+    if os.environ.get('DLPNO_DOI_GRID'):            # externally supplied grid (validation)
+        g = np.load(os.environ['DLPNO_DOI_GRID'])
+        coords, weights = g[:, :3], g[:, 3]
+    else:
+        coords, weights = doi_grid(mol, grid)
     nl, nu = C_lmo.shape[1], C_pao.shape[1]
     ij = np.zeros((nl, nl))
     iu = np.zeros((nl, nu))
@@ -171,37 +182,61 @@ def compute_doi(mol, C_lmo, C_pao, grid=(25, 50), blksize=4096, need_uv=True):
 
 def dipole_pair_energies(orb, doi_iu, t_cut_do_pre, s_cut, bf_atom, atom_bfs):
     """Approximate SC-MP2 pair energies of distant pairs from dipole
-    integrals (Pinski EQ 17).  Returns (estimate, bound) matrices."""
+    integrals (Pinski EQ 17).  Returns (estimate, bound) matrices.
+
+    On the device: the dipole PAO domains of all LMOs are orthocanonicalised
+    in one batch (pivoted Cholesky selection at S_CUT, as ``orthocanonicalize``)
+    and the pair sums run as batched contractions over j for each i."""
+    import cupy as cp
+    from electrolites.dlpno.linalg import eigh_batched, orthonormal_domain
+    from electrolites.dlpno.ragged import padded
     mol = orb.mol
     with mol.with_common_orig((0, 0, 0)):
         r = mol.intor_symmetric('int1e_r')
     L, P = orb.C_lmo, orb.C_pao
     n = orb.naocc
     R = np.einsum('xmi,mi->ix', np.einsum('xmn,ni->xmi', r, L), L)
-    lp = np.einsum('mi,xmn,nu->xiu', L, r, P)
-    dr, ee = [], []
-    for i in range(n):
-        idx = contract_to_atoms(np.where(np.abs(doi_iu[i]) > t_cut_do_pre)[0],
-                                bf_atom, atom_bfs)
-        X, e = orthocanonicalize(orb.S_pao[np.ix_(idx, idx)],
-                                 orb.F_pao[np.ix_(idx, idx)], s_cut)
-        dr.append(lp[:, i, idx] @ X)          # (3, nu_i)
-        ee.append(e)
+    lp = cp.asarray(np.einsum('mi,xmn,nu->xiu', L, r, P))
+    doms = [contract_to_atoms(np.where(np.abs(doi_iu[i]) > t_cut_do_pre)[0], bf_atom, atom_bfs)
+            for i in range(n)]
+    nn = np.array([len(d) for d in doms])
+    Pm = int(padded(max(nn.max(), 1)))
+    idx = np.zeros((n, Pm), np.int64)
+    msk = np.zeros((n, Pm))
+    for i, d in enumerate(doms):
+        idx[i, :len(d)] = d
+        msk[i, :len(d)] = 1.
+    gi, gm = cp.asarray(idx), cp.asarray(msk)
+    mm = gm[:, :, None] * gm[:, None, :]
+    Sd = cp.asarray(orb.S_pao)[gi[:, :, None], gi[:, None, :]] * mm
+    Fd = cp.asarray(orb.F_pao)[gi[:, :, None], gi[:, None, :]] * mm
+    X0, keep = orthonormal_domain(Sd, nn, s_cut, 'pivchol')
+    Fo = cp.matmul(X0.transpose(0, 2, 1), cp.matmul(Fd, X0)) + 1e6 * cp.eye(Pm)[None] * (~keep)[:, :, None]
+    e, V = eigh_batched(Fo)
+    X = cp.matmul(X0, V)
+    valid = e < 1e5
+    ar = cp.arange(n)
+    D = cp.einsum('xbu,buv->bxv', lp[:, ar[:, None], gi] * gm[None], X)      # (n, 3, Pm)
+    D = D * valid[:, None, :]
+    f = cp.asarray(np.diag(orb.F_lmo))
+    ev = cp.where(valid, e, 1e6)
     E = np.zeros((n, n))
     B = np.zeros((n, n))
-    f = np.diag(orb.F_lmo)
-    for i in range(n):
-        for j in range(i + 1, n):
-            Rij = R[i] - R[j]
-            d = np.linalg.norm(Rij)
-            rh = Rij / d
-            iu, jv = dr[i], dr[j]
-            dot = iu.T @ jv
-            num = (dot - 3 * np.outer(rh @ iu, rh @ jv)) ** 2
-            numb = (-2 * dot) ** 2
-            den = ee[i][:, None] + ee[j][None, :] - f[i] - f[j]
-            E[i, j] = E[j, i] = -4 * d ** -6 * np.sum(num / den)
-            B[i, j] = B[j, i] = -4 * d ** -6 * np.sum(numb / den)
+    Rd = cp.asarray(R)
+    for i in range(n - 1):
+        js = cp.arange(i + 1, n)
+        Rij = Rd[i][None] - Rd[js]                                         # (m, 3)
+        d = cp.linalg.norm(Rij, axis=1)
+        rh = Rij / d[:, None]
+        dot = cp.einsum('xu,jxv->juv', D[i], D[js])                         # (m, P, P)
+        ri = cp.einsum('jx,xu->ju', rh, D[i])
+        rj = cp.einsum('jx,jxv->jv', rh, D[js])
+        den = ev[i][None, :, None] + ev[js][:, None, :] - f[i] - f[js][:, None, None]
+        num = (dot - 3 * ri[:, :, None] * rj[:, None, :]) ** 2
+        Ei = -4 * d ** -6 * cp.sum(num / den, axis=(1, 2))
+        Bi = -4 * d ** -6 * cp.sum((2 * dot) ** 2 / den, axis=(1, 2))
+        E[i, i + 1:] = E[i + 1:, i] = Ei.get()
+        B[i, i + 1:] = B[i + 1:, i] = Bi.get()
     return E, B
 
 

@@ -156,42 +156,55 @@ class _K3:
         self.run_all([(kind, src_name, dst_name, src, dst)])
         return dst
 
+    @staticmethod
+    def _index(P, src, dst):
+        """device index arrays of a plan for its (fixed) source / target layouts."""
+        key = (id(src.layout), id(dst.layout))
+        c = P.get('_dev')
+        if c is not None and c[0] == key:
+            return c[1]
+        slay, dlay = src.layout, dst.layout
+        sg = slay.group[P['src']]
+        srcs = []
+        for gs in np.unique(sg):
+            q = np.where(sg == gs)[0]
+            srcs.append((int(gs), cp.asarray(slay.slot[P['src'][q]]), cp.asarray(P['slot'][q]),
+                         cp.asarray(P['rank'][q]), len(q)))
+        dg = dlay.group[P['dst']]
+        dsts = []
+        for gd in np.unique(dg):
+            q = np.where(dg == gd)[0]
+            dsts.append((int(gd), cp.asarray(q), cp.asarray(dlay.slot[P['dst'][q]])))
+        ix = dict(srcs=srcs, dsts=dsts, slot=cp.asarray(P['slot']), rank=cp.asarray(P['rank']))
+        P['_dev'] = (key, ix)
+        return ix
+
     def _apply(self, kind, P, Y, src, dst):
-        if True:
-            N, d0, d1, d2 = Y.shape
-            m = P['m']
-            # vectors per (slot, rank)
-            slay = src.layout
-            if kind in ('c3', 'c2'):
-                D = d2 if kind == 'c3' else d1
-                Vb = cp.zeros((N, D, m))
-                for gs in np.unique(slay.group[P['src']]):
-                    q = np.where(slay.group[P['src']] == gs)[0]
-                    v = src.data[gs][cp.asarray(slay.slot[P['src'][q]]), :D, 0]
-                    Vb[cp.asarray(P['slot'][q]), :, cp.asarray(P['rank'][q])] = v
-                if kind == 'c3':
-                    res = cp.matmul(Y.reshape(N, d0 * d1, d2), Vb).reshape(N, d0, d1, m)
-                    res = res.transpose(0, 3, 1, 2)                         # (N, m, b, c)
-                else:
-                    res = cp.matmul(Vb.transpose(0, 2, 1)[:, None], Y)    # (N, b, m, c)
-                    res = res.transpose(0, 2, 1, 3)
+        ix = self._index(P, src, dst)
+        N, d0, d1, d2 = Y.shape
+        m = P['m']
+        if kind in ('c3', 'c2'):
+            D = d2 if kind == 'c3' else d1
+            Vb = cp.zeros((N, D, m))
+            for gs, ss, sl, rk, _ in ix['srcs']:
+                Vb[sl, :, rk] = src.data[gs][ss, :D, 0]
+            if kind == 'c3':
+                res = cp.matmul(Y.reshape(N, d0 * d1, d2), Vb).reshape(N, d0, d1, m)
+                res = res.transpose(0, 3, 1, 2)                         # (N, m, b, c)
             else:
-                Vb = cp.zeros((N, d1 * d2, m))
-                for gs in np.unique(slay.group[P['src']]):
-                    q = np.where(slay.group[P['src']] == gs)[0]
-                    M = src.data[gs][cp.asarray(slay.slot[P['src'][q]])]   # (n, c, d) padded
-                    M = M[:, :d2, :d1].transpose(0, 2, 1).reshape(len(q), d1 * d2)
-                    Vb[cp.asarray(P['slot'][q]), :, cp.asarray(P['rank'][q])] = M
-                res = cp.matmul(Y.reshape(N, d0, d1 * d2), Vb)               # (N, a, m)
-                res = res.transpose(0, 2, 1)[:, :, :, None]                  # (N, m, a, 1)
-            dlay = dst.layout
-            vals = res[cp.asarray(P['slot']), cp.asarray(P['rank'])] * P['w'][:, None, None]
-            dg = dlay.group[P['dst']]
-            for gd in np.unique(dg):
-                q = np.where(dg == gd)[0]
-                pr, pc = dlay.shapes[gd]
-                blk = vals[cp.asarray(q)][:, :pr, :pc]
-                cupyx.scatter_add(dst.data[gd], cp.asarray(dlay.slot[P['dst'][q]]), blk)
+                res = cp.matmul(Vb.transpose(0, 2, 1)[:, None], Y)    # (N, b, m, c)
+                res = res.transpose(0, 2, 1, 3)
+        else:
+            Vb = cp.zeros((N, d1 * d2, m))
+            for gs, ss, sl, rk, nq in ix['srcs']:
+                M = src.data[gs][ss]                                    # (n, c, d) padded
+                Vb[sl, :, rk] = M[:, :d2, :d1].transpose(0, 2, 1).reshape(nq, d1 * d2)
+            res = cp.matmul(Y.reshape(N, d0, d1 * d2), Vb)               # (N, a, m)
+            res = res.transpose(0, 2, 1)[:, :, :, None]                  # (N, m, a, 1)
+        vals = res[ix['slot'], ix['rank']] * P['w'][:, None, None]
+        for gd, q, ds in ix['dsts']:
+            pr, pc = dst.layout.shapes[gd]
+            cupyx.scatter_add(dst.data[gd], ds, vals[q][:, :pr, :pc])
 
 
 class UCCSDGPUv(UCCSDGPU):
@@ -383,7 +396,7 @@ class UCCSDGPUv(UCCSDGPU):
     # overlaps S(kl, c) of the F'_vv and oooo-ladder terms: generated per
     # chunk of strong pairs every iteration instead of being stored
     # ------------------------------------------------------------------
-    MAX_S_CHUNK_BYTES = 1 << 29
+    MAX_S_CHUNK_BYTES = 1 << 31
 
     def _np_kl_terms(self):
         """F'_vv rows (c, spin, kl, item) and oooo-ladder rows
@@ -869,13 +882,13 @@ class UCCSDGPUv(UCCSDGPU):
             Fpp[sel] += ent(col)
         if self.p_fp.n:
             dots = self.p_fp.dots(st, self.p_fp.n)
-            cupyx.scatter_add(Fpp, self.fp_f, dots * cp.asarray(self.fp.f('w')))
+            cupyx.scatter_add(Fpp, self.fp_f, dots * self.fp.fd('w'))
         # R2 projection terms
         if self.p_e1.n:
             self.p_e1.run(R, st)
             self.p_e2.run(R, st)
         if self.p_rg.n:
-            self.p_rg.run(R, st, w=Fpp[self.rg_f] * cp.asarray(self.rg.f('w')))
+            self.p_rg.run(R, st, w=Fpp[self.rg_f] * self.rg.fd('w'))
         # ring
         Z = Ragged(self.LZ)
         V1 = Ragged(self.LV1)
@@ -885,34 +898,34 @@ class UCCSDGPUv(UCCSDGPU):
         self.p_zj1.run(Z, st)
         for p_, t_ in zip(self.p_zkx, self.zkx):
             if p_.n:
-                p_.run(Z, st, w=cp.asarray(t_.f('w')))
+                p_.run(Z, st, w=t_.fd('w'))
         if self.p_zq.n:
-            self.p_zq.run(Z, st, w=cp.asarray(self.zq.f('w')))
+            self.p_zq.run(Z, st, w=self.zq.fd('w'))
         st['Z'] = Z
         for tr in (0, 1):
             if self.p_ring_np[tr].n:
-                self.p_ring_np[tr].run(R, st, w=cp.asarray(self.ring_np[tr].f('w')))
+                self.p_ring_np[tr].run(R, st, w=self.ring_np[tr].fd('w'))
             if self.p_ring_z[tr].n:
-                self.p_ring_z[tr].run(R, st, w=cp.asarray(self.ring_z[tr].f('w')))
+                self.p_ring_z[tr].run(R, st, w=self.ring_z[tr].fd('w'))
         # R1
         Fk = self.Fk0.copy()
         st['Fk'] = Fk
         if self.p_fkc.n:
-            self.p_fkc.run(Fk, st, w=cp.asarray(self.fkc.f('w')))
+            self.p_fkc.run(Fk, st, w=self.fkc.fd('w'))
         if self.p_r1c.n:
-            self.p_r1c.run(R1, st, w=cp.asarray(self.r1c.f('w')))
+            self.p_r1c.run(R1, st, w=self.r1c.fd('w'))
         st['V1'] = V1
         if self.p_a1.n:
             self.p_a1.run(R1, st)
         if self.p_r1a2.n:
             wd = self.p_r1a2_w.dots(st, self.p_r1a2.n)
-            self.p_r1a2.run(R1, st, w=wd * cp.asarray(self.r1a2.f('w')))
+            self.p_r1a2.run(R1, st, w=wd * self.r1a2.fd('w'))
         Uv = self.U0.copy()
         st['U'] = Uv
         if self.p_uq.n:
             self.p_uq.run(Uv, st)
         if self.p_r1b.n:
-            self.p_r1b.run(R1, st, w=cp.asarray(self.r1b.f('w')))
+            self.p_r1b.run(R1, st, w=self.r1b.fd('w'))
         R = self._mask_strong(R)
         self.last = dict(Fpp=Fpp, beta=beta, Z=Z, Tn=Tn, Fv=Fv, Fk=Fk, U=Uv)
         return R1, R

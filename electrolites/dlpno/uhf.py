@@ -49,6 +49,13 @@ def _half(L, x):
 class UDLPNO(UTriplesGPU, RefUDLPNO2):
     """GPU open-shell DLPNO-CCSD(T); same interface as RefUDLPNO."""
 
+    def __init__(self, mf, *args, **opts):
+        # open-shell singles converge slowly near (quasi)degeneracies of the
+        # SOMOs: a longer DIIS history and more iterations by default
+        opts.setdefault('MAXITER', 100)
+        opts.setdefault('DIIS_MAX_VECS', 8)
+        super().__init__(mf, *args, **opts)
+
     def kernel(self):
         from electrolites.dlpno.devmem import pooled
         with pooled():

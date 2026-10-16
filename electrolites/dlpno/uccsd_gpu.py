@@ -102,6 +102,13 @@ class _Terms:
             self._np[key] = np.asarray(self.get(k, []), dtype=np.float64)
         return self._np[key]
 
+    def fd(self, k):
+        """float column on the device (cached)."""
+        key = ('fd', k)
+        if key not in self._np:
+            self._np[key] = cp.asarray(self.f(k))
+        return self._np[key]
+
     def __len__(self):
         if getattr(self, '_n', None) is not None:
             return self._n
@@ -116,6 +123,7 @@ class _Terms:
         for k in keep:
             if k in self:
                 self.f(k)
+                self.fd(k)
         self._cols, self._rows, self._n = {}, None, n
 
 
@@ -951,11 +959,10 @@ class UCCSDGPU:
             R1.data[g][s_, :v.shape[0], 0] += v
 
     def _mask_strong(self, R):
-        out = R.copy()
-        for g, m in enumerate(R.layout.members):
-            z = cp.asarray(~self.strong_mask[m])
-            out.data[g][z] = 0.
-        return out
+        if getattr(self, '_smask', None) is None:
+            self._smask = [cp.asarray(self.strong_mask[m].astype(np.float64))[:, None, None]
+                           for m in R.layout.members]
+        return Ragged(R.layout, [d * mk for d, mk in zip(R.data, self._smask)])
 
     # ------------------------------------------------------------------
     def energy(self, T, T1):
