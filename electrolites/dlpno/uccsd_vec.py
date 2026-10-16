@@ -585,32 +585,70 @@ class UCCSDGPUv(UCCSDGPU):
             dmk[p, :n_] = 1.
         self._klt = dict(PP=PP, X=[cp.asarray(XA), cp.asarray(XB)], dom=cp.asarray(dom), dmk=cp.asarray(dmk))
 
+    def _tmp(self, name, layout):
+        """persistent zeroed work Ragged (stable addresses: the plans' pointer
+        tables stay cached and no host->device copy stalls the stream)."""
+        tm = self.__dict__.setdefault('_tmps', {})
+        r = tm.get(name)
+        if r is None or r.layout is not layout:
+            r = tm[name] = Ragged(layout)
+        else:
+            for d in r.data:
+                d.fill(0.)
+        return r
+
+    def _S_workspace(self):
+        """one flat buffer, viewed as every chunk's S Raggeds (chunks run one at a time)."""
+        need = 0
+        for d in self.klchunks:
+            need = max(need, sum(sum(len(m) * r * c for m, (r, c) in zip(c_[2].members, c_[2].shapes))
+                                 for c_ in d['cpl']))
+        ws = cp.empty(max(need, 1))
+        for d in self.klchunks:
+            off = 0
+            rags = []
+            for kl, cl, lay in d['cpl']:
+                data = []
+                for m, (r, c) in zip(lay.members, lay.shapes):
+                    n = len(m) * r * c
+                    data.append(ws[off:off + n].reshape(len(m), r, c))
+                    off += n
+                rags.append(Ragged(lay, data))
+            d['Sc'] = rags
+            d['dev'] = [(cp.asarray(kl), cp.asarray(cl), [cp.asarray(m) for m in lay.members])
+                        for kl, cl, lay in d['cpl']]
+        self._sws = ws
+
     def _gen_S(self, ch):
         """the S(kl, c) of one chunk, per spin, as Raggeds."""
         kt = self._klt
         S_d = self.u.S_pao_d
         PP, ns = kt['PP'], self.u.ns
-        cs = cp.asarray(ch['cs'])
+        cs = ch.get('gcs')
+        if cs is None:
+            cs = ch['gcs'] = cp.asarray(ch['cs'])
         dom, dmk = kt['dom'][cs], kt['dmk'][cs]
         SP_ = S_d[:, dom].transpose(1, 0, 2) * dmk[:, None, :]          # (nc, nbf, PP)
+        if 'Sc' not in ch:
+            self._S_workspace()
         out = []
         for s in (0, 1):
             kl, cl, lay = ch['cpl'][s]
-            R = Ragged(lay)
+            R = ch['Sc'][s]
+            gkl, gcl, gm = ch['dev'][s]
             if len(kl):
                 X = kt['X'][s]
                 Xc = X[cs]
                 Z = cp.matmul(SP_, Xc[:, :PP])                              # (nc, nbf, V)
-                gkl = cp.asarray(kl)
                 rows = kt['dom'][gkl]
-                G = Z[cp.asarray(cl)[:, None], rows] * kt['dmk'][gkl][:, :, None]
+                G = Z[gcl[:, None], rows] * kt['dmk'][gkl][:, :, None]
                 if s == 1 and ns:
-                    G = cp.concatenate([G, Xc[cp.asarray(cl), PP:]], axis=1)
+                    G = cp.concatenate([G, Xc[gcl, PP:]], axis=1)
                 Sv = cp.matmul(X[gkl].transpose(0, 2, 1), G)               # (n, VPkl, Vc)
-                for g, m in enumerate(lay.members):
+                for g, m in enumerate(gm):
                     if len(m):
                         pr, pc = lay.shapes[g]
-                        R.data[g][...] = Sv[cp.asarray(m), :pr, :pc]
+                        R.data[g][...] = Sv[m, :pr, :pc]
             out.append(R)
         return out
 
@@ -848,15 +886,15 @@ class UCCSDGPUv(UCCSDGPU):
     def residuals(self, T, T1):
         sp = self.spin
         st = self.stores(T, T1)
-        Tn = [self.p_tn[s].run(Ragged(self.LTn[s]), st) for s in (0, 1)]
+        Tn = [self.p_tn[s].run(self._tmp(('Tn', s), self.LTn[s]), st) for s in (0, 1)]
         st['Tn'] = Tn
         st['J1R'] = self.J1R
-        Pt = self.p_pt.run(Ragged(self.LPt), st)
+        Pt = self.p_pt.run(self._tmp('Pt', self.LPt), st)
         st['Pt'] = Pt
-        Fv = [Ragged(self.LF[s]) for s in (0, 1)]
-        Fbov = [Ragged(self.LTn[s]) for s in (0, 1)]
-        R = Ragged(self.LT)
-        R1 = Ragged(self.LT1)
+        Fv = [self._tmp(('Fv', s), self.LF[s]) for s in (0, 1)]
+        Fbov = [self._tmp(('Fbov', s), self.LTn[s]) for s in (0, 1)]
+        R = self._tmp('R', self.LT)
+        R1 = self._tmp('R1', self.LT1)
         beta = cp.zeros(self.nbeta)
         for gi, d in enumerate(self.dfg):
             self._df_run(gi, d, T, T1, Tn, Fv, Fbov, R, R1, beta)
@@ -878,7 +916,7 @@ class UCCSDGPUv(UCCSDGPU):
                 sel, its, lay, K1 = self.fk1[s]
                 Fpp[sel] -= gather_like(Tn[s], its, lay).vdot_items(K1)
             lay, plan, sel, ent = self.fbt[s]
-            col = plan.run(Ragged(lay), [Fbov[s], T1])
+            col = plan.run(self._tmp(('fbt', s), lay), [Fbov[s], T1])
             Fpp[sel] += ent(col)
         if self.p_fp.n:
             dots = self.p_fp.dots(st, self.p_fp.n)
@@ -890,8 +928,8 @@ class UCCSDGPUv(UCCSDGPU):
         if self.p_rg.n:
             self.p_rg.run(R, st, w=Fpp[self.rg_f] * self.rg.fd('w'))
         # ring
-        Z = Ragged(self.LZ)
-        V1 = Ragged(self.LV1)
+        Z = self._tmp('Z', self.LZ)
+        V1 = self._tmp('V1', self.LV1)
         self.k3.run_all([('c3', 'Pt', 'Z', Pt, Z), ('c2', 'Pt', 'Z', Pt, Z), ('a', 'T', 'V1', T, V1)])
         st['K1Z'] = self.K1Z
         self.p_zk1.run(Z, st, w=cp.full(self.p_zk1.n, -1.) if self.p_zk1.n else None)
