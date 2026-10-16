@@ -743,8 +743,8 @@ against what Phases 4–5 measured.
 S6; built localisation (all four methods), EOM-IP/EA-CCSD, ADC(2)
 EE/IP/EA, k-point MP2, sfX2C1e gradients and GHF TDA/TDHF. Three upstream
 defects found and worked around (frozen-core CCSD, X2C SCF eigensolver,
-batched GHF J/K). EOM-EE, Λ, ADC(2)-x/(3), the X2C Hessian and GKS TDDFT
-remain.
+batched GHF J/K). Singlet EOM-EE-CCSD and Λ followed (§17.8).
+ADC(2)-x/(3), the X2C Hessian and GKS TDDFT remain.
 
 §5.2's glue items run alongside every phase. They need no kernel work, and
 each closes a crash or a host-only route that users hit today.
@@ -2599,13 +2599,63 @@ faster than the CPU on alanine dipeptide⁺.
 | entry | status | measured |
 |---|---|---|
 | **S7** | **built** (Boys, PM, DF-ER, IBO) | PM 14–23x, IBO 6–37x, Boys 4–6x; ER 0.7 s against 32 min |
-| **P6** | **IP and EA built**; EE-EOM and Λ open | IP 7–18x, EA 8–38x; no v⁴ array |
+| **P6** | **built**: IP, EA, singlet EE, Λ (§17.2, §17.8) | IP 7–18x, EA 8–38x, EE 30–59x, Λ 12–31x; no v⁴ array |
 | **P10** | **ADC(2) EE/IP/EA built**; ADC(2)-x, ADC(3), properties open | EE 19x, IP 2–7x, EA 5–14x |
 | **X4** | **built** (KRHF, GDF, no frozen orbitals) | 11–39x the CPU node (2-atom diamond), 3x (8-atom, 2×2×2) |
 | **S5** | **built** (gradient; Hessian open) | 22x on a Pt(II) complex; GPU4PySCF's X2C SCF fixed (D14) |
 | **S6** | **GHF TDA/TDHF built**; GKS open | TDA 4–6x, TDHF 2x |
 
-Left for §5.4 or a later phase: EOM-EE-CCSD and the CCSD Λ equations (the
-EE sigma needs the same AO-direct ladder as EA, on o²v² vectors);
-ADC(2)-x/ADC(3) (the ladder on the doubles); ADC transition properties;
+Left for §5.4 or a later phase (EOM-EE singlet and Λ were built after,
+§17.8): triplet/spin-flip EOM-EE; ADC(2)-x/ADC(3) (the ladder on the doubles); ADC transition properties;
 the sfX2C1e Hessian; GKS TDDFT (non-collinear f_xc).
+
+### 17.8 P6, completed — singlet EOM-EE-CCSD and the CCSD Λ equations
+
+**EOM-EE** (`eom_gpu.EOMEESinglet(mycc)`, also `mycc.eomee_ccsd_singlet()`
+on GPU4PySCF's CCSD): PySCF's singlet equations (`_IMDS.make_ee`,
+`eeccsd_matvec_singlet`, the singlet part of `eeccsd_diag`, the same
+packed vector) term for term on device arrays, unblocked.  The two
+expensive pieces:
+
+* the (ae|bf) ladder on τ₂ = r₂ + r₁t₁ + t₁r₁ for every trial vector, run
+  AO-direct through `fastccsd`'s integral blocks.  τ₂ is pair-symmetric
+  (τ₂[j,i] = τ₂[i,j]ᵀ) and the ladder of Xᵀ is the transpose of the ladder
+  of X, so only the i ≥ j pairs go through the integrals (half the
+  GEMMs);
+* the integral cache: at ferrocene the CCSD had left its 13 GB of AO
+  blocks in host memory (no room beside its amplitudes), and every sigma
+  batch copied them to the device -- 93 of 203 s.  The ladder now moves
+  the cache to the device once when it fits (ferrocene EOM-EE 203 → 99 s;
+  the Λ solver benefits the same way).
+
+The eigensolver is a device non-symmetric block Davidson (batched sigma
+over each step's trial vectors, PySCF's convergence test with residual
+tolerance √tol, 3 spare guesses), as for ADC.
+
+**Λ** (`ccsd_lambda_gpu.kernel(mycc)`, also `mycc.solve_lambda()`):
+PySCF's `make_intermediates` and `update_lambda` term for term, unblocked,
+the λ₂ ladder AO-direct with the same pair symmetry, GPU4PySCF's device
+DIIS on (λ₁, λ₂).
+
+`ipccsd`, `eaccsd`, `eomee_ccsd_singlet`, `eom*_method` and
+`solve_lambda` -- `NotImplemented` on GPU4PySCF's `CCSDBase` -- are bound
+when the features are enabled.
+
+Correctness (`tests/test_eomee_lambda_gpu.py`, water/cc-pVDZ and
+frozen-core glycine/SVP): λ₁/λ₂ equal PySCF's to 8e-11, one update on the
+same λ to 1e-12; EOM-EE sigma vectors to 2e-10 relative, diagonals to
+3e-11, 4 singlet roots to ≤ 1.2e-8 Eh (at the √tol residual both solvers
+use).
+
+| step (frozen core) | system | **GPU** | CPU node |
+|---|---|---|---|
+| EOM-EE-CCSD singlet, 4 roots | alanine dipeptide/SVP | **34.9 s** | 2072 s (59x) |
+| EOM-EE-CCSD singlet, 4 roots | glycine/TZVP | **21.1 s** | 625 s (30x) |
+| EOM-EE-CCSD singlet, 4 roots | ferrocene/SVP | **99.9 s** | not finished in 54 min (> 32x) |
+| Λ | alanine dipeptide/SVP | **5.4 s** | 165 s (31x) |
+| Λ | glycine/TZVP | **7.8 s** | 93.6 s (12x) |
+| Λ | ferrocene/SVP | **27.3 s** | 330 s (12x) |
+
+(The CCSD before them: 6–7 / 5–6 / 26 s on the GPU against 206–209 / 57–67 /
+321 s.)  The triplet and spin-flip EOM-EE and the left (Λ-like) EOM
+vectors are not built, nor the CCSD density matrices that Λ enables.
