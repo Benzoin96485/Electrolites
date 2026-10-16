@@ -155,7 +155,22 @@ class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
         nv = [self.X[q].shape[1] for q in pairs]
         return [J[r, :, :v] for r, v in enumerate(nv)], [K[r, :, :v] for r, v in enumerate(nv)]
 
+    def _decide_df_offload(self):
+        import os
+        env = os.environ.get('DLPNO_OFFLOAD')
+        if env is not None:
+            return env == '1'
+        nb = 0.
+        for p, (i, j) in enumerate(self.pl.pairs):
+            if i <= j and self.strong[p]:
+                A = sum(len(self.dfi.atom_ribfs[a]) for a in self.riatoms[p])
+                nv, nl = self.X[p].shape[1], len(self.lmos[p])
+                nb += 8. * A * (nv * nv + nl * nv + 2 * nl + 2 * nv)
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        return nb > free / 3.
+
     def pno_integrals(self):
+        self.df_offload = self._decide_df_offload()
         pl = self.pl
         dfi = self.dfi
         npair = len(pl)
@@ -211,6 +226,12 @@ class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
                 self.J_ijmb[q] = self.J_ijmb[p]
                 self.K_ivvv[q] = q_jv.T @ q_vv.reshape(na, -1)
             if self.strong[p]:
+                if self.df_offload:
+                    # the strong pairs' DF tensors wait in pinned host memory
+                    from electrolites.dlpno.devmem import to_pinned
+                    q_io, q_iv, q_ov, q_vv = (to_pinned(x) for x in (q_io, q_iv, q_ov, q_vv))
+                    if q != p:
+                        q_jo, q_jv = to_pinned(q_jo), to_pinned(q_jv)
                 self.iQk[p], self.iQa[p] = q_io, q_iv
                 self.Qma[p], self.Qab[p] = q_ov, q_vv
                 if q != p:

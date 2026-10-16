@@ -334,8 +334,11 @@ class CCSDGPU:
         # C: -J(p,k) T[kj]^T S(kj,p) ; D: (2K - J)(p,k) Tt[jk]^T S(jk,p)
         self.p_rc1 = P(LP, pk_p, [op(LJ, cid), op(LP, rc['kj'], True), op(LS, rc['s3'])])
         self.p_rd1 = P(LP, pk_p, [op(LJ, cid), op(LP, rd['jk'], True), op(LS, rd['s3'])])
-        # DF groups over strong canonical pairs
+        # DF groups over strong canonical pairs; the per-pair copies are then dropped
         self._load_df()
+        for name in ('Qma', 'Qab', 'iQk', 'iQa'):
+            setattr(ref, name, [None] * len(getattr(ref, name)))
+        cp.get_default_memory_pool().free_all_blocks()
 
     def _load_df(self):
         ref = self.ref
@@ -361,19 +364,32 @@ class CCSDGPU:
             A = int(uk[u][0])
             Lp, Vp = self.LN.shapes[int(uk[u][2])]
             g = len(mem)
-            Qma = cp.zeros((g, A, Lp, Vp))
-            Qab = cp.zeros((g, A, Vp, Vp))
-            Qk = cp.zeros((g, 2, A, Lp))
-            Qa = cp.zeros((g, 2, A, Vp))
+            off = getattr(ref, 'df_offload', False)
+            if off:
+                from electrolites.dlpno.devmem import pinned_empty
+
+                def _z(shape):
+                    a_ = pinned_empty(shape)
+                    a_[...] = 0.
+                    return a_
+                Qma, Qab = _z((g, A, Lp, Vp)), _z((g, A, Vp, Vp))
+                Qk, Qa = _z((g, 2, A, Lp)), _z((g, 2, A, Vp))
+                cv = lambda x: x if isinstance(x, np.ndarray) else cp.asnumpy(x)
+            else:
+                Qma = cp.zeros((g, A, Lp, Vp))
+                Qab = cp.zeros((g, A, Vp, Vp))
+                Qk = cp.zeros((g, 2, A, Lp))
+                Qa = cp.zeros((g, 2, A, Vp))
+                cv = cp.asarray
             for s, p in enumerate(mem):
                 q = self.ji[p]
                 na, nl, nv = ref.Qma[p].shape
-                Qma[s, :na, :nl, :nv] = cp.asarray(ref.Qma[p])
-                Qab[s, :na, :nv, :nv] = cp.asarray(ref.Qab[p])
-                Qk[s, 0, :na, :nl] = cp.asarray(ref.iQk[p])
-                Qk[s, 1, :na, :nl] = cp.asarray(ref.iQk[q])
-                Qa[s, 0, :na, :nv] = cp.asarray(ref.iQa[p])
-                Qa[s, 1, :na, :nv] = cp.asarray(ref.iQa[q])
+                Qma[s, :na, :nl, :nv] = cv(ref.Qma[p])
+                Qab[s, :na, :nv, :nv] = cv(ref.Qab[p])
+                Qk[s, 0, :na, :nl] = cv(ref.iQk[p])
+                Qk[s, 1, :na, :nl] = cv(ref.iQk[q])
+                Qa[s, 0, :na, :nv] = cv(ref.iQa[p])
+                Qa[s, 1, :na, :nv] = cv(ref.iQa[q])
             q = self.ji[mem]
             pos = ref.lmo_pos
             gL = self.LL.group[mem]
@@ -395,7 +411,7 @@ class CCSDGPU:
                 rj=cp.asarray([pos[p][self.pj[p]] for p in mem]),
                 dsel=cp.asarray(np.where(dmask)[0]), di=self.pi[mem][dmask],
                 ev=cp.asarray(ev), lm_idx=cp.asarray(lm_idx), lm_msk=cp.asarray(lm_msk),
-                Qma=cp.asarray(Qma), Qab=cp.asarray(Qab), Qk=cp.asarray(Qk), Qa=cp.asarray(Qa)))
+                Qma=Qma, Qab=Qab, Qk=Qk, Qa=Qa))
 
     # ------------------------------------------------------------------
     # elementwise helpers
@@ -518,7 +534,7 @@ class CCSDGPU:
             Tnq = Tn.data[gN][d['sNq']]
             Tp = T.data[gP][d['sP']]
             Tq = T.data[gP][d['sPq']]
-            Qma, Qab, Qk, Qa = d['Qma'], d['Qab'], d['Qk'], d['Qa']
+            Qma, Qab, Qk, Qa = (cp.asarray(d[k_]) for k_ in ('Qma', 'Qab', 'Qk', 'Qa'))
             ar = cp.arange(len(d['p']))
             ti = Tnp[ar, d['ri']]
             tj = Tnq[ar, d['rj']]
