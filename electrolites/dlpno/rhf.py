@@ -55,7 +55,13 @@ class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
         mf, mol, opt = self.mf, self.mol, self.opt
         S = su.asnumpy(mf.get_ovlp())
         dm = mf.make_rdm1()
-        F = su.asnumpy(mf.get_fock(dm=dm))
+        if getattr(mf, 'converged', False) and getattr(mf, 'mo_energy', None) is not None:
+            # converged SCF: F = S C e C^T S, no J/K build
+            C0, e0 = su.asnumpy(mf.mo_coeff), su.asnumpy(mf.mo_energy)
+            SC = S @ C0
+            F = (SC * e0) @ SC.T
+        else:
+            F = su.asnumpy(mf.get_fock(dm=dm))
         C = su.asnumpy(mf.mo_coeff)
         occ = su.asnumpy(mf.mo_occ)
         nocc = int(np.count_nonzero(occ > 0))
