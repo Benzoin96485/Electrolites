@@ -341,11 +341,11 @@ class UCCSDGPUv(UCCSDGPU):
         """overlaps, Pt layout, Kx store and plans depend on registries that
         _vec_terms extended."""
         u = self.u
-        self._overlaps()
         self.LPt = Layout(np.array([self.nvs[p, self.spin[Z]] for (Z, p) in self.preg.keys], np.int64), 1)
         self.pt = _Terms()
         for r_, (Z, p) in enumerate(self.preg.keys):
             self.pt.add(r=r_, s=self.S(p, self.dii[Z], self.spin[Z]), z=Z, a=self.spin[Z])
+        self._overlaps()
         mats = [self.fix[kl]['Kx'][(self.lmo[K], self.lmo[L], self.spin[K], self.spin[L])]
                 for (kl, K, L) in self.kx_reg.keys]
         self.LKx = Layout(np.array([m.shape[0] for m in mats], np.int64),

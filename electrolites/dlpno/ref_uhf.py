@@ -261,7 +261,17 @@ class RefUDLPNO:
                     or abs(e_pno) < energy * abs(e_tot) or a < self.opt['MIN_PNOS']):
                 occ_pno += occ[a]
                 nfin += 1
-        return max(1, nfin)
+        # directions with zero occupation (the null space of a rank-deficient
+        # density, e.g. a pair of SOMOs) carry no amplitude and are arbitrary
+        nfin = min(nfin, int(np.count_nonzero(occ > 1e-12 * occ.max())))
+        nfin = max(1, nfin)
+        # never split a degenerate set of PNOs: the density of a pair of
+        # SOMOs (same-spin amplitudes only) has pairwise degenerate
+        # occupations, and a cut through a pair makes the space arbitrary
+        while nfin < len(occ) and abs(occ[nfin] - occ[nfin - 1]) <= 1e-9 * abs(occ[nfin - 1]) \
+                and abs(occ[nfin - 1]) > 1e-14:
+            nfin += 1
+        return nfin
 
     def sc_mp2_pair_energies(self):
         pl = self.pl

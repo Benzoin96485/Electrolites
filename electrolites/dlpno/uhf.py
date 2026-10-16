@@ -129,7 +129,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
     # device DF helpers
     # ------------------------------------------------------------------
     def _metric_L(self, ribfs):
-        key = (len(ribfs), int(ribfs[0]) if len(ribfs) else -1, int(np.sum(ribfs)))
+        key = np.asarray(ribfs, np.int64).tobytes()
         L = self._chol.get(key)
         if L is None:
             idx = cp.asarray(ribfs)
