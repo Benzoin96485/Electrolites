@@ -283,35 +283,40 @@ including the entries that turned out to be closed upstream or reversed.
 
 ## Features added to GPU4PySCF
 
-Not replacements: things GPU4PySCF 1.8.1 does not run on the GPU at all,
-turned on with `electrolites.enable(name)` (or `enable_all()`).  Each checks
-first that its slot is still empty upstream
-(`docs/FEATURE_TARGETS_PYSCF_2.13.md`, whose IDs are in brackets).
+Methods that previously ran only on the CPU (in PySCF or pyscf-properties),
+or nowhere, now run on the GPU. Turn them on with `electrolites.enable(name)`
+(or `enable_all()`); each first checks that GPU4PySCF still lacks it.
 
-| feature | adds | round |
+Speed-ups are measured in our test environment: one NVIDIA A100-SXM4-80GB
+against one full CPU node (2x AMD EPYC 7763, 128 cores), with PySCF 2.13 or
+pyscf-properties as the CPU reference (32 threads for the CAS-based methods,
+128 otherwise). Basis def2-SVP unless noted. Every feature is checked against
+the CPU code, or against finite differences where there is none
+(`tests/`). Full numbers: `docs/FEATURE_TARGETS_PYSCF_2.13.md`.
+
+| feature | what now runs on the GPU | typical speed-up vs the CPU node |
 |---|---|---|
-| `stability` | `mf.stability()` for RHF/RKS, UHF/UKS (internal and external) and ROHF/ROKS (internal) on the device; batched orbital-Hessian products | [S2], FEATURE_TARGETS §12 |
-| `rohf_grad` | ROHF/ROKS analytic gradients, direct and DF, on GPU4PySCF's UHF/UKS gradient kernels | [S3], §12 |
-| `sap` | `init_guess='sap'` (the Gaussian-fit SAP guess) for RHF/UHF/ROHF and KS | [S8], §12 |
-| `mp2_rdm` | `make_rdm1` and `make_fno` (frozen natural orbitals) on conventional and DF MP2 | [P5], §12 |
-| `ccsd_t` | `CCSD.ccsd_t()`: the closed-shell (T) correction on the device | [P1], §12 |
-| `casscf` | `mf.CASSCF` / `mf.CASCI` (and `electrolites.casscf_gpu.CASSCF`): PySCF's CASSCF/CASCI, state averaging included, with the FCI solver (σ, Davidson, RDMs), the `_ERIS`, and every J/K on the device; density-fitted for a DF mean field, exact integrals otherwise | [M1–M5, M2], §13 |
-| `dfmp2_grad` | `DFMP2.Gradients()` and `DFMP2.make_rdm1_relaxed()` on GPU4PySCF's DF-MP2: the RI-MP2 nuclear gradient (PySCF has none) on an RHF or global-hybrid RKS reference, exact or DF SCF, frozen core, spin-component scaling | [P3], §14 |
-| `dhdft` | `electrolites.dhdft.DoubleHybrid(mol, 'B2PLYP')` (also B2GP-PLYP, mPW2PLYP, PBE0-DH, PBE-QIDH, or custom): double-hybrid energies and analytic gradients, absent from both PySCF and GPU4PySCF | [P4], §14 |
-| `casscf` (gradients) | `mc.nuc_grad_method()` of a GPU DF-CASSCF (single state), of a GPU DF-SA-CASSCF (PySCF's Lagrangian, response on the device), and `mc.nac_method()` — DF non-adiabatic couplings, which PySCF has only for exact integrals | [M6], §15 |
-| `casscf` (orbital step) | the CASSCF orbital step on the device: `gen_g_hop`, the AH Hessian product with factored-density J/K, `update_casdm`, `solve_approx_ci`, the newton/SA Lagrangian products, the FCI diagonal and S² (`electrolites.casscf_orb`; `ELECTROLITES_HOST_ORB=1` for PySCF's) | [M4], §16 |
-| `mcpdft` | `electrolites.mcpdft_gpu.MCPDFT(gpu_mc, 'tPBE')` (or `.CASSCF`/`.CASCI`): PySCF's MC-PDFT with the classical energy from the GPU J/K and the on-top energy on the device (translated/fully-translated LDA/GGA, hybrids, state averaging) | [M8], §15 |
-| `nevpt2` | `electrolites.nevpt2_gpu.NEVPT(gpu_mc)`: SC-NEVPT2 with the 3-RDM and the 4-RDM contractions (PySCF's `f3ca`/`f3ac`), the DF integrals and the S_r/S_i/S_ijrs spaces on the device | [M7], §15 |
-| `rpa` | `electrolites.rpa_gpu.RPA(gpu_mf)`: direct RPA correlation energy | [P8], §15 |
-| `gw` | `electrolites.gw_gpu.GWAC(gpu_mf)`: PySCF's G0W0 (analytic continuation) with the integrals, the self-energy loop and V_xc/Σ_x on the device | [P9], §15 |
-| `pbc_tda` | `electrolites.pbc_tdscf.TDA(gpu_cell_mf)`: Γ-point periodic TDA (RKS/RHF, singlet and triplet); `KTDA(gpu_kmf)`: k-point TDA at kshift 0; the corrected periodic `gen_response` is D10 in `fixes` | [X1], §15; [X2], §16 |
-| `pbc_stability` | `electrolites.pbc_stability.stability(gpu_cell_mf)`: periodic RHF/RKS internal and RHF→UHF stability, Γ point and k-points | [X3], §16 |
-| `polar` | `electrolites.polar_gpu.polarizability(gpu_mf, freq)`: static and frequency-dependent dipole polarizability, RHF/RKS and UHF/UKS | [O3], §16 |
-| `ir_uks` | `electrolites.ir_uks.eval_ir_freq_intensity(mf, mf.Hessian())`: IR intensities for UHF/UKS (and RHF/RKS) | [O3], §16 |
-| `cubegen` | `electrolites.cubegen_gpu.density/orbital/mep`: cube files on the GPU, PySCF's format | [T1], §16 |
-| QM/MM | `mf.Hessian()` of a GPU QM/MM RHF/RKS (`electrolites.qmmm_hess`, point and Gaussian MM charges; it raised since Phase 0); Gaussian MM charges in the QM/MM energy and gradients (`fixes`) | [V2, V3], §16 |
-| `ssc` | `electrolites.ssc_gpu.SSC(gpu_mf)`: NMR spin–spin couplings (DSO, PSO, FC, FC+SD) for RHF/RKS | [O2], §15 |
-| `nmr_uks` | `electrolites.nmr_uks.NMR(gpu_uks)`: GIAO shielding for UHF/UKS (GPU4PySCF's is closed-shell only), with the GIAO two-electron term on the GPU (`electrolites.giao_jk`, shifted-basis J/K) | [O1], §15 |
+| `stability` | `mf.stability()`: RHF/RKS, UHF/UKS (internal and external), ROHF/ROKS (internal) | **41–66x** (Ni dithiolene⁻ and a 113-atom Co(II) complex, UKS B3LYP) |
+| `rohf_grad` | ROHF/ROKS analytic gradients, direct and density-fitted | not timed (was a CPU fallback) |
+| `sap` | `init_guess='sap'` for RHF/UHF/ROHF and KS | not timed (initial guess) |
+| `mp2_rdm` | MP2 one-particle density and frozen natural orbitals, conventional and DF | not timed |
+| `ccsd_t` | CCSD(T): the (T) correction on the device | (T) **7–8x**; whole CCSD(T) **9–19x** (glycine/TZVP, alanine dipeptide, ferrocene) |
+| `casscf` | CASSCF/CASCI and state-averaged CASSCF: FCI solver, integrals, J/K and the orbital step | **32–60x** per macro-iteration (p-benzyne CAS(10,10) 32x, Ni dithiolene⁻ CAS(10,9) 35x, Cu macrocycle²⁺ CAS(10,9) 60x) |
+| `casscf` gradients | CASSCF gradients (single state and state-averaged) and non-adiabatic couplings, density-fitted | gradient **7–9x** (Ni, Cu complexes); SA-2 gradient **10x**, SA-2 NAC **15x** (p-benzyne CAS(10,10)); DF NACs do not exist in PySCF |
+| `mcpdft` | MC-PDFT energies (translated LDA/GGA and hybrid on-top functionals, state averaging) | **8–10x** (Ni, Cu complexes, tPBE) |
+| `nevpt2` | SC-NEVPT2: 3- and 4-RDM contractions, integrals and all subspaces | **15–24x** (p-benzyne CAS(10,10)–(14,14), ferrocene CAS(10,10)); CAS(14,14) 209 s vs 3201 s |
+| `dfmp2_grad` | RI-MP2 nuclear gradient and relaxed density (RHF or hybrid RKS reference) | PySCF has no DF-MP2 gradient; **12–58x** its DF relaxed density alone, **18–113x** its conventional MP2 gradient |
+| `dhdft` | double-hybrid energies and analytic gradients (B2PLYP, B2GP-PLYP, PBE0-DH, …) | new: neither PySCF nor GPU4PySCF has them |
+| `rpa` | direct RPA correlation energy | **6–15x** (penicillin V, def2-SVP and def2-TZVP) |
+| `gw` | G0W0 quasiparticle energies (analytic continuation) | **8–13x** (alanine dipeptide, penicillin V) |
+| `pbc_tda` | periodic TDA, Γ point and k-points (kshift 0), RKS/RHF | k-points **31x** (PBE) and **134x** (PBE0), diamond 2×2×2; at Γ, 16- and 54-atom cells run in seconds where PySCF runs out of memory or does not finish |
+| `pbc_stability` | periodic RHF/RKS stability analysis, Γ and k-points | > **44x** (diamond 2×2×2 PBE0: 68 s; PySCF unfinished after 50 min) |
+| `polar` | static and frequency-dependent polarizability, RHF/RKS and UHF/UKS | **410x** (penicillin V, α(ω)); open-shell cases where pyscf-properties fails to converge |
+| `ir_uks` | IR intensities for UHF/UKS (and RHF/RKS) | **24x** (alanine dipeptide cation, UKS B3LYP, including the Hessian) |
+| `nmr_uks` | NMR shielding for UHF/UKS; the GIAO two-electron term on the GPU for RKS as well | UKS **1.6–4.1x**, RKS **1.4–3.3x** (22–42 atoms); 10x GPU4PySCF's own host-term path at taxol |
+| `ssc` | NMR spin–spin couplings (DSO, PSO, FC, FC+SD), RHF/RKS | **16–67x** (glycine to penicillin V, B3LYP) |
+| `cubegen` | density, orbital and electrostatic-potential cube files | **345x** (electrostatic potential, penicillin V/def2-TZVP, 80³ grid) |
+| QM/MM | QM/MM Hessian (RHF/RKS) and Gaussian-smeared MM charges | new: PySCF has no QM/MM Hessian; GPU4PySCF returned the vacuum one |
 
 ## Tests
 
