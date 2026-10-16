@@ -652,18 +652,21 @@ class UCCSDGPUv(UCCSDGPU):
         sc = self.strong_c
         fx = self.fix
         naux = np.array([fx[c]['Qov'][0].shape[0] for c in sc], np.int64)
-        Ap = -(-naux // 32) * 32
-        g0 = self.LTn[0].group[[self.cpos[c] for c in sc]]
-        g1 = self.LTn[1].group[[self.cpos[c] for c in sc]]
-        key = np.stack([Ap, g0, g1], 1)
+        # coarse buckets (few groups, few launches per iteration); every padded
+        # item shape fits its bucket since padded(n) <= ceil16(n) <= bucket
+        bk = lambda n, q: np.maximum(q, -(-np.asarray(n) // q) * q)
+        Ap = bk(naux, 128)
+        Rb = [bk(np.array([len(self.rows[c][s]) for c in sc]), 16) for s in (0, 1)]
+        Vb = [bk(self.nvs[np.array(sc, np.int64), s], 32) for s in (0, 1)]
+        key = np.stack([Ap, Rb[0], Rb[1], Vb[0], Vb[1]], 1)
         uk, inv = np.unique(key, axis=0, return_inverse=True)
         inv = inv.reshape(-1)
         self.dfg = []
         bmap = {}
         for gi in range(len(uk)):
             A = int(uk[gi][0])
-            R = [self.LTn[s].shapes[int(uk[gi][1 + s])][0] for s in (0, 1)]
-            V = [self.LTn[s].shapes[int(uk[gi][1 + s])][1] for s in (0, 1)]
+            R = [int(uk[gi][1]), int(uk[gi][2])]
+            V = [int(uk[gi][3]), int(uk[gi][4])]
             per = 8 * A * (sum(V[s] * V[s] + 2 * R[s] * V[s] + V[s] * R[s] for s in (0, 1)) + 4 * max(V) ** 2)
             step = max(1, self.MAX_DF_CHUNK_BYTES // per)
             allm = np.array(sc)[inv == gi]
@@ -790,10 +793,17 @@ class UCCSDGPUv(UCCSDGPU):
                 for c in mem:                 # assembled: drop the per-pair copies
                     for key in ('Qov', 'Qvv', 'Qmz', 'Qaz'):
                         fx[c].pop(key, None)
-            d[('tn', s)] = cp.asarray(self.LTn[s].slot[[self.cpos[c] for c in mem]])
-            d[('gtn', s)] = int(self.LTn[s].group[self.cpos[mem[0]]])
-            d[('fv', s)] = cp.asarray(self.LF[s].slot[[self.fvpos[c] for c in mem]])
-            d[('gfv', s)] = int(self.LF[s].group[self.fvpos[mem[0]]])
+            # members by source / target layout group
+            its = np.array([self.cpos[c] for c in mem], np.int64)
+            lay = self.LTn[s]
+            d[('tn', s)] = [(int(gs), cp.asarray(np.where(lay.group[its] == gs)[0]),
+                             cp.asarray(lay.slot[its[lay.group[its] == gs]])) + tuple(lay.shapes[gs])
+                            for gs in np.unique(lay.group[its])]
+            itf = np.array([self.fvpos[c] for c in mem], np.int64)
+            lay = self.LF[s]
+            d[('fv', s)] = [(int(gs), cp.asarray(np.where(lay.group[itf] == gs)[0]),
+                             cp.asarray(lay.slot[itf[lay.group[itf] == gs]])) + tuple(lay.shapes[gs])
+                            for gs in np.unique(lay.group[itf])]
         # strong spin-orbital pairs by combo (side_i, a, side_j, b)
         combos = {}
         for m, c in enumerate(mem):
@@ -803,17 +813,15 @@ class UCCSDGPUv(UCCSDGPU):
                 key = (0 if lmo[I] == x else 1, sp[I], 0 if lmo[J] == x and x != y else (1 if x != y else 0), sp[J])
                 if x == y:
                     key = (0, sp[I], 0, sp[J])
-                combos.setdefault(key, []).append((m, o, I, J))
+                combos.setdefault(key + (int(self.LT.group[o]),), []).append((m, o, I, J))
         d['combos'] = []
         for key, lst in combos.items():
-            si_, a, sj_, b = key
+            si_, a, sj_, b, gT = key
             mm = np.array([l[0] for l in lst], np.int64)
             oo = np.array([l[1] for l in lst], np.int64)
-            gT = self.LT.group[oo]
-            assert np.all(gT == gT[0])
             cid = len(d['combos'])
-            d['combos'].append(dict(key=key, m=cp.asarray(mm), o=oo, gT=int(gT[0]),
-                                    sT=cp.asarray(self.LT.slot[oo])))
+            d['combos'].append(dict(key=key[:4], m=cp.asarray(mm), o=oo, gT=gT,
+                                    sT=cp.asarray(self.LT.slot[oo]), shp=self.LT.shapes[gT]))
             # beta entries of these pairs: (n, position in combo, rK, rL)
             gi = len(self.dfg)
             for which in (0, 1):
@@ -966,8 +974,11 @@ class UCCSDGPUv(UCCSDGPU):
         tr = lambda X: X.swapaxes(-1, -2)
         Tc, Qov, Qvv, Fbo, Fbv, Qvt, Bk, Ba = {}, {}, {}, {}, {}, {}, {}, {}
         gam = 0.
+        g = len(d['mem'])
         for s in (0, 1):
-            Tc[s] = Tn[s].data[d[('gtn', s)]][d[('tn', s)]]
+            Tc[s] = cp.zeros((g, d['R'][s], d['V'][s]))
+            for gs, mi, sl, pr, pc in d[('tn', s)]:
+                Tc[s][mi, :pr, :pc] = Tn[s].data[gs][sl]
             Qov[s], Qvv[s] = d[('Qov', s)], d[('Qvv', s)]
             gam = gam + cp.einsum('gAme,gme->gA', Qov[s], Tc[s])
         for s in (0, 1):
@@ -979,8 +990,11 @@ class UCCSDGPUv(UCCSDGPU):
             Y = mm(Qov[s], tr(tc))                                       # (g, A, R, R)
             fbo = d[('fov', s)] + cp.einsum('gA,gAkc->gkc', gam, Qov[s]) - mm(Y, Qov[s]).sum(axis=1)
             Fbv[s], Fbo[s] = fbv, fbo
-            Fv[s].data[d[('gfv', s)]][d[('fv', s)]] = fbv - mm(tr(Tc[s]), fbo)
-            Fbov[s].data[d[('gtn', s)]][d[('tn', s)]] = fbo
+            fvv = fbv - mm(tr(Tc[s]), fbo)
+            for gs, mi, sl, pr, pc in d[('fv', s)]:
+                Fv[s].data[gs][sl] = fvv[mi, :pr, :pc]
+            for gs, mi, sl, pr, pc in d[('tn', s)]:
+                Fbov[s].data[gs][sl] = fbo[mi, :pr, :pc]
             Qvt[s] = Qvv[s] - mm(tr(tc), Qov[s])
             # dressed (Q|K z) and (Q|A z) for z = x, y
             g = Tc[s].shape[0]
@@ -996,13 +1010,15 @@ class UCCSDGPUv(UCCSDGPU):
         for cid, cb in enumerate(d['combos']):
             si_, a, sj_, b = cb['key']
             m = cb['m']
-            t = T.data[cb['gT']][cb['sT']]
+            pr, pc = cb['shp']
+            t = cp.zeros((len(cb['o']), d['V'][a], d['V'][b]))
+            t[:, :pr, :pc] = T.data[cb['gT']][cb['sT']]
             ba, bb = Ba[(si_, a)][m], Ba[(sj_, b)][m]
             M = mm(tr(ba), bb)
             if a == b:
                 M = M - mm(tr(Ba[(sj_, a)][m]), Ba[(si_, a)][m])
             M = M + mm(mm(Qvt[a][m], t[:, None]), tr(Qvt[b][m])).sum(axis=1)
-            R.data[cb['gT']][cb['sT']] += M
+            R.data[cb['gT']][cb['sT']] += M[:, :pr, :pc]
             # beta matrices
             W1 = mm(tr(Bk[(si_, a)][m]), Bk[(sj_, b)][m])                  # (n, Ra, Rb)
             W2 = mm(tr(Bk[(sj_, b)][m]), Bk[(si_, a)][m])                  # (n, Rb, Ra)
