@@ -881,7 +881,7 @@ class UCCSDGPUv(UCCSDGPU):
                 qq = np.array([k[1] for k in keys], np.int64)
                 need += float(np.sum(8. * self.nvs[pp, s] * self.nvs[qq, s]))
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        return need > 0.25 * free
+        return need > 0.5 * free
 
     def _make_spin_plan(self, layouts, out_layout, terms, out_col, specs, **kw):
         uses_s = any(k == 'S' for (k, c, sc, tr) in specs)

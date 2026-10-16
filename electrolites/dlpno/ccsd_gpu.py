@@ -289,7 +289,7 @@ class CCSDGPU:
             # store the overlaps when they fit comfortably, else regenerate them
             need = float(np.sum(8. * nv[cp_] * nv[cq_]))
             free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-            onfly = need > 0.25 * free
+            onfly = need > 0.5 * free
         else:
             onfly = mode == '1'
         self.onfly_s = onfly

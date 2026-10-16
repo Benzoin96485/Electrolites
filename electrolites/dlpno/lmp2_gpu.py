@@ -339,7 +339,7 @@ class LMP2GPU:
         mode = os.environ.get('DLPNO_ONFLY_S', 'auto')
         need = float(np.sum(8. * nv[cps] * nv[cqs]))
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        onfly = (need > 0.25 * free) if mode == 'auto' else mode == '1'
+        onfly = (need > 0.5 * free) if mode == 'auto' else mode == '1'
         if onfly:
             chunks = gen.prepare(cps, cqs)
         else:                       # one chunk whose S is generated once and kept
