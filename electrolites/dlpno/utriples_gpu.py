@@ -274,8 +274,8 @@ class UTriplesGPU:
                 A = int(-(-self._naux_t[ch].max() // 32) * 32)
                 L = int(padded(max(1, self._nl_t[ch].max())))
                 Vm = max(Va, Vb)
-                per = 8 * (A * A + 2 * A * (Va * Va + Vb * Vb) + 6 * A * Vm + 20 * Vm ** 3
-                           + 6 * L * Vm * Vm + 2 * nbf * Vm + 3 * A * Pv)
+                per = 8 * (2 * A * A + 14 * A * Vm + 18 * Vm ** 3
+                           + 8 * L * Vm * Vm + 2 * nbf * Vm + 4 * A * Pv)
                 sub = max(1, int(self.MAX_CHUNK_BYTES // per))
                 for s0 in range(0, len(ch), sub):
                     sl = slice(s0, s0 + sub)
@@ -337,8 +337,15 @@ class UTriplesGPU:
             qv.append([cp.matmul(Linv, qa), cp.matmul(Linv, qb)])
             o = dfi.qij[ga[:, :, None], lmo[:, None, None], gl[:, None, :]] * (gam[:, :, None] * glm[:, None, :])
             qo.append(cp.matmul(Linv, o))
-        # ---- (Q|ab) per spin -------------------------------------------------
-        qvv = [cp.zeros((B, A, Va, Va)), cp.zeros((B, A, Vb, Vb))]
+        # ---- 3-external tensors K3[(r, s, t)][e, y, z] = (e y | r z) -----------
+        # (e, y of spin s; z of spin t = the spin of position r).  The fitted
+        # (Q|ab) is never formed: K3 = sum_Q (Q|ey)_raw (J^-1 (Q|rz)), accumulated
+        # per auxiliary atom block, so neither A V^2 storage nor an A^2 V^2
+        # fitting step is needed.
+        wq = [[cp.matmul(Linv.transpose(0, 2, 1), qv[r][t]) for t in (0, 1)] for r in range(3)]
+        r_spins = [(0,) if np.all(self.is_somo[ijk[:, r]]) else (0, 1) for r in range(3)]
+        K3 = {(r, s_, t): cp.zeros((B, Vs[s_], Vs[s_], Vs[t]))
+              for r in range(3) for s_ in (0, 1) for t in r_spins[r]}
         atoms = sorted({int(a) for t in ch for a in self.t_riatoms[t]})
         for a in atoms:
             qa_ = dfi.qab[a]
@@ -352,25 +359,40 @@ class UTriplesGPU:
             assert (pos >= 0).all(), 'triplet PAO outside the extended domain'
             gr, gpos = cp.asarray(rows), cp.asarray(pos)
             mrow = gpm[gr]
-            step = max(1, int((1 << 28) // (8 * na * P * P)))
+            step = max(1, int((1 << 28) // (8 * na * max(P, Vb) ** 2)))
             for r0 in range(0, len(rows), step):
                 sl = slice(r0, r0 + step)
+                g_ = gr[sl]
+                nr = len(rows[sl])
                 blk = qa_[:, gpos[sl][:, :, None], gpos[sl][:, None, :]].transpose(1, 0, 2, 3)
                 blk = blk * (mrow[sl][:, :, None] * mrow[sl][:, None, :])[:, None]
                 oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
-                for s, Xs in ((0, Xa), (1, Xbp)):
-                    xr = Xs[gr[sl]]
-                    qvv[s][gr[sl][:, None], oo] = cp.matmul(cp.matmul(tr(xr)[:, None], blk), xr[:, None])
+                for s_, Xs in ((0, Xa), (1, Xbp)):
+                    xr = Xs[g_]
+                    q_ = cp.matmul(cp.matmul(tr(xr)[:, None], blk), xr[:, None])      # (nr, na, V, V)
+                    q_ = q_.reshape(nr, na, -1).transpose(0, 2, 1)                     # (nr, V*V, na)
+                    for (r, s2, t), K in K3.items():
+                        if s2 != s_:
+                            continue
+                        w = wq[r][t][g_[:, None], oo]                                  # (nr, na, Vt)
+                        K[g_] += cp.matmul(q_, w).reshape(nr, Vs[s_], Vs[s_], Vs[t])
+                del blk
         if ns:
-            qsu = dfi.qia[ga[:, :, None, None], so_idx[None, None, :, None], gp[:, None, None, :]]
-            qsu = qsu * (gam[:, :, None, None] * gpm[:, None, None, :])            # (B, A, ns, P)
-            qss = dfi.qij[ga[:, :, None, None], so_idx[None, None, :, None], so_idx[None, None, None, :]]
-            qss = qss * gam[:, :, None, None]
-            XbpT = tr(Xbp)[:, None]
-            XbsT = tr(Xbs)[:, None]
-            m1 = cp.matmul(cp.matmul(XbpT, tr(qsu)), Xbs[:, None])
-            qvv[1] += m1 + tr(m1) + cp.matmul(cp.matmul(XbsT, qss), Xbs[:, None])
-        qvv = [cp.matmul(Linv, x.reshape(B, A, -1)).reshape(x.shape) for x in qvv]
+            # SOMO parts of the beta (Q|ab): (Q|u s), (Q|s t), dense in Q
+            for q0 in range(0, A, 128):
+                qs_ = slice(q0, q0 + 128)
+                ga_, gam_ = ga[:, qs_], gam[:, qs_]
+                qsu = dfi.qia[ga_[:, :, None, None], so_idx[None, None, :, None], gp[:, None, None, :]]
+                qsu = qsu * (gam_[:, :, None, None] * gpm[:, None, None, :])
+                qss = dfi.qij[ga_[:, :, None, None], so_idx[None, None, :, None], so_idx[None, None, None, :]]
+                qss = qss * gam_[:, :, None, None]
+                m1 = cp.matmul(cp.matmul(tr(Xbp)[:, None], tr(qsu)), Xbs[:, None])
+                mq = m1 + tr(m1) + cp.matmul(cp.matmul(tr(Xbs)[:, None], qss), Xbs[:, None])
+                nq = mq.shape[1]
+                mq = mq.reshape(B, nq, -1).transpose(0, 2, 1)
+                for (r, s2, t), K in K3.items():
+                    if s2 == 1:
+                        K += cp.matmul(mq, wq[r][t][:, qs_]).reshape(B, Vb, Vb, Vs[t])
         # ---- Fock (occupied position r -> triplet virtuals) and singles -----
         nbf = self.orb.nbf
         Zt = [cp.matmul(self.S_pao_d[:, gp].transpose(1, 0, 2) * gpm[:, None, :], Xa),
@@ -466,8 +488,7 @@ class UTriplesGPU:
             def k3(rA, s, t_):
                 key = ('k3', rA, s, t_)
                 if key not in cache:
-                    q = qvv[s][gsb]
-                    cache[key] = cp.matmul(tr(q.reshape(n, A, -1)), qv[rA][t_][gsb]).reshape(n, Vs[s], Vs[s], Vs[t_])
+                    cache[key] = K3[(rA, s, t_)][gsb]
                 return cache[key]
 
             def kov(rB, rC, s):
