@@ -36,6 +36,7 @@ from electrolites.dlpno.dfints import DFInts, ExtDomains
 from electrolites.dlpno.ragged import Layout, Ragged, padded, op
 from electrolites.dlpno.linalg import eigh_batched, orthonormal_domain
 from electrolites.dlpno.ccsd_gpu import _DeviceDIIS
+from electrolites.dlpno.utriples_gpu import UTriplesGPU
 from electrolites.dlpno.uccsd_gpu import _SpinPlan, _Terms, _Reg, _set_items, _get
 from electrolites.dlpno.uccsd_vec import UCCSDGPUv as UCCSDGPU
 
@@ -45,7 +46,7 @@ def _half(L, x):
     return cpla.solve_triangular(L, x.reshape(L.shape[0], -1), lower=True).reshape(s)
 
 
-class UDLPNO(RefUDLPNO2):
+class UDLPNO(UTriplesGPU, RefUDLPNO2):
     """GPU open-shell DLPNO-CCSD(T); same interface as RefUDLPNO."""
 
     MAX_PAIR_CHUNK_BYTES = 1 << 30
