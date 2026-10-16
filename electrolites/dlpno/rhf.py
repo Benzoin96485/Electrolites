@@ -45,6 +45,11 @@ def _half(L, x):
 class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
     """GPU DLPNO-CCSD(T).  Same interface as RefDLPNO."""
 
+    def kernel(self):
+        from electrolites.dlpno.devmem import pooled
+        with pooled():
+            return super().kernel()
+
     def setup(self):
         t = time.perf_counter()
         mf, mol, opt = self.mf, self.mol, self.opt

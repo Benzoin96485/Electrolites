@@ -182,6 +182,38 @@ class UCCSDGPUv(UCCSDGPU):
             t0 = time.perf_counter()
             fn()
             self.t_build[name] = time.perf_counter() - t0
+        # the DF tensors now live (padded) in the DF groups, the 3-external
+        # tensors in the K3 store: drop the per-pair copies
+        for c in self.canon_sp:
+            for key in ('Qov', 'Qvv', 'Qmz', 'Qaz', 'K3'):
+                self.fix[c].pop(key, None)
+        cp.get_default_memory_pool().free_all_blocks()
+        self.mem_report = self._mem_report()
+
+    def _mem_report(self):
+        """device bytes held by the main stores (GB)."""
+        def rag(r):
+            return sum(d.nbytes for d in r.data) if r is not None else 0
+        rep = {}
+        fixb = {}
+        for c in self.canon_sp:
+            for k, v in self.fix[c].items():
+                if isinstance(v, dict):
+                    b = sum(x.nbytes for x in v.values() if hasattr(x, 'nbytes'))
+                elif isinstance(v, list):
+                    b = sum(x.nbytes for x in v if hasattr(x, 'nbytes'))
+                else:
+                    b = getattr(v, 'nbytes', 0)
+                fixb[k] = fixb.get(k, 0) + b
+        rep.update({'fix.' + k: v / 1e9 for k, v in fixb.items()})
+        rep['S'] = sum(rag(r) for r in self.Sd) / 1e9
+        rep['NP'] = rag(self.NP) / 1e9
+        rep['Kx'] = rag(self.Kx) / 1e9
+        rep['T'] = rag(Ragged(self.LT)) / 1e9 if False else self.LT.nbytes() / 1e9
+        rep['K3'] = sum(d.nbytes for d in self.k3.data) / 1e9
+        rep['dfg'] = sum(v.nbytes for d in self.dfg for v in d.values() if hasattr(v, 'nbytes')) / 1e9
+        rep['pool_used'] = cp.get_default_memory_pool().used_bytes() / 1e9
+        return {k: round(v, 3) for k, v in rep.items()}
 
     # ------------------------------------------------------------------
     def _vec_terms(self):
@@ -307,6 +339,161 @@ class UCCSDGPUv(UCCSDGPU):
         canon = self.canon
         self.sym_src = np.array([self.sidx[k] for k in canon], np.int64)
         self.sym_dst = np.array([self.sidx[(k[1], k[0])] for k in canon], np.int64)
+        self._split_kl()
+
+    # ------------------------------------------------------------------
+    # overlaps S(kl, c) of the F'_vv and oooo-ladder terms: generated per
+    # chunk of strong pairs every iteration instead of being stored
+    # ------------------------------------------------------------------
+    MAX_S_CHUNK_BYTES = 1 << 29
+
+    def _split_kl(self):
+        u = self.u
+        nvs = self.nvs
+        Sk = [list(self.Sreg[0].keys), list(self.Sreg[1].keys)]
+        uses = {}
+        for s in (0, 1):
+            for c, s1 in zip(self.fv[s].get('c', []), self.fv[s].get('s1', [])):
+                uses.setdefault(self.strong_c[c], set()).add((s, s1))
+        rb = self.rb
+        for o, s1, s2, a, b in zip(rb.get('o', []), rb.get('s1', []), rb.get('s2', []),
+                                   rb.get('a', []), rb.get('b', [])):
+            c = self.cmap[self.sp_of[o]]
+            uses.setdefault(c, set()).update({(a, s1), (b, s2)})
+        PP = int(padded(max(len(u.pao[p]) for p in range(self.npair))))
+        chunks, cur, cb, cg = [], [], 0, 0
+        for c in self.strong_c:
+            us = uses.get(c, set())
+            b = sum(8 * nvs[Sk[s][i][0], s] * nvs[Sk[s][i][1], s] for (s, i) in us)
+            g = sum(8 * PP * nvs[Sk[s][i][1], s] for (s, i) in us)
+            if cur and (cb + b > self.MAX_S_CHUNK_BYTES or cg + g > self.MAX_S_CHUNK_BYTES):
+                chunks.append(cur)
+                cur, cb, cg = [], 0, 0
+            cur.append(c)
+            cb += b
+            cg += g
+        if cur:
+            chunks.append(cur)
+        cid = {}
+        for n, ch in enumerate(chunks):
+            for c in ch:
+                cid[c] = n
+        fvc = [[_Terms(), _Terms()] for _ in chunks]
+        rbc = [_Terms() for _ in chunks]
+        loc = [[_Reg(), _Reg()] for _ in chunks]
+        for s in (0, 1):
+            f = self.fv[s]
+            for c, s1, it, w in zip(f.get('c', []), f.get('s1', []), f.get('it', []), f.get('w', [])):
+                n = cid[self.strong_c[c]]
+                fvc[n][s].add(c=c, s1=loc[n][s](Sk[s][s1]), it=it, sa=s, w=w)
+        for o, s1, t, s2, beta, a, b, w in zip(rb.get('o', []), rb.get('s1', []), rb.get('t', []), rb.get('s2', []),
+                                               rb.get('beta', []), rb.get('a', []), rb.get('b', []), rb.get('w', [])):
+            n = cid[self.cmap[self.sp_of[o]]]
+            rbc[n].add(o=o, s1=loc[n][a](Sk[a][s1]), t=t, s2=loc[n][b](Sk[b][s2]), beta=beta, a=a, b=b, w=w)
+        self.klchunks = []
+        for n, ch in enumerate(chunks):
+            d = dict(cs=np.array(ch, np.int64), fv=fvc[n], rb=rbc[n], cpl=[])
+            cpos = {c: r for r, c in enumerate(ch)}
+            for s in (0, 1):
+                keys = loc[n][s].keys
+                kl = np.array([k[0] for k in keys], np.int64)
+                cc = np.array([k[1] for k in keys], np.int64)
+                # (p and its transpose share one space)
+                assert all(self.cmap[c] in cpos for c in cc), 'S(kl, c) with c outside the chunk'
+                d['cpl'].append((kl, np.array([cpos[self.cmap[c]] for c in cc], np.int64),
+                                 Layout(nvs[kl, s], nvs[cc, s])))
+            self.klchunks.append(d)
+        self.fv = [_Terms(), _Terms()]
+        self.rb = _Terms()
+        self._compact_S()
+
+    def _s_columns(self):
+        """(terms, S column, spin column or fixed spin) of every term list
+        whose plans read the global overlap store."""
+        L = [(self.tn[0], 's', 0), (self.tn[1], 's', 1)]
+        L += [(self.fp, 'sa', 'a'), (self.fp, 'sb', 'b'), (self.rg, 's1', 'a'), (self.rg, 's2', 'b')]
+        for tr in (0, 1):
+            L += [(self.ring_np[tr], 's1', 'a'), (self.ring_z[tr], 's1', 'a'),
+                  (self.ring_z[tr], 's2', 'c'), (self.ring_z[tr], 's3', 'b')]
+        L += [(self.zq, 's1', 'b'), (self.zq, 's2', 'd'), (self.zq, 's3', 'c'),
+              (self.fkc, 's1', 'a'), (self.fkc, 's2', 'b'), (self.r1c, 's1', 'a'),
+              (self.r1a2, 's1', 'a'), (self.r1a2, 'sa', 'aK'), (self.r1a2, 'sb', 'a'),
+              (self.uq, 's', 'a'), (self.r1b, 's1', 'a'), (self.pt, 's', 'a'), (self.a1, 's', 'a')]
+        for t_ in self.zkx:
+            L += [(t_, 's1', 'a'), (t_, 's2', 'b')]
+        return L
+
+    def _compact_S(self):
+        cols = self._s_columns()
+        used = [set(), set()]
+        for t_, col, sc in cols:
+            if not dict.__len__(t_) or col not in t_:
+                continue
+            spins = [sc] * len(t_[col]) if isinstance(sc, int) else t_[sc]
+            for i, s in zip(t_[col], spins):
+                used[s].add(i)
+        new = [_Reg(), _Reg()]
+        mp = []
+        for s in (0, 1):
+            m = {}
+            for i in sorted(used[s]):
+                m[i] = new[s](self.Sreg[s].keys[i])
+            mp.append(m)
+        for t_, col, sc in cols:
+            if not dict.__len__(t_) or col not in t_:
+                continue
+            spins = [sc] * len(t_[col]) if isinstance(sc, int) else t_[sc]
+            t_[col] = [mp[s][i] for i, s in zip(t_[col], spins)]
+        self.Sreg = new
+
+    def _kl_tables(self):
+        """pair PNO coefficients in their PAO domains (beta: PAO rows, then SOMO rows)."""
+        u, ns = self.u, self.u.ns
+        npair = self.npair
+        npo = np.array([len(u.pao[p]) for p in range(npair)])
+        PP = int(padded(npo.max()))
+        VA, VB = int(padded(self.nvs[:, 0].max())), int(padded(self.nvs[:, 1].max()))
+        XA = np.zeros((npair, PP, VA))
+        XB = np.zeros((npair, PP + ns, VB))
+        dom = np.zeros((npair, PP), np.int64)
+        dmk = np.zeros((npair, PP))
+        for p in range(npair):
+            n_ = npo[p]
+            XA[p, :n_, :self.nvs[p, 0]] = u.Xa[p]
+            XB[p, :n_, :self.nvs[p, 1]] = u.Xb[p][:n_]
+            XB[p, PP:, :self.nvs[p, 1]] = u.Xb[p][n_:]
+            dom[p, :n_] = u.pao[p]
+            dmk[p, :n_] = 1.
+        self._klt = dict(PP=PP, X=[cp.asarray(XA), cp.asarray(XB)], dom=cp.asarray(dom), dmk=cp.asarray(dmk))
+
+    def _gen_S(self, ch):
+        """the S(kl, c) of one chunk, per spin, as Raggeds."""
+        kt = self._klt
+        S_d = self.u.S_pao_d
+        PP, ns = kt['PP'], self.u.ns
+        cs = cp.asarray(ch['cs'])
+        dom, dmk = kt['dom'][cs], kt['dmk'][cs]
+        SP_ = S_d[:, dom].transpose(1, 0, 2) * dmk[:, None, :]          # (nc, nbf, PP)
+        out = []
+        for s in (0, 1):
+            kl, cl, lay = ch['cpl'][s]
+            R = Ragged(lay)
+            if len(kl):
+                X = kt['X'][s]
+                Xc = X[cs]
+                Z = cp.matmul(SP_, Xc[:, :PP])                              # (nc, nbf, V)
+                gkl = cp.asarray(kl)
+                rows = kt['dom'][gkl]
+                G = Z[cp.asarray(cl)[:, None], rows] * kt['dmk'][gkl][:, :, None]
+                if s == 1 and ns:
+                    G = cp.concatenate([G, Xc[cp.asarray(cl), PP:]], axis=1)
+                Sv = cp.matmul(X[gkl].transpose(0, 2, 1), G)               # (n, VPkl, Vc)
+                for g, m in enumerate(lay.members):
+                    if len(m):
+                        pr, pc = lay.shapes[g]
+                        R.data[g][...] = Sv[cp.asarray(m), :pr, :pc]
+            out.append(R)
+        return out
 
     # ------------------------------------------------------------------
     def _df_groups(self):
@@ -373,6 +560,16 @@ class UCCSDGPUv(UCCSDGPU):
                                  [('Pt', 'pl_', None, False), ('Pt', 'pj', None, True), ('S', 's1', 'a', False),
                                   ('Kx', 'kx', None, tr2), ('S', 's2', 'b', True)]))
         self.p_a1 = SP(lays, self.LT1, self.a1, 'i', [('S', 's', 'a', False), ('V1', 'v', None, False)])
+        self._kl_tables()
+        for d in self.klchunks:
+            cl = dict(Sc=[c[2] for c in d['cpl']], T=self.LT, G=self.LT)
+            d['p_fv'] = [SP(cl, self.LF[s], d['fv'][s], 'c', [('Sc', 's1', 'sa', True), ('T', 'it', None, False),
+                                                          ('G', 'it', None, True), ('Sc', 's1', 'sa', False)])
+                         for s in (0, 1)]
+            d['p_rb'] = SP(cl, self.LT, d['rb'], 'o', [('Sc', 's1', 'a', True), ('T', 't', None, False),
+                                                      ('Sc', 's2', 'b', False)])
+            d['beta'] = cp.asarray(d['rb'].a('beta'))
+            d['w'] = cp.asarray(d['rb'].f('w'))
         en = self.en_t
         self.p_en1 = VDotPlan([op(self.LPt, en.a('pi'))], [op(self.LT, en.a('o')), op(self.LPt, en.a('pj'))])
         ss = np.where(self.e_same.get() > 0)[0]
@@ -516,10 +713,15 @@ class UCCSDGPUv(UCCSDGPU):
         for gi, d in enumerate(self.dfg):
             self._df_run(gi, d, T, T1, Tn, Fv, Fbov, R, R1, beta)
         st['Fv'] = Fv
-        # F'_vv projections
-        for s in (0, 1):
-            if self.p_fv[s].n:
-                self.p_fv[s].run(Fv[s], st, w=cp.full(self.p_fv[s].n, -.5))
+        # F'_vv projections and the oooo ladder, with S(kl, c) generated per chunk
+        for d in self.klchunks:
+            st['Sc'] = self._gen_S(d)
+            for s in (0, 1):
+                if d['p_fv'][s].n:
+                    d['p_fv'][s].run(Fv[s], st, w=cp.full(d['p_fv'][s].n, -.5))
+            if d['p_rb'].n:
+                d['p_rb'].run(R, st, w=beta[d['beta']] * d['w'])
+        st.pop('Sc', None)
         # Fbar_KJ, F'_KJ
         Fpp = self.F0.copy()
         for s in (0, 1):
@@ -539,8 +741,6 @@ class UCCSDGPUv(UCCSDGPU):
             self.p_e2.run(R, st)
         if self.p_rg.n:
             self.p_rg.run(R, st, w=Fpp[self.rg_f] * cp.asarray(self.rg.f('w')))
-        if self.p_rb.n:
-            self.p_rb.run(R, st, w=beta[self.rb_beta] * cp.asarray(self.rb.f('w')))
         # ring
         Z = Ragged(self.LZ)
         st['K1Z'] = self.K1Z

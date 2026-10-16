@@ -49,6 +49,11 @@ def _half(L, x):
 class UDLPNO(UTriplesGPU, RefUDLPNO2):
     """GPU open-shell DLPNO-CCSD(T); same interface as RefUDLPNO."""
 
+    def kernel(self):
+        from electrolites.dlpno.devmem import pooled
+        with pooled():
+            return super().kernel()
+
     MAX_PAIR_CHUNK_BYTES = 1 << 30
     PAO_ORTHO = 'pivchol'
 
@@ -823,37 +828,55 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                         v[:, :, :ne] += cp.matmul(Xbs.T[None], qsu)
                         v[:, :, ne:] += cp.matmul(Xbs.T[None], qss)
                 Vx.append(_half(L, v))
-            T1c, T2c, Xcc = {}, {}, {}
-            for n in idx:
-                (_, K, Q, bp, c_, q) = keys[n]
-                k, qo = so[K][0], so[Q][0]
-                sK, sQ = so[K][1], so[Q][1]
-                Z = None
-                if sK == c_ and bp == sQ:
-                    t1 = T1c.get((qo, bp))
-                    if t1 is None:            # (k u|B q) for every domain LMO k
-                        t1 = T1c[(qo, bp)] = cp.einsum('Qb,Qku->kbu', Bm[bp][:, lpos[qo]], Qk)
-                    Z = t1[lpos[k]]
-                if sK == sQ and bp == c_:
-                    t2 = T2c.get((qo, bp))
-                    if t2 is None:            # (k q|B u) for every domain LMO k
-                        t2 = T2c[(qo, bp)] = cp.einsum('Qk,Qbu->kbu', Boo[:, :, lpos[qo]], Vx[bp])
-                    Z = -t2[lpos[k]] if Z is None else Z - t2[lpos[k]]
-                Xc = Xcc.get((q, c_))
-                if Xc is None:
+            Xcc = {}
+
+            def xc(q, c_):
+                X = Xcc.get((q, c_))
+                if X is None:
                     npo = len(self.pao[q])
                     if c_ == 0:
-                        Xh = np.zeros((ne + ns, self.nva(q)))
-                        Xh[epos[self.pao[q]]] = self.Xa[q]
+                        X = np.zeros((ne + ns, self.nva(q)))
+                        X[epos[self.pao[q]]] = self.Xa[q]
                     else:
-                        Xh = np.zeros((ne + ns, self.nvb(q)))
-                        Xh[epos[self.pao[q]]] = self.Xb[q][:npo]
-                        Xh[ne:] = self.Xb[q][npo:]
-                    Xc = Xcc[(q, c_)] = cp.asarray(Xh)
-                if Z is None:
-                    out[n] = cp.zeros((self.nva(p) if bp == 0 else self.nvb(p), Xc.shape[1]))
+                        X = np.zeros((ne + ns, self.nvb(q)))
+                        X[epos[self.pao[q]]] = self.Xb[q][:npo]
+                        X[ne:] = self.Xb[q][npo:]
+                    Xcc[(q, c_)] = X
+                return X
+            grp = {}
+            for n in idx:
+                (_, K, Q, bp, c_, q) = keys[n]
+                grp.setdefault((so[Q][0], bp), []).append(n)
+            for (qo, bp), lst in grp.items():
+                c1 = np.zeros(len(lst))
+                c2 = np.zeros(len(lst))
+                lk = np.zeros(len(lst), np.int64)
+                for r_, n in enumerate(lst):
+                    (_, K, Q, _, c_, q) = keys[n]
+                    sK, sQ = so[K][1], so[Q][1]
+                    lk[r_] = lpos[so[K][0]]
+                    c1[r_] = 1. if (sK == c_ and bp == sQ) else 0.
+                    c2[r_] = 1. if (sK == sQ and bp == c_) else 0.
+                glk = cp.asarray(lk)
+                Z = 0.
+                if c1.any():        # (k u|B q) for the domain LMOs k
+                    t1 = cp.einsum('Qb,Qku->kbu', Bm[bp][:, lpos[qo]], Qk)
+                    Z = Z + t1[glk] * cp.asarray(c1)[:, None, None]
+                if c2.any():        # (k q|B u)
+                    t2 = cp.einsum('Qk,Qbu->kbu', Boo[:, :, lpos[qo]], Vx[bp])
+                    Z = Z - t2[glk] * cp.asarray(c2)[:, None, None]
+                ws = [xc(keys[n][5], keys[n][4]).shape[1] for n in lst]
+                Wm = max(ws)
+                Xs = np.zeros((len(lst), ne + ns, Wm))
+                for r_, n in enumerate(lst):
+                    Xs[r_, :, :ws[r_]] = xc(keys[n][5], keys[n][4])
+                nvp = self.nva(p) if bp == 0 else self.nvb(p)
+                if isinstance(Z, float):
+                    res = cp.zeros((len(lst), nvp, Wm))
                 else:
-                    out[n] = Z @ Xc
+                    res = cp.matmul(Z, cp.asarray(Xs))
+                for r_, n in enumerate(lst):
+                    out[n] = res[r_, :, :ws[r_]]
         return out
 
     # ------------------------------------------------------------------
@@ -862,6 +885,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         self.ucc = g = UCCSDGPU(self)
         g.build()
         self.timings['cc_build'] = time.perf_counter() - t0
+        self.log('  CC stores (GB):', getattr(g, 'mem_report', None))
+        self.mem_cc = getattr(g, 'mem_report', None)
         self.e_lccsd, self.de_weak = g.kernel(verbose=self.verbose >= 4)
         # amplitudes back for the triples (blocks and dense host copies)
         Th = g.T.to_list()
