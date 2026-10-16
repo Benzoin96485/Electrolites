@@ -752,26 +752,30 @@ class UTriplesGPU:
             return out
         e_prev = 0.
         ntrip = len(self.trip)
+        by_sn = {}
+        for g in plan:
+            by_sn.setdefault(g['sn'], []).append(g)
         for it in range(1, opt['MAXITER'] + 1):
-            D = {}
-            R = {}
-            for s in bk:
-                D[s] = stack_D(s, bk[s])
-                R[s] = to_dev(W[s]) - D[s] * T[s]
-            for g in plan:
-                Au = T[g['su']][g['suo']].transpose((0,) + tuple(1 + p for p in g['perm']))
-                S0, S1, S2 = gather_S(g)
-                c_, a0, a1, a2 = Au.shape
-                t0, t1, t2 = S0.shape[1], S1.shape[1], S2.shape[1]
-                A1 = cp.matmul(S0, Au.reshape(c_, a0, a1 * a2)).reshape(c_, t0, a1, a2)
-                A2 = cp.matmul(A1.reshape(c_, t0 * a1, a2), S2.transpose(0, 2, 1)).reshape(c_, t0, a1, t2)
-                A3 = cp.matmul(S1[:, None], A2)
-                cupyx.scatter_add(R[g['sn']], g['st'], -g['w'][:, None, None, None] * A3)
+            # bucket by bucket (Gauss-Seidel across buckets): only one bucket's
+            # W, D and residual live on the device at a time
             rms = 0.
             for s in bk:
-                T[s] = T[s] + R[s] / D[s]
-                r = cp.sqrt(cp.sum(R[s] ** 2, axis=(1, 2, 3)) / cnt[s])
+                Ds = stack_D(s, bk[s])
+                Rs = to_dev(W[s]) - Ds * T[s]
+                for g in by_sn.get(s, []):
+                    Au = T[g['su']][g['suo']].transpose((0,) + tuple(1 + p for p in g['perm']))
+                    S0, S1, S2 = gather_S(g)
+                    c_, a0, a1, a2 = Au.shape
+                    t0, t1, t2 = S0.shape[1], S1.shape[1], S2.shape[1]
+                    A1 = cp.matmul(S0, Au.reshape(c_, a0, a1 * a2)).reshape(c_, t0, a1, a2)
+                    A2 = cp.matmul(A1.reshape(c_, t0 * a1, a2), S2.transpose(0, 2, 1)).reshape(c_, t0, a1, t2)
+                    A3 = cp.matmul(S1[:, None], A2)
+                    cupyx.scatter_add(Rs, g['st'], -g['w'][:, None, None, None] * A3)
+                    del Au, A1, A2, A3
+                T[s] += Rs / Ds
+                r = cp.sqrt(cp.sum(Rs ** 2, axis=(1, 2, 3)) / cnt[s])
                 rms = max(rms, float(r.max()))
+                del Ds, Rs
             self.e_ijk = np.zeros(ntrip)
             for s in bk:
                 e = (mult[s] / 6.) * cp.sum(T[s] * to_dev(Vv[s]), axis=(1, 2, 3))
