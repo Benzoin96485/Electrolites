@@ -825,8 +825,6 @@ class UCCSDGPUv(UCCSDGPU):
         return ch['Sc']
 
     def _df_groups(self):
-        # registries may have grown in _vec_terms: rebuild the dependent stores
-        self._rebuild_after_vec()
         o_ = self._rbnp[:, 0].astype(np.int64)
         order = np.argsort(o_, kind='stable')
         uo, st_ = np.unique(o_[order], return_index=True)
@@ -873,6 +871,10 @@ class UCCSDGPUv(UCCSDGPU):
         cp.cuda.Device(home).use()
         # beta entries -> (group, combo, which matrix, member, rK, rL)
         self.beta_src = bmap
+        # registries may have grown in _vec_terms: rebuild the dependent stores
+        # (after the DF groups, whose per-pair tensors have left this device)
+        cp.get_default_memory_pool().free_all_blocks()
+        self._rebuild_after_vec()
 
     def _rebuild_after_vec(self):
         """overlaps, Pt layout, Kx store and plans depend on registries that
@@ -973,9 +975,6 @@ class UCCSDGPUv(UCCSDGPU):
                 qq = np.array([k[1] for k in keys], np.int64)
                 need += float(np.sum(8. * self.nvs[pp, s] * self.nvs[qq, s]))
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        if getattr(self, '_ndev', 1) > 1 and not self.offload:
-            # the per-pair DF tensors still on this device move to the other GPUs
-            free += getattr(self, '_df_bytes', 0.)
         onfly = need > 0.5 * free
         if onfly:
             # generated per chunk; chunks keep their overlaps up to a budget
