@@ -404,20 +404,28 @@ class TriplesGPU:
             Z = cp.matmul(S_d[:, gp].transpose(1, 0, 2) * gpm[:, None, :], X)   # (B, nbf, V)
             ar = cp.arange(B)
             W = cp.zeros((B, V, V, V))
+            # projected amplitudes, shared by the permutations: T_kj (T_jk = T_kj^T,
+            # same PNO space) and the domain amplitudes t_il of each position I
+            Tc, Tl = {}, {}
             for r, (I, J_, K) in enumerate(_PERMS):
-                pkj = cp.asarray(pl.ij[ijk[:, K], ijk[:, J_]])
-                s = self._project(Z, ar, pkj)                           # (B, VP, V)
-                Tkj = cp.matmul(s.transpose(0, 2, 1), cp.matmul(pt['T'][pkj], s))
+                key = (min(J_, K), max(J_, K))
+                if key not in Tc:
+                    pkj = cp.asarray(pl.ij[ijk[:, key[1]], ijk[:, key[0]]])
+                    s = self._project(Z, ar, pkj)                       # (B, VP, V)
+                    Tc[key] = cp.matmul(s.transpose(0, 2, 1), cp.matmul(pt['T'][pkj], s))
+                Tkj = Tc[key] if (K, J_) == (key[1], key[0]) else Tc[key].transpose(0, 2, 1)
                 w = cp.matmul(Kvvv[I].reshape(B, V * V, V), Tkj.transpose(0, 2, 1))
                 # t_il^{ab} (jl|kc) over the triplet's LMO domain
-                pil = pl.ij[ijk[:, I][:, None], lidx]                   # (B, L)
-                pil = np.where(lmk > 0, pil, 0)
-                bb = cp.asarray(np.repeat(np.arange(B), L))
-                gpil = cp.asarray(pil.reshape(-1))
-                s = self._project(Z, bb, gpil)                          # (B*L, VP, V)
-                Til = cp.matmul(s.transpose(0, 2, 1), cp.matmul(pt['T'][gpil], s))
-                Til = Til.reshape(B, L, V * V) * glm[:, :, None]
-                w -= cp.matmul(Til.transpose(0, 2, 1), Kov[(J_, K)])
+                if I not in Tl:
+                    pil = pl.ij[ijk[:, I][:, None], lidx]               # (B, L)
+                    pil = np.where(lmk > 0, pil, 0)
+                    bb = cp.asarray(np.repeat(np.arange(B), L))
+                    gpil = cp.asarray(pil.reshape(-1))
+                    s = self._project(Z, bb, gpil)                      # (B*L, VP, V)
+                    Til = cp.matmul(s.transpose(0, 2, 1), cp.matmul(pt['T'][gpil], s))
+                    Tl[I] = Til.reshape(B, L, V * V) * glm[:, :, None]
+                    del s
+                w -= cp.matmul(Tl[I].transpose(0, 2, 1), Kov[(J_, K)])
                 W += w.reshape(B, V, V, V).transpose((0,) + tuple(a + 1 for a in _BACK[r]))
             # ---- V, T3, energy -------------------------------------------
             t1 = []
@@ -534,8 +542,13 @@ class TriplesGPU:
             order = np.argsort(gk, kind='stable')
             ukeys, starts = np.unique(gk[order], return_index=True)
             ends = np.append(starts[1:], len(order))
+            pieces = []
             for k0, k1 in zip(starts, ends):
-                mem = order[k0:k1]
+                m0 = order[k0:k1]
+                vmax = int(max(Vp[CT[m0[0]]], Vp[CU[m0[0]]]))
+                step = max(1, int((1 << 28) // (8 * 4 * vmax ** 3)))      # bounded sweep temporaries
+                pieces += [m0[i0:i0 + step] for i0 in range(0, len(m0), step)]
+            for mem in pieces:
                 tt, uu = CT[mem], CU[mem]
                 vt, vu, case = int(Vp[tt[0]]), int(Vp[uu[0]]), int(CC[mem[0]])
                 ids = sid[mem]

@@ -223,22 +223,24 @@ class _SStore:
         self.nr = nv[cp_].astype(np.int32)
         self.nc = nv[cq_].astype(np.int32)
         self.rags = []
-        for d, a, b in zip(devs, bounds[:-1], bounds[1:]):
-            if b <= a:
-                continue
-            with cp.cuda.Device(d):
-                gen = OverlapGen(cp.asarray(S_pao), pao, X)
-                idx = np.arange(a, b)
-                lay = Layout(nv[cp_[idx]], nv[cq_[idx]])
-                R = Ragged(lay)
-                for P_ in gen.prepare(cp_[idx], cq_[idx], out_layout=lay, out_idx=np.arange(len(idx))):
-                    gen.run(P_, R)
-                del gen
-                shp = np.array(lay.shapes, np.int64).reshape(-1, 2)
-                base = np.array([x.data.ptr for x in R.data], np.int64)
-                self.ptr[idx] = base[lay.group] + 8 * lay.slot * shp[lay.group, 0] * shp[lay.group, 1]
-                self.ld[idx] = shp[lay.group, 1]
-                self.rags.append(R)
+        rng = {d: (a, b) for d, a, b in zip(devs, bounds[:-1], bounds[1:]) if b > a}
+
+        def build(d):                      # every device generates its range concurrently
+            a, b = rng[d]
+            gen = OverlapGen(cp.asarray(S_pao), pao, X, max_bytes=1 << 31)
+            idx = np.arange(a, b)
+            lay = Layout(nv[cp_[idx]], nv[cq_[idx]])
+            R = Ragged(lay)
+            for P_ in gen.prepare(cp_[idx], cq_[idx], out_layout=lay, out_idx=np.arange(len(idx))):
+                gen.run(P_, R)
+            del gen
+            shp = np.array(lay.shapes, np.int64).reshape(-1, 2)
+            base = np.array([x.data.ptr for x in R.data], np.int64)
+            self.ptr[idx] = base[lay.group] + 8 * lay.slot * shp[lay.group, 0] * shp[lay.group, 1]
+            self.ld[idx] = shp[lay.group, 1]
+            self.rags.append(R)
+        from electrolites.dlpno import mgpu
+        mgpu.run_per_device(build, sorted(rng))
         self.nbytes = float(np.sum(byt))
 
     def tables(self, LSc, uni):
