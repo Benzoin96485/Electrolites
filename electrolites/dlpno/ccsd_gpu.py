@@ -211,7 +211,7 @@ class _SStore:
     the GPUs (contiguous couple ranges); ``tables`` / ``gather`` assemble a
     chunk's overlaps from (possibly remote) blocks by pointer."""
 
-    def __init__(self, S_pao, pao, X, cp_, cq_, nv, devs):
+    def __init__(self, S_pao, pao, X, cp_, cq_, nv, devs, ne=0):
         from electrolites.dlpno.ovgen import OverlapGen
         n = len(cp_)
         byt = 8. * nv[cp_] * nv[cq_]
@@ -227,7 +227,7 @@ class _SStore:
 
         def build(d):                      # every device generates its range concurrently
             a, b = rng[d]
-            gen = OverlapGen(cp.asarray(S_pao), pao, X, max_bytes=1 << 31)
+            gen = OverlapGen(cp.asarray(S_pao), pao, X, ne=ne, max_bytes=1 << 31)
             idx = np.arange(a, b)
             lay = Layout(nv[cp_[idx]], nv[cq_[idx]])
             R = Ragged(lay)

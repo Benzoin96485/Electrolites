@@ -266,8 +266,12 @@ class ChunkedSpinPlan:
                     ids.append(codes[sel, j][msk] % BIG)
                 uni = np.unique(np.concatenate(ids)) if ids else np.zeros(0, np.int64)
                 LSc.append(Layout(nvs[kp[s][uni], s], nvs[kq[s][uni], s]))
-                preps.append(gens[s].prepare(kp[s][uni], kq[s][uni], out_layout=LSc[s],
-                                             out_idx=np.arange(len(uni))) if len(uni) else [])
+                stores = getattr(owner, '_sstores', None)
+                if stores is not None:
+                    preps.append(stores[s].tables(LSc[s], uni) if len(uni) else [])
+                else:
+                    preps.append(gens[s].prepare(kp[s][uni], kq[s][uni], out_layout=LSc[s],
+                                                 out_idx=np.arange(len(uni))) if len(uni) else [])
                 for j, (c, sc) in enumerate(scols):
                     msk = (codes[sel, j] // BIG) == s
                     loc = np.searchsorted(uni, codes[sel, j][msk] % BIG)
@@ -283,10 +287,15 @@ class ChunkedSpinPlan:
             self.chunks.append(dict(sel=cp.asarray(sel), LS=LSc, preps=preps, plan=plan, nt=len(sel)))
         self.gens = gens
         self.budget = getattr(owner, '_s_budget', None)
+        self.stores = getattr(owner, '_sstores', None)
 
     def _S(self, ch):
         if ch.get('S') is not None:
             return ch['S']
+        if self.stores is not None:
+            from electrolites.dlpno.ccsd_gpu import _SStore
+            return [_SStore.gather(ch['LS'][s], ch['preps'][s]) if len(ch['preps'][s]) else Ragged(ch['LS'][s])
+                    for s in (0, 1)]
         S = []
         for s in (0, 1):
             R = Ragged(ch['LS'][s])
@@ -980,7 +989,32 @@ class UCCSDGPUv(UCCSDGPU):
         if not self.offload:
             # the grouped 3-external tensors are still to be built here
             free -= getattr(self, '_k3_bytes', 0.)
-        onfly = need > 0.5 * free
+        onfly = need > 0.5 * free or __import__('os').environ.get('DLPNO_FORCE_STORE') == '1'
+        self._sstores = None
+        from electrolites.dlpno import mgpu
+        devs = mgpu.devices()
+        home = cp.cuda.Device().id
+        others = [d for d in devs if d != home]
+        if onfly and others and self.ONFLY_MODE == 'auto':
+            cap = 0.
+            for d in others:
+                with cp.cuda.Device(d):
+                    cap += cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+            if need < 0.5 * cap:
+                # computed once, spread over the other GPUs; chunks gather by pointer
+                from electrolites.dlpno.ccsd_gpu import _SStore
+                u = self.u
+                npair = self.npair
+                st = []
+                for s_ in (0, 1):
+                    keys = self.Sreg[s_].keys
+                    pp = np.array([k[0] for k in keys], np.int64)
+                    qq = np.array([k[1] for k in keys], np.int64)
+                    X = [u.Xa[p] for p in range(npair)] if s_ == 0 else [u.Xb[p] for p in range(npair)]
+                    st.append(_SStore(u.S_pao_d, u.pao, X, pp, qq, self.nvs[:, s_].astype(np.int64), others,
+                                      ne=(u.ns if s_ == 1 else 0)) if len(keys) else None)
+                cp.cuda.Device(home).use()
+                self._sstores = st
         if onfly:
             # generated per chunk; chunks keep their overlaps up to a budget
             import os
