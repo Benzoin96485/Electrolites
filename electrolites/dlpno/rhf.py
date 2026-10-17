@@ -28,6 +28,7 @@ from electrolites.dlpno.dfints import DFInts, ExtDomains
 from electrolites.dlpno.ccsd_gpu import CCSDGPU
 from electrolites.dlpno.triples_gpu import TriplesGPU
 from electrolites.dlpno.lmp2_gpu import LMP2GPU
+from electrolites.dlpno.pnoints import PNOIntsGPU
 
 
 def _cho_solve(L, x):
@@ -42,7 +43,7 @@ def _half(L, x):
     return cpla.solve_triangular(L, x.reshape(L.shape[0], -1), lower=True).reshape(s)
 
 
-class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
+class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
     """GPU DLPNO-CCSD(T).  Same interface as RefDLPNO."""
 
     def kernel(self):
@@ -95,6 +96,8 @@ class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
         self.ext = ExtDomains(mol.natm, dom.lmo_riatoms, dom.lmo_paos, pairs, orb.nbf)
         self.dfi = DFInts(mol, auxmol, orb.C_lmo, orb.C_pao, self.ext, self.doi_uv,
                           opt['T_CUT_DO_UV'], self.ribf_atom, self.atom_ribfs)
+        if self.verbose >= 2:
+            print('[mem] DF ints GB:', {k: round(v / 1e9, 2) for k, v in self.dfi.nbytes.items()}, flush=True)
         self.J2c = self.dfi.J2c
         self.S_pao_d = cp.asarray(orb.S_pao)
         t = self._tick('df_ints', t)
@@ -170,6 +173,9 @@ class DLPNO(LMP2GPU, TriplesGPU, RefDLPNO):
         return nb > free / 3.
 
     def pno_integrals(self):
+        import os
+        if os.environ.get('DLPNO_PNOINT_LOOP') != '1':
+            return self.pno_integrals_batched()
         self.df_offload = self._decide_df_offload()
         pl = self.pl
         dfi = self.dfi

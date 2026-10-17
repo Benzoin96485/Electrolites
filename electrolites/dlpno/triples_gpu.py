@@ -254,36 +254,54 @@ class TriplesGPU:
         P = padded(self._npao_t)
         nbf = self.orb.nbf
         PP = self._pt['PP']
+        from electrolites.dlpno import mgpu
+        devs = mgpu.devices()
+        items = []
         for Pv in np.unique(P):
             sel = np.where(P == Pv)[0]
             sel = sel[np.argsort(self._naux_t[sel], kind='stable')]
             Pv = int(Pv)
             per = 8 * (10 * Pv * Pv + 2 * nbf * Pv + 3 * PP * Pv)
             step = max(1, int(self._chunk_bytes() // per))
-            for c0 in range(0, len(sel), step):
-                ch = sel[c0:c0 + step]
-                Xt, et, nfin, pidx, pm = self._tno_chunk(ch, Pv, self._t_cut_tno)
-                if save:
-                    for s, t in enumerate(ch):
-                        self.X_tno[t] = Xt[s, :self._npao_t[t], :nfin[s]]
-                        self.e_tno[t] = cp.asarray(et[s, :nfin[s]])
-                # (T0) in memory-bounded pieces of the chunk
-                V = int(padded(nfin.max()))
-                A = int(-(-self._naux_t[ch].max() // 32) * 32)
-                L = int(padded(max(1, self._nl_t[ch].max())))
-                per = 8 * (A * V * V + 3 * A * Pv + A * A + 14 * V ** 3
-                           + 3 * L * V * V + nbf * V + 3 * A * V)
-                sub = max(1, int(self._chunk_bytes() // per))
-                for s0 in range(0, len(ch), sub):
-                    sl = slice(s0, s0 + sub)
-                    Xs = Xt[sl]
-                    if Xs.shape[2] < V:
-                        Xs = cp.concatenate([Xs, cp.zeros(Xs.shape[:2] + (V - Xs.shape[2],))], axis=2)
-                    ev = np.full((len(ch[sl]), V), 1e3)
-                    for s, t in enumerate(ch[sl]):
-                        ev[s, :nfin[sl][s]] = et[sl][s, :nfin[sl][s]]
-                    self._t0_chunk(ch[sl], Xs, ev, nfin[sl], pidx[sl], pm[sl], save)
+            # several GPUs: smaller chunks, so that every device gets work
+            if len(devs) > 1:
+                step = max(1, min(step, -(-len(sel) // (2 * len(devs)))))
+            items += [(Pv, sel[c0:c0 + step]) for c0 in range(0, len(sel), step)]
+        # largest chunks first (load balance of the device queue)
+        items.sort(key=lambda it: -len(it[1]) * it[0] ** 2)
+        mgpu.run_queue(items, lambda w, it: w._t0_item(*it, save=save), devs,
+                       setup=lambda d: self._dev_view())
         return float(self.e_ijk.sum())
+
+    def _dev_view(self):
+        """this object with its device tables on the current device."""
+        from electrolites.dlpno import mgpu
+        return mgpu.device_view(self, ('_pt', 'S_pao_d', 'F_pao_d'),
+                                sub={'dfi': ('qia', 'qij', 'J2c')})
+
+    def _t0_item(self, Pv, ch, save):
+        nbf = self.orb.nbf
+        Xt, et, nfin, pidx, pm = self._tno_chunk(ch, Pv, self._t_cut_tno)
+        if save:
+            for s, t in enumerate(ch):
+                self.X_tno[t] = Xt[s, :self._npao_t[t], :nfin[s]]
+                self.e_tno[t] = cp.asarray(et[s, :nfin[s]])
+        # (T0) in memory-bounded pieces of the chunk
+        V = int(padded(nfin.max()))
+        A = int(-(-self._naux_t[ch].max() // 32) * 32)
+        L = int(padded(max(1, self._nl_t[ch].max())))
+        per = 8 * (A * V * V + 3 * A * Pv + A * A + 14 * V ** 3
+                   + 3 * L * V * V + nbf * V + 3 * A * V)
+        sub = max(1, int(self._chunk_bytes() // per))
+        for s0 in range(0, len(ch), sub):
+            sl = slice(s0, s0 + sub)
+            Xs = Xt[sl]
+            if Xs.shape[2] < V:
+                Xs = cp.concatenate([Xs, cp.zeros(Xs.shape[:2] + (V - Xs.shape[2],))], axis=2)
+            ev = np.full((len(ch[sl]), V), 1e3)
+            for s, t in enumerate(ch[sl]):
+                ev[s, :nfin[sl][s]] = et[sl][s, :nfin[sl][s]]
+            self._t0_chunk(ch[sl], Xs, ev, nfin[sl], pidx[sl], pm[sl], save)
 
     def _t0_chunk(self, ch, X, ev, ntv, pidx, pm, save):
         pl, f = self.pl, self.orb.F_lmo
@@ -340,7 +358,7 @@ class TriplesGPU:
             qvv = cp.zeros((B, A, V, V))
             atoms = sorted({int(a) for t in ch for a in self.t_riatoms[t]})
             for a in atoms:
-                qa = dfi.qab[a]
+                qa = dfi.qab_get(a)
                 if qa is None:
                     continue
                 na = qa.shape[0]

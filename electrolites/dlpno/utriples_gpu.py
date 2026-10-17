@@ -268,28 +268,39 @@ class UTriplesGPU:
             self.tno = [None] * ntrip
         P = padded(self._npao_t)
         nbf = self.orb.nbf
+        from electrolites.dlpno import mgpu
+        devs = mgpu.devices()
+        items = []
         for Pv in np.unique(P):
             sel = np.where(P == Pv)[0]
             sel = sel[np.argsort(self._naux_t[sel], kind='stable')]
             Pv = int(Pv)
             per = 8 * (12 * Pv * Pv + 2 * nbf * Pv)
             step = max(1, int(self._chunk_bytes() // per))
-            for c0 in range(0, len(sel), step):
-                ch = sel[c0:c0 + step]
-                tn = self._tno_chunk(ch, Pv, self._t_cut_tno)
-                Va, Vb = tn['Xa'].shape[2], tn['Xbp'].shape[2]
-                A = int(-(-self._naux_t[ch].max() // 32) * 32)
-                L = int(padded(max(1, self._nl_t[ch].max())))
-                Vm = max(Va, Vb)
-                per = 8 * (2 * A * A + 14 * A * Vm + 18 * Vm ** 3
-                           + 8 * L * Vm * Vm + 2 * nbf * Vm + 4 * A * Pv)
-                sub = max(1, int(self._chunk_bytes() // per))
-                for s0 in range(0, len(ch), sub):
-                    sl = slice(s0, s0 + sub)
-                    part = {k: (v[sl] if k not in ('nfa', 'nfb', 'pidx', 'pm') else v[sl])
-                            for k, v in tn.items()}
-                    self._ut0_chunk(ch[sl], part, save)
+            if len(devs) > 1:
+                step = max(1, min(step, -(-len(sel) // (2 * len(devs)))))
+            items += [(Pv, sel[c0:c0 + step]) for c0 in range(0, len(sel), step)]
+        items.sort(key=lambda it: -len(it[1]) * it[0] ** 2)
+        mgpu.run_queue(items, lambda w, it: w._ut0_item(*it, save=save), devs,
+                       setup=lambda d: mgpu.device_view(
+                           self, ('_pt', 'S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d'),
+                           sub={'dfi': ('qia', 'qij', 'J2c')}))
         return float(self.e_ijk.sum())
+
+    def _ut0_item(self, Pv, ch, save):
+        nbf = self.orb.nbf
+        tn = self._tno_chunk(ch, Pv, self._t_cut_tno)
+        Va, Vb = tn['Xa'].shape[2], tn['Xbp'].shape[2]
+        A = int(-(-self._naux_t[ch].max() // 32) * 32)
+        L = int(padded(max(1, self._nl_t[ch].max())))
+        Vm = max(Va, Vb)
+        per = 8 * (2 * A * A + 14 * A * Vm + 18 * Vm ** 3
+                   + 8 * L * Vm * Vm + 2 * nbf * Vm + 4 * A * Pv)
+        sub = max(1, int(self._chunk_bytes() // per))
+        for s0 in range(0, len(ch), sub):
+            sl = slice(s0, s0 + sub)
+            part = {k: v[sl] for k, v in tn.items()}
+            self._ut0_chunk(ch[sl], part, save)
 
     # ------------------------------------------------------------------
     def _ut0_chunk(self, ch, tn, save):
@@ -355,7 +366,7 @@ class UTriplesGPU:
               for r in range(3) for s_ in (0, 1) for t in r_spins[r]}
         atoms = sorted({int(a) for t in ch for a in self.t_riatoms[t]})
         for a in atoms:
-            qa_ = dfi.qab[a]
+            qa_ = dfi.qab_get(a)
             if qa_ is None:
                 continue
             na = qa_.shape[0]
@@ -755,6 +766,9 @@ class UTriplesGPU:
                              st=cp.asarray(slot[[l[0] for l in lst]]), suo=cp.asarray(slot[[l[1] for l in lst]]),
                              w=cp.asarray(np.array([l[2] for l in lst]))))
 
+        self.log(f'  U(T): {len(keys)} spin triples in {len(bk)} buckets, '
+                 f'{sum(g["c"] for g in plan)} couplings in {len(plan)} groups')
+
         def gather_S(g):
             out = []
             for sg, parts, a_, b_ in g['axes']:
@@ -768,31 +782,42 @@ class UTriplesGPU:
         by_sn = {}
         for g in plan:
             by_sn.setdefault(g['sn'], []).append(g)
+        from electrolites.dlpno.devmem import Prof
+        prof = Prof('U(T) iter')
         for it in range(1, opt['MAXITER'] + 1):
             # bucket by bucket (Gauss-Seidel across buckets): only one bucket's
             # W, D and residual live on the device at a time
             rms = 0.
             for s in bk:
+                prof('W,D')
                 Ds = stack_D(s, bk[s])
                 Rs = to_dev(W[s]) - Ds * T[s]
                 for g in by_sn.get(s, []):
+                    prof('perm')
                     Au = T[g['su']][g['suo']].transpose((0,) + tuple(1 + p for p in g['perm']))
+                    prof('gatherS')
                     S0, S1, S2 = gather_S(g)
+                    prof('mm')
                     c_, a0, a1, a2 = Au.shape
                     t0, t1, t2 = S0.shape[1], S1.shape[1], S2.shape[1]
                     A1 = cp.matmul(S0, Au.reshape(c_, a0, a1 * a2)).reshape(c_, t0, a1, a2)
                     A2 = cp.matmul(A1.reshape(c_, t0 * a1, a2), S2.transpose(0, 2, 1)).reshape(c_, t0, a1, t2)
                     A3 = cp.matmul(S1[:, None], A2)
+                    prof('scatter')
                     cupyx.scatter_add(Rs, g['st'], -g['w'][:, None, None, None] * A3)
                     del Au, A1, A2, A3
+                prof('update')
                 T[s] += Rs / Ds
                 r = cp.sqrt(cp.sum(Rs ** 2, axis=(1, 2, 3)) / cnt[s])
                 rms = max(rms, float(r.max()))
                 del Ds, Rs
+            prof('energy')
             self.e_ijk = np.zeros(ntrip)
             for s in bk:
                 e = (mult[s] / 6.) * cp.sum(T[s] * to_dev(Vv[s]), axis=(1, 2, 3))
                 np.add.at(self.e_ijk, trip_of[s], e.get())
+            prof(None)
+            prof.report()
             E = float(self.e_ijk.sum())
             self.log(f'  GPU U(T) iter {it:3d} {E:.12f} {E - e_prev:.3e} {rms:.3e}')
             if rms < opt['R_CONVERGENCE'] and abs(E - e_prev) < opt['E_CONVERGENCE']:

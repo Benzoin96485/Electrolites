@@ -28,6 +28,18 @@ from electrolites.dlpno import setup as su
 from electrolites.dlpno.options import make_options
 
 
+
+def _phase_log(key, dt):
+    """one line per phase: wall time and the device memory in use / pooled."""
+    try:
+        import cupy as cp
+        free, tot = cp.cuda.runtime.memGetInfo()
+        pool = cp.get_default_memory_pool()
+        mem = f' dev used {(tot - free) / 1e9:.1f} GB (pool {pool.used_bytes() / 1e9:.1f} / {pool.total_bytes() / 1e9:.1f} GB)'
+    except Exception:
+        mem = ''
+    print(f'[phase] {key:16s} {dt:9.2f} s{mem}', flush=True)
+
 class DIIS:
     def __init__(self, nvec=6):
         self.nvec = nvec
@@ -109,6 +121,8 @@ class RefDLPNO:
     # ------------------------------------------------------------------
     def _tick(self, key, t0):
         self.timings[key] = self.timings.get(key, 0.) + time.perf_counter() - t0
+        if getattr(self, 'verbose', 0) >= 2:
+            _phase_log(key, self.timings[key])
         return time.perf_counter()
 
     def log(self, *args):

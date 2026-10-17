@@ -285,11 +285,20 @@ class LMP2GPU:
         self._prep_dev()
         pl = self.pl
         e = np.zeros(len(pl))
-        for ch in self._pair_chunks(self._canon_pairs()):
-            v = self._sc_chunk(ch)
+
+        def work(w, ch):
+            v = w._sc_chunk(ch)
             e[ch] = v
             e[pl.ji[ch]] = v
+        self._run_chunks(self._pair_chunks(self._canon_pairs()), work)
         return e
+
+    def _run_chunks(self, chunks, work):
+        """work(view, chunk) for every pair chunk, over the visible GPUs."""
+        from electrolites.dlpno import mgpu
+        chunks = sorted(chunks, key=lambda c: -len(c))
+        mgpu.run_queue(chunks, work, setup=lambda d: mgpu.device_view(
+            self, ('S_pao_d', 'F_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c')}))
 
     def _prep_dev(self):
         if getattr(self, 'F_pao_d', None) is None:
@@ -306,11 +315,12 @@ class LMP2GPU:
         self.de_pno = np.zeros(npair)
         self._lag = True
         pno = (opt['T_CUT_PNO_MP2'], opt['T_CUT_TRACE_MP2'], opt['T_CUT_ENERGY_MP2'])
-        for ch in self._pair_chunks(self._canon_pairs()):
-            _, res = self._sc_chunk(ch, pno)
+        def work(w, ch):
+            _, res = w._sc_chunk(ch, pno)
             for p, X, ep, K, T, de in res:
                 self.de_pno[p] = de
                 self._store_pair(p, X, ep, K, T)
+        self._run_chunks(self._pair_chunks(self._canon_pairs()), work)
         self.de_pno_total = self.de_pno.sum()
 
     # ------------------------------------------------------------------

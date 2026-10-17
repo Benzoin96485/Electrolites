@@ -129,6 +129,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         self.ext = ExtDomains(mol.natm, dom.lmo_riatoms, dom.lmo_paos, pairs, orb.nbf)
         self.dfi = DFInts(mol, auxmol, L, P, self.ext, self.doi_uv, opt['T_CUT_DO_UV'],
                           self.ribf_atom, self.atom_ribfs)
+        if self.verbose >= 2:
+            print('[mem] DF ints GB:', {k: round(v / 1e9, 2) for k, v in self.dfi.nbytes.items()}, flush=True)
         self.J2c = self.dfi.J2c
         self.S_pao_d = cp.asarray(orb.S_pao)
         self.Fa_pao_d, self.Fb_pao_d = cp.asarray(self.Fa_pao), cp.asarray(self.Fb_pao)
@@ -809,7 +811,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         atoms = sorted({a for o_ in offs for a in o_})
         tr = lambda Y: Y.swapaxes(-1, -2)
         for a in atoms:
-            qa_ = dfi.qab[a]
+            qa_ = dfi.qab_get(a)
             if qa_ is None:
                 continue
             na = qa_.shape[0]
