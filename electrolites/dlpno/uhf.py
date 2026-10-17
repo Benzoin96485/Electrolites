@@ -571,34 +571,59 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                 f = self._fock_oo(K, I)
                 if K != I and K != J and kj >= 0 and abs(f) > opt['F_CUT']:
                     rows_.append((o, Creg((p, kj)), sidx[(K, J)], a, b, -f))
-        # S(p, ik) per spin regenerated per chunk of couples every iteration
+        # couple chunks of S(p, ik) per spin; with several GPUs the chunks
+        # (their generators, kept overlaps and GEMM plans) are spread over them
         from electrolites.dlpno.ovgen import OverlapGen
+        from electrolites.dlpno import mgpu
         npair = len(pl)
-        gA = OverlapGen(self.S_pao_d, self.pao, [self.Xa[p] for p in range(npair)])
-        gB = OverlapGen(self.S_pao_d, self.pao, [self.Xb[p] for p in range(npair)], ne=self.ns)
+        devs = mgpu.devices()
+        home = cp.cuda.Device().id
+        XA = [self.Xa[p] for p in range(npair)]
+        XB = [self.Xb[p] for p in range(npair)]
+        gens = {}
+
+        def gens_on(d):
+            if d not in gens:
+                with cp.cuda.Device(d):
+                    Sd = cp.asarray(self.S_pao_d)
+                    gens[d] = (OverlapGen(Sd, self.pao, XA), OverlapGen(Sd, self.pao, XB, ne=self.ns))
+            return gens[d]
+        gA, gB = gens_on(home)
         pp = np.array([k[0] for k in Creg.keys], np.int64)
         qq = np.array([k[1] for k in Creg.keys], np.int64)
         R_ = np.array(rows_, dtype=np.float64).reshape(-1, 6)
         parts = gB.chunks(pp, qq)
-        PA = gA.prepare(pp, qq, parts=parts)
-        PB = gB.prepare(pp, qq, parts=parts)
         cpl = R_[:, 1].astype(np.int64)
         chunk_of = np.zeros(len(pp), np.int64)
         local = np.zeros(len(pp), np.int64)
         for ci, (sel, _, _) in enumerate(parts):
             chunk_of[sel] = ci
             local[sel] = np.arange(len(sel))
+        rc = chunk_of[cpl]
+        ro = np.argsort(rc, kind='stable')
+        rb_ = np.searchsorted(rc[ro], np.arange(len(parts) + 1))
+        load = np.zeros(len(devs))
         lmp2_chunks = []
         for ci in range(len(parts)):
-            rsel = np.where(chunk_of[cpl] == ci)[0]
-            t_ = _Terms()
-            for r in rsel:
-                o, c_, t, a, b, w_ = R_[r]
-                t_.add(o=int(o), s=int(local[int(c_)]), t=int(t), a=int(a), b=int(b), w=w_)
-            lays = dict(S=[PA[ci]['LS'], PB[ci]['LS']], T=LT)
-            pl_ = _SpinPlan(lays, LT, t_, 'o', [('S', 's', 'a', False), ('T', 't', None, False),
-                                               ('S', 's', 'b', True)])
-            lmp2_chunks.append((PA[ci], PB[ci], pl_, cp.asarray(t_.f('w')) if len(t_) else None))
+            rsel = ro[rb_[ci]:rb_[ci + 1]]
+            r_ = int(np.argmin(load))
+            load[r_] += len(rsel) + 1
+            d = devs[r_]
+            with cp.cuda.Device(d):
+                ga_, gb_ = gens_on(d)
+                Pa = ga_.prepare(pp, qq, parts=[parts[ci]])[0]
+                Pb = gb_.prepare(pp, qq, parts=[parts[ci]])[0]
+                t_ = _Terms()
+                t_._keys = ('o', 's', 't', 'a', 'b', 'w')
+                Rs = R_[rsel]
+                t_._rows = list(zip(Rs[:, 0].astype(np.int64).tolist(), local[Rs[:, 1].astype(np.int64)].tolist(),
+                                    Rs[:, 2].astype(np.int64).tolist(), Rs[:, 3].astype(np.int64).tolist(),
+                                    Rs[:, 4].astype(np.int64).tolist(), Rs[:, 5].tolist()))
+                lays = dict(S=[Pa['LS'], Pb['LS']], T=LT)
+                pl_ = _SpinPlan(lays, LT, t_, 'o', [('S', 's', 'a', False), ('T', 't', None, False),
+                                                   ('S', 's', 'b', True)])
+                lmp2_chunks.append((Pa, Pb, pl_, cp.asarray(t_.f('w')) if len(t_) else None, d))
+        cp.cuda.Device(home).use()
         Gr = Ragged(LT)
         _set_items(Gr, range(len(sop)), [G[k] for k in sop])
         T = Ragged(LT)
@@ -628,12 +653,45 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         gm = [cp.asarray(cmask[m]) for m in LT.members]
         # keep the overlaps when they fit comfortably, else regenerate them per iteration
         import os
-        need = sum(Pa['LS'].nbytes() + Pb['LS'].nbytes() for Pa, Pb, _, _ in lmp2_chunks)
-        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         mode = os.environ.get('DLPNO_ONFLY_S', 'auto')
-        onfly = (need > 0.5 * free) if mode == 'auto' else mode == '1'
-        Skept = None if onfly else [(gA.run(Pa), gB.run(Pb)) if pl_.n else None
-                                    for Pa, Pb, pl_, _ in lmp2_chunks]
+        cdevs = sorted({c[4] for c in lmp2_chunks})
+        onfly = {}
+        for d in cdevs:
+            with cp.cuda.Device(d):
+                need = sum(Pa['LS'].nbytes() + Pb['LS'].nbytes() for Pa, Pb, _, _, dd in lmp2_chunks if dd == d)
+                free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+                onfly[d] = (need > 0.5 * free) if mode == 'auto' else mode == '1'
+        Skept = []
+        for Pa, Pb, pl_, _, d in lmp2_chunks:
+            if onfly[d] or not pl_.n:
+                Skept.append(None)
+                continue
+            with cp.cuda.Device(d):
+                ga_, gb_ = gens_on(d)
+                Skept.append((ga_.run(Pa), gb_.run(Pb)))
+        cp.cuda.Device(home).use()
+
+        def coupling(R, T):
+            parts_ = {}
+
+            def work(d):
+                if d == home:
+                    R_, T_ = R, T
+                else:
+                    R_, T_ = Ragged(R.layout), Ragged(T.layout, mgpu.replicate(T.data))
+                for c_, (Pa, Pb, pl_, w_, dd) in enumerate(lmp2_chunks):
+                    if dd != d or not pl_.n:
+                        continue
+                    ga_, gb_ = gens_on(d)
+                    Sab = Skept[c_] if Skept[c_] is not None else (ga_.run(Pa), gb_.run(Pb))
+                    pl_.run(R_, dict(S=list(Sab), T=T_), w=w_)
+                parts_[d] = R_
+            mgpu.run_per_device(work, cdevs)
+            for d, R_ in parts_.items():
+                if d != home:
+                    for g in range(len(R.data)):
+                        if R.data[g].size:
+                            R.data[g] += cp.asarray(R_.data[g])
         # persistent buffers (stable addresses: cached GEMM pointer tables, no
         # host synchronisation inside an iteration)
         R = Ragged(LT)
@@ -643,10 +701,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             for g in range(len(R.data)):
                 cp.multiply(D.data[g], T.data[g], out=R.data[g])
                 R.data[g] += Gr.data[g]
-            for c_, (Pa, Pb, pl_, w_) in enumerate(lmp2_chunks):
-                if pl_.n:
-                    Sab = Skept[c_] if Skept is not None else (gA.run(Pa), gB.run(Pb))
-                    pl_.run(R, dict(S=list(Sab), T=T), w=w_)
+            coupling(R, T)
             for g in range(len(R.data)):
                 R.data[g] *= fm[g]
             rms = float(R.rms_per_item().max())
