@@ -764,8 +764,15 @@ class UCCSDGPUv(UCCSDGPU):
         # the S(kl, c) are fixed: when all chunks of this device fit (40% of
         # its free memory) each chunk keeps its own, generated once
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        keep = 8. * sum(sizes) < 0.4 * free and os.environ.get('DLPNO_KL_KEEP', '1') == '1'
-        ws = cp.empty(max(sum(sizes) if keep else need, 1))
+        keep = 8. * sum(sizes) < 0.3 * free and os.environ.get('DLPNO_KL_KEEP', '1') == '1'
+        ws = None
+        if keep:
+            try:
+                ws = cp.empty(max(sum(sizes), 1))
+            except cp.cuda.memory.OutOfMemoryError:
+                keep = False
+        if ws is None:
+            ws = cp.empty(max(need, 1))
         gens = self._gens_on(dev) if (dev != home or getattr(self, '_ovgens', None) is not None) else None
         base = 0
         for d, sz in zip(chunks, sizes):

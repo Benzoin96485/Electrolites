@@ -39,9 +39,46 @@ def overlaps_chunked(S_pao_d, pao, Xp, cp_, cq_, LS, Xs=None, max_bytes=1 << 29)
         h = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
         X = [np.vstack([h(a), h(b)]) for a, b in zip(Xp, Xs)]
         ne = Xs[0].shape[0]
-    gen = OverlapGen(S_pao_d, pao, X, ne=ne, max_bytes=max_bytes)
-    for P in gen.prepare(cp_, cq_, out_layout=LS, out_idx=np.arange(len(cp_))):
-        gen.run(P, S)
+    from electrolites.dlpno import mgpu
+    devs = mgpu.devices()
+    home = cp.cuda.Device().id
+    if len(devs) == 1 or len(cp_) < 10000:
+        gen = OverlapGen(S_pao_d, pao, X, ne=ne, max_bytes=max_bytes)
+        for P in gen.prepare(cp_, cq_, out_layout=LS, out_idx=np.arange(len(cp_))):
+            gen.run(P, S)
+        return S
+    # several GPUs: every device generates a share of the couples, then the
+    # home device gathers them into the result by pointer (peer reads)
+    from electrolites.dlpno.gather import gather2d
+    nv = np.array([x.shape[1] for x in X], np.int64)
+    parts = np.array_split(np.arange(len(cp_)), len(devs))
+    ptr = np.zeros(len(cp_), np.int64)
+    ld = np.zeros(len(cp_), np.int32)
+    keep = []
+
+    def build(d):
+        idx = parts[devs.index(d)]
+        if not len(idx):
+            return
+        gen = OverlapGen(cp.asarray(S_pao_d), pao, X, ne=ne, max_bytes=max_bytes)
+        lay = Layout(nv[cp_[idx]], nv[cq_[idx]])
+        R = Ragged(lay)
+        for P in gen.prepare(cp_[idx], cq_[idx], out_layout=lay, out_idx=np.arange(len(idx))):
+            gen.run(P, R)
+        shp = np.array(lay.shapes, np.int64).reshape(-1, 2)
+        base = np.array([x.data.ptr for x in R.data], np.int64)
+        ptr[idx] = base[lay.group] + 8 * lay.slot * shp[lay.group, 0] * shp[lay.group, 1]
+        ld[idx] = shp[lay.group, 1]
+        keep.append(R)
+    mgpu.run_per_device(build, devs)
+    with cp.cuda.Device(home):
+        for g, m in enumerate(LS.members):
+            if len(m):
+                pr, pc = LS.shapes[g]
+                gather2d(cp.asarray(ptr[m]), cp.asarray(ld[m]), cp.asarray(LS.rows[m].astype(np.int32)),
+                         cp.asarray(LS.cols[m].astype(np.int32)), pr, pc, out=S.data[g])
+        cp.cuda.Device(home).synchronize()
+    del keep
     return S
 
 
