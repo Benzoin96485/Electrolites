@@ -163,8 +163,16 @@ def _base(rag):
 
 
 def _ptrs(rag, op):
-    """device array of element pointers for an operand."""
-    return _base(rag)[op.gg] + op.goff * 8
+    """device array of element pointers for an operand (cached per buffer
+    addresses: persistent buffers cost nothing after the first call)."""
+    key = tuple(d.data.ptr for d in rag.data)
+    c = op.__dict__.setdefault('_pc', {})
+    p = c.get(key)
+    if p is None:
+        if len(c) >= 2:
+            c.clear()
+        p = c[key] = _base(rag)[op.gg] + op.goff * 8
+    return p
 
 
 class VChainPlan:

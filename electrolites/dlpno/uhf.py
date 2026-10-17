@@ -634,17 +634,25 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         onfly = (need > 0.5 * free) if mode == 'auto' else mode == '1'
         Skept = None if onfly else [(gA.run(Pa), gB.run(Pb)) if pl_.n else None
                                     for Pa, Pb, pl_, _ in lmp2_chunks]
+        # persistent buffers (stable addresses: cached GEMM pointer tables, no
+        # host synchronisation inside an iteration)
+        R = Ragged(LT)
+        fm = [z.astype(cp.float64)[:, None, None] for z in gm]
+        tix = _transpose_index(LT, src, dst)
         for it in range(1, opt['MAXITER'] + 1):
-            R = Gr + D * T
+            for g in range(len(R.data)):
+                cp.multiply(D.data[g], T.data[g], out=R.data[g])
+                R.data[g] += Gr.data[g]
             for c_, (Pa, Pb, pl_, w_) in enumerate(lmp2_chunks):
                 if pl_.n:
                     Sab = Skept[c_] if Skept is not None else (gA.run(Pa), gB.run(Pb))
                     pl_.run(R, dict(S=list(Sab), T=T), w=w_)
-            for g, z in enumerate(gm):
-                R.data[g][~z] = 0.
+            for g in range(len(R.data)):
+                R.data[g] *= fm[g]
             rms = float(R.rms_per_item().max())
-            T = T - R / D
-            T = _transpose_items(T, src, dst)
+            for g in range(len(T.data)):
+                T.data[g] -= R.data[g] / D.data[g]
+            _transpose_inplace(T, tix)
             T.set_flat(diis.update(T.flat(), R.flat()))
             e_so = Gr.vdot_items(T) * cp.asarray(.25 * mult)
             e_cur = float(e_so.sum())
@@ -1134,6 +1142,29 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         import gc
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
+
+
+def _transpose_index(lay, src, dst):
+    out = []
+    combos = {}
+    for s_, d_ in zip(src, dst):
+        combos.setdefault((lay.group[s_], lay.group[d_]), []).append((lay.slot[s_], lay.slot[d_]))
+    for (g1, g2), lst in combos.items():
+        out.append((g1, g2, cp.asarray(np.array([l[0] for l in lst], np.int64)),
+                    cp.asarray(np.array([l[1] for l in lst], np.int64))))
+    return out
+
+
+def _transpose_inplace(T, tix):
+    """T[dst] = T[src]^T in place (source and destination slots disjoint)."""
+    lay = T.layout
+    for g1, g2, a, b in tix:
+        Ms = T.data[g1][a].transpose(0, 2, 1)
+        pr, pc = lay.shapes[g2]
+        r, c = min(pr, Ms.shape[1]), min(pc, Ms.shape[2])
+        blk = cp.zeros((Ms.shape[0], pr, pc))
+        blk[:, :r, :c] = Ms[:, :r, :c]
+        T.data[g2][b] = blk
 
 
 def _transpose_items(T, src, dst):

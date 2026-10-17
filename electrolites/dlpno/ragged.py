@@ -212,9 +212,10 @@ class Ragged:
         return cp.concatenate([a.ravel() for a in self.data]) if self.data else cp.zeros(0)
 
     def set_flat(self, v):
+        """copy a flat vector into the existing buffers (addresses stay)."""
         off = 0
         for g, a in enumerate(self.data):
-            self.data[g] = v[off:off + a.size].reshape(a.shape)
+            a[...] = v[off:off + a.size].reshape(a.shape)
             off += a.size
 
     def rms_per_item(self):
