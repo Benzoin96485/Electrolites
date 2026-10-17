@@ -288,6 +288,7 @@ class UCCSDGPU:
         from electrolites.dlpno import mgpu
         nd = len(mgpu.devices())
         self.offload_bytes = nk3 + ndf
+        self._df_bytes, self._ndev = ndf, nd
         # the DF groups are spread over the GPUs, the 3-external tensors stay home
         return nk3 + ndf / nd > free / 3.
 

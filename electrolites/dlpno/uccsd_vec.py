@@ -852,6 +852,9 @@ class UCCSDGPUv(UCCSDGPU):
         devs = mgpu.devices()
         load = np.zeros(len(devs))
         home = cp.cuda.Device().id
+        if len(devs) > 1:
+            # the home device keeps the overlaps, 3-external tensors and plans
+            load[devs.index(home)] = np.inf
         for gi in range(len(uk)):
             A = int(uk[gi][0])
             R = [int(uk[gi][1]), int(uk[gi][2])]
@@ -920,6 +923,8 @@ class UCCSDGPUv(UCCSDGPU):
         devs = mgpu.devices()
         home = cp.cuda.Device().id
         load = np.zeros(len(devs))
+        if len(devs) > 1:
+            load[devs.index(home)] = np.inf
         for d in self.klchunks:
             r = int(np.argmin(load))
             load[r] += len(d['rb']) + len(d['fv'][0]) + len(d['fv'][1]) + 1
@@ -968,6 +973,9 @@ class UCCSDGPUv(UCCSDGPU):
                 qq = np.array([k[1] for k in keys], np.int64)
                 need += float(np.sum(8. * self.nvs[pp, s] * self.nvs[qq, s]))
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        if getattr(self, '_ndev', 1) > 1 and not self.offload:
+            # the per-pair DF tensors still on this device move to the other GPUs
+            free += getattr(self, '_df_bytes', 0.)
         onfly = need > 0.5 * free
         if onfly:
             # generated per chunk; chunks keep their overlaps up to a budget
