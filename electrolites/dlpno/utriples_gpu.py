@@ -149,6 +149,13 @@ class UTriplesGPU:
         pt = self._pt
         bidx = cp.asarray(bidx)
         pidx = cp.asarray(pidx)
+        n = len(pidx)
+        V_ = Z[s].shape[2]
+        step = max(1, int((1 << 28) // (8 * (pt['PP'] + self.ns) * (max(pt['VA'], pt['VB']) + V_))))
+        if n > step:
+            # bounded temporaries: the gathered PAO rows are (couples, PP, VP + V)
+            parts = [self._proj(Z, s, bidx[c0:c0 + step], pidx[c0:c0 + step]) for c0 in range(0, n, step)]
+            return cp.concatenate(parts, axis=0)
         dom, dmk = pt['dom'][pidx], pt['dmk'][pidx]
         if s == 0:
             Zg = Z[0][bidx[:, None], dom] * dmk[:, :, None]
