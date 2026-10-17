@@ -180,9 +180,17 @@ class _SpinPlan:
         spin_cols = [s for (k, c, s, t) in specs if s is not None]
         if dot_left is not None and dot_left[2] is not None:
             spin_cols = [dot_left[2]] + spin_cols
-        keys = list(zip(*[terms[c] for c in spin_cols])) if spin_cols else [()] * n
-        for key in sorted(set(keys)):
-            sel = np.array([i for i, k in enumerate(keys) if k == key], np.int64)
+        if spin_cols:
+            km = np.stack([terms.a(c) for c in spin_cols], 1)
+            ukeys, inv = np.unique(km, axis=0, return_inverse=True)
+            inv = inv.reshape(-1)
+            order = np.argsort(inv, kind='stable')
+            bounds = np.searchsorted(inv[order], np.arange(len(ukeys) + 1))
+            groups = [(tuple(int(x) for x in ukeys[g]), order[bounds[g]:bounds[g + 1]])
+                      for g in range(len(ukeys))]
+        else:
+            groups = [((), np.arange(n, dtype=np.int64))]
+        for key, sel in groups:
             it = iter(key)
             if dot_left is not None and dot_left[2] is not None:
                 lspin = next(it)
@@ -267,18 +275,21 @@ class UCCSDGPU:
         if env is not None:
             return env == '1'
         u = self.u
-        nb = 0.
+        nk3 = ndf = 0.
         for c in self.canon_sp:
             na, nb_ = self.nvs[c]
             nz = 2 if self.pl.pairs[c][0] != self.pl.pairs[c][1] else 1
-            nb += 8. * nz * 2 * (na ** 3 + nb_ ** 3 + na * nb_ * (na + nb_)) / 2
+            nk3 += 8. * nz * 2 * (na ** 3 + nb_ ** 3 + na * nb_ * (na + nb_)) / 2
             if self.strong_sp[c]:
                 A = len(u.ribfs[c])
                 R = [len(self.rows[c][s]) for s in (0, 1)]
-                nb += 8. * A * (na * na + nb_ * nb_ + R[0] * na + R[1] * nb_)
+                ndf += 8. * A * (na * na + nb_ * nb_ + R[0] * na + R[1] * nb_)
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        self.offload_bytes = nb
-        return nb > free / 3.
+        from electrolites.dlpno import mgpu
+        nd = len(mgpu.devices())
+        self.offload_bytes = nk3 + ndf
+        # the DF groups are spread over the GPUs, the 3-external tensors stay home
+        return nk3 + ndf / nd > free / 3.
 
     def tb(self, K, L, a, b):
         sK, sL = self.spin[K], self.spin[L]

@@ -582,12 +582,21 @@ class UCCSDGPUv(UCCSDGPU):
         for n, ch in enumerate(chunks):
             cid[ch] = n
         self.klchunks = []
+
+        def by_chunk(cc):
+            # term indices of every chunk (one sort instead of a scan per chunk)
+            if not len(cc):
+                return [np.zeros(0, np.int64)] * len(chunks)
+            k = cid[cc]
+            o = np.argsort(k, kind='stable')
+            b = np.searchsorted(k[o], np.arange(len(chunks) + 1))
+            return [o[b[i]:b[i + 1]] for i in range(len(chunks))]
+        fby, rby = by_chunk(fv_c), by_chunk(rb_c)
         for n, ch in enumerate(chunks):
             cpos = -np.ones(self.npair, np.int64)
             cpos[ch] = np.arange(len(ch))
             d = dict(cs=np.array(ch, np.int64), cpl=[])
-            fsel = np.where(cid[fv_c] == n)[0] if len(fv_c) else np.zeros(0, np.int64)
-            rsel = np.where(cid[rb_c] == n)[0] if len(rb_c) else np.zeros(0, np.int64)
+            fsel, rsel = fby[n], rby[n]
             loc_idx = {}
             for s in (0, 1):
                 # couples (kl, c) of this chunk and spin
