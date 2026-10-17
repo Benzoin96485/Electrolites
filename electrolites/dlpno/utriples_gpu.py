@@ -290,10 +290,13 @@ class UTriplesGPU:
                 step = max(1, min(step, -(-len(sel) // (2 * len(devs)))))
             items += [(Pv, sel[c0:c0 + step]) for c0 in range(0, len(sel), step)]
         items.sort(key=lambda it: -len(it[1]) * it[0] ** 2)
-        mgpu.run_queue(items, lambda w, it: w._ut0_item(*it, save=save), devs,
-                       setup=lambda d: mgpu.device_view(
-                           self, ('_pt', 'S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d'),
-                           sub={'dfi': ('qia', 'qij', 'J2c')}))
+        ctxs = mgpu.run_queue(items, lambda w, it: w._ut0_item(*it, save=save), devs,
+                              setup=lambda d: mgpu.device_view(
+                                  self, ('_pt', 'S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d'),
+                                  sub={'dfi': ('qia', 'qij', 'J2c')}))
+        for c in ctxs:
+            if getattr(c, '_prof', None) is not None:
+                c._prof.report()
         return float(self.e_ijk.sum())
 
     def _ut0_item(self, Pv, ch, save):
@@ -314,6 +317,9 @@ class UTriplesGPU:
 
     # ------------------------------------------------------------------
     def _ut0_chunk(self, ch, tn, save):
+        from electrolites.dlpno.devmem import Prof
+        prof = self.__dict__.setdefault('_prof', Prof('U(T0)'))
+        prof('setup')
         pl, dfi, ns = self.pl, self.dfi, self.ns
         ext = dfi.ext
         pt = self._pt
@@ -374,6 +380,7 @@ class UTriplesGPU:
         r_spins = [(0,) if np.all(self.is_somo[ijk[:, r]]) else (0, 1) for r in range(3)]
         K3 = {(r, s_, t): cp.zeros((B, Vs[s_], Vs[s_], Vs[t]))
               for r in range(3) for s_ in (0, 1) for t in r_spins[r]}
+        prof('k3')
         atoms = sorted({int(a) for t in ch for a in self.t_riatoms[t]})
         for a in atoms:
             qa_ = dfi.qab_get(a)
@@ -420,6 +427,7 @@ class UTriplesGPU:
                 for (r, s2, t), K in K3.items():
                     if s2 == 1:
                         K += cp.matmul(mq, wq[r][t][:, qs_]).reshape(B, Vb, Vb, Vs[t])
+        prof('w')
         # ---- Fock (occupied position r -> triplet virtuals) and singles -----
         nbf = self.orb.nbf
         Zt = [cp.matmul(self.S_pao_d[:, gp].transpose(1, 0, 2) * gpm[:, None, :], Xa),
@@ -631,6 +639,7 @@ class UTriplesGPU:
                 na_, nb_ = int(tn['nfa'][s]), int(tn['nfb'][s])
                 self.tno[t] = dict(Xa=Xa[s, :, :na_], Xb=cp.concatenate([Xbp[s, :, :nb_], Xbs[s, :, :nb_]], axis=0),
                                    pidx=pidx[s][:self._npao_t[t]])
+        prof(None)
 
     # ------------------------------------------------------------------
     def lccsd_t_iterations(self):

@@ -1394,8 +1394,11 @@ class RefUDLPNO:
         if self.triples:
             self.triples_sparsity(True)
             self.tno_transform(opt['T_CUT_TNO_PRE'])
+            self.log(f'  (T0) prescreening over {len(self.trip)} triplets')
             self.lccsd_t0()
+            t = self._tick('t0_prescreen', t)
             self.triples_sparsity(False)
+            self.log(f'  (T0) over {len(self.trip)} triplets')
             self.tno_transform(opt['T_CUT_TNO'])
             e_t0 = self.lccsd_t0()
             e_t = e_t0 + self.de_t_screened

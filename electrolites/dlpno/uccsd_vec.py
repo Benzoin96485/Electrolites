@@ -282,14 +282,20 @@ class ChunkedSpinPlan:
                              transpose_out=transpose_out, dot_left=dot_left)
             self.chunks.append(dict(sel=cp.asarray(sel), LS=LSc, preps=preps, plan=plan, nt=len(sel)))
         self.gens = gens
+        self.budget = getattr(owner, '_s_budget', None)
 
     def _S(self, ch):
+        if ch.get('S') is not None:
+            return ch['S']
         S = []
         for s in (0, 1):
             R = Ragged(ch['LS'][s])
             for P in ch['preps'][s]:
                 self.gens[s].run(P, R)
             S.append(R)
+        bud = getattr(self, 'budget', None)
+        if bud is not None and bud.take(cp.cuda.Device().id, sum(L.nbytes() for L in ch['LS'])):
+            ch['S'] = S                   # kept: not regenerated in later iterations
         return S
 
     def run(self, out, stores, w=None):
@@ -962,7 +968,17 @@ class UCCSDGPUv(UCCSDGPU):
                 qq = np.array([k[1] for k in keys], np.int64)
                 need += float(np.sum(8. * self.nvs[pp, s] * self.nvs[qq, s]))
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        return need > 0.5 * free
+        onfly = need > 0.5 * free
+        if onfly:
+            # generated per chunk; chunks keep their overlaps up to a budget
+            import os
+            from electrolites.dlpno.ccsd_gpu import _SBudget
+            frac = float(os.environ.get('DLPNO_S_KEEP', '0.3'))
+            self._s_budget = _SBudget({cp.cuda.Device().id: frac * free})
+        if getattr(self.u, 'verbose', 0) >= 2:
+            print(f'[mem] open CC overlaps {need / 1e9:.1f} GB, free {free / 1e9:.1f} GB, '
+                  f'on the fly: {onfly}', flush=True)
+        return onfly
 
     def _make_spin_plan(self, layouts, out_layout, terms, out_col, specs, **kw):
         uses_s = any(k == 'S' for (k, c, sc, tr) in specs)
