@@ -451,6 +451,24 @@ class UTriplesGPU:
             for pat in self._patterns(t):
                 pats.setdefault(pat, []).append(s)
         si = self.so_index
+        # projections onto pair PNO spaces, for the whole chunk: shared by all
+        # spin patterns of a triplet (a pattern selects its rows)
+        ccache = {}
+        Ball = np.arange(B)
+
+        def chunk_lproj(rA, sp_):
+            kp = ('P', rA, sp_)
+            if kp not in ccache:
+                pil_all = np.where(lmk > 0, pl.ij[ijk[:, rA][:, None], lidx], 0)
+                S = self._proj(Zt, sp_, np.repeat(Ball, L), pil_all.reshape(-1))
+                ccache[kp] = S.reshape((B, L) + S.shape[1:])
+            return ccache[kp]
+
+        def chunk_pproj(rB, rC, sp_):
+            kp = ('Q', min(rB, rC), max(rB, rC), sp_)
+            if kp not in ccache:
+                ccache[kp] = self._proj(Zt, sp_, Ball, pl.ij[ijk[:, rB], ijk[:, rC]])
+            return ccache[kp]
         for pat, sb_l in pats.items():
             sb = np.array(sb_l, np.int64)
             gsb = cp.asarray(sb)
@@ -482,10 +500,7 @@ class UTriplesGPU:
 
                 def pproj(sp_):
                     # (B, C) and (C, B) share their PNO space: one projection per spin
-                    kp = ('Q', min(rB, rC), max(rB, rC), sp_)
-                    if kp not in cache:
-                        cache[kp] = self._proj(Zt, sp_, gsb, pp)
-                    return cache[kp]
+                    return chunk_pproj(rB, rC, sp_)[gsb]
                 S1 = pproj(s1)                                          # (n, VP1, V1)
                 S2 = pproj(s2)
                 Tm = pt['TS'][cp.asarray(items)][:, :S1.shape[1], :S2.shape[1]]
@@ -522,10 +537,8 @@ class UTriplesGPU:
 
                 def lproj(sp_):
                     # projections onto the (A, l) pairs depend on A and the spin only
-                    kp = ('P', rA, sp_)
-                    if kp not in cache:
-                        cache[kp] = self._proj(Zt, sp_, bb, pil.reshape(-1))
-                    return cache[kp]
+                    S = chunk_lproj(rA, sp_)[gsb]
+                    return S.reshape((n * L,) + S.shape[2:])
                 S1 = lproj(s1)
                 S2 = lproj(s2)
                 Tm = pt['TS'][cp.asarray(items.reshape(-1))][:, :S1.shape[1], :S2.shape[1]]
