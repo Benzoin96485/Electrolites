@@ -320,7 +320,7 @@ the CPU code, or against finite differences where there is none
 | `cubegen` | density, orbital and electrostatic-potential cube files | **345x** (electrostatic potential, penicillin V/def2-TZVP, 80³ grid) |
 | QM/MM | QM/MM Hessian (RHF/RKS) and Gaussian-smeared MM charges | new: PySCF has no QM/MM Hessian; GPU4PySCF returned the vacuum one |
 | `lo` | orbital localisation: Foster–Boys, Pipek–Mezey (all PySCF populations), density-fitted Edmiston–Ruedenberg, intrinsic bond orbitals | Boys **4–6x**, PM **14–23x**, IBO **6–37x** (penicillin V, taxol); ER 0.7 s against 32 min on penicillin V |
-| `eom` | EOM-IP/EA-CCSD (right and left vectors) and singlet, triplet and spin-flip EOM-EE-CCSD on the GPU CCSD, without the v⁴ intermediate (`mycc.ipccsd()`, `eomee_ccsd_*()`, `eomsf_ccsd()` now work) | IP **7–18x**, EA **11–39x**, EE singlet **49–118x**, triplet/spin-flip **59–74x**, left IP/EA **4–34x** (alanine dipeptide, ferrocene, glycine/TZVP) |
+| `eom` | EOM-IP/EA-CCSD (right and left vectors) and singlet, triplet and spin-flip EOM-EE-CCSD on the GPU CCSD; the vvvv term as an MO GEMM when v⁴ fits on the device, else AO-direct (`mycc.ipccsd()`, `eomee_ccsd_*()`, `eomsf_ccsd()` now work) | IP **7–18x**, EA **11–39x**, EE singlet **49–118x**, triplet/spin-flip **59–74x**, left IP/EA **4–34x** (alanine dipeptide, ferrocene, glycine/TZVP) |
 | `cc_lambda` | CCSD Λ equations (`mycc.solve_lambda()`) | **14–43x** (alanine dipeptide, glycine/TZVP, ferrocene) |
 | `cc_rdm` | CCSD one- and two-particle density matrices (`mycc.make_rdm1()`, `make_rdm2()`) | 2-RDM **37–128x** (same systems) |
 | `adc` | ADC(2) excitation (singlet), ionisation and attachment energies | EE **19x**, IP **2–7x**, EA **5–14x** (alanine dipeptide, penicillin V) |
