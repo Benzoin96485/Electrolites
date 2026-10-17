@@ -694,26 +694,66 @@ class UTriplesGPU:
             d['Xb'] = cp.concatenate([d['Xb'][:npao], d['Xb'][P:]], axis=0)
             d['Xa_rows'] = npao
 
-        groups = {}
-        for n, O in enumerate(Os):
-            for r in range(3):
-                X = O[r]
-                xs = so[X][1]
-                for Lso in range(nso):
-                    if so[Lso][1] != xs or Lso in O:
-                        continue
-                    f = F[xs][so[Lso][0], so[X][0]]
-                    if abs(f) < opt['F_CUT_T']:
-                        continue
-                    new = list(O)
-                    new[r] = Lso
-                    ck = okey(new)
-                    u = where.get(ck)
-                    if u is None:
-                        continue
-                    perm = tuple(ck.index(new[q]) for q in range(3))
-                    pat_n = tuple(so[I][1] for I in O)
-                    groups.setdefault((bof[n], bof[u], perm, pat_n), []).append((n, u, f))
+        # ---- couplings t <- u (X -> L at one position), vectorised ----------
+        nT = len(Os)
+        so_l = np.array([x for x, _ in so], np.int64)
+        so_s = np.array([sp_ for _, sp_ in so], np.int64)
+        rk = np.empty(nso, np.int64)                    # rank of (lmo, spin)
+        rk[np.lexsort((so_s, so_l))] = np.arange(nso)
+        Oa = np.array(Os, np.int64).reshape(-1, 3)
+
+        def tcode(M):                                   # canonical code of spin-orbital triples
+            r_ = np.sort(rk[M], axis=1)
+            return (r_[:, 0] * nso + r_[:, 1]) * nso + r_[:, 2]
+        codes = tcode(Oa)
+        corder = np.argsort(codes)
+        csorted = codes[corder]
+        bucket_id = {s_: i for i, s_ in enumerate(bk)}
+        bid = np.array([bucket_id[bof[n]] for n in range(nT)], np.int64)
+        trip_n = np.array([k[0] for k in keys], np.int64)
+        cn, cu, cf, cr = [], [], [], []
+        for r in range(3):
+            X = Oa[:, r]
+            xs = so_s[X]
+            for sg in (0, 1):
+                rows = np.where(xs == sg)[0]
+                if not len(rows):
+                    continue
+                Ls = np.where(so_s == sg)[0]
+                fm = F[sg][np.ix_(so_l[Ls], so_l[X[rows]])].T          # (rows, Ls)
+                ok = np.abs(fm) >= opt['F_CUT_T']
+                ok &= ~(Ls[None, :] == Oa[rows][:, [0]]) & ~(Ls[None, :] == Oa[rows][:, [1]]) \
+                    & ~(Ls[None, :] == Oa[rows][:, [2]])
+                ri, li = np.nonzero(ok)
+                if not len(ri):
+                    continue
+                nn_ = rows[ri]
+                Mnew = Oa[nn_].copy()
+                Mnew[:, r] = Ls[li]
+                c_ = tcode(Mnew)
+                pos = np.searchsorted(csorted, c_)
+                pos = np.minimum(pos, len(csorted) - 1)
+                hit = csorted[pos] == c_
+                cn.append(nn_[hit])
+                cu.append(corder[pos[hit]])
+                cf.append(fm[ri[hit], li[hit]])
+                cr.append(np.full(int(hit.sum()), r, np.int64))
+        cn = np.concatenate(cn) if cn else np.zeros(0, np.int64)
+        cu = np.concatenate(cu) if cu else np.zeros(0, np.int64)
+        cf = np.concatenate(cf) if cf else np.zeros(0)
+        cr = np.concatenate(cr) if cr else np.zeros(0, np.int64)
+        # perm[q]: position in u's stored triple of the q-th orbital of the new triple
+        Ou = Oa[cu]
+        rem = [Oa[cn, (cr + 1) % 3], Oa[cn, (cr + 2) % 3]]
+        isL = np.ones((len(cn), 3), bool)
+        for q in range(3):
+            isL[:, q] = (Ou[:, q] != rem[0]) & (Ou[:, q] != rem[1])
+        Lcol = Ou[np.arange(len(cn)), np.argmax(isL, axis=1)]
+        Mnew = Oa[cn].copy()
+        Mnew[np.arange(len(cn)), cr] = Lcol
+        perm = np.zeros((len(cn), 3), np.int64)
+        for q in range(3):
+            perm[:, q] = np.argmax(Ou == Mnew[:, [q]], axis=1)
         # the TNO overlaps S_s(t, u) once per distinct (t, u, spin), from the
         # device overlap generator over the triplets' compact TNO coefficients
         from electrolites.dlpno.ovgen import OverlapGen
@@ -723,74 +763,78 @@ class UTriplesGPU:
                 for t in range(ntr)]
         Xs_ = [[self.tno[t]['Xa'] if self.tno[t] is not None else cp.zeros((0, 1)) for t in range(ntr)],
                [self.tno[t]['Xb'] if self.tno[t] is not None else cp.zeros((self.ns, 1)) for t in range(ntr)]]
-        need = [dict(), dict()]
-        for (sn, su, perm, _), lst in groups.items():
-            for (n, u, f) in lst:
-                for q in range(3):
-                    sg = so[Os[n][q]][1]
-                    need[sg].setdefault((keys[n][0], keys[u][0]), len(need[sg]))
-        SU, LU = [], []
+        tt_c, uu_c = trip_n[cn], trip_n[cu]
+        tu = tt_c * ntr + uu_c
+        axspin = so_s[Oa[cn]]                                  # (c, 3) spin of each axis
+        SU, LU, sid = [], [], np.zeros((len(cn), 3), np.int64)
         for sg in (0, 1):
-            kk = list(need[sg])
-            tt = np.array([k[0] for k in kk], np.int64)
-            uu = np.array([k[1] for k in kk], np.int64)
+            msk = axspin == sg
+            codes_sg = np.unique(tu[msk.any(axis=1)])
+            for q in range(3):
+                sel_ = msk[:, q]
+                sid[sel_, q] = np.searchsorted(codes_sg, tu[sel_])
+            tt = codes_sg // ntr
+            uu = codes_sg % ntr
             gen = OverlapGen(S_d, tpao, Xs_[sg], ne=(self.ns if sg == 1 else 0))
             nvt = gen.nv
-            lay = Layout(nvt[tt], nvt[uu]) if len(kk) else Layout(np.zeros(0, np.int64), 1)
+            lay = Layout(nvt[tt], nvt[uu]) if len(codes_sg) else Layout(np.zeros(0, np.int64), 1)
             R_ = Ragged(lay)
-            if len(kk):
-                for P_ in gen.prepare(tt, uu, out_layout=lay, out_idx=np.arange(len(kk))):
+            if len(codes_sg):
+                for P_ in gen.prepare(tt, uu, out_layout=lay, out_idx=np.arange(len(codes_sg))):
                     gen.run(P_, R_)
             SU.append(R_)
             LU.append(lay)
             del gen
-        # coupling groups: destination bucket part x permuted (padded) source
-        # shape; every coupling carries its own source pointer / strides and
-        # its three TNO-overlap blocks (gathered by pointer each sweep), so a
-        # group is a handful of kernels however its permutations and spin
-        # patterns mix
+        # ---- coupling groups: destination bucket part x coarse permuted
+        # source shape; every coupling carries its source pointer / strides
+        # and the pointers of its three TNO-overlap blocks, so a group is a
+        # handful of kernels however its permutations and spin patterns mix
         from electrolites.dlpno.gather import gather2d, gather3p
-        bucket_of = {}
+        bks = list(bk)
+        shp_b = np.array([b_[:3] for b_ in bks], np.int64)          # (nb, 3)
+        tbase = np.array([T[b_].data.ptr for b_ in bks], np.int64)
+        su_c = shp_b[bid[cu]]                                        # (c, 3)
+        up_true = np.take_along_axis(su_c, perm, axis=1)
         coarse = lambda v: -(-v // 32) * 32          # few source shapes -> few, large groups
-        for (sn, su, perm, _), lst0 in groups.items():
-            up = tuple(coarse(su[perm[q]]) for q in range(3))
-            for (n, u, f) in lst0:
-                bucket_of.setdefault((sn, up), []).append((n, u, f, perm, su))
+        up_c = coarse(up_true)
+        full = np.stack([su_c[:, 1] * su_c[:, 2], su_c[:, 2], np.ones(len(cn), np.int64)], 1)
+        strd_all = np.take_along_axis(full, perm, axis=1)
+        src_all = tbase[bid[cu]] + 8 * slot[cu] * su_c.prod(axis=1)
+        # S pointer tables per axis
+        sptr, sld, snr, snc = (np.zeros((len(cn), 3), np.int64) for _ in range(4))
+        for sg in (0, 1):
+            lay = LU[sg]
+            if not lay.n:
+                continue
+            shp = np.array(lay.shapes, np.int64).reshape(-1, 2)
+            gbase = np.array([d.data.ptr for d in SU[sg].data], np.int64)
+            for q in range(3):
+                sel_ = axspin[:, q] == sg
+                ids = sid[sel_, q]
+                g_ = lay.group[ids]
+                sptr[sel_, q] = gbase[g_] + 8 * lay.slot[ids] * shp[g_, 0] * shp[g_, 1]
+                sld[sel_, q] = shp[g_, 1]
+                snr[sel_, q] = lay.rows[ids]
+                snc[sel_, q] = lay.cols[ids]
+        gkey = (bid[cn] * 4096 + up_c[:, 0] // 32 * 256 + up_c[:, 1] // 32 * 16 + up_c[:, 2] // 32)
+        order = np.argsort(gkey, kind='stable')
+        ukeys, starts = np.unique(gkey[order], return_index=True)
+        ends = np.append(starts[1:], len(order))
         plan = []
-        for (sn, up), lst0 in bucket_of.items():
+        for k0, k1 in zip(starts, ends):
+            mem = order[k0:k1]
+            sn = bks[int(bid[cn[mem[0]]])]
+            up = tuple(int(x) for x in up_c[mem[0]])
             per = 8 * 6 * max(int(np.prod(sn[:3])), int(np.prod(up)))
             step = max(1, int((1 << 28) // per))
-            for i0 in range(0, len(lst0), step):
-                lst = lst0[i0:i0 + step]
-                c = len(lst)
-                src = np.empty(c, np.int64)
-                strd = np.empty((c, 3), np.int64)
-                nn = np.empty((c, 3), np.int32)
-                sp = [np.empty(c, np.int64) for _ in range(3)]
-                sld = [np.empty(c, np.int32) for _ in range(3)]
-                snr = [np.empty(c, np.int32) for _ in range(3)]
-                snc = [np.empty(c, np.int32) for _ in range(3)]
-                for r, (n, u, f, perm, su) in enumerate(lst):
-                    d0, d1, d2 = su[0], su[1], su[2]
-                    full = (d1 * d2, d2, 1)
-                    src[r] = T[su].data.ptr + 8 * int(slot[u]) * d0 * d1 * d2
-                    strd[r] = [full[perm[q]] for q in range(3)]
-                    nn[r] = [su[perm[q]] for q in range(3)]
-                    for q in range(3):
-                        sg = so[Os[n][q]][1]
-                        ids = need[sg][(keys[n][0], keys[u][0])]
-                        lay = LU[sg]
-                        g_ = lay.group[ids]
-                        pr, pc = lay.shapes[g_]
-                        sp[q][r] = SU[sg].data[g_].data.ptr + 8 * int(lay.slot[ids]) * pr * pc
-                        sld[q][r] = pc
-                        snr[q][r] = lay.rows[ids]
-                        snc[q][r] = lay.cols[ids]
-                plan.append(dict(sn=sn, up=up, c=c, src=cp.asarray(src), strd=cp.asarray(strd), nn=cp.asarray(nn),
-                                 S=[(cp.asarray(sp[q]), cp.asarray(sld[q]), cp.asarray(snr[q]),
-                                     cp.asarray(snc[q])) for q in range(3)],
-                                 st=cp.asarray(slot[[l[0] for l in lst]]),
-                                 w=cp.asarray(np.array([l[2] for l in lst]))))
+            for i0 in range(0, len(mem), step):
+                m_ = mem[i0:i0 + step]
+                plan.append(dict(sn=sn, up=up, c=len(m_), src=cp.asarray(src_all[m_]),
+                                 strd=cp.asarray(strd_all[m_]), nn=cp.asarray(up_true[m_].astype(np.int32)),
+                                 S=[(cp.asarray(sptr[m_, q]), cp.asarray(sld[m_, q].astype(np.int32)),
+                                     cp.asarray(snr[m_, q].astype(np.int32)), cp.asarray(snc[m_, q].astype(np.int32)))
+                                    for q in range(3)],
+                                 st=cp.asarray(slot[cn[m_]]), w=cp.asarray(cf[m_])))
 
         self.log(f'  U(T): {len(keys)} spin triples in {len(bk)} buckets, '
                  f'{sum(g["c"] for g in plan)} couplings in {len(plan)} groups')

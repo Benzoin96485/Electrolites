@@ -70,6 +70,34 @@ Memory (what grows with system size, and what is done about it):
 * every variable-size GEMM chain runs in memory-bounded term chunks; the CC
   stores are released before the triples; the CuPy pool allocator is used
   inside the kernels (GPU4PySCF routes >100 MB allocations to cudaMalloc).
+* per-atom (Q|uv) blocks (the full 3-index tensor once the molecule is
+  smaller than the PAO-domain radius: 41 GB for taxol / cc-pVDZ): pinned
+  host memory behind a device LRU cache (`DFInts.qab_get`) when they would
+  take more than 35% of the free device memory (`DLPNO_QAB_HOST=auto|0|1`,
+  cache size `DLPNO_QAB_CACHE_GB`, default a quarter of the device).  All
+  consumers (PNO integrals, pair integrals, triples) contract them one aux
+  atom at a time; the cache is dropped before the CC iterations.
+* closed-shell PNO integrals are built in pair batches (`pnoints.py`): the
+  strong pairs' (k i|a e) over the extended domain are accumulated atom by
+  atom from (Q|uv), never as a (Q|a e) tensor; per-pair lists are released
+  as soon as the CC stores are assembled.
+* DIIS keeps a host Gram matrix and extrapolates vector by vector (no
+  stacked copies of the history; pinned host history when it is large).
+
+## Several GPUs (`mgpu.py`)
+
+All visible GPUs of a node are used (one Python thread per device;
+`DLPNO_NGPU` limits the count).  Peer access over NVLink is enabled.
+
+| stage | distribution |
+|---|---|
+| SC-MP2 / LMP2 PNOs, PNO integrals, open-shell pair integrals, (T0) | work queue of pair / triplet chunks; per device a view of the driver with replicas of the small device tables (qia, qij, metric, S_pao, pair tables); (Q|uv) through the per-device cache |
+| LCCSD, closed shell | DF groups of the strong pairs live on (and are dressed by) their device; every plan whose operands include PNO overlaps is chunked, its chunks spread over the devices, each device keeping the overlaps of its chunks (up to `DLPNO_S_KEEP` of its free memory, rest regenerated); dynamic operands replicated per call, static integrals once; partial outputs added on the home device |
+| LCCSD, open shell | DF groups and the F'_vv / oooo-ladder chunks (with their overlap generators and workspaces) per device, same reduction |
+
+So the device memory that grows fastest (overlaps, DF tensors) is spread
+over the GPUs, and with 4 GPUs overlaps that would have to be regenerated
+on one device are kept.
 
 ## Validation
 
