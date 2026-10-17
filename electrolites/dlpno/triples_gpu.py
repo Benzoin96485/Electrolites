@@ -272,7 +272,7 @@ class TriplesGPU:
         items = []
         for Pv in np.unique(P):
             sel = np.where(P == Pv)[0]
-            sel = sel[np.argsort(self._naux_t[sel], kind='stable')]
+            sel = sel[self.dfi.spatial_order([self.t_riatoms[t] for t in sel])]
             Pv = int(Pv)
             per = 8 * (10 * Pv * Pv + 2 * nbf * Pv + 3 * PP * Pv)
             step = max(1, int(self._chunk_bytes() // per))

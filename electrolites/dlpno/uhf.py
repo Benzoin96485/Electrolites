@@ -880,7 +880,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         chunks = []
         for Pv in np.unique(P):
             sel = [c for c, pv in zip(clist, P) if pv == Pv]
-            sel.sort(key=lambda c: len(self.ribfs[c]))
+            o_ = self.dfi.spatial_order([np.unique(self.ribf_atom[self.ribfs[c]]) for c in sel])
+            sel = [sel[k] for k in o_]
             ch = []
             for c in sel + [None]:
                 if c is not None:

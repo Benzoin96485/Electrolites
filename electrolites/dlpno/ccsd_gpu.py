@@ -254,6 +254,53 @@ def _partner_slots(layout, partner):
     return out
 
 
+
+class _VCouples:
+    """Registry of PNO-overlap couples (p, q), vectorised: ``C(p_array,
+    q_array)`` returns provisional codes; ``finalize`` renumbers every
+    registered code list to dense couple indices (couples in first-use
+    order is not needed: sorted by code)."""
+
+    def __init__(self, npair):
+        self.npair = npair
+        self._codes = []
+
+    def __call__(self, p, q):
+        c = np.asarray(p, np.int64) * self.npair + np.asarray(q, np.int64)
+        return _Code(c)
+
+    def finalize(self, terms):
+        cols = [(t, k) for t in terms for k, v in t.cols.items() if isinstance(v, _Code)]
+        allc = np.concatenate([t.cols[k].c for t, k in cols]) if cols else np.zeros(0, np.int64)
+        uni = np.unique(allc)
+        for t, k in cols:
+            t.cols[k] = np.searchsorted(uni, t.cols[k].c).astype(np.int64)
+        self.p = (uni // self.npair).tolist()
+        self.q = (uni % self.npair).tolist()
+
+
+class _Code:
+    __slots__ = ('c',)
+
+    def __init__(self, c):
+        self.c = c
+
+
+class _VTerms:
+    """columns of one term list (numpy arrays)."""
+
+    def __init__(self, **cols):
+        self.cols = dict(cols)
+
+    def __getitem__(self, k):
+        v = self.cols[k]
+        return v if isinstance(v, np.ndarray) else np.asarray(v, dtype=np.int64)
+
+    def __len__(self):
+        v = next(iter(self.cols.values()))
+        return len(v.c) if isinstance(v, _Code) else len(v)
+
+
 class CCSDGPU:
     """Device data and plans for one set of CC PNOs (built from a RefDLPNO
     object after ``recompute_pnos`` and ``pno_integrals``)."""
@@ -291,100 +338,76 @@ class CCSDGPU:
         L11 = self.L11 = Layout(np.ones(npair, np.int64), 1)
         self.pslot = {id(L): _partner_slots(L, ji) for L in (LP, LV, LN, LL)}
 
-        C = self.C = _Couples()
         pos = ref.lmo_pos
         lmos = ref.lmos
 
-        # ---- term lists ----------------------------------------------------
+        # ---- term lists (vectorised over pairs x domain LMOs) -------------------
+        C = self.C = _VCouples(npair)
+        cnt = nl
+        Pl = np.repeat(np.arange(npair), cnt)                     # pair of each (p, l)
+        Ll = np.concatenate([np.asarray(l, np.int64) for l in lmos]) if npair else np.zeros(0, np.int64)
+        Rl = np.concatenate([np.arange(c) for c in cnt]) if npair else np.zeros(0, np.int64)
+        Il, Jl = pi[Pl], pj[Pl]
+        T = _VTerms
         # T_n and S(p,ii) T1[i]
-        tn = _Terms('p', 'row', 's', 'n')
-        for p in range(npair):
-            for r, m in enumerate(lmos[p]):
-                tn.add(p=p, row=r, s=C(p, dii[m]), n=m)
-        ti = _Terms('p', 's', 'i')
-        tj = _Terms('p', 's', 'j')
-        for p in range(npair):
-            ti.add(p=p, s=C(p, dii[pi[p]]), i=pi[p])
-            tj.add(p=p, s=C(p, dii[pj[p]]), j=pj[p])
+        tn = T(p=Pl, row=Rl, s=C(Pl, dii[Ll]), n=Ll)
+        allp = np.arange(npair)
+        ti = T(p=allp, s=C(allp, dii[pi]), i=pi)
+        tj = T(p=allp, s=C(allp, dii[pj]), j=pj)
         # Fkc (all pairs)
-        fkc = _Terms('p', 's1', 'ik', 's2', 'k')
-        for p in range(npair):
-            i = pi[p]
-            for k in lmos[p]:
-                ik, kk = ij[i, k], dii[k]
-                fkc.add(p=p, s1=C(p, ik), ik=ik, s2=C(ik, kk), k=k)
-        # Fkj += Fkc_bar[jj] row i . T1[j]
-        # gamma (all pairs p = (k, i))
-        g3 = _Terms('p', 's1', 'l', 'i', 's2', 'kl', 's3')
-        g4 = _Terms('p', 's1', 'li', 's2', 'kl', 's3')
-        for p in range(npair):
-            k, i = pi[p], pj[p]
-            ii = dii[i]
-            for l in lmos[p]:
-                kl, ll, li = ij[k, l], dii[l], ij[l, i]
-                g3.add(p=p, s1=C(p, ll), l=l, i=i, s2=C(kl, ii), kl=kl, s3=C(p, kl))
-                g4.add(p=p, s1=C(p, li), li=li, s2=C(li, kl), kl=kl, s3=C(kl, p))
+        ik_ = ij[Il, Ll]
+        fkc = T(p=Pl, s1=C(Pl, ik_), ik=ik_, s2=C(ik_, dii[Ll]), k=Ll)
+        # gamma (all pairs p = (k, i)): k = pi, i = pj
+        kl_, ll_, li_ = ij[Il, Ll], dii[Ll], ij[Ll, Jl]
+        g3 = T(p=Pl, s1=C(Pl, ll_), l=Ll, i=Jl, s2=C(kl_, dii[Jl]), kl=kl_, s3=C(Pl, kl_))
+        g4 = T(p=Pl, s1=C(Pl, li_), li=li_, s2=C(li_, kl_), kl=kl_, s3=C(kl_, Pl))
         # delta (all pairs p = (i, k))
-        d3 = _Terms('p', 's1', 'l', 'i', 's2', 'lk', 's3')
-        d4 = _Terms('p', 's1', 'il', 's2', 'lk', 's3')
-        for p in range(npair):
-            i, k = pi[p], pj[p]
-            ii = dii[i]
-            for l in lmos[p]:
-                ll, lk, il = dii[l], ij[l, k], ij[i, l]
-                d3.add(p=p, s1=C(p, ll), l=l, i=i, s2=C(lk, ii), lk=lk, s3=C(lk, p))
-                d4.add(p=p, s1=C(p, il), il=il, s2=C(il, lk), lk=lk, s3=C(lk, p))
+        lk_, il_ = ij[Ll, Jl], ij[Il, Ll]
+        d3 = T(p=Pl, s1=C(Pl, ll_), l=Ll, i=Il, s2=C(lk_, dii[Il]), lk=lk_, s3=C(lk_, Pl))
+        d4 = T(p=Pl, s1=C(Pl, il_), il=il_, s2=C(il_, lk_), lk=lk_, s3=C(lk_, Pl))
         # Fkj double tilde
-        fdd = _Terms('p', 'li', 's1', 'lj', 's2', 'flat')
-        for p in range(npair):
-            i, j = pi[p], pj[p]
-            for l in lmos[p]:
-                li, lj = ij[l, i], ij[l, j]
-                if li < 0 or lj < 0:
-                    continue
-                fdd.add(p=p, li=li, s1=C(li, lj), lj=lj, s2=C(lj, li), flat=i * n + j)
+        li2, lj2 = ij[Ll, Il], ij[Ll, Jl]
+        m_ = (li2 >= 0) & (lj2 >= 0)
+        fdd = T(p=Pl[m_], li=li2[m_], s1=C(li2[m_], lj2[m_]), lj=lj2[m_], s2=C(lj2[m_], li2[m_]),
+                flat=Il[m_] * n + Jl[m_])
         # R1
-        r1a = _Terms('i', 's', 'q')
-        r1b = _Terms('i', 's', 'l', 'kl', 'q', 'sa', 'sb')
-        r1c = _Terms('i', 's', 'p', 'q')
-        for p in range(npair):
-            i, k = pi[p], pj[p]
-            q = ji[p]
-            ii = dii[i]
-            r1a.add(i=i, s=C(q, ii), q=q)
-            for l in lmos[p]:
-                kl, ll = ij[k, l], dii[l]
-                r1b.add(i=i, s=C(ii, ll), l=l, kl=kl, q=q, sa=C(kl, q), sb=C(q, kl))
-            r1c.add(i=i, s=C(p, ii), p=p, q=q)
-        r1d = _Terms('i', 's', 'p', 'row')
-        for p in range(npair):
-            for r, i in enumerate(lmos[p]):
-                r1d.add(i=i, s=C(p, dii[i]), p=p, row=r)
-        # R2: B and Fbc over (k, l) in the pair's LMO domain
-        rb = _Terms('p', 's', 'kl', 'bflat')
-        for p in np.where(strong & canon)[0]:
-            lm = lmos[p]
+        qq = ji[allp]
+        r1a = T(i=pi, s=C(qq, dii[pi]), q=qq)
+        klb = ij[Jl, Ll]
+        r1b = T(i=Il, s=C(dii[Il], dii[Ll]), l=Ll, kl=klb, q=ji[Pl], sa=C(klb, ji[Pl]), sb=C(ji[Pl], klb))
+        r1c = T(i=pi, s=C(allp, dii[pi]), p=allp, q=qq)
+        r1d = T(i=Ll, s=C(Pl, dii[Ll]), p=Pl, row=Rl)
+        # R2: B and Fbc over (k, l) in the pair's LMO domain (strong canonical pairs)
+        sc_ = np.where(strong & canon)[0]
+        pa, ka, la, fa = [], [], [], []
+        for p in sc_:
+            lm = np.asarray(lmos[p], np.int64)
             L = len(lm)
-            for a, k in enumerate(lm):
-                for b, l in enumerate(lm):
-                    kl = ij[k, l]
-                    if kl < 0:
-                        continue
-                    rb.add(p=p, s=C(kl, p), kl=kl, bflat=a * L + b)
-        rc = _Terms('p', 'jk_cpl', 'kj', 's1', 'ki', 's2', 's3')
-        rd = _Terms('p', 'jk_cpl', 'jk', 's1', 'ik', 's2', 's3')
-        rg = _Terms('p', 's', 'ik', 'fflat')
-        for p in np.where(strong)[0]:
-            i, j = pi[p], pj[p]
-            for kk, k in enumerate(lmos[p]):
-                ki, kj, ik, jk = ij[k, i], ij[k, j], ij[i, k], ij[j, k]
-                rc.add(p=p, jk_cpl=-1, kj=kj, s1=C(p, ki), ki=ki, s2=C(ki, kj), s3=C(kj, p))
-                rd.add(p=p, jk_cpl=-1, jk=jk, s1=C(p, ik), ik=ik, s2=C(ik, jk), s3=C(jk, p))
-            for k in range(n):
-                ik = ij[i, k]
-                if ik < 0:
-                    continue
-                rg.add(p=p, s=C(p, ik), ik=ik, fflat=k * n + j)
+            kk, ll2 = np.meshgrid(lm, lm, indexing='ij')
+            pa.append(np.full(L * L, p))
+            ka.append(kk.ravel())
+            la.append(ll2.ravel())
+            fa.append(np.arange(L * L))
+        if pa:
+            pa, ka, la, fa = (np.concatenate(x) for x in (pa, ka, la, fa))
+        else:
+            pa = ka = la = fa = np.zeros(0, np.int64)
+        klr = ij[ka, la]
+        m_ = klr >= 0
+        rb = T(p=pa[m_], s=C(klr[m_], pa[m_]), kl=klr[m_], bflat=fa[m_])
+        ms = strong[Pl]
+        Ps, Ks, Is, Js = Pl[ms], Ll[ms], Il[ms], Jl[ms]
+        ki_, kj_, ik2, jk_ = ij[Ks, Is], ij[Ks, Js], ij[Is, Ks], ij[Js, Ks]
+        neg = np.full(len(Ps), -1)
+        rc = T(p=Ps, jk_cpl=neg, kj=kj_, s1=C(Ps, ki_), ki=ki_, s2=C(ki_, kj_), s3=C(kj_, Ps))
+        rd = T(p=Ps, jk_cpl=neg, jk=jk_, s1=C(Ps, ik2), ik=ik2, s2=C(ik2, jk_), s3=C(jk_, Ps))
+        sp_ = np.where(strong)[0]
+        Pg = np.repeat(sp_, n)
+        Kg = np.tile(np.arange(n), len(sp_))
+        ikg = ij[pi[Pg], Kg]
+        m_ = ikg >= 0
+        rg = T(p=Pg[m_], s=C(Pg[m_], ikg[m_]), ik=ikg[m_], fflat=Kg[m_] * n + pj[Pg[m_]])
+        C.finalize([tn, ti, tj, fkc, g3, g4, d3, d4, fdd, r1a, r1b, r1c, r1d, rb, rc, rd, rg])
         # energy
         self.t_build['terms'] = time.perf_counter() - t0
         t0 = time.perf_counter()

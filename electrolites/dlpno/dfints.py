@@ -202,7 +202,27 @@ class DFInts:
         env = os.environ.get('DLPNO_QAB_CACHE_GB')
         if env is not None:
             return float(env) * 1e9
-        return 0.25 * cp.cuda.Device().mem_info[1]
+        # grow while a quarter of the device stays free (whole tensor resident
+        # when it fits), never below a quarter of the device
+        free, tot = cp.cuda.runtime.memGetInfo()
+        free += cp.get_default_memory_pool().free_bytes()
+        mine = self._cache_bytes.get(cp.cuda.Device().id, 0)
+        return max(0.25 * tot, min(0.7 * tot, free + mine - 0.25 * tot))
+
+    def spatial_order(self, atom_sets):
+        """order of items (given by their aux-atom sets) along a Morton curve
+        of their centres: consecutive chunks then share most aux atoms (and
+        their cached (Q|uv) blocks)."""
+        xyz = np.asarray(self.mol.atom_coords())
+        c = np.array([xyz[np.asarray(a, np.int64)].mean(axis=0) if len(a) else np.zeros(3)
+                      for a in atom_sets])
+        lo, hi = c.min(axis=0), c.max(axis=0)
+        q = ((c - lo) / np.maximum(hi - lo, 1e-9) * 1023).astype(np.int64)
+        code = np.zeros(len(c), np.int64)
+        for bit in range(10):
+            for d in range(3):
+                code |= ((q[:, d] >> bit) & 1) << (3 * bit + d)
+        return np.argsort(code, kind='stable')
 
     def cache_clear(self):
         self._cache.clear()

@@ -40,7 +40,9 @@ class PNOIntsGPU:
         for Pv in np.unique(P):
             sel = [p for p, pv in zip(canon, P) if pv == Pv]
             # neighbouring pairs share aux atoms: order by the fitting domain
-            sel.sort(key=lambda p: (int(self.strong[p]), tuple(self.riatoms[p][:3])))
+            # neighbouring pairs (Morton order of their fitting domains) share aux atoms
+            o_ = self.dfi.spatial_order([self.riatoms[p] for p in sel])
+            sel = [sel[k] for k in o_]
             ch, tot = [], 0
             for p in sel:
                 A = -(-sum(len(self.dfi.atom_ribfs[a]) for a in self.riatoms[p]) // 32) * 32
