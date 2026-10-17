@@ -472,50 +472,68 @@ class TriplesGPU:
                     - fs[:, None, None, None])
             coef[v] = cp.asarray(np.array([_energy_coeffs(*self.trip[t]) for t in mem]))
         self.W3 = self.V3 = self.T3 = None
-        # couplings, grouped by (V_t, V_u, case)
-        groups = {}
-        for t, (i, j, k) in enumerate(self.trip):
-            for l in range(n):
-                for key, fl, ok in (((i, j, l), f[l, k], l != k),
-                                    ((i, l, k), f[l, j], l != j),
-                                    ((l, j, k), f[l, i], l != i)):
-                    if ok and key in self.trip_idx and abs(fl) >= opt['F_CUT_T']:
-                        u = self.trip_idx[key]
-                        g = groups.setdefault((int(Vp[t]), int(Vp[u]), _perm_case(*key)), [])
-                        g.append((t, u, fl))
+        # couplings t <- u (one LMO of t replaced by l), vectorised over triplets
+        tri = self._trip_arr
+        ts = np.sort(tri, axis=1)
+        code = lambda M: (M[:, 0] * n + M[:, 1]) * n + M[:, 2]
+        cs = code(ts)
+        corder = np.argsort(cs)
+        csorted = cs[corder]
+        CT, CU, CF, CC = [], [], [], []
+        for r in (2, 1, 0):
+            x = tri[:, r]
+            fm = f[:, x].T                                   # (ntrip, n): f[l, x_t]
+            ok = (np.abs(fm) >= opt['F_CUT_T']) & (np.arange(n)[None, :] != x[:, None])
+            ti, li = np.nonzero(ok)
+            key = tri[ti].copy()
+            key[:, r] = li
+            c_ = code(np.sort(key, axis=1))
+            pos = np.minimum(np.searchsorted(csorted, c_), len(csorted) - 1)
+            hit = csorted[pos] == c_
+            a1, a2, a3 = key[hit, 0], key[hit, 1], key[hit, 2]
+            case = np.select([(a1 <= a2) & (a2 <= a3), (a1 <= a3) & (a3 <= a2), (a2 <= a1) & (a1 <= a3),
+                              (a2 <= a3) & (a3 <= a1), (a3 <= a1) & (a1 <= a2)], [0, 1, 2, 3, 4], 5)
+            CT.append(ti[hit])
+            CU.append(corder[pos[hit]])
+            CF.append(fm[ti[hit], li[hit]])
+            CC.append(case)
+        CT, CU = np.concatenate(CT), np.concatenate(CU)
+        CF, CC = np.concatenate(CF), np.concatenate(CC)
         # TNO overlaps of every coupling, padded: S_tu = X_t^T S_pao[d_t, d_u] X_u
         # (device overlap generator over the triplets' compact TNO coefficients,
         # once per distinct couple; then padded per group by pointer gathers)
         from electrolites.dlpno.ovgen import OverlapGen
         from electrolites.dlpno.gather import gather2d
-        need = {}
-        for lst in groups.values():
-            for (t, u, fl) in lst:
-                need.setdefault((t, u), len(need))
-        kk = list(need)
+        tu = CT * ntrip + CU
+        ucode, sid = np.unique(tu, return_inverse=True)
+        sid = sid.reshape(-1)
+        tt0, uu0 = ucode // ntrip, ucode % ntrip
         gen = OverlapGen(S_d, self.t_paos, [cp.asnumpy(x) for x in self.X_tno])
-        tt0 = np.array([k[0] for k in kk], np.int64)
-        uu0 = np.array([k[1] for k in kk], np.int64)
-        LU = Layout(nv[tt0], nv[uu0]) if kk else None
-        SU = Ragged(LU) if kk else None
-        if kk:
-            for P_ in gen.prepare(tt0, uu0, out_layout=LU, out_idx=np.arange(len(kk))):
+        LU = Layout(nv[tt0], nv[uu0]) if len(ucode) else None
+        SU = Ragged(LU) if len(ucode) else None
+        if len(ucode):
+            for P_ in gen.prepare(tt0, uu0, out_layout=LU, out_idx=np.arange(len(ucode))):
                 gen.run(P_, SU)
         del gen
         plan = []
-        for (vt, vu, case), lst in groups.items():
-            tt = np.array([c[0] for c in lst])
-            uu = np.array([c[1] for c in lst])
-            ids = np.array([need[(t, u)] for (t, u, fl) in lst], np.int64)
-            g_ = LU.group[ids]
+        if len(CT):
             shp = np.array(LU.shapes, np.int64).reshape(-1, 2)
             base = np.array([d.data.ptr for d in SU.data], np.int64)
-            ptr = base[g_] + 8 * LU.slot[ids] * shp[g_, 0] * shp[g_, 1]
-            S = gather2d(cp.asarray(ptr), cp.asarray(shp[g_, 1].astype(np.int32)),
-                         cp.asarray(nv[tt].astype(np.int32)), cp.asarray(nv[uu].astype(np.int32)), vt, vu)
-            plan.append(dict(vt=vt, vu=vu, case=case, S=S,
-                             st=cp.asarray(bslot[tt]), su=cp.asarray(bslot[uu]),
-                             w=cp.asarray(np.array([c[2] for c in lst]))))
+            gk = (Vp[CT] * 4096 + Vp[CU]) * 8 + CC
+            order = np.argsort(gk, kind='stable')
+            ukeys, starts = np.unique(gk[order], return_index=True)
+            ends = np.append(starts[1:], len(order))
+            for k0, k1 in zip(starts, ends):
+                mem = order[k0:k1]
+                tt, uu = CT[mem], CU[mem]
+                vt, vu, case = int(Vp[tt[0]]), int(Vp[uu[0]]), int(CC[mem[0]])
+                ids = sid[mem]
+                g_ = LU.group[ids]
+                ptr = base[g_] + 8 * LU.slot[ids] * shp[g_, 0] * shp[g_, 1]
+                S = gather2d(cp.asarray(ptr), cp.asarray(shp[g_, 1].astype(np.int32)),
+                             cp.asarray(nv[tt].astype(np.int32)), cp.asarray(nv[uu].astype(np.int32)), vt, vu)
+                plan.append(dict(vt=vt, vu=vu, case=case, S=S,
+                                 st=cp.asarray(bslot[tt]), su=cp.asarray(bslot[uu]), w=cp.asarray(CF[mem])))
         e_old = np.zeros(ntrip)
         e_prev = 0.
         ax = lambda c: (0,) + tuple(a + 1 for a in _CASES[c])
