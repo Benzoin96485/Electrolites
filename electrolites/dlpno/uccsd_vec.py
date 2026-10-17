@@ -706,6 +706,20 @@ class UCCSDGPUv(UCCSDGPU):
             t_[col] = [mp[s][i] for i, s in zip(t_[col], spins)]
         self.Sreg = new
 
+    def _kl_tables_dev(self, dev):
+        """(LXk, Xk, MXk) on device ``dev`` (built once per device)."""
+        c = self.__dict__.setdefault('_klt', {})
+        if dev not in c:
+            keep = (getattr(self, 'LXk', None), getattr(self, 'Xk', None), getattr(self, 'MXk', None))
+            if keep[1] and keep[1][0].data and keep[1][0].data[0].device.id == dev:
+                c[dev] = keep
+            else:
+                with cp.cuda.Device(dev):
+                    self._kl_tables()
+                    c[dev] = (self.LXk, self.Xk, self.MXk)
+                self.LXk, self.Xk, self.MXk = keep
+        return c[dev]
+
     def _kl_tables(self):
         """pair virtual coefficients over all PAOs (beta: + SOMO rows), and the
         same multiplied by the PAO (+SOMO) metric, as Raggeds per spin."""
@@ -788,7 +802,14 @@ class UCCSDGPUv(UCCSDGPU):
                 keep = False
         if ws is None:
             ws = cp.empty(max(need, 1))
-        gens = self._gens_on(dev) if (dev != home or getattr(self, '_ovgens', None) is not None) else None
+        # S(kl, c) of the chunks from the full-PAO coefficient tables of this
+        # device (one variable-size GEMM per spin; much cheaper than the
+        # union-domain generator for these many small couples)
+        from electrolites.dlpno import mgpu
+        if len(mgpu.devices()) > 1 or getattr(self, '_ovgens', None) is None:
+            gens, ktab = None, self._kl_tables_dev(dev)
+        else:                   # one GPU, overlaps on the fly: no full-PAO tables
+            gens, ktab = self._gens_on(dev), None
         base = 0
         for d, sz in zip(chunks, sizes):
             off = base if keep else 0
@@ -810,9 +831,10 @@ class UCCSDGPUv(UCCSDGPU):
                             for s, (kl, cl, lay, cu) in enumerate(d['cpl'])]
                 d['gens'] = gens
             else:
-                d['gen'] = [VChainPlan(lay, np.arange(len(kl)), [op(self.LXk[s], kl, True), op(self.LXk[s], cu)])
+                d['gen'] = [VChainPlan(lay, np.arange(len(kl)), [op(ktab[0][s], kl, True), op(ktab[0][s], cu)])
                             for s, (kl, cl, lay, cu) in enumerate(d['cpl'])]
                 d['gens'] = None
+                d['ktab'] = ktab
             d['ws'] = ws[off - sz if keep else 0:off]
         self.__dict__.setdefault('_sws', {})[dev] = ws
 
@@ -830,7 +852,8 @@ class UCCSDGPUv(UCCSDGPU):
                 for P in ch['gen'][s]:
                     ch['gens'][s].run(P, ch['Sc'][s])
             else:
-                ch['gen'][s].run(ch['Sc'][s], [self.Xk[s], self.MXk[s]])
+                kt = ch.get('ktab') or (self.LXk, self.Xk, self.MXk)
+                ch['gen'][s].run(ch['Sc'][s], [kt[1][s], kt[2][s]])
         return ch['Sc']
 
     def _df_groups(self):
