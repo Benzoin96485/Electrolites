@@ -51,6 +51,7 @@ def overlaps_chunked(S_pao_d, pao, Xp, cp_, cq_, LS, Xs=None, max_bytes=1 << 29)
     # home device gathers them into the result by pointer (peer reads)
     from electrolites.dlpno.gather import gather2d
     nv = np.array([x.shape[1] for x in X], np.int64)
+    devs = [d for d in devs if d != home]          # the home device only receives
     parts = np.array_split(np.arange(len(cp_)), len(devs))
     ptr = np.zeros(len(cp_), np.int64)
     ld = np.zeros(len(cp_), np.int32)
