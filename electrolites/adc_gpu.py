@@ -258,6 +258,11 @@ def _davidson(matvec, x0, diag, nroots, tol, tol_residual, max_cycle,
 
 
 def _es_kernel(es, nroots, guess, eris):
+    from electrolites.eom_gpu import _on_pool
+    return _on_pool(_es_kernel_impl)(es, nroots, guess, eris)
+
+
+def _es_kernel_impl(es, nroots, guess, eris):
     """``radc.kernel`` with the device Davidson (PySCF's host Davidson on
     o^2 v^2 vectors was 95 % of an ADC(2)-EE run)."""
     from pyscf.data.nist import HARTREE2EV

@@ -2716,3 +2716,41 @@ from the RDMs reproduces the CCSD energy to 5e-10 Eh.  The earlier EOM,
 The triplet and spin-flip sigma run PySCF's per-vector functions (no
 batching over a Davidson step), so they take 1.0–2.7x the batched singlet's
 time on the same system.
+
+### 17.10 A speed-up pass on the CC response code
+
+A profile of the triplet and spin-flip EOM-EE (alanine dipeptide) split
+the time three ways, and each got a fix that applies to every CC response
+path here (EOM IP/EA/EE, Λ, RDMs, and the ADC Davidson):
+
+1. **GPU4PySCF's allocator** sends every request above 100 MB to
+   cudaMalloc/cudaFree, which synchronise; the o²v² arrays of these
+   methods are 80–400 MB, so a third of the triplet run was `_malloc`.
+   The kernels now run on CuPy's memory pool (`_on_pool`).
+2. **The vvvv ladder in the MO basis.**  With the MO (ac|bd) on the device
+   -- built once per CCSD object when v⁴ doubles fit in a sixth of the
+   free memory, otherwise (or on an out-of-memory) the AO-direct ladder
+   as before -- the ladder is one GEMM over v⁴ instead of the AO
+   contraction over nao⁴ (v = 176 against nao = 200 at alanine dipeptide).
+3. **Batched ladders for the per-vector triplet/spin-flip functions**: the
+   ladder inputs of all trial vectors of a Davidson step are built first
+   and contracted in one call, then handed to PySCF's per-vector sigma
+   functions in the order they ask for them.  (On its own this changed
+   little -- the AO ladder was GEMM-bound, not launch-bound -- but it is
+   what lets the MO GEMM see thousands of columns.)
+
+The Davidson subspace is also capped by free device memory (ferrocene
+triplet: the first try of the MO path ran out of memory there).
+
+| GPU time, 4 roots | alanine dipeptide/SVP | glycine/TZVP | ferrocene/SVP |
+|---|---|---|---|
+| EOM-EE singlet | 34.9 → **17.6 s** (118x CPU) | 21.1 → **12.7 s** (49x) | 99.9 → **62.8 s** (> 52x) |
+| EOM-EE triplet | 62.6 → **25.1 s** (73x) | 22.0 → **10.9 s** (62x) | 171 → **107 s** |
+| EOM-EE spin-flip | 93.5 → **34.8 s** (74x) | 28.7 → **12.7 s** (59x) | 200 → **146 s** |
+| EOM-EA | 10.7 → **10.4 s** (39x) | 20.1 → **11.2 s** (19x) | 41.7 → **31.8 s** (11x) |
+| Λ | 5.4 → **3.8 s** (43x) | 7.8 → **4.4 s** (21x) | 27.3 → **23.5 s** (14x) |
+| CCSD 2-RDM | 2.5 s | 1.8 s | 5.1 → **2.3 s** (128x) |
+
+All CC/EOM/ADC tests pass unchanged.  Note that the MO (ac|bd) stays on
+the CCSD object (`mycc._eom_vvvv`, v⁴ doubles) for later EOM/Λ calls;
+`del mycc._eom_vvvv` frees it.

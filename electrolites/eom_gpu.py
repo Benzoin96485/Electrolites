@@ -36,6 +36,20 @@ from pyscf.lib import logger
 _ein = cp.einsum
 
 
+def _on_pool(fn):
+    """Run ``fn`` on CuPy's memory pool.  GPU4PySCF's allocator sends every
+    request above 100 MB to cudaMalloc/cudaFree, which synchronise: o^2 v^2
+    arrays at alanine dipeptide are ~80-160 MB, and in the per-vector EOM-EE
+    sigma functions those calls were a third of the run."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with cp.cuda.using_allocator(cp.get_default_memory_pool().malloc):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
 class _Imds:
     """Device integrals, amplitudes and intermediates."""
 
@@ -218,6 +232,7 @@ def _make_ea(imds, mycc):
         - _ein('lbaa,lb->ab', ovvv, t1) - _ein('kabb,ka->ab', ovvv, t1)
     vhf = _ladder_setup(mycc)
     imds.orbv_s = vhf.coeff @ orbv
+    _vvvv_mo(mycc, nv)
     return imds
 
 
@@ -321,6 +336,60 @@ def _ladder(mycc, x2):
     return Ht2ao
 
 
+def _vvvv_mo(mycc, nv):
+    """(ac|bd) as a (v^2, v^2) matrix [(a,b), (c,d)] on the device, or None
+    when it would take more than a third of the free device memory."""
+    from electrolites import fastmp2
+    from electrolites.fastccsd import _avail
+    key = getattr(mycc, '_eom_vvvv', None)
+    if key is not None and key[0] == nv:
+        return key[1]
+    if getattr(mycc, '_eom_ao_ladder', False):
+        return None
+    # the array, its transposed build copy and the integral workspace; the
+    # rest of the device stays for the sigma intermediates and the Davidson
+    if nv ** 4 * 8 * 3 > _avail() / 2:
+        mycc._eom_ao_ladder = True
+        return None
+    mask = mycc.get_frozen_mask()
+    mo = cp.asarray(mycc.mo_coeff)[:, cp.asarray(mask)]
+    orbv = mo[:, mo.shape[1] - nv:]
+    try:
+        v = cp.asarray(fastmp2.get_int4c2e_ovpq(mycc.mol, orbv, orbv, orbv,
+                                                orbv))        # (ac|bd)[acbd]
+        W = cp.ascontiguousarray(v.transpose(0, 2, 1, 3)).reshape(nv * nv,
+                                                                  -1)
+    except (cp.cuda.memory.OutOfMemoryError, RuntimeError):
+        v = W = None
+        cp.get_default_memory_pool().free_all_blocks()
+        mycc._eom_ao_ladder = True
+        return None
+    v = None
+    mycc._eom_vvvv = (nv, W)
+    return W
+
+
+def _ladder_mo(mycc, ov, x):
+    """y[m,a,b] = sum_cd (ac|bd) x[m,c,d] for MO matrices x (m, v, v).
+
+    With the MO (ac|bd) on the device (v^4 doubles, kept on ``mycc`` when
+    they fit in a third of the free memory) this is one GEMM over v^4
+    instead of the AO-direct contraction over nao^4 (alanine dipeptide:
+    v = 176 against nao = 200, 1.7x fewer flops, no integral-block loop);
+    otherwise the AO-direct ladder through ``fastccsd``'s blocks."""
+    nv = x.shape[-1]
+    if not len(x):
+        return cp.zeros_like(x)
+    W = None if getattr(mycc, '_eom_ao_ladder', False) else \
+        _vvvv_mo(mycc, nv)
+    if W is not None:
+        return (x.reshape(len(x), -1) @ W).reshape(x.shape)
+    X = _ein('pe,mef,qf->mpq', ov, x, ov)
+    Y = _ladder(mycc, X)
+    X = None
+    return _ein('pa,mpq,qb->mab', ov, Y, ov)
+
+
 def _ip_sigma(imds, r1, r2):
     """ipccsd_matvec (partition None) for a batch: r1 (n, o), r2 (n, o, o, v)."""
     Hr1 = -_ein('ki,nk->ni', imds.Loo, r1)
@@ -381,11 +450,8 @@ def _ea_sigma(imds, mycc, r1, r2):
     Hr2 -= _ein('lbcj,nlca->njab', imds.Wovvo, r2)
     # sum_cd Wvvvv[abcd] r2[jcd]
     ov = imds.orbv_s
-    x = _ein('pc,mcd,qd->mpq', ov, r2.reshape(n * no, nv, nv), ov)
-    y = _ladder(mycc, x)
-    x = None
-    Hr2 += _ein('pa,mpq,qb->mab', ov, y, ov).reshape(n, no, nv, nv)
-    y = None
+    Hr2 += _ladder_mo(mycc, ov, r2.reshape(n * no, nv, nv)).reshape(
+        n, no, nv, nv)
     g = _ein('kcld,njcd->njkl', imds.ovov, r2)
     Hr2 += _ein('njkl,klab->njab', g, imds.tau)
     g = _ein('ldac,njcd->njal', imds.ovvv, r2)
@@ -418,6 +484,10 @@ def _ea_diag(imds):
 class EOMEA(eom_rccsd.EOMEA):
     """PySCF's EOM-EA-CCSD with the integrals, intermediates and sigma
     vectors on the device and no v^4 array."""
+
+    @_on_pool
+    def kernel(self, *args, **kwargs):
+        return eom_rccsd.EOMEA.kernel(self, *args, **kwargs)
 
     def make_imds(self, eris=None):
         if self.partition is not None:
@@ -462,6 +532,10 @@ class EOMEA(eom_rccsd.EOMEA):
 class EOMIP(eom_rccsd.EOMIP):
     """PySCF's EOM-IP-CCSD with the integrals, intermediates and sigma
     vectors on the device."""
+
+    @_on_pool
+    def kernel(self, *args, **kwargs):
+        return eom_rccsd.EOMIP.kernel(self, *args, **kwargs)
 
     def __init__(self, cc):
         eom_rccsd.EOMIP.__init__(self, cc)
@@ -609,6 +683,7 @@ def _make_ee(imds, mycc):
     mo = cp.asarray(mycc.mo_coeff)[:, cp.asarray(mask)]
     imds.orbv = mo[:, no:]
     imds.orbv_s = _ladder_setup(mycc).coeff @ imds.orbv
+    _vvvv_mo(mycc, imds.nvir)
     return imds
 
 
@@ -621,11 +696,7 @@ def _ladder_pairsym(mycc, ov, x):
     x = x.reshape((-1, no, no, nv, nv))
     i, j = cp.tril_indices(no)
     xt = x[:, i, j]                                     # (n, npair, v, v)
-    X = _ein('pe,mef,qf->mpq', ov, xt.reshape(-1, nv, nv), ov)
-    Y = _ladder(mycc, X)
-    X = None
-    y = _ein('pa,mpq,qb->mab', ov, Y, ov).reshape(xt.shape)
-    Y = None
+    y = _ladder_mo(mycc, ov, xt.reshape(-1, nv, nv)).reshape(xt.shape)
     out = cp.empty_like(x)
     out[:, i, j] = y
     out[:, j, i] = y.transpose(0, 1, 3, 2)
@@ -761,6 +832,11 @@ def _davidson_nosym(matvec, x0, diag, nroots, tol, tol_residual, max_cycle,
         return out
 
     nwant = len(x0)
+    from electrolites.fastccsd import _avail
+    room = int(.4 * _avail() // (2 * 8 * x0.shape[1]))
+    if room < max_space:
+        log.warn('EOM Davidson: subspace capped at %d vectors (memory)', room)
+        max_space = max(room, 2 * nwant)
     V = cp.stack(orth(list(x0), None))
     AV = matvec(V)
     e_last = None
@@ -847,6 +923,7 @@ class EOMEESinglet(eom_rccsd.EOMEESinglet):
             imds = self.make_imds()
         return self.gen_matvec(imds, diag=np.zeros(1))[0]([vector])[0]
 
+    @_on_pool
     def kernel(self, nroots=1, koopmans=False, guess=None, eris=None,
                imds=None, diag=None):
         log = logger.new_logger(self)
@@ -934,15 +1011,10 @@ def _ladder_sym(mycc, ov, x, t2sym=None):
     (x[j,i] = -x[i,j]) go through the i >= j pairs only."""
     no, nv = x.shape[0], x.shape[-1]
     if t2sym not in ('jiba', '-jiba', '-jiab'):
-        X = _ein('pe,mef,qf->mpq', ov, x.reshape(-1, nv, nv), ov)
-        Y = _ladder(mycc, X)
-        return _ein('pa,mpq,qb->mab', ov, Y, ov).reshape(x.shape)
+        return _ladder_mo(mycc, ov, x.reshape(-1, nv, nv)).reshape(x.shape)
     i, j = cp.tril_indices(no)
     xt = x[i, j]
-    X = _ein('pe,mef,qf->mpq', ov, xt, ov)
-    Y = _ladder(mycc, X)
-    X = None
-    y = _ein('pa,mpq,qb->mab', ov, Y, ov)
+    y = _ladder_mo(mycc, ov, xt)
     out = cp.empty_like(x)
     out[i, j] = y
     if t2sym == 'jiba':
@@ -954,16 +1026,74 @@ def _ladder_sym(mycc, ov, x, t2sym=None):
     return out
 
 
+def _ladder_many(mycc, ov, items):
+    """``_ladder_sym`` for a list of (x, t2sym) in one AO-direct pass: the
+    matrices of every item (i >= j pairs for the symmetric ones) are
+    contracted together, so the integral-block GEMMs see thousands of
+    columns instead of one vector's."""
+    no, nv = items[0][0].shape[0], items[0][0].shape[-1]
+    i, j = cp.tril_indices(no)
+    mats, plan = [], []
+    for x, sym in items:
+        xs = x[i, j] if sym in ('jiba', '-jiba', '-jiab') else \
+            x.reshape(-1, nv, nv)
+        plan.append((len(xs), sym))
+        mats.append(xs)
+    y = _ladder_mo(mycc, ov, cp.concatenate(mats))
+    mats = None
+    out, p0 = [], 0
+    for (x, sym), (n, _) in zip(items, plan):
+        yy = y[p0:p0 + n]
+        p0 += n
+        if sym not in ('jiba', '-jiba', '-jiab'):
+            out.append(yy.reshape(x.shape))
+            continue
+        o = cp.empty_like(x)
+        o[i, j] = yy
+        if sym == 'jiba':
+            o[j, i] = yy.transpose(0, 2, 1)
+        elif sym == '-jiba':
+            o[j, i] = -yy.transpose(0, 2, 1)
+        else:
+            o[j, i] = -yy
+        out.append(o)
+    return out
+
+
 class _CCShim:
-    """What the transplanted EOM functions read from ``eom._cc``."""
+    """What the transplanted EOM functions read from ``eom._cc``.  With
+    ``pending`` set (a list of ladders computed for the whole Davidson
+    batch beforehand, in the order the sigma function asks for them) the
+    ladder is popped instead of computed."""
 
     def __init__(self, mycc, imds):
         self.mycc, self.imds = mycc, imds
+        self.pending = None
 
     def _add_vvvv(self, t1, t2, eris, out=None, with_ovvv=False,
                   t2sym=None):
         assert t1 is None and not with_ovvv
+        if self.pending:
+            return self.pending.pop(0)
         return _ladder_sym(self.mycc, self.imds.orbv_s, t2, t2sym)
+
+
+def _ee_taus(kind, r1, r2, t1):
+    """The ladder inputs of eeccsd_matvec_triplet / _sf, as those functions
+    build them, with their t2sym, in their call order."""
+    rt = _ein('ia,jb->ijab', r1, t1)
+    if kind == 'triplet':
+        r2aa, r2ab = r2
+        aa = rt - _ein('ia,jb->jiab', r1, t1)
+        aa = aa - aa.transpose(0, 1, 3, 2) + r2aa
+        ab = rt - _ein('ia,jb->ijab', t1, r1) + r2ab
+        return [(aa, 'jiba'), (ab, '-jiba')]
+    baaa, aaba = r2
+    b = rt + baaa * .5
+    b = b - b.transpose(0, 1, 3, 2)
+    a = rt + aaba * .5
+    a = a - a.transpose(1, 0, 2, 3)
+    return [(a, '-jiab'), (b, None)]
 
 
 class _ERIShim:
@@ -1100,8 +1230,24 @@ class _EEOtherBase:
         f = (_eomt().eeccsd_matvec_triplet if self._kind == 'triplet'
              else _eomt().eeccsd_matvec_sf)
 
+        cc = shim._cc
+
         def matvec(V):
-            return cp.stack([f(shim, v.copy(), imds) for v in V])
+            out = []
+            for p0 in range(0, len(V), _EE_BLK):
+                vs = [v.copy() for v in V[p0:p0 + _EE_BLK]]
+                items = []
+                for v in vs:
+                    r1, r2 = shim.vector_to_amplitudes(v, shim.nmo,
+                                                       shim.nocc)
+                    items += _ee_taus(self._kind, r1, r2, imds.t1)
+                lad = _ladder_many(self._cc, imds.orbv_s, items)
+                items = None
+                for k, v in enumerate(vs):
+                    cc.pending = lad[2 * k:2 * k + 2]
+                    out.append(f(shim, v, imds))
+                cc.pending = None
+            return cp.stack(out)
         return matvec
 
     def gen_matvec(self, imds=None, diag=None, **kwargs):
@@ -1121,6 +1267,7 @@ class _EEOtherBase:
         return cp.asnumpy(self._sigma_fn(imds)(
             cp.asarray(np.asarray(vector))[None])[0])
 
+    @_on_pool
     def kernel(self, nroots=1, koopmans=False, guess=None, eris=None,
                imds=None, diag=None):
         log = logger.new_logger(self)
@@ -1218,11 +1365,8 @@ def _lea_sigma(imds, mycc, r1, r2):
     # sum_ab r[l,a,b] Wvvvv[a,b,c,d]: the ladder ((ac|bd) = (ca|db)) and
     # the tau / t1 pieces of Wvvvv
     ov = imds.orbv_s
-    x = _ein('pc,mcd,qd->mpq', ov, r2.reshape(n * no, nv, nv), ov)
-    y = _ladder(mycc, x)
-    x = None
-    Hr2 += _ein('pa,mpq,qb->mab', ov, y, ov).reshape(n, no, nv, nv)
-    y = None
+    Hr2 += _ladder_mo(mycc, ov, r2.reshape(n * no, nv, nv)).reshape(
+        n, no, nv, nv)
     g = _ein('nlab,kmab->nlkm', r2, imds.tau)
     Hr2 += _ein('nlkm,kcmd->nlcd', g, imds.ovov)
     u = _ein('nlab,mb->nlam', r2, t1)

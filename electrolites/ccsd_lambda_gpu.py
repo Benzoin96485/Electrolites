@@ -223,7 +223,18 @@ def update_lambda(imds, mycc, l1, l2):
     return l1new, l2new
 
 
-def kernel(mycc, t1=None, t2=None, l1=None, l2=None, max_cycle=50,
+def _kernel_on_pool(*args, **kwargs):
+    from electrolites.eom_gpu import _on_pool
+    return _on_pool(_kernel)(*args, **kwargs)
+
+
+def kernel(*args, **kwargs):
+    """Solve the Λ equations; returns (converged, l1, l2) as host arrays
+    (and sets ``mycc.l1``, ``mycc.l2``)."""
+    return _kernel_on_pool(*args, **kwargs)
+
+
+def _kernel(mycc, t1=None, t2=None, l1=None, l2=None, max_cycle=50,
            tol=1e-8, verbose=None):
     """Solve the Λ equations; returns (converged, l1, l2) as host arrays
     (and sets ``mycc.l1``, ``mycc.l2``)."""

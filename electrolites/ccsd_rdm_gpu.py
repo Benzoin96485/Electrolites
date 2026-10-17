@@ -58,7 +58,17 @@ def _embed(mycc, dm, nfull_occ, ndim, with_mf):
     return out
 
 
-def make_rdm1(mycc, t1=None, t2=None, l1=None, l2=None, ao_repr=False,
+def make_rdm1(*args, **kwargs):
+    from electrolites.eom_gpu import _on_pool
+    return _on_pool(_make_rdm1)(*args, **kwargs)
+
+
+def make_rdm2(*args, **kwargs):
+    from electrolites.eom_gpu import _on_pool
+    return _on_pool(_make_rdm2)(*args, **kwargs)
+
+
+def _make_rdm1(mycc, t1=None, t2=None, l1=None, l2=None, ao_repr=False,
               with_frozen=True, with_mf=True):
     """Spin-traced CCSD 1-RDM (PySCF ``ccsd_rdm.make_rdm1``), device."""
     m = _mod()
@@ -73,7 +83,7 @@ def make_rdm1(mycc, t1=None, t2=None, l1=None, l2=None, ao_repr=False,
     return dm1
 
 
-def make_rdm2(mycc, t1=None, t2=None, l1=None, l2=None, ao_repr=False,
+def _make_rdm2(mycc, t1=None, t2=None, l1=None, l2=None, ao_repr=False,
               with_frozen=True, with_dm1=True):
     """Spin-traced CCSD 2-RDM (PySCF ``ccsd_rdm.make_rdm2``), device."""
     m = _mod()
