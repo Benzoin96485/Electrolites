@@ -16,6 +16,8 @@ per-pair Python loops by batched device work:
 Every quantity is the one ``UCCSDGPU.residuals`` computes (validated to
 round-off by ``test_uccsd_vec``).
 """
+import os
+
 import numpy as np
 import cupy as cp
 import cupyx
@@ -747,14 +749,22 @@ class UCCSDGPUv(UCCSDGPU):
                 self._S_workspace_dev(dev, [d for d in self.klchunks if d.get('dev', home) == dev], home)
 
     def _S_workspace_dev(self, dev, chunks, home):
-        need = 0
-        for d in chunks:
-            need = max(need, sum(sum(len(m) * r * c for m, (r, c) in zip(c_[2].members, c_[2].shapes))
-                                 for c_ in d['cpl']))
-        ws = cp.empty(max(need, 1))
+        sizes = [sum(sum(len(m) * r * c for m, (r, c) in zip(c_[2].members, c_[2].shapes))
+                     for c_ in d['cpl']) for d in chunks]
+        need = max(sizes) if sizes else 0
+        # the S(kl, c) are fixed: when all chunks of this device fit (40% of
+        # its free memory) each chunk keeps its own, generated once
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        keep = 8. * sum(sizes) < 0.4 * free and os.environ.get('DLPNO_KL_KEEP', '1') == '1'
+        ws = cp.empty(max(sum(sizes) if keep else need, 1))
         gens = self._gens_on(dev) if (dev != home or getattr(self, '_ovgens', None) is not None) else None
-        for d in chunks:
-            off = 0
+        base = 0
+        for d, sz in zip(chunks, sizes):
+            off = base if keep else 0
+            if keep:
+                base += sz
+            d['S_keep'] = keep
+            d['S_done'] = False
             rags = []
             for kl, cl, lay, cu in d['cpl']:
                 data = []
@@ -772,7 +782,7 @@ class UCCSDGPUv(UCCSDGPU):
                 d['gen'] = [VChainPlan(lay, np.arange(len(kl)), [op(self.LXk[s], kl, True), op(self.LXk[s], cu)])
                             for s, (kl, cl, lay, cu) in enumerate(d['cpl'])]
                 d['gens'] = None
-            d['ws'] = ws[:off]
+            d['ws'] = ws[off - sz if keep else 0:off]
         self.__dict__.setdefault('_sws', {})[dev] = ws
 
     def _gen_S(self, ch):
@@ -780,6 +790,9 @@ class UCCSDGPUv(UCCSDGPU):
         (+SOMO) rows, one variable-size batched GEMM per spin."""
         if 'Sc' not in ch:
             self._S_workspace()
+        if ch.get('S_keep') and ch.get('S_done'):
+            return ch['Sc']
+        ch['S_done'] = True
         ch['ws'].fill(0.)
         for s in (0, 1):
             if ch.get('gens') is not None:
