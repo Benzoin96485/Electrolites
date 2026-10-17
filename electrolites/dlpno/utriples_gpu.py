@@ -305,7 +305,7 @@ class UTriplesGPU:
         Vm = max(Va, Vb)
         per = 8 * (2 * A * A + 14 * A * Vm + 18 * Vm ** 3
                    + 8 * L * Vm * Vm + 2 * nbf * Vm + 4 * A * Pv
-                   + 4 * L * self._pt["PP"] * Vm)
+                   + 8 * L * self._pt["PP"] * Vm)
         sub = max(1, int(self._chunk_bytes() // per))
         for s0 in range(0, len(ch), sub):
             sl = slice(s0, s0 + sub)
@@ -471,8 +471,15 @@ class UTriplesGPU:
                 signs = np.where(ok, sg, 0.)
                 items = np.where(ok, items, 0)
                 pp = pl.ij[lm3[:, rB], lm3[:, rC]]
-                S1 = self._proj(Zt, s1, gsb, pp)                       # (n, VP1, V1)
-                S2 = self._proj(Zt, s2, gsb, pp)
+
+                def pproj(sp_):
+                    # (B, C) and (C, B) share their PNO space: one projection per spin
+                    kp = ('Q', min(rB, rC), max(rB, rC), sp_)
+                    if kp not in cache:
+                        cache[kp] = self._proj(Zt, sp_, gsb, pp)
+                    return cache[kp]
+                S1 = pproj(s1)                                          # (n, VP1, V1)
+                S2 = pproj(s2)
                 Tm = pt['TS'][cp.asarray(items)][:, :S1.shape[1], :S2.shape[1]]
                 v = cp.matmul(tr(S1), cp.matmul(Tm, S2)) * cp.asarray(signs)[:, None, None]
                 cache[key] = v
@@ -502,10 +509,17 @@ class UTriplesGPU:
                     return None
                 signs = np.where(ok, sg, 0.)
                 items = np.where(ok, items, 0)
-                pil = np.where(ok, pl.ij[lm3[:, rA][:, None], lmo_l], 0)
+                pil = np.where(lmk[sb] > 0, pl.ij[lm3[:, rA][:, None], lmo_l], 0)
                 bb = np.repeat(sb, L)
-                S1 = self._proj(Zt, s1, bb, pil.reshape(-1))
-                S2 = self._proj(Zt, s2, bb, pil.reshape(-1))
+
+                def lproj(sp_):
+                    # projections onto the (A, l) pairs depend on A and the spin only
+                    kp = ('P', rA, sp_)
+                    if kp not in cache:
+                        cache[kp] = self._proj(Zt, sp_, bb, pil.reshape(-1))
+                    return cache[kp]
+                S1 = lproj(s1)
+                S2 = lproj(s2)
                 Tm = pt['TS'][cp.asarray(items.reshape(-1))][:, :S1.shape[1], :S2.shape[1]]
                 v = cp.matmul(tr(S1), cp.matmul(Tm, S2)) * cp.asarray(signs.reshape(-1))[:, None, None]
                 v = v.reshape(n, L, S1.shape[2], S2.shape[2])
