@@ -95,6 +95,24 @@ class DFInts:
         # memory behind a device cache (``qab_get``)
         nab = sum(8. * len(atom_ribfs[a]) * len(ext.paos[a]) ** 2 for a in range(natm)) if need_ab else 0.
         self.qab_host = _decide_qab_host(nab)
+        # several GPUs: rather than pinned host memory, shard the blocks over
+        # the other devices (served by peer copies over NVLink)
+        self._shard = None
+        if ((self.qab_host and os.environ.get('DLPNO_QAB_HOST', 'auto') == 'auto')
+                or os.environ.get('DLPNO_QAB_SHARD') == '1'):
+            from electrolites.dlpno import mgpu
+            devs = mgpu.devices()
+            home = cp.cuda.Device().id
+            others = [d for d in devs if d != home]
+            if others:
+                cap = 0.
+                for d in others:
+                    with cp.cuda.Device(d):
+                        cap += cp.cuda.runtime.memGetInfo()[0]
+                if nab < 0.35 * cap:
+                    mgpu.enable_peer(devs)
+                    self.qab_host = False
+                    self._shard = dict(devs=others, load=np.zeros(len(others)))
         self._cache = {}               # device -> OrderedDict(atom -> block)
         self._cache_bytes = {}
         self.cache_stats = dict(hit=0, miss=0, bytes=0.)
@@ -139,7 +157,16 @@ class DFInts:
                     m = mask_uv[cp.asarray(pa)[:, None], cp.asarray(pa)[None, :]]
                     u *= m[None]
                     del m
-                    self.qab[a] = to_pinned(u) if self.qab_host else u
+                    if self.qab_host:
+                        self.qab[a] = to_pinned(u)
+                    elif self._shard is not None:
+                        sh = self._shard
+                        r = int(np.argmin(sh['load']))
+                        sh['load'][r] += u.nbytes
+                        with cp.cuda.Device(sh['devs'][r]):
+                            self.qab[a] = cp.asarray(u)
+                    else:
+                        self.qab[a] = u
                     del u
                     off += na
             del j3c

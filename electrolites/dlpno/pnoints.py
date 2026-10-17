@@ -90,7 +90,7 @@ class PNOIntsGPU:
                 c._prof.report()
         self._ext = None
         if getattr(self, 'verbose', 0) >= 2:
-            if getattr(self.dfi, 'qab_host', False):
+            if getattr(self.dfi, 'qab_host', False) or getattr(self.dfi, '_shard', None):
                 print('[mem] (Q|uv) cache', self.dfi.cache_stats, flush=True)
             sz = {}
             for name in ('K_mibj', 'J_ijmb', 'K_ivvv', 'J_ikac', 'K_iakc', 'iQk', 'iQa', 'Qma', 'Qab'):
