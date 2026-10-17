@@ -549,6 +549,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         return sp, nvs, Layout(nvs[sp, si], nvs[sp, sj])
 
     def lmp2_iterations(self):
+        t_l0 = time.perf_counter()
         opt, pl = self.opt, self.pl
         G = self._exchange_blocks()
         sop = self.sop
@@ -697,7 +698,9 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         R = Ragged(LT)
         fm = [z.astype(cp.float64)[:, None, None] for z in gm]
         tix = _transpose_index(LT, src, dst)
+        self.log(f'  ULMP2 setup {time.perf_counter() - t_l0:.1f} s')
         for it in range(1, opt['MAXITER'] + 1):
+            t_it = time.perf_counter()
             for g in range(len(R.data)):
                 cp.multiply(D.data[g], T.data[g], out=R.data[g])
                 R.data[g] += Gr.data[g]
@@ -711,7 +714,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             T.set_flat(diis.update(T.flat(), R.flat()))
             e_so = Gr.vdot_items(T) * cp.asarray(.25 * mult)
             e_cur = float(e_so.sum())
-            self.log(f'  GPU ULMP2 iter {it:3d} {e_cur:.12f} {e_cur - e_prev:.3e} {rms:.3e}')
+            self.log(f'  GPU ULMP2 iter {it:3d} {e_cur:.12f} {e_cur - e_prev:.3e} {rms:.3e} '
+                     f'{time.perf_counter() - t_it:.2f}s')
             if abs(e_cur - e_prev) < ec and rms < rc:
                 break
             e_prev = e_cur
