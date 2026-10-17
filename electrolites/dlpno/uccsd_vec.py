@@ -917,7 +917,9 @@ class UCCSDGPUv(UCCSDGPU):
                                  [('Pt', 'pl_', None, False), ('Pt', 'pj', None, True), ('S', 's1', 'a', False),
                                   ('Kx', 'kx', None, tr2), ('S', 's2', 'b', True)]))
         self.p_a1 = SP(lays, self.LT1, self.a1, 'i', [('S', 's', 'a', False), ('V1', 'v', None, False)])
-        if getattr(self, '_ovgens', None) is None:
+        from electrolites.dlpno import mgpu
+        if getattr(self, '_ovgens', None) is None and len(mgpu.devices()) == 1:
+            # (several GPUs: the kl chunks run on the other devices with generators)
             self._kl_tables()
         # several GPUs: the F'_vv / oooo-ladder chunks (S(kl, c) generated per
         # chunk) are spread over the devices
