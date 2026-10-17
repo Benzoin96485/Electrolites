@@ -94,8 +94,8 @@ class OverlapGen:
             p, q = int(pp[c]), int(qq[c])
             new = [r for r in (p, q) if r not in inv]
             if new and sel:
-                add = np.unique(np.concatenate([self.pao[r] for r in new]))
-                nU2 = nU + int((~mask[add]).sum())
+                # (an upper bound if the new pairs' domains overlap)
+                nU2 = nU + sum(int(np.count_nonzero(~mask[self.pao[r]])) for r in new)
                 if 16 * (len(inv) + len(new)) * (nU2 + ne) * Vm > self.max_bytes:
                     out.append((np.array(sel), np.flatnonzero(mask), np.array(sorted(inv))))
                     sel, inv, mask, nU = [], set(), np.zeros(self.nbf, bool), 0
