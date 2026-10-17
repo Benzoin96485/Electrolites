@@ -129,6 +129,18 @@ class _Terms:
 
 def _set_items(rag, items, mats):
     lay = rag.layout
+    items = np.asarray(list(items), np.int64)
+    dev = cp.cuda.Device().id
+    if len(items) > 8 and all(isinstance(M, cp.ndarray) and M.device.id == dev for M in mats):
+        # device items: one copy kernel per layout group
+        from electrolites.dlpno.ragged import _gather_items
+        mats = list(mats)
+        gg = lay.group[items]
+        for g in np.unique(gg):
+            sel = np.where(gg == g)[0]
+            _gather_items(rag.data[g], [mats[k] for k in sel], lay.rows[items[sel]], lay.cols[items[sel]],
+                          slots=lay.slot[items[sel]])
+        return
     for it, M in zip(items, mats):
         g, s = lay.group[it], lay.slot[it]
         M = M.reshape(lay.rows[it], lay.cols[it])

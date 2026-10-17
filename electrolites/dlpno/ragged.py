@@ -35,13 +35,14 @@ _GATHER = r'''
 extern "C" __global__ void gather_items(const long long* __restrict__ srcp, const long long* __restrict__ rs,
                                         const long long* __restrict__ cs, const int* __restrict__ nr,
                                         const int* __restrict__ nc, double* __restrict__ dst,
-                                        const int pr, const int pc)
+                                        const int pr, const int pc, const long long* __restrict__ slots)
 {
     const int s = blockIdx.x;
+    const long long ds = slots ? slots[s] : s;
     const double* src = (const double*)srcp[s];
     const int r = nr[s], c = nc[s];
     const long long a = rs[s], b = cs[s];
-    double* d = dst + (long long)s * pr * pc;
+    double* d = dst + ds * pr * pc;
     for (int e = threadIdx.x; e < r * c; e += blockDim.x) {
         const int i = e / c, j = e % c;
         d[(long long)i * pc + j] = src[i * a + j * b];
@@ -51,7 +52,7 @@ extern "C" __global__ void gather_items(const long long* __restrict__ srcp, cons
 _gk = None
 
 
-def _gather_items(out, items, rows, cols):
+def _gather_items(out, items, rows, cols, slots=None):
     """out[s, :rows[s], :cols[s]] = items[s] (device arrays, any strides; an
     item may be stored flat with rows[s] * cols[s] elements)."""
     global _gk
@@ -71,7 +72,8 @@ def _gather_items(out, items, rows, cols):
     pr, pc = out.shape[1], out.shape[2]
     _gk((n,), (128,), (cp.asarray(ptr), cp.asarray(rs), cp.asarray(cs),
                        cp.asarray(np.asarray(rows, np.int32)), cp.asarray(np.asarray(cols, np.int32)),
-                       out, np.int32(pr), np.int32(pc)))
+                       out, np.int32(pr), np.int32(pc),
+                       cp.asarray(np.asarray(slots, np.int64)) if slots is not None else np.uint64(0)))
     cp.cuda.get_current_stream().synchronize()
 
 
