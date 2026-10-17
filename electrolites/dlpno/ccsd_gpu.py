@@ -26,6 +26,25 @@ else:
     ChainPlan, DotPlan = _ChainPlan, _DotPlan
 
 
+
+# ---- batched contractions as GEMMs (CuPy's einsum takes a slower path) ----
+def _mv(M, v):
+    """'gA...ab,gb->gA...a': M (g, ..., a, b) times per-g vector v (g, b)."""
+    sh = (v.shape[0],) + (1,) * (M.ndim - 3) + (v.shape[1], 1)
+    return cp.matmul(M, v.reshape(sh))[..., 0]
+
+
+def _dot2(M, T):
+    """'gAme,gme->gA'."""
+    g, A = M.shape[:2]
+    return cp.matmul(M.reshape(g, A, -1), T.reshape(g, -1, 1))[..., 0]
+
+
+def _wsum(w, M):
+    """'gA,gA...->g...'."""
+    g, A = M.shape[:2]
+    return cp.matmul(w[:, None, :], M.reshape(g, A, -1)).reshape((g,) + M.shape[2:])
+
 class _ChunkedPlan:
     """A chain (or dot) plan whose PNO-overlap operands (layout ``LS``) are
     generated on the device per chunk of terms (``ovgen``) instead of being
@@ -730,7 +749,7 @@ class CCSDGPU:
         for g, m in enumerate(LP.members):
             if not len(m):
                 continue
-            v = cp.einsum('gcda,gcd->ga', self.K3[g], Tt.data[g])
+            v = _wsum(Tt.data[g].reshape(Tt.data[g].shape[0], -1), self.K3[g].reshape(self.K3[g].shape[0], -1, self.K3[g].shape[3]))
             gv = LV.group[m]
             assert np.all(gv == gv[0])
             V3.data[gv[0]][cp.asarray(LV.slot[m]), :, 0] = v
@@ -782,7 +801,7 @@ class CCSDGPU:
         self.p_g1.run(G, [Tn, self.Jijmb], alpha=-1.)
         for g in range(LP.ngroups):
             if G.data[g].shape[0]:
-                G.data[g] += cp.einsum('gb,gbac->gac', TjP.data[g][:, :, 0], K3[g])
+                G.data[g] += _wsum(TjP.data[g][:, :, 0], K3[g])
         self.p_g3.run(G, [S, T1, T1, S, self.K, S], alpha=-1.)
         self.p_g4.run(G, [S, T, S, self.K, S], alpha=-.5)
         Dl = Ragged(LP)
@@ -792,8 +811,8 @@ class CCSDGPU:
             if Dl.data[g].shape[0]:
                 Kq = K3[g][ps[g]]
                 tiv = TiP.data[g][:, :, 0]
-                Dl.data[g] += 2 * cp.einsum('gcab,gb->gac', Kq, tiv)
-                Dl.data[g] -= cp.einsum('gb,gbac->gac', tiv, Kq)
+                Dl.data[g] += 2 * _mv(Kq, tiv).transpose(0, 2, 1)
+                Dl.data[g] -= _wsum(tiv, Kq)
         self.p_d3.run(Dl, [S, T1, T1, S, self.Lij, S], alpha=-1.)
         self.p_d4.run(Dl, [S, Tt, S, self.Lij, S], alpha=.5)
         Fdd = Fkj.copy()
@@ -850,15 +869,15 @@ class CCSDGPU:
             ar = cp.arange(len(d['p']))
             ti = Tnp[ar, d['ri']]
             tj = Tnq[ar, d['rj']]
-            qk_p = Qk[:, 0] + cp.einsum('gAka,ga->gAk', Qma, ti)
-            qa_p = Qa[:, 0] - cp.matmul(qk_p, Tnp) + cp.einsum('gAab,gb->gAa', Qab, ti)
-            qk_q = Qk[:, 1] + cp.einsum('gAka,ga->gAk', Qma, tj)
-            qa_q = Qa[:, 1] - cp.matmul(qk_q, Tnq) + cp.einsum('gAab,gb->gAa', Qab, tj)
-            gam = cp.einsum('gAme,gme->gA', Qma, Tnp)
+            qk_p = Qk[:, 0] + _mv(Qma, ti)
+            qa_p = Qa[:, 0] - cp.matmul(qk_p, Tnp) + _mv(Qab, ti)
+            qk_q = Qk[:, 1] + _mv(Qma, tj)
+            qa_q = Qa[:, 1] - cp.matmul(qk_q, Tnq) + _mv(Qab, tj)
+            gam = _dot2(Qma, Tnp)
             X = cp.matmul(Qma, Tnp.transpose(0, 2, 1)[:, None])          # gAkm
-            fkc = 2 * cp.einsum('gA,gAkc->gkc', gam, Qma) - cp.matmul(X, Qma).sum(axis=1)
+            fkc = 2 * _wsum(gam, Qma) - cp.matmul(X, Qma).sum(axis=1)
             Y = cp.matmul(Qab, Tnp.transpose(0, 2, 1)[:, None])          # gAam
-            fab = 2 * cp.einsum('gA,gAab->gab', gam, Qab) - cp.matmul(Y, Qma).sum(axis=1)
+            fab = 2 * _wsum(gam, Qab) - cp.matmul(Y, Qma).sum(axis=1)
             ev = d['ev']
             fab = fab + ev[:, :, None] * cp.eye(ev.shape[1])[None]
             Fkc_bar.data[gN][d['sN']] = fkc

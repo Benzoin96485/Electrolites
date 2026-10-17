@@ -22,6 +22,7 @@ import cupyx
 
 from electrolites.dlpno.ragged import Layout, Ragged, padded, op
 from electrolites.dlpno.vbatch import VChainPlan, VDotPlan
+from electrolites.dlpno.ccsd_gpu import _mv, _dot2, _wsum
 from electrolites.dlpno.uccsd_gpu import UCCSDGPU, _SpinPlan, _Terms, _Reg, _set_items, _get
 
 
@@ -1287,15 +1288,15 @@ class UCCSDGPUv(UCCSDGPU):
             for gs, mi, sl, pr, pc in d[('tn', s)]:
                 Tc[s][mi, :pr, :pc] = Tn[s].data[gs][sl]
             Qov[s], Qvv[s] = d[('Qov', s)], d[('Qvv', s)]
-            gam = gam + cp.einsum('gAme,gme->gA', Qov[s], Tc[s])
+            gam = gam + _dot2(Qov[s], Tc[s])
         for s in (0, 1):
             tc = Tc[s][:, None]
             X = mm(Qvv[s], tr(tc))                                       # (g, A, V, R)
-            fbv = cp.einsum('gA,gAab->gab', gam, Qvv[s]) - mm(X, Qov[s]).sum(axis=1)
+            fbv = _wsum(gam, Qvv[s]) - mm(X, Qov[s]).sum(axis=1)
             ev = d[('ev', s)]
             fbv = fbv + ev[:, :, None] * cp.eye(ev.shape[1])[None]
             Y = mm(Qov[s], tr(tc))                                       # (g, A, R, R)
-            fbo = d[('fov', s)] + cp.einsum('gA,gAkc->gkc', gam, Qov[s]) - mm(Y, Qov[s]).sum(axis=1)
+            fbo = d[('fov', s)] + _wsum(gam, Qov[s]) - mm(Y, Qov[s]).sum(axis=1)
             Fbv[s], Fbo[s] = fbv, fbo
             fvv = fbv - mm(tr(Tc[s]), fbo)
             for gs, mi, sl, pr, pc in d[('fv', s)]:
@@ -1309,10 +1310,10 @@ class UCCSDGPUv(UCCSDGPU):
             ar = cp.arange(g)
             for side in (0, 1):
                 tz = Tc[s][ar, zrow[:, side]] * zm[:, side][:, None]       # (g, V)
-                bk = d[('Qmz', s)][:, side] + cp.einsum('gAkc,gc->gAk', Qov[s], tz)
+                bk = d[('Qmz', s)][:, side] + _mv(Qov[s], tz)
                 Bk[(side, s)] = bk
                 Ba[(side, s)] = (d[('Qaz', s)][:, side] - mm(bk, Tc[s])
-                                 + cp.einsum('gAab,gb->gAa', Qvv[s], tz)) * zm[:, side][:, None, None]
+                                 + _mv(Qvv[s], tz)) * zm[:, side][:, None, None]
         # residual DF terms and beta of the strong spin-orbital pairs
         for cid, cb in enumerate(d['combos']):
             si_, a, sj_, b = cb['key']

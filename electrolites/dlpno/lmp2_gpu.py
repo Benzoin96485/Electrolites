@@ -24,65 +24,24 @@ def overlaps_chunked(S_pao_d, pao, Xp, cp_, cq_, LS, Xs=None, max_bytes=1 << 29)
     Memory-lean: couples are processed in chunks (sorted by q); a chunk works
     in the union of its pairs' PAO domains only (plus the extra identity-metric
     rows Xs, e.g. SOMOs), so nothing of size npair x nbf is ever formed."""
-    from electrolites.dlpno.vbatch import VChainPlan
+    from electrolites.dlpno.ovgen import OverlapGen
     cp_ = np.asarray(cp_, np.int64)
     cq_ = np.asarray(cq_, np.int64)
     S = Ragged(LS)
     if len(cp_) == 0:
         return S
-    nbf = S_pao_d.shape[0]
-    ns = 0 if Xs is None else Xs[0].shape[0]
-    nv = np.array([x.shape[1] for x in Xp], np.int64)
-    order = np.argsort(cq_, kind='stable')
-    Vm = int(nv.max())
-
-    def flush(sel, inv):
-        inv = np.array(sorted(inv), np.int64)
-        U = np.unique(np.concatenate([pao[r] for r in inv]))
-        posU = -np.ones(nbf, np.int64)
-        posU[U] = np.arange(len(U))
-        nr = len(U) + ns
-        loc = -np.ones(len(Xp), np.int64)
-        loc[inv] = np.arange(len(inv))
-        LX = Layout(np.full(len(inv), nr), nv[inv])
-        X = Ragged(LX)
-        for g, m in enumerate(LX.members):
-            pr_, pc_ = LX.shapes[g]
-            buf = np.zeros((len(m), pr_, pc_))
-            for s_, r in enumerate(inv[m]):
-                buf[s_, posU[pao[r]], :nv[r]] = Xp[r]
-                if ns:
-                    buf[s_, len(U):nr, :nv[r]] = Xs[r]
-            X.data[g] = cp.asarray(buf)
-        pr = LX.shapes[0][0]
-        M = cp.zeros((pr, pr))
-        gU = cp.asarray(U)
-        M[:len(U), :len(U)] = S_pao_d[gU[:, None], gU[None, :]]
-        if ns:
-            M[len(U):nr, len(U):nr] = cp.eye(ns)
-        W = Ragged(LX, [cp.matmul(M, d) for d in X.data])
-        sel = np.asarray(sel, np.int64)
-        VChainPlan(LS, sel, [op(LX, loc[cp_[sel]], True), op(LX, loc[cq_[sel]])]).run(S, [X, W])
-
-    sel, inv, mask = [], set(), np.zeros(nbf, bool)
-    for c in order:
-        p, q = int(cp_[c]), int(cq_[c])
-        new = [r for r in (p, q) if r not in inv]
-        if new and sel:
-            m2 = mask.copy()
-            for r in new:
-                m2[pao[r]] = True
-            est = 16 * (len(inv) + len(new)) * (int(m2.sum()) + ns) * Vm
-            if est > max_bytes:
-                flush(sel, inv)
-                sel, inv, mask = [], set(), np.zeros(nbf, bool)
-        for r in (p, q):
-            if r not in inv:
-                inv.add(r)
-                mask[pao[r]] = True
-        sel.append(c)
-    if sel:
-        flush(sel, inv)
+    # device generator: compact coefficients scattered into each chunk's
+    # union of PAO domains on the device
+    if Xs is None:
+        X = Xp
+        ne = 0
+    else:
+        h = lambda a: a.get() if hasattr(a, 'get') else np.asarray(a)
+        X = [np.vstack([h(a), h(b)]) for a, b in zip(Xp, Xs)]
+        ne = Xs[0].shape[0]
+    gen = OverlapGen(S_pao_d, pao, X, ne=ne, max_bytes=max_bytes)
+    for P in gen.prepare(cp_, cq_, out_layout=LS, out_idx=np.arange(len(cp_))):
+        gen.run(P, S)
     return S
 
 
