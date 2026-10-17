@@ -29,16 +29,27 @@ else:
 class _ChunkedPlan:
     """A chain (or dot) plan whose PNO-overlap operands (layout ``LS``) are
     generated on the device per chunk of terms (``ovgen``) instead of being
-    stored for every couple."""
+    stored for every couple.
+
+    With several GPUs the chunks are spread over the devices: each device
+    keeps the overlaps of its chunks (as long as its share of ``budget``
+    lasts; beyond that they are regenerated every call), runs its chunks on
+    replicas of the dynamic operands and its partial output is added into
+    the home device's."""
 
     MAX_BYTES = 1 << 29
 
-    def __init__(self, gen, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=None, left=None):
+    def __init__(self, gens, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=None, left=None,
+                 devs=None, budget=None):
         n = len(out_idx) if left is None else len(left[0].idx)
         self.n = self.nterms = n
-        self.gen = gen
+        self.gens = gens if callable(gens) else (lambda d, g=gens: g)
+        self.home = cp.cuda.Device().id
+        devs = devs or [self.home]
+        self.budget = budget
         self.chunks = []
         if n == 0:
+            self.devs = [self.home]
             return
         s_ops = [i for i, o in enumerate(operands) if o.layout is LS]
         self.s_ops = s_ops
@@ -50,52 +61,130 @@ class _ChunkedPlan:
             new = {int(c) for c in cid[t]} - cur
             add = int(sum(byt[c] for c in new))
             if cur and tot + add > self.MAX_BYTES:
-                bounds.append((start, pos))
+                bounds.append((start, pos, tot))
                 start, cur, tot = pos, set(), 0
                 new = {int(c) for c in cid[t]}
                 add = int(sum(byt[c] for c in new))
             cur |= new
             tot += add
-        bounds.append((start, n))
-        for a, b in bounds:
-            sel = order[a:b]
-            uni = np.unique(cid[sel])
-            LSc = Layout(nv[cp_[uni]], nv[cq_[uni]])
-            preps = gen.prepare(cp_[uni], cq_[uni], out_layout=LSc, out_idx=np.arange(len(uni)))
-            ops = []
-            for i, o in enumerate(operands):
-                row = None if o.row is None else o.row[sel]
-                if i in s_ops:
-                    ops.append(op(LSc, np.searchsorted(uni, o.idx[sel]), o.trans, row))
-                else:
-                    ops.append(op(o.layout, o.idx[sel], o.trans, row))
-            if left is None:
-                plan = ChainPlan(out_layout, np.asarray(out_idx)[sel], ops,
-                                 out_row=None if out_row is None else np.asarray(out_row)[sel])
+        bounds.append((start, n, tot))
+        load = np.zeros(len(devs))
+        for a, b, nb in bounds:
+            r = int(np.argmin(load))
+            load[r] += nb + 8 * (b - a)
+            with cp.cuda.Device(devs[r]):
+                self._chunk(order[a:b], cid, nv, cp_, cq_, operands, out_layout, out_idx, out_row, left)
+                self.chunks[-1]['dev'] = devs[r]
+        self.devs = sorted({ch['dev'] for ch in self.chunks})
+
+    def _chunk(self, sel, cid, nv, cp_, cq_, operands, out_layout, out_idx, out_row, left):
+        s_ops = self.s_ops
+        uni = np.unique(cid[sel])
+        LSc = Layout(nv[cp_[uni]], nv[cq_[uni]])
+        gen = self.gens(cp.cuda.Device().id)
+        preps = gen.prepare(cp_[uni], cq_[uni], out_layout=LSc, out_idx=np.arange(len(uni)))
+        ops = []
+        for i, o in enumerate(operands):
+            row = None if o.row is None else o.row[sel]
+            if i in s_ops:
+                ops.append(op(LSc, np.searchsorted(uni, o.idx[sel]), o.trans, row))
             else:
-                lo = left[0]
-                plan = DotPlan([op(lo.layout, lo.idx[sel], lo.trans)], ops)
-            self.chunks.append(dict(sel=cp.asarray(sel), LS=LSc, preps=preps, plan=plan))
+                ops.append(op(o.layout, o.idx[sel], o.trans, row))
+        if left is None:
+            plan = ChainPlan(out_layout, np.asarray(out_idx)[sel], ops,
+                             out_row=None if out_row is None else np.asarray(out_row)[sel])
+        else:
+            lo = left[0]
+            plan = DotPlan([op(lo.layout, lo.idx[sel], lo.trans)], ops)
+        self.chunks.append(dict(sel=cp.asarray(sel), sel_h=sel, LS=LSc, preps=preps, plan=plan, gen=gen))
 
     def _S(self, ch):
+        S = ch.get('S')
+        if S is not None:
+            return S
         S = Ragged(ch['LS'])
         for P in ch['preps']:
-            self.gen.run(P, S)
+            ch['gen'].run(P, S)
+        if self.budget is not None and self.budget.take(ch['dev'], ch['LS'].nbytes()):
+            ch['S'] = S                   # kept: this chunk's overlaps are not regenerated
         return S
 
-    def run(self, out, rags, w=None, alpha=1.):
-        if isinstance(out, list):              # dot plan: run(lrags, rrags)
-            outv = cp.zeros(self.n)
-            for ch in self.chunks:
-                S = self._S(ch)
-                r = [S if i in self.s_ops else x for i, x in enumerate(rags)]
-                outv[ch['sel']] = ch['plan'].run(out, r)
-            return outv
-        for ch in self.chunks:
+    def _run_chunks(self, chunks, out, rags, w, alpha, dot):
+        res = []
+        for ch in chunks:
             S = self._S(ch)
             r = [S if i in self.s_ops else x for i, x in enumerate(rags)]
-            ch['plan'].run(out, r, w=None if w is None else w[ch['sel']], alpha=alpha)
+            if dot:
+                res.append((ch, ch['plan'].run(out, r)))
+            else:
+                ch['plan'].run(out, r, w=None if w is None else w[ch['sel']], alpha=alpha)
+        return res
+
+    def run(self, out, rags, w=None, alpha=1.):
+        dot = isinstance(out, list)            # dot plan: run(lrags, rrags)
+        if self.devs == [self.home] or not self.chunks:
+            if dot:
+                outv = cp.zeros(self.n)
+                for ch, v in self._run_chunks(self.chunks, out, rags, None, alpha, True):
+                    outv[ch['sel']] = v
+                return outv
+            self._run_chunks(self.chunks, out, rags, w, alpha, False)
+            return out
+        from electrolites.dlpno import mgpu
+        parts = {}
+
+        def rep(x):
+            if isinstance(x, Ragged):
+                if getattr(x, '_static', False):
+                    # fixed integrals: replicated once per device
+                    c = x.__dict__.setdefault('_replicas', {})
+                    d = cp.cuda.Device().id
+                    if d not in c:
+                        c[d] = Ragged(x.layout, mgpu.replicate(x.data))
+                    return c[d]
+                return Ragged(x.layout, mgpu.replicate(x.data))
+            return x
+
+        def work(dv):
+            chs = [ch for ch in self.chunks if ch['dev'] == dv]
+            if dv == self.home:
+                parts[dv] = (self._run_chunks(chs, out, rags, w, alpha, dot), None)
+                return
+            rr = [None if i in self.s_ops else rep(x) for i, x in enumerate(rags)]
+            if dot:
+                parts[dv] = (self._run_chunks(chs, [rep(x) for x in out], rr, None, alpha, True), None)
+                return
+            o = Ragged(out.layout)
+            parts[dv] = (self._run_chunks(chs, o, rr, None if w is None else mgpu.replicate(w), alpha, False), o)
+        mgpu.run_per_device(work, self.devs)
+        if dot:
+            outv = cp.zeros(self.n)
+            for res, _ in parts.values():
+                for ch, v in res:
+                    outv[cp.asarray(ch['sel_h'])] = cp.asarray(v)
+            return outv
+        for dv, (_, o) in parts.items():
+            if o is not None:
+                for g in range(len(out.data)):
+                    if out.data[g].size:
+                        out.data[g] += cp.asarray(o.data[g])
         return out
+
+
+class _SBudget:
+    """bytes of generated overlaps each device may keep (thread safe)."""
+
+    def __init__(self, per_dev):
+        import threading
+        self.left = dict(per_dev)
+        self.lock = threading.Lock()
+
+    def take(self, dev, nb):
+        with self.lock:
+            if self.left.get(dev, 0) >= nb:
+                self.left[dev] -= nb
+                return True
+            return False
 
 
 class _Couples:
@@ -285,18 +374,36 @@ class CCSDGPU:
         cp_, cq_ = np.array(C.p, np.int64), np.array(C.q, np.int64)
         LS = self.LS = Layout(nv[cp_], nv[cq_])
         mode = os.environ.get('DLPNO_ONFLY_S', 'auto')
+        from electrolites.dlpno import mgpu
+        devs = mgpu.devices()
+        home = cp.cuda.Device().id
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         if mode == 'auto':
-            # store the overlaps when they fit comfortably, else regenerate them
+            # store the overlaps when they fit comfortably, else regenerate them;
+            # several GPUs: always chunked, the chunks (and their overlaps) spread
             need = float(np.sum(8. * nv[cp_] * nv[cq_]))
-            free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-            onfly = need > 0.5 * free
+            onfly = need > 0.5 * free or len(devs) > 1
         else:
             onfly = mode == '1'
         self.onfly_s = onfly
         if onfly:
-            # no stored overlaps: every plan reading LS regenerates its chunk's S
+            # chunked plans; each device keeps the overlaps of its chunks up to a
+            # budget, the rest is regenerated per use
             from electrolites.dlpno.ovgen import OverlapGen
-            gen = OverlapGen(cp.asarray(ref.orb.S_pao), ref.pao, ref.X)
+            gens = {}
+
+            def gen(d):
+                if d not in gens:
+                    with cp.cuda.Device(d):
+                        gens[d] = OverlapGen(cp.asarray(ref.orb.S_pao), ref.pao, ref.X)
+                return gens[d]
+            frac = float(os.environ.get('DLPNO_S_KEEP', '0.45' if len(devs) > 1 else '0.3'))
+            per = {}
+            for d in devs:
+                with cp.cuda.Device(d):
+                    per[d] = frac * (cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes())
+            per[home] = min(per[home], frac * free)
+            sbud = _SBudget(per) if mode != '1' else None
             self.S = None
         else:
             self.S = self._overlaps(cp_, cq_)
@@ -306,12 +413,13 @@ class CCSDGPU:
         # ---- plans ---------------------------------------------------------
         def P(out_layout, out_idx, operands, out_row=None):
             if onfly and any(o.layout is LS for o in operands):
-                return _ChunkedPlan(gen, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=out_row)
+                return _ChunkedPlan(gen, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=out_row,
+                                    devs=devs, budget=sbud)
             return ChainPlan(out_layout, out_idx, operands, out_row=out_row)
 
         def DotPlan_(left, right):
             if onfly and any(o.layout is LS for o in right):
-                return _ChunkedPlan(gen, LS, cp_, cq_, nv, None, None, right, left=left)
+                return _ChunkedPlan(gen, LS, cp_, cq_, nv, None, None, right, left=left, devs=devs, budget=sbud)
             return DotPlan(left, right)
         self._P = P
         self.p_tn = P(LN, tn['p'], [op(LS, tn['s']), op(LT1, tn['n'])], out_row=tn['row'])
@@ -431,6 +539,8 @@ class CCSDGPU:
         self.p_rc1 = P(LP, pk_p, [op(LJ, cid), op(LP, rc['kj'], True), op(LS, rc['s3'])])
         self.p_rd1 = P(LP, pk_p, [op(LJ, cid), op(LP, rd['jk'], True), op(LS, rd['s3'])])
         # DF groups over strong canonical pairs; the per-pair copies are then dropped
+        for x in (self.K, self.Lij, self.Kmibj, self.Jijmb, self.Jikac, self.Kiakc):
+            x._static = True
         # the per-pair lists are no longer needed: free them before the DF groups
         for name in ('K_mibj', 'J_ijmb', 'K_ivvv', 'J_ikac', 'K_iakc'):
             setattr(ref, name, None)
