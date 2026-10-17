@@ -59,7 +59,8 @@ class _ChunkedPlan:
     MAX_BYTES = 1 << 29
 
     def __init__(self, gens, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=None, left=None,
-                 devs=None, budget=None):
+                 devs=None, budget=None, store=None):
+        self.store = store
         n = len(out_idx) if left is None else len(left[0].idx)
         self.n = self.nterms = n
         self.gens = gens if callable(gens) else (lambda d, g=gens: g)
@@ -107,8 +108,13 @@ class _ChunkedPlan:
         s_ops = self.s_ops
         uni = np.unique(cid[sel])
         LSc = Layout(nv[cp_[uni]], nv[cq_[uni]])
-        gen = self.gens(cp.cuda.Device().id)
-        preps = gen.prepare(cp_[uni], cq_[uni], out_layout=LSc, out_idx=np.arange(len(uni)))
+        if self.store is not None:
+            # overlaps computed once into a store spread over the GPUs: this
+            # chunk gathers its blocks by pointer (peer reads over NVLink)
+            gen, preps = None, self.store.tables(LSc, uni)
+        else:
+            gen = self.gens(cp.cuda.Device().id)
+            preps = gen.prepare(cp_[uni], cq_[uni], out_layout=LSc, out_idx=np.arange(len(uni)))
         ops = []
         for i, o in enumerate(operands):
             row = None if o.row is None else o.row[sel]
@@ -128,6 +134,8 @@ class _ChunkedPlan:
         S = ch.get('S')
         if S is not None:
             return S
+        if self.store is not None:
+            return self.store.gather(ch['LS'], ch['preps'])
         S = Ragged(ch['LS'])
         for P in ch['preps']:
             ch['gen'].run(P, S)
@@ -196,6 +204,64 @@ class _ChunkedPlan:
                         out.data[g] += cp.asarray(o.data[g])
         return out
 
+
+
+class _SStore:
+    """PNO overlaps of all registered couples, computed once and spread over
+    the GPUs (contiguous couple ranges); ``tables`` / ``gather`` assemble a
+    chunk's overlaps from (possibly remote) blocks by pointer."""
+
+    def __init__(self, S_pao, pao, X, cp_, cq_, nv, devs):
+        from electrolites.dlpno.ovgen import OverlapGen
+        n = len(cp_)
+        byt = 8. * nv[cp_] * nv[cq_]
+        cum = np.cumsum(byt)
+        cuts = np.searchsorted(cum, cum[-1] * np.arange(1, len(devs)) / len(devs)) if n else []
+        bounds = np.concatenate([[0], cuts, [n]]).astype(np.int64)
+        self.ptr = np.zeros(n, np.int64)
+        self.ld = np.zeros(n, np.int32)
+        self.nr = nv[cp_].astype(np.int32)
+        self.nc = nv[cq_].astype(np.int32)
+        self.rags = []
+        for d, a, b in zip(devs, bounds[:-1], bounds[1:]):
+            if b <= a:
+                continue
+            with cp.cuda.Device(d):
+                gen = OverlapGen(cp.asarray(S_pao), pao, X)
+                idx = np.arange(a, b)
+                lay = Layout(nv[cp_[idx]], nv[cq_[idx]])
+                R = Ragged(lay)
+                for P_ in gen.prepare(cp_[idx], cq_[idx], out_layout=lay, out_idx=np.arange(len(idx))):
+                    gen.run(P_, R)
+                del gen
+                shp = np.array(lay.shapes, np.int64).reshape(-1, 2)
+                base = np.array([x.data.ptr for x in R.data], np.int64)
+                self.ptr[idx] = base[lay.group] + 8 * lay.slot * shp[lay.group, 0] * shp[lay.group, 1]
+                self.ld[idx] = shp[lay.group, 1]
+                self.rags.append(R)
+        self.nbytes = float(np.sum(byt))
+
+    def tables(self, LSc, uni):
+        """per layout group of the chunk: device pointer tables of its items."""
+        out = []
+        for g, m in enumerate(LSc.members):
+            if not len(m):
+                out.append(None)
+                continue
+            c = uni[m]
+            out.append((cp.asarray(self.ptr[c]), cp.asarray(self.ld[c]), cp.asarray(self.nr[c]),
+                        cp.asarray(self.nc[c])) + tuple(LSc.shapes[g]))
+        return out
+
+    @staticmethod
+    def gather(LSc, tabs):
+        from electrolites.dlpno.gather import gather2d
+        S = Ragged(LSc)
+        for g, t in enumerate(tabs):
+            if t is not None:
+                ptr, ld, nr, nc, pr, pc = t
+                gather2d(ptr, ld, nr, nc, pr, pc, out=S.data[g])
+        return S
 
 class _SBudget:
     """bytes of generated overlaps each device may keep (thread safe)."""
@@ -454,6 +520,15 @@ class CCSDGPU:
             per[home] = min(per[home], frac * free)
             sbud = _SBudget(per) if mode != '1' else None
             self.S = None
+            store = None
+            need = float(np.sum(8. * nv[cp_] * nv[cq_]))
+            if len(devs) > 1 and mode != '1' and need < sum(per.values()):
+                store = _SStore(ref.orb.S_pao, ref.pao, ref.X, cp_, cq_, nv, devs)
+                sbud = None
+                cp.cuda.Device(home).use()
+            if getattr(ref, 'verbose', 0) >= 2:
+                print(f'[mem] PNO overlaps {need / 1e9:.1f} GB:',
+                      'stored over the GPUs' if store is not None else 'regenerated per chunk', flush=True)
         else:
             self.S = self._overlaps(cp_, cq_)
         self.t_build['overlaps'] = time.perf_counter() - t0
@@ -463,12 +538,13 @@ class CCSDGPU:
         def P(out_layout, out_idx, operands, out_row=None):
             if onfly and any(o.layout is LS for o in operands):
                 return _ChunkedPlan(gen, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=out_row,
-                                    devs=devs, budget=sbud)
+                                    devs=devs, budget=sbud, store=store)
             return ChainPlan(out_layout, out_idx, operands, out_row=out_row)
 
         def DotPlan_(left, right):
             if onfly and any(o.layout is LS for o in right):
-                return _ChunkedPlan(gen, LS, cp_, cq_, nv, None, None, right, left=left, devs=devs, budget=sbud)
+                return _ChunkedPlan(gen, LS, cp_, cq_, nv, None, None, right, left=left, devs=devs, budget=sbud,
+                                    store=store)
             return DotPlan(left, right)
         self._P = P
         self.p_tn = P(LN, tn['p'], [op(LS, tn['s']), op(LT1, tn['n'])], out_row=tn['row'])
