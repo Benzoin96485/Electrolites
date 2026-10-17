@@ -569,95 +569,118 @@ class CCSDGPU:
         cp.get_default_memory_pool().free_all_blocks()
 
     def _load_df(self):
+        """DF tensors of the strong canonical pairs in coarse size buckets
+        (aux to 128, LMOs to 16, PNOs to 32: few groups, few launches per
+        iteration); a member's items are gathered from / scattered to their
+        own layout groups."""
         ref = self.ref
         sel = np.where(self.strong & self.canon)[0]
         naux = np.array([ref.Qma[p].shape[0] for p in sel], np.int64)
-        apad = -(-naux // 32) * 32
-        LPk = self.LP.group[sel]
-        LNk = self.LN.group[sel]
-        key = np.stack([apad, LPk, LNk], 1)
+        bk = lambda n, q: np.maximum(q, -(-np.asarray(n) // q) * q)
+        Ab, Lb, Vb = bk(naux, 128), bk(self.nl[sel], 16), bk(self.nv[sel], 32)
+        key = np.stack([Ab, Lb, Vb], 1)
         uk, inv = np.unique(key, axis=0, return_inverse=True)
         inv = inv.reshape(-1)
         self.df = []
         chunks = []
         for u in range(len(uk)):
-            A = int(uk[u][0])
-            Lp, Vp = self.LN.shapes[int(uk[u][2])]
+            A, Lp, Vp = (int(x) for x in uk[u])
             per = 8 * A * max(Vp * Vp, Lp * Lp, Lp * Vp) * 4
             step = max(1, (1 << 28) // per)
             allm = sel[inv == u]
             for c0 in range(0, len(allm), step):
-                chunks.append((u, allm[c0:c0 + step]))
+                chunks.append((A, Lp, Vp, allm[c0:c0 + step]))
         from electrolites.dlpno import mgpu
         self.devs = mgpu.devices()
         load = np.zeros(len(self.devs))
         home = cp.cuda.Device().id
-        for u, mem in chunks:
-            A = int(uk[u][0])
-            Lp, Vp = self.LN.shapes[int(uk[u][2])]
+        for A, Lp, Vp, mem in chunks:
             g = len(mem)
             # several GPUs: the groups (and their DF tensors) are spread
             r = int(np.argmin(load))
             load[r] += g * A * (Vp * Vp + Lp * Vp)
             with cp.cuda.Device(self.devs[r]):
-                self._load_df_group(u, uk, mem, A, Lp, Vp, g)
+                self._load_df_group(mem, A, Lp, Vp, g)
         self.df_dev = sorted({d['dev'] for d in self.df})
         cp.cuda.Device(home).use()
 
-    def _load_df_group(self, u, uk, mem, A, Lp, Vp, g):
-        ref = self.ref
-        if True:
-            off = getattr(ref, 'df_offload', False)
-            if off:
-                from electrolites.dlpno.devmem import pinned_empty
+    @staticmethod
+    def _items(layout, its):
+        """[(layout group, member rows, slots, rows, cols)] of items ``its``."""
+        out = []
+        gg = layout.group[its]
+        for g_ in np.unique(gg):
+            m = np.where(gg == g_)[0]
+            pr, pc = layout.shapes[g_]
+            out.append((int(g_), cp.asarray(m), cp.asarray(layout.slot[its[m]]), pr, pc))
+        return out
 
-                def _z(shape):
-                    a_ = pinned_empty(shape)
-                    a_[...] = 0.
-                    return a_
-                Qma, Qab = _z((g, A, Lp, Vp)), _z((g, A, Vp, Vp))
-                Qk, Qa = _z((g, 2, A, Lp)), _z((g, 2, A, Vp))
-                cv = lambda x: x if isinstance(x, np.ndarray) else cp.asnumpy(x)
+    @staticmethod
+    def _gat(rag, lst, g, R, C):
+        out = cp.zeros((g, R, C))
+        for gs, mi, sl, pr, pc in lst:
+            out[mi, :pr, :pc] = rag.data[gs][sl]
+        return out
+
+    @staticmethod
+    def _put(rag, lst, X, add=False):
+        for gs, mi, sl, pr, pc in lst:
+            if add:
+                rag.data[gs][sl] += X[mi, :pr, :pc]
             else:
-                Qma = cp.zeros((g, A, Lp, Vp))
-                Qab = cp.zeros((g, A, Vp, Vp))
-                Qk = cp.zeros((g, 2, A, Lp))
-                Qa = cp.zeros((g, 2, A, Vp))
-                cv = cp.asarray
-            for s, p in enumerate(mem):
-                q = self.ji[p]
-                na, nl, nv = ref.Qma[p].shape
-                Qma[s, :na, :nl, :nv] = cv(ref.Qma[p])
-                Qab[s, :na, :nv, :nv] = cv(ref.Qab[p])
-                Qk[s, 0, :na, :nl] = cv(ref.iQk[p])
-                Qk[s, 1, :na, :nl] = cv(ref.iQk[q])
-                Qa[s, 0, :na, :nv] = cv(ref.iQa[p])
-                Qa[s, 1, :na, :nv] = cv(ref.iQa[q])
-                # release the per-pair copies as soon as they are grouped
-                ref.Qma[p] = ref.Qab[p] = ref.iQk[p] = ref.iQa[p] = None
-                ref.Qma[q] = ref.Qab[q] = ref.iQk[q] = ref.iQa[q] = None
-            q = self.ji[mem]
-            pos = ref.lmo_pos
-            gL = self.LL.group[mem]
-            assert np.all(gL == gL[0])
-            dmask = self.pi[mem] == self.pj[mem]
-            ev = np.zeros((g, Vp))
-            lm_idx = np.zeros((g, Lp), np.int64)
-            lm_msk = np.zeros((g, Lp))
-            for s, p in enumerate(mem):
-                ev[s, :self.nv[p]] = ref.e_pno[p]
-                lm_idx[s, :self.nl[p]] = ref.lmos[p]
-                lm_msk[s, :self.nl[p]] = 1.
-            self.df.append(dict(
-                p=mem, q=q, gP=int(uk[u][1]), gN=int(uk[u][2]), gL=int(gL[0]),
-                sP=cp.asarray(self.LP.slot[mem]), sPq=cp.asarray(self.LP.slot[q]),
-                sN=cp.asarray(self.LN.slot[mem]), sNq=cp.asarray(self.LN.slot[q]),
-                sL=cp.asarray(self.LL.slot[mem]), sLq=cp.asarray(self.LL.slot[q]),
-                ri=cp.asarray([pos[p][self.pi[p]] for p in mem]),
-                rj=cp.asarray([pos[p][self.pj[p]] for p in mem]),
-                dsel=cp.asarray(np.where(dmask)[0]), di=self.pi[mem][dmask],
-                ev=cp.asarray(ev), lm_idx=cp.asarray(lm_idx), lm_msk=cp.asarray(lm_msk),
-                Qma=Qma, Qab=Qab, Qk=Qk, Qa=Qa, dev=cp.cuda.Device().id))
+                rag.data[gs][sl] = X[mi, :pr, :pc]
+
+    def _load_df_group(self, mem, A, Lp, Vp, g):
+        ref = self.ref
+        off = getattr(ref, 'df_offload', False)
+        if off:
+            from electrolites.dlpno.devmem import pinned_empty
+
+            def _z(shape):
+                a_ = pinned_empty(shape)
+                a_[...] = 0.
+                return a_
+            Qma, Qab = _z((g, A, Lp, Vp)), _z((g, A, Vp, Vp))
+            Qk, Qa = _z((g, 2, A, Lp)), _z((g, 2, A, Vp))
+            cv = lambda x: x if isinstance(x, np.ndarray) else cp.asnumpy(x)
+        else:
+            Qma = cp.zeros((g, A, Lp, Vp))
+            Qab = cp.zeros((g, A, Vp, Vp))
+            Qk = cp.zeros((g, 2, A, Lp))
+            Qa = cp.zeros((g, 2, A, Vp))
+            cv = cp.asarray
+        for s, p in enumerate(mem):
+            q = self.ji[p]
+            na, nl, nv = ref.Qma[p].shape
+            Qma[s, :na, :nl, :nv] = cv(ref.Qma[p])
+            Qab[s, :na, :nv, :nv] = cv(ref.Qab[p])
+            Qk[s, 0, :na, :nl] = cv(ref.iQk[p])
+            Qk[s, 1, :na, :nl] = cv(ref.iQk[q])
+            Qa[s, 0, :na, :nv] = cv(ref.iQa[p])
+            Qa[s, 1, :na, :nv] = cv(ref.iQa[q])
+            # release the per-pair copies as soon as they are grouped
+            ref.Qma[p] = ref.Qab[p] = ref.iQk[p] = ref.iQa[p] = None
+            ref.Qma[q] = ref.Qab[q] = ref.iQk[q] = ref.iQa[q] = None
+        q = self.ji[mem]
+        pos = ref.lmo_pos
+        dmask = self.pi[mem] == self.pj[mem]
+        ev = np.zeros((g, Vp))
+        lm_idx = np.zeros((g, Lp), np.int64)
+        lm_msk = np.zeros((g, Lp))
+        for s, p in enumerate(mem):
+            ev[s, :self.nv[p]] = ref.e_pno[p]
+            lm_idx[s, :self.nl[p]] = ref.lmos[p]
+            lm_msk[s, :self.nl[p]] = 1.
+        it = self._items
+        self.df.append(dict(
+            p=mem, q=q, A=A, Lb=Lp, Vb=Vp,
+            N=it(self.LN, mem), Nq=it(self.LN, q), P=it(self.LP, mem), Pq=it(self.LP, q),
+            L=it(self.LL, mem), Lq=it(self.LL, q),
+            ri=cp.asarray([pos[p][self.pi[p]] for p in mem]),
+            rj=cp.asarray([pos[p][self.pj[p]] for p in mem]),
+            dsel=cp.asarray(np.where(dmask)[0]), di=self.pi[mem][dmask],
+            ev=cp.asarray(ev), lm_idx=cp.asarray(lm_idx), lm_msk=cp.asarray(lm_msk),
+            Qma=Qma, Qab=Qab, Qk=Qk, Qa=Qa, dev=cp.cuda.Device().id))
 
     # ------------------------------------------------------------------
     # elementwise helpers
@@ -786,13 +809,15 @@ class CCSDGPU:
         for d, ds, fai, fab, fkc, Tnd in diag_items:
             di = d['di']
             g1, sl1 = LT1.group[di], LT1.slot[di]
-            t1 = cp.stack([T1.data[g][s][:, 0] for g, s in zip(g1, sl1)])
+            t1 = cp.zeros((len(di), fab.shape[-1]))
+            for k, (g, s) in enumerate(zip(g1, sl1)):
+                t1[k, :LT1.shapes[g][0]] = T1.data[g][s][:, 0]
             col = Fij_bar[d['lm_idx'][ds], cp.asarray(di)[:, None]] * d['lm_msk'][ds]
             fai = (fai + cp.einsum('gab,gb->ga', fab, t1)
                    - cp.einsum('gka,gk->ga', Tnd, cp.einsum('gkb,gb->gk', fkc, t1))
                    - cp.einsum('gka,gk->ga', Tnd, col))
             for k, (g, s) in enumerate(zip(g1, sl1)):
-                Fai.data[g][s, :, 0] = fai[k]
+                Fai.data[g][s, :, 0] = fai[k, :LT1.shapes[g][0]]
         # ---- gamma, delta, F'' ------------------------------------------------
         prof('gamma_delta')
         K3 = self.K3
@@ -859,12 +884,13 @@ class CCSDGPU:
         """T1-dressed DF terms of the strong pairs of ``groups`` (all on the
         current device) into the given outputs; returns the diagonal items."""
         diag_items = []
+        gat, put = self._gat, self._put
         for d in groups:
-            gP, gN, gL = d['gP'], d['gN'], d['gL']
-            Tnp = Tn.data[gN][d['sN']]
-            Tnq = Tn.data[gN][d['sNq']]
-            Tp = T.data[gP][d['sP']]
-            Tq = T.data[gP][d['sPq']]
+            g, Lb, Vb = len(d['p']), d['Lb'], d['Vb']
+            Tnp = gat(Tn, d['N'], g, Lb, Vb)
+            Tnq = gat(Tn, d['Nq'], g, Lb, Vb)
+            Tp = gat(T, d['P'], g, Vb, Vb)
+            Tq = gat(T, d['Pq'], g, Vb, Vb)
             Qma, Qab, Qk, Qa = (cp.asarray(d[k_]) for k_ in ('Qma', 'Qab', 'Qk', 'Qa'))
             ar = cp.arange(len(d['p']))
             ti = Tnp[ar, d['ri']]
@@ -880,18 +906,18 @@ class CCSDGPU:
             fab = 2 * _wsum(gam, Qab) - cp.matmul(Y, Qma).sum(axis=1)
             ev = d['ev']
             fab = fab + ev[:, :, None] * cp.eye(ev.shape[1])[None]
-            Fkc_bar.data[gN][d['sN']] = fkc
-            Fab.data[gP][d['sP']] = fab - cp.matmul(Tnp.transpose(0, 2, 1), fkc)
+            put(Fkc_bar, d['N'], fkc)
+            put(Fab, d['P'], fab - cp.matmul(Tnp.transpose(0, 2, 1), fkc))
             QT = cp.matmul(Qma, Tp[:, None])
-            beta.data[gL][d['sL']] = (cp.matmul(qk_p.transpose(0, 2, 1), qk_q)
-                                      + cp.matmul(QT, Qma.transpose(0, 1, 3, 2)).sum(axis=1))
+            put(beta, d['L'], cp.matmul(qk_p.transpose(0, 2, 1), qk_q)
+                + cp.matmul(QT, Qma.transpose(0, 1, 3, 2)).sum(axis=1))
             QT = cp.matmul(Qma, Tq[:, None])
-            beta.data[gL][d['sLq']] = (cp.matmul(qk_q.transpose(0, 2, 1), qk_p)
-                                       + cp.matmul(QT, Qma.transpose(0, 1, 3, 2)).sum(axis=1))
+            put(beta, d['Lq'], cp.matmul(qk_q.transpose(0, 2, 1), qk_p)
+                + cp.matmul(QT, Qma.transpose(0, 1, 3, 2)).sum(axis=1))
             Kij = cp.matmul(qa_p.transpose(0, 2, 1), qa_q)
             Qt = Qab - cp.matmul(Tnp.transpose(0, 2, 1)[:, None], Qma)
             A = cp.matmul(cp.matmul(Qt, Tp[:, None]), Qt.transpose(0, 1, 3, 2)).sum(axis=1)
-            Rsym.data[gP][d['sP']] += Kij + A
+            put(Rsym, d['P'], Kij + A, add=True)
             if len(d['di']):
                 ds = d['dsel']
                 fai = 2 * cp.einsum('gA,gAa->ga', gam[ds], Qa[ds, 0])
