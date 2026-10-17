@@ -83,30 +83,41 @@ class OverlapGen:
 
     def chunks(self, pp, qq):
         """split couple indices into chunks (sorted by q); returns
-        [(couple ids, U, involved pairs)]."""
+        [(couple ids, U, involved pairs)].  Vectorised greedy split: a chunk
+        grows while 16 x (pairs) x (union PAO bound + ne) x max(nv) stays
+        within max_bytes."""
         pp, qq = np.asarray(pp, np.int64), np.asarray(qq, np.int64)
+        N = len(pp)
+        if N == 0:
+            return []
         order = np.argsort(qq, kind='stable')
+        P_, Q_ = pp[order], qq[order]
         ne, Vm = self.ne, int(self.nv.max()) if len(self.nv) else 1
+        nbf = self.nbf
         out = []
-        sel, inv, mask = [], set(), np.zeros(self.nbf, bool)
-        nU = 0
-        for c in order:
-            p, q = int(pp[c]), int(qq[c])
-            new = [r for r in (p, q) if r not in inv]
-            if new and sel:
-                # (an upper bound if the new pairs' domains overlap)
-                nU2 = nU + sum(int(np.count_nonzero(~mask[self.pao[r]])) for r in new)
-                if 16 * (len(inv) + len(new)) * (nU2 + ne) * Vm > self.max_bytes:
-                    out.append((np.array(sel), np.flatnonzero(mask), np.array(sorted(inv))))
-                    sel, inv, mask, nU = [], set(), np.zeros(self.nbf, bool), 0
-            for r in (p, q):
-                if r not in inv:
-                    inv.add(r)
-                    nU += int((~mask[self.pao[r]]).sum())
-                    mask[self.pao[r]] = True
-            sel.append(c)
-        if sel:
-            out.append((np.array(sel), np.flatnonzero(mask), np.array(sorted(inv))))
+        start = 0
+        guess = max(64, int(self.max_bytes // (16 * (nbf + ne) * Vm)) * 8)
+        while start < N:
+            W = min(N - start, guess)
+            ids = np.stack([P_[start:start + W], Q_[start:start + W]], 1).ravel()
+            _, first = np.unique(ids, return_index=True)
+            isnew = np.zeros(2 * W, np.int64)
+            isnew[first] = 1
+            npc = np.cumsum(isnew.reshape(W, 2).sum(axis=1))
+            nuc = np.minimum(np.cumsum((self.npao[ids] * isnew).reshape(W, 2).sum(axis=1)), nbf)
+            est = 16. * npc * (nuc + ne) * Vm
+            over = np.flatnonzero(est > self.max_bytes)
+            L = int(over[0]) if len(over) else W
+            L = max(1, L)
+            if not len(over) and W < N - start:
+                guess *= 2
+            sel = order[start:start + L]
+            inv = np.unique(np.concatenate([P_[start:start + L], Q_[start:start + L]]))
+            mask = np.zeros(nbf, bool)
+            for r in inv:
+                mask[self.pao[r]] = True
+            out.append((sel, np.flatnonzero(mask), inv))
+            start += L
         return out
 
     def prepare(self, pp, qq, out_layout=None, out_idx=None, parts=None):

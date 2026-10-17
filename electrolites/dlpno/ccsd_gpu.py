@@ -75,18 +75,25 @@ class _ChunkedPlan:
         cid = np.stack([np.asarray(operands[i].idx, np.int64) for i in s_ops], 1)
         byt = 8 * nv[cp_] * nv[cq_]
         order = (np.argsort(np.asarray(out_idx), kind='stable') if out_idx is not None else np.arange(n))
-        bounds, cur, tot, start = [], set(), 0, 0
-        for pos, t in enumerate(order):
-            new = {int(c) for c in cid[t]} - cur
-            add = int(sum(byt[c] for c in new))
-            if cur and tot + add > self.MAX_BYTES:
-                bounds.append((start, pos, tot))
-                start, cur, tot = pos, set(), 0
-                new = {int(c) for c in cid[t]}
-                add = int(sum(byt[c] for c in new))
-            cur |= new
-            tot += add
-        bounds.append((start, n, tot))
+        # greedy chunks of terms whose distinct overlaps stay within MAX_BYTES
+        # (vectorised: first uses counted within a window from the chunk start)
+        bounds, start = [], 0
+        k = cid.shape[1]
+        W0 = 4096
+        while start < n:
+            W = min(n - start, W0)
+            ids = cid[order[start:start + W]].ravel()
+            _, first = np.unique(ids, return_index=True)
+            add = np.zeros(W * k)
+            add[first] = byt[ids[first]]
+            cum = np.cumsum(add.reshape(W, k).sum(axis=1))
+            over = np.flatnonzero(cum > self.MAX_BYTES)
+            if not len(over) and W < n - start:
+                W0 *= 2
+                continue
+            L = max(1, int(over[0])) if len(over) else W
+            bounds.append((start, start + L, float(cum[L - 1])))
+            start += L
         load = np.zeros(len(devs))
         for a, b, nb in bounds:
             r = int(np.argmin(load))
