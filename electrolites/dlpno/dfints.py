@@ -234,7 +234,7 @@ class DFInts:
         free, tot = cp.cuda.runtime.memGetInfo()
         free += cp.get_default_memory_pool().free_bytes()
         mine = self._cache_bytes.get(cp.cuda.Device().id, 0)
-        return max(0.25 * tot, min(0.7 * tot, free + mine - 0.25 * tot))
+        return max(0.2 * tot, min(0.55 * tot, free + mine - 0.35 * tot))
 
     def spatial_order(self, atom_sets):
         """order of items (given by their aux-atom sets) along a Morton curve
