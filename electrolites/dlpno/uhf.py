@@ -987,8 +987,32 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         for n, key in enumerate(keys):
             by_p.setdefault(key[0], []).append(n)
         out = [None] * len(keys)
+        from electrolites.dlpno import mgpu
+        home = cp.cuda.Device().id
+
+        def setup(d):
+            w = mgpu.device_view(self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'J2c'),
+                                 sub={'dfi': ('qia', 'qij', 'J2c')})
+            w._chol = {}
+            return w
+
+        def work(w, it):
+            p, idx = it
+            res = w._ring_np_pair(p, idx, keys)
+            if cp.cuda.Device().id != home:
+                with cp.cuda.Device(home):
+                    res = mgpu.replicate(res)
+            for n, v in zip(idx, res):
+                out[n] = v
+        items = sorted(by_p.items(), key=lambda kv: -len(kv[1]))
+        mgpu.run_queue(items, work, setup=setup)
+        return out
+
+    def _ring_np_pair(self, p, idx, keys):
+        pl, so = self.pl, self.so
         nbf, ns = self.orb.nbf, self.ns
-        for p, idx in by_p.items():
+        out = {}
+        if True:
             aux = self.ribfs[p]
             L = self._halfL(p)
             lm = list(self.lmos[p])
@@ -1077,7 +1101,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                     res = cp.matmul(Z, cp.asarray(Xs))
                 for r_, n in enumerate(lst):
                     out[n] = res[r_, :, :ws[r_]].copy()
-        return out
+        return [out[n] for n in idx]
 
     # ------------------------------------------------------------------
     def lccsd_iterations(self):
