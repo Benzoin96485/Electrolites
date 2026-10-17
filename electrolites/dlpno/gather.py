@@ -74,13 +74,16 @@ extern "C" __global__ void gather2d(const long long* __restrict__ ptr, const int
         o[e] = (i < r && j < k) ? src[(long long)i * l + j] : 0.;
     }
 }
-// out[c, x0, x1, x2] = src_c[x0 * s0_c + x1 * s1_c + x2 * s2_c]   (permuted 3-index copy)
+// out[c, x0, x1, x2] = src_c[x0 * s0_c + x1 * s1_c + x2 * s2_c] for x_k < n_k[c], else 0
+// (permuted 3-index copy into a common padded shape)
 extern "C" __global__ void gather3p(const long long* __restrict__ ptr, const long long* __restrict__ st,
-                                    double* __restrict__ out, const int A0, const int A1, const int A2)
+                                    const int* __restrict__ nn, double* __restrict__ out,
+                                    const int A0, const int A1, const int A2)
 {
     const int c = blockIdx.y;
     const double* src = (const double*)ptr[c];
     const long long s0 = st[3 * c], s1 = st[3 * c + 1], s2 = st[3 * c + 2];
+    const int n0 = nn[3 * c], n1 = nn[3 * c + 1], n2 = nn[3 * c + 2];
     const long long n = (long long)A0 * A1 * A2;
     double* o = out + (long long)c * n;
     for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x; e < n;
@@ -88,7 +91,7 @@ extern "C" __global__ void gather3p(const long long* __restrict__ ptr, const lon
         const int x2 = (int)(e % A2);
         const long long t = e / A2;
         const int x1 = (int)(t % A1), x0 = (int)(t / A1);
-        o[e] = src[x0 * s0 + x1 * s1 + x2 * s2];
+        o[e] = (x0 < n0 && x1 < n1 && x2 < n2) ? src[x0 * s0 + x1 * s1 + x2 * s2] : 0.;
     }
 }
 '''
@@ -112,8 +115,9 @@ def gather2d(ptr, ld, nr, nc, R, C, out=None):
     return out
 
 
-def gather3p(ptr, strides, A0, A1, A2, out=None):
-    """stack of (A0, A1, A2) blocks read through per-item strides (c, 3)."""
+def gather3p(ptr, strides, nn, A0, A1, A2, out=None):
+    """stack of (A0, A1, A2) blocks read through per-item strides (c, 3),
+    item c's block being nn[c] (c, 3) and zero beyond."""
     c = int(ptr.shape[0])
     if out is None:
         out = cp.empty((c, A0, A1, A2))
@@ -121,6 +125,6 @@ def gather3p(ptr, strides, A0, A1, A2, out=None):
     gx = max(1, min(64, (n + 255) // 256))
     for c0 in range(0, c, 65535):
         c1 = min(c, c0 + 65535)
-        _mod2().get_function('gather3p')((gx, c1 - c0), (256,), (ptr[c0:c1], strides[c0:c1], out[c0:c1],
+        _mod2().get_function('gather3p')((gx, c1 - c0), (256,), (ptr[c0:c1], strides[c0:c1], nn[c0:c1], out[c0:c1],
                                                                 np.int32(A0), np.int32(A1), np.int32(A2)))
     return out

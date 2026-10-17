@@ -870,11 +870,14 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         return out
 
     def gpu_pair_ints_many(self, clist, rows_of, strong_of, host=False):
-        """(c, entry) for every canonical pair, the expensive parts batched over
-        chunks of pairs with equal padded PAO-domain size."""
+        """[(c, entry)] for every canonical pair, the expensive parts batched
+        over chunks of pairs with equal padded PAO-domain size; the chunks are
+        distributed over the visible GPUs and the entries gathered on the
+        current one."""
         clist = list(clist)
         npao = np.array([len(self.pao[c]) for c in clist])
         P = padded(npao)
+        chunks = []
         for Pv in np.unique(P):
             sel = [c for c, pv in zip(clist, P) if pv == Pv]
             sel.sort(key=lambda c: len(self.ribfs[c]))
@@ -888,11 +891,24 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                         ch.append(c)
                         continue
                 if ch:
-                    core = self._pair_core_chunk(ch)
-                    for c2 in ch:
-                        yield c2, self.gpu_pair_ints(c2, rows_of[c2], strong_of[c2], host, core=core[c2])
-                    del core
+                    chunks.append(ch)
                 ch = [c] if c is not None else []
+        from electrolites.dlpno import mgpu
+        home = cp.cuda.Device().id
+        out = []
+
+        def work(w, ch):
+            core = w._pair_core_chunk(ch)
+            res = [(c2, w.gpu_pair_ints(c2, rows_of[c2], strong_of[c2], host, core=core[c2])) for c2 in ch]
+            del core
+            if cp.cuda.Device().id != home:
+                with cp.cuda.Device(home):
+                    res = [(c2, mgpu.replicate(e)) for c2, e in res]
+            out.extend(res)
+        chunks.sort(key=lambda c: -len(c))
+        mgpu.run_queue(chunks, work, setup=lambda d: mgpu.device_view(
+            self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c')}))
+        return out
 
     def gpu_pair_ints(self, c, rows, strong, host=False, core=None):
         """fixed integrals of canonical spatial pair c for UCCSDGPU."""

@@ -16,7 +16,7 @@ from electrolites.dlpno.gather import blocks as gather_blocks
 from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx
 
-from electrolites.dlpno.ragged import padded
+from electrolites.dlpno.ragged import padded, Layout, Ragged
 from electrolites.dlpno.linalg import eigh_batched, orthonormal_domain
 
 # the six orders of (i, j, k) in W (Jiang Eq. 109) and the transpose that
@@ -484,14 +484,35 @@ class TriplesGPU:
                         g = groups.setdefault((int(Vp[t]), int(Vp[u]), _perm_case(*key)), [])
                         g.append((t, u, fl))
         # TNO overlaps of every coupling, padded: S_tu = X_t^T S_pao[d_t, d_u] X_u
+        # (device overlap generator over the triplets' compact TNO coefficients,
+        # once per distinct couple; then padded per group by pointer gathers)
+        from electrolites.dlpno.ovgen import OverlapGen
+        from electrolites.dlpno.gather import gather2d
+        need = {}
+        for lst in groups.values():
+            for (t, u, fl) in lst:
+                need.setdefault((t, u), len(need))
+        kk = list(need)
+        gen = OverlapGen(S_d, self.t_paos, [cp.asnumpy(x) for x in self.X_tno])
+        tt0 = np.array([k[0] for k in kk], np.int64)
+        uu0 = np.array([k[1] for k in kk], np.int64)
+        LU = Layout(nv[tt0], nv[uu0]) if kk else None
+        SU = Ragged(LU) if kk else None
+        if kk:
+            for P_ in gen.prepare(tt0, uu0, out_layout=LU, out_idx=np.arange(len(kk))):
+                gen.run(P_, SU)
+        del gen
         plan = []
         for (vt, vu, case), lst in groups.items():
             tt = np.array([c[0] for c in lst])
             uu = np.array([c[1] for c in lst])
-            S = cp.zeros((len(lst), vt, vu))
-            for c, (t, u, fl) in enumerate(lst):
-                pt_, pu = cp.asarray(self.t_paos[t]), cp.asarray(self.t_paos[u])
-                S[c, :nv[t], :nv[u]] = self.X_tno[t].T @ S_d[pt_[:, None], pu[None, :]] @ self.X_tno[u]
+            ids = np.array([need[(t, u)] for (t, u, fl) in lst], np.int64)
+            g_ = LU.group[ids]
+            shp = np.array(LU.shapes, np.int64).reshape(-1, 2)
+            base = np.array([d.data.ptr for d in SU.data], np.int64)
+            ptr = base[g_] + 8 * LU.slot[ids] * shp[g_, 0] * shp[g_, 1]
+            S = gather2d(cp.asarray(ptr), cp.asarray(shp[g_, 1].astype(np.int32)),
+                         cp.asarray(nv[tt].astype(np.int32)), cp.asarray(nv[uu].astype(np.int32)), vt, vu)
             plan.append(dict(vt=vt, vu=vu, case=case, S=S,
                              st=cp.asarray(bslot[tt]), su=cp.asarray(bslot[uu]),
                              w=cp.asarray(np.array([c[2] for c in lst]))))

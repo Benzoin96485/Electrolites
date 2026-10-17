@@ -721,14 +721,38 @@ class UCCSDGPUv(UCCSDGPU):
                 d.fill(0.)
         return r
 
+    def _gens_on(self, dev):
+        """overlap generators on device ``dev`` (built once per device)."""
+        if dev == getattr(self, '_kl_home', dev) and getattr(self, '_ovgens', None) is not None:
+            return self._ovgens
+        g = self.__dict__.setdefault('_ovg_dev', {})
+        if dev not in g:
+            from electrolites.dlpno.ovgen import OverlapGen
+            u = self.u
+            with cp.cuda.Device(dev):
+                Spao = cp.asarray(u.S_pao_d) if u.S_pao_d.device.id != dev else u.S_pao_d
+                if not Spao.flags.c_contiguous:
+                    Spao = cp.ascontiguousarray(Spao)
+                g[dev] = [OverlapGen(Spao, u.pao, [u.Xa[p] for p in range(self.npair)]),
+                          OverlapGen(Spao, u.pao, [u.Xb[p] for p in range(self.npair)], ne=u.ns)]
+        return g[dev]
+
     def _S_workspace(self):
-        """one flat buffer, viewed as every chunk's S Raggeds (chunks run one at a time)."""
+        """per device one flat buffer, viewed as every chunk's S Raggeds
+        (the chunks of a device run one at a time)."""
+        home = getattr(self, '_kl_home', cp.cuda.Device().id)
+        for dev in sorted({d.get('dev', home) for d in self.klchunks}):
+            with cp.cuda.Device(dev):
+                self._S_workspace_dev(dev, [d for d in self.klchunks if d.get('dev', home) == dev], home)
+
+    def _S_workspace_dev(self, dev, chunks, home):
         need = 0
-        for d in self.klchunks:
+        for d in chunks:
             need = max(need, sum(sum(len(m) * r * c for m, (r, c) in zip(c_[2].members, c_[2].shapes))
                                  for c_ in d['cpl']))
         ws = cp.empty(max(need, 1))
-        for d in self.klchunks:
+        gens = self._gens_on(dev) if (dev != home or getattr(self, '_ovgens', None) is not None) else None
+        for d in chunks:
             off = 0
             rags = []
             for kl, cl, lay, cu in d['cpl']:
@@ -739,14 +763,16 @@ class UCCSDGPUv(UCCSDGPU):
                     off += n
                 rags.append(Ragged(lay, data))
             d['Sc'] = rags
-            if getattr(self, '_ovgens', None) is not None:
-                d['gen'] = [self._ovgens[s].prepare(kl, cu, out_layout=lay, out_idx=np.arange(len(kl)))
+            if gens is not None:
+                d['gen'] = [gens[s].prepare(kl, cu, out_layout=lay, out_idx=np.arange(len(kl)))
                             for s, (kl, cl, lay, cu) in enumerate(d['cpl'])]
+                d['gens'] = gens
             else:
                 d['gen'] = [VChainPlan(lay, np.arange(len(kl)), [op(self.LXk[s], kl, True), op(self.LXk[s], cu)])
                             for s, (kl, cl, lay, cu) in enumerate(d['cpl'])]
+                d['gens'] = None
             d['ws'] = ws[:off]
-        self._sws = ws
+        self.__dict__.setdefault('_sws', {})[dev] = ws
 
     def _gen_S(self, ch):
         """the S(kl, c) of one chunk, per spin: X_kl^T (S X_c) over full PAO
@@ -755,9 +781,9 @@ class UCCSDGPUv(UCCSDGPU):
             self._S_workspace()
         ch['ws'].fill(0.)
         for s in (0, 1):
-            if getattr(self, '_ovgens', None) is not None:
+            if ch.get('gens') is not None:
                 for P in ch['gen'][s]:
-                    self._ovgens[s].run(P, ch['Sc'][s])
+                    ch['gens'][s].run(P, ch['Sc'][s])
             else:
                 ch['gen'][s].run(ch['Sc'][s], [self.Xk[s], self.MXk[s]])
         return ch['Sc']
@@ -852,15 +878,28 @@ class UCCSDGPUv(UCCSDGPU):
         self.p_a1 = SP(lays, self.LT1, self.a1, 'i', [('S', 's', 'a', False), ('V1', 'v', None, False)])
         if getattr(self, '_ovgens', None) is None:
             self._kl_tables()
+        # several GPUs: the F'_vv / oooo-ladder chunks (S(kl, c) generated per
+        # chunk) are spread over the devices
+        from electrolites.dlpno import mgpu
+        devs = mgpu.devices()
+        home = cp.cuda.Device().id
+        load = np.zeros(len(devs))
         for d in self.klchunks:
-            cl = dict(Sc=[c[2] for c in d['cpl']], T=self.LT, G=self.LT)
-            d['p_fv'] = [SP(cl, self.LF[s], d['fv'][s], 'c', [('Sc', 's1', 'sa', True), ('T', 'it', None, False),
-                                                          ('G', 'it', None, True), ('Sc', 's1', 'sa', False)])
-                         for s in (0, 1)]
-            d['p_rb'] = SP(cl, self.LT, d['rb'], 'o', [('Sc', 's1', 'a', True), ('T', 't', None, False),
-                                                      ('Sc', 's2', 'b', False)])
-            d['beta'] = cp.asarray(d['beta_n'])
-            d['w'] = cp.asarray(d['rb_w'])
+            r = int(np.argmin(load))
+            load[r] += len(d['rb']) + len(d['fv'][0]) + len(d['fv'][1]) + 1
+            d['dev'] = devs[r]
+            with cp.cuda.Device(devs[r]):
+                cl = dict(Sc=[c[2] for c in d['cpl']], T=self.LT, G=self.LT)
+                d['p_fv'] = [_SpinPlan(cl, self.LF[s], d['fv'][s], 'c',
+                                       [('Sc', 's1', 'sa', True), ('T', 'it', None, False),
+                                        ('G', 'it', None, True), ('Sc', 's1', 'sa', False)])
+                             for s in (0, 1)]
+                d['p_rb'] = _SpinPlan(cl, self.LT, d['rb'], 'o', [('Sc', 's1', 'a', True), ('T', 't', None, False),
+                                                                ('Sc', 's2', 'b', False)])
+                d['beta'] = cp.asarray(d['beta_n'])
+                d['w'] = cp.asarray(d['rb_w'])
+        cp.cuda.Device(home).use()
+        self._kl_home = home
         en = self.en_t
         self.p_en1 = VDotPlan([op(self.LPt, en.a('pi'))], [op(self.LT, en.a('o')), op(self.LPt, en.a('pj'))])
         ss = np.where(self.e_same.get() > 0)[0]
@@ -1080,13 +1119,7 @@ class UCCSDGPUv(UCCSDGPU):
         prof('kl')
         st['Fv'] = Fv
         # F'_vv projections and the oooo ladder, with S(kl, c) generated per chunk
-        for d in self.klchunks:
-            st['Sc'] = self._gen_S(d)
-            for s in (0, 1):
-                if d['p_fv'][s].n:
-                    d['p_fv'][s].run(Fv[s], st, w=cp.full(d['p_fv'][s].n, -.5))
-            if d['p_rb'].n:
-                d['p_rb'].run(R, st, w=beta[d['beta']] * d['w'])
+        self._kl_all(st, Fv, R, beta)
         st.pop('Sc', None)
         prof('fpp')
         # Fbar_KJ, F'_KJ
@@ -1153,6 +1186,52 @@ class UCCSDGPUv(UCCSDGPU):
         prof(None)
         self.last = dict(Fpp=Fpp, beta=beta, Z=Z, Tn=Tn, Fv=Fv, Fk=Fk, U=Uv)
         return R1, R
+
+    @staticmethod
+    def _kl_run(chunks, st, Fv, R, beta):
+        for d in chunks:
+            st['Sc'] = d['_self']._gen_S(d) if '_self' in d else None
+            for s in (0, 1):
+                if d['p_fv'][s].n:
+                    d['p_fv'][s].run(Fv[s], st, w=cp.full(d['p_fv'][s].n, -.5))
+            if d['p_rb'].n:
+                d['p_rb'].run(R, st, w=beta[d['beta']] * d['w'])
+
+    def _kl_all(self, st, Fv, R, beta):
+        """F'_vv projections and the oooo ladder of all kl chunks; with
+        several GPUs every device runs its chunks on replicas of T (and of the
+        static G) and its outputs are added into the home device's."""
+        home = cp.cuda.Device().id
+        for d in self.klchunks:
+            d['_self'] = self
+        if any('Sc' not in d for d in self.klchunks):
+            self._S_workspace()
+        devs = sorted({d.get('dev', home) for d in self.klchunks})
+        if devs in ([home], []):
+            self._kl_run(self.klchunks, st, Fv, R, beta)
+            return
+        from electrolites.dlpno import mgpu
+        res = {}
+        Gd = self.__dict__.setdefault('_G_dev', {})
+
+        def work(dv):
+            chs = [d for d in self.klchunks if d.get('dev', home) == dv]
+            if dv == home:
+                self._kl_run(chs, st, Fv, R, beta)
+                return
+            if dv not in Gd:
+                Gd[dv] = Ragged(self.G.layout, mgpu.replicate(self.G.data))
+            st_ = dict(T=Ragged(st['T'].layout, mgpu.replicate(st['T'].data)), G=Gd[dv])
+            Fv_ = [Ragged(x.layout) for x in Fv]
+            R_ = Ragged(R.layout)
+            self._kl_run(chs, st_, Fv_, R_, cp.asarray(beta))
+            res[dv] = Fv_ + [R_]
+        mgpu.run_per_device(work, devs)
+        for outs in res.values():
+            for D, S_ in zip(list(Fv) + [R], outs):
+                for g in range(len(D.data)):
+                    if D.data[g].size:
+                        D.data[g] += cp.asarray(S_.data[g])
 
     def _df_all(self, T, T1, Tn, Fv, Fbov, R, R1, beta):
         """DF terms of all groups; with several GPUs every device runs its

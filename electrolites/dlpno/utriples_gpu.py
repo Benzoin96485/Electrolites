@@ -751,8 +751,9 @@ class UTriplesGPU:
         # patterns mix
         from electrolites.dlpno.gather import gather2d, gather3p
         bucket_of = {}
+        coarse = lambda v: -(-v // 32) * 32          # few source shapes -> few, large groups
         for (sn, su, perm, _), lst0 in groups.items():
-            up = tuple(su[perm[q]] for q in range(3))
+            up = tuple(coarse(su[perm[q]]) for q in range(3))
             for (n, u, f) in lst0:
                 bucket_of.setdefault((sn, up), []).append((n, u, f, perm, su))
         plan = []
@@ -764,6 +765,7 @@ class UTriplesGPU:
                 c = len(lst)
                 src = np.empty(c, np.int64)
                 strd = np.empty((c, 3), np.int64)
+                nn = np.empty((c, 3), np.int32)
                 sp = [np.empty(c, np.int64) for _ in range(3)]
                 sld = [np.empty(c, np.int32) for _ in range(3)]
                 snr = [np.empty(c, np.int32) for _ in range(3)]
@@ -773,6 +775,7 @@ class UTriplesGPU:
                     full = (d1 * d2, d2, 1)
                     src[r] = T[su].data.ptr + 8 * int(slot[u]) * d0 * d1 * d2
                     strd[r] = [full[perm[q]] for q in range(3)]
+                    nn[r] = [su[perm[q]] for q in range(3)]
                     for q in range(3):
                         sg = so[Os[n][q]][1]
                         ids = need[sg][(keys[n][0], keys[u][0])]
@@ -783,7 +786,7 @@ class UTriplesGPU:
                         sld[q][r] = pc
                         snr[q][r] = lay.rows[ids]
                         snc[q][r] = lay.cols[ids]
-                plan.append(dict(sn=sn, up=up, c=c, src=cp.asarray(src), strd=cp.asarray(strd),
+                plan.append(dict(sn=sn, up=up, c=c, src=cp.asarray(src), strd=cp.asarray(strd), nn=cp.asarray(nn),
                                  S=[(cp.asarray(sp[q]), cp.asarray(sld[q]), cp.asarray(snr[q]),
                                      cp.asarray(snc[q])) for q in range(3)],
                                  st=cp.asarray(slot[[l[0] for l in lst]]),
@@ -809,7 +812,7 @@ class UTriplesGPU:
                 Rs = to_dev(W[s]) - Ds * T[s]
                 for g in by_sn.get(s, []):
                     prof('perm')
-                    Au = gather3p(g['src'], g['strd'], *g['up'])
+                    Au = gather3p(g['src'], g['strd'], g['nn'], *g['up'])
                     prof('gatherS')
                     S0, S1, S2 = (gather2d(*g['S'][q], g['sn'][q], g['up'][q]) for q in range(3))
                     prof('mm')
