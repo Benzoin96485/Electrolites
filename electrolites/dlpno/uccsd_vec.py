@@ -977,6 +977,9 @@ class UCCSDGPUv(UCCSDGPU):
                 qq = np.array([k[1] for k in keys], np.int64)
                 need += float(np.sum(8. * self.nvs[pp, s] * self.nvs[qq, s]))
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        if not self.offload:
+            # the grouped 3-external tensors are still to be built here
+            free -= getattr(self, '_k3_bytes', 0.)
         onfly = need > 0.5 * free
         if onfly:
             # generated per chunk; chunks keep their overlaps up to a budget
