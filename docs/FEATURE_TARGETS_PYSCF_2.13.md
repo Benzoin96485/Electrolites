@@ -2599,14 +2599,14 @@ faster than the CPU on alanine dipeptide⁺.
 | entry | status | measured |
 |---|---|---|
 | **S7** | **built** (Boys, PM, DF-ER, IBO) | PM 14–23x, IBO 6–37x, Boys 4–6x; ER 0.7 s against 32 min |
-| **P6** | **built**: IP, EA, singlet EE, Λ (§17.2, §17.8) | IP 7–18x, EA 8–38x, EE 30–59x, Λ 12–31x; no v⁴ array |
+| **P6** | **built**: IP/EA (right and left), singlet/triplet/spin-flip EE, Λ, CCSD 1-/2-RDMs (§17.2, §17.8, §17.9) | IP 7–18x, EA 8–38x, EE singlet 30–59x, triplet/SF 26–31x, left IP/EA 4–34x, Λ 12–31x, 2-RDM 37–99x; no v⁴ array |
 | **P10** | **ADC(2) EE/IP/EA built**; ADC(2)-x, ADC(3), properties open | EE 19x, IP 2–7x, EA 5–14x |
 | **X4** | **built** (KRHF, GDF, no frozen orbitals) | 11–39x the CPU node (2-atom diamond), 3x (8-atom, 2×2×2) |
 | **S5** | **built** (gradient; Hessian open) | 22x on a Pt(II) complex; GPU4PySCF's X2C SCF fixed (D14) |
 | **S6** | **GHF TDA/TDHF built**; GKS open | TDA 4–6x, TDHF 2x |
 
-Left for §5.4 or a later phase (EOM-EE singlet and Λ were built after,
-§17.8): triplet/spin-flip EOM-EE; ADC(2)-x/ADC(3) (the ladder on the doubles); ADC transition properties;
+Left for §5.4 or a later phase (the rest of P6 was built after, §17.8–17.9):
+ADC(2)-x/ADC(3) (the ladder on the doubles); ADC transition properties;
 the sfX2C1e Hessian; GKS TDDFT (non-collinear f_xc).
 
 ### 17.8 P6, completed — singlet EOM-EE-CCSD and the CCSD Λ equations
@@ -2659,3 +2659,60 @@ use).
 (The CCSD before them: 6–7 / 5–6 / 26 s on the GPU against 206–209 / 57–67 /
 321 s.)  The triplet and spin-flip EOM-EE and the left (Λ-like) EOM
 vectors are not built, nor the CCSD density matrices that Λ enables.
+
+### 17.9 P6, rest — triplet and spin-flip EOM-EE, left EOM-IP/EA, CCSD RDMs
+
+* **Triplet and spin-flip EOM-EE** (`eom_gpu.EOMEETriplet`,
+  `EOMEESpinFlip`; `mycc.eomee_ccsd_triplet()`, `mycc.eomsf_ccsd()`).  The
+  sigma vectors and the EE diagonals are PySCF's own functions
+  (`eeccsd_matvec_triplet`, `eeccsd_matvec_sf`, `eeccsd_diag`) compiled
+  again with CuPy as the array module, as `adc_gpu` does, with `lib.einsum`,
+  `lib.direct_sum` and the HDF5 scratch replaced by device versions; the
+  vvvv ladder they call through `_cc._add_vvvv` is the AO-direct one,
+  honouring PySCF's `t2sym` ('jiba', '-jiba', '-jiab' go through the i ≥ j
+  pairs only).  The packed vector layouts are PySCF's; one of them has a
+  trap `[X]`: the triplet ab block is unpacked with PySCF's ANTIHERMI fill,
+  whose diagonal is *minus* the packed value, and those (ia, ia) entries
+  are not degrees of freedom at all -- the antisymmetrised sigma is zero
+  there, so a Davidson that lets them in finds a spurious zero root (water,
+  first build).  They are masked out of the trial space.
+* **Left EOM-IP/EA** (`EOMIP/EOMEA.kernel(left=True)`, `l_matvec`):
+  PySCF's `lipccsd_matvec` / `leaccsd_matvec` batched on the device.  The
+  left EA's Σ_ab r[l,a,b] Wvvvv[a,b,c,d] (PySCF stores Wvvvv) is the same
+  AO-direct ladder ((ac|bd) = (ca|db)) plus its τ and t₁ pieces through
+  `ovov`/`ovvv`.
+* **CCSD 1- and 2-RDMs** (`ccsd_rdm_gpu`; `mycc.make_rdm1()`,
+  `mycc.make_rdm2()`, solving Λ first if needed): PySCF's `ccsd_rdm`
+  (`_gamma1_intermediates`, `_gamma2_outcore`, `_make_rdm1/2`) compiled
+  with CuPy, its HDF5 datasets as device arrays; frozen orbitals embedded on
+  the device.  Same conventions as PySCF (dm2 in chemists' order, vvvv block
+  symmetrised); the 2-RDM is a dense nmo⁴ device array.
+
+Correctness (`tests/test_eom_more_gpu.py`, water/cc-pVDZ and frozen-core
+glycine/SVP): triplet and spin-flip energies (4 roots) ≤ 6e-9 Eh from
+PySCF's, sigma vectors to 1.3e-10 relative; left IP/EA eigenvalues equal
+PySCF's left ones to 3e-12 and the right ones to 4e-9, left sigma vectors
+to 1.6e-10; 1-RDM to 8e-11 and 2-RDM to 1.7e-10 of PySCF's; the energy
+from the RDMs reproduces the CCSD energy to 5e-10 Eh.  The earlier EOM,
+Λ and ADC tests still pass.
+
+| step (frozen core) | system | **GPU** | CPU node |
+|---|---|---|---|
+| left EOM-IP, 4 roots | alanine dipeptide/SVP | **3.2 s** | 37.6 s (12x) |
+| left EOM-IP, 4 roots | glycine/TZVP | **2.8 s** | 12.6 s (4.5x) |
+| left EOM-IP, 4 roots | ferrocene/SVP | **9.3 s** | 38.4 s (4.1x) |
+| left EOM-EA, 4 roots | alanine dipeptide/SVP | **10.6 s** | 359 s (34x) |
+| left EOM-EA, 4 roots | glycine/TZVP | **17.0 s** | 231 s (14x) |
+| left EOM-EA, 4 roots | ferrocene/SVP | **31.2 s** | 308 s (9.9x) |
+| CCSD 2-RDM (1-RDM) | alanine dipeptide/SVP | **2.5 s** (0.09 s) | 244 s (0.55 s) (99x) |
+| CCSD 2-RDM (1-RDM) | glycine/TZVP | **1.8 s** (0.01 s) | 66 s (0.19 s) (37x) |
+| CCSD 2-RDM (1-RDM) | ferrocene/SVP | **5.1 s** (0.07 s) | 292 s (0.92 s) (57x) |
+| EOM-EE triplet, 4 roots | glycine/TZVP | **22.0 s** | 673 s (31x) |
+| EOM-EE spin-flip, 4 roots | glycine/TZVP | **28.7 s** | 750 s (26x) |
+| EOM-EE triplet, 4 roots | alanine dipeptide/SVP | **62.6 s** | 1825 s (29x) |
+| EOM-EE spin-flip, 4 roots | alanine dipeptide/SVP | **93.5 s** | 2570 s (27x) |
+| EOM-EE triplet / spin-flip, 4 roots | ferrocene/SVP | **171 s** / **200 s** | not run (the singlet did not finish in 54 min) |
+
+The triplet and spin-flip sigma run PySCF's per-vector functions (no
+batching over a Davidson step), so they take 1.0–2.7x the batched singlet's
+time on the same system.
