@@ -612,9 +612,15 @@ class UTriplesGPU:
         self.st = None
         okey = lambda O: tuple(sorted(O, key=lambda I: (so[I][0], so[I][1])))
         where = {okey(e['O']): n for n, e in enumerate(ent)}
-        bk = {}
+        bk0 = {}
         for n, e in enumerate(ent):
-            bk.setdefault(tuple(int(padded(x)) for x in e['W'].shape), []).append(n)
+            bk0.setdefault(tuple(int(padded(x)) for x in e['W'].shape), []).append(n)
+        # buckets of at most ~512 MB per array (key: shape + part number)
+        bk = {}
+        for shp, mem in bk0.items():
+            step = max(1, int((1 << 29) // (8 * int(np.prod(shp)))))
+            for i0 in range(0, len(mem), step):
+                bk[shp + (i0 // step,)] = mem[i0:i0 + step]
         slot = np.zeros(len(keys), np.int64)
         bof = [None] * len(keys)
         for s, mem in bk.items():
@@ -624,7 +630,7 @@ class UTriplesGPU:
         from electrolites.dlpno.devmem import pinned_empty, to_dev
 
         def stack_host(name, s, mem):
-            out = pinned_empty((len(mem),) + s)
+            out = pinned_empty((len(mem),) + s[:3])
             out[...] = 0.
             for i, m_ in enumerate(mem):
                 a = ent[m_][name]
@@ -632,7 +638,7 @@ class UTriplesGPU:
             return out
 
         def stack_dev(s, mem):
-            out = cp.zeros((len(mem),) + s)
+            out = cp.zeros((len(mem),) + s[:3])
             for i, m_ in enumerate(mem):
                 a = ent[m_]['T']
                 out[i, :a.shape[0], :a.shape[1], :a.shape[2]] = a
@@ -728,7 +734,7 @@ class UTriplesGPU:
         plan = []
         split = []
         for (sn, su, perm, _), lst0 in groups.items():
-            per = 8 * 6 * max(int(np.prod(sn)), int(np.prod(su)))
+            per = 8 * 6 * max(int(np.prod(sn[:3])), int(np.prod(su[:3])))
             step = max(1, int((1 << 28) // per))
             for i0 in range(0, len(lst0), step):
                 split.append(((sn, su, perm), lst0[i0:i0 + step]))
