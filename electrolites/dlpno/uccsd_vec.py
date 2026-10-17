@@ -989,7 +989,11 @@ class UCCSDGPUv(UCCSDGPU):
         if not self.offload:
             # the grouped 3-external tensors are still to be built here
             free -= getattr(self, '_k3_bytes', 0.)
-        onfly = need > 0.5 * free or __import__('os').environ.get('DLPNO_FORCE_STORE') == '1'
+        from electrolites.dlpno import mgpu as _mg
+        # several GPUs: prefer the store over the other devices early (home
+        # keeps the 3-external tensors and the plans)
+        lim = 0.25 if len(_mg.devices()) > 1 else 0.5
+        onfly = need > lim * free or __import__('os').environ.get('DLPNO_FORCE_STORE') == '1'
         self._sstores = None
         from electrolites.dlpno import mgpu
         devs = mgpu.devices()
