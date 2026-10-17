@@ -85,6 +85,9 @@ def _phase_log(key, dt):
     except Exception:
         mem = ''
     print(f'[phase] {key:16s} {dt:9.2f} s{mem}', flush=True)
+    import os
+    if os.environ.get('DLPNO_STOP_AFTER') == key:      # profiling aid
+        raise SystemExit(0)
 
 class RefUDLPNO:
     def __init__(self, mf, pno='normal', triples='t0', auxbasis=None,

@@ -11,6 +11,7 @@ test, Jiang et al. 2024) runs on the host, over a vector per pair.
 """
 import numpy as np
 import cupy as cp
+from electrolites.dlpno.linalg import chol_inv_batched
 
 from electrolites.dlpno.ragged import Layout, Ragged, ChainPlan, op, padded
 from electrolites.dlpno.linalg import eigh_batched, orthonormal_domain
@@ -208,7 +209,7 @@ class LMP2GPU:
         ga, gam = cp.asarray(aidx), cp.asarray(am)
         J = dfi.J2c[ga[:, :, None], ga[:, None, :]] * (gam[:, :, None] * gam[:, None, :])
         J += cp.eye(A)[None] * (1 - gam)[:, :, None]
-        Linv = cp.linalg.inv(cp.linalg.cholesky(J))
+        Linv = chol_inv_batched(J)
         mq = gam[:, :, None] * gpm[:, None, :]
         iq = cp.matmul(Linv, dfi.qia[ga[:, :, None], cp.asarray(ii)[:, None, None], gp[:, None, :]] * mq)
         jq = cp.matmul(Linv, dfi.qia[ga[:, :, None], cp.asarray(jj)[:, None, None], gp[:, None, :]] * mq)

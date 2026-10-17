@@ -12,6 +12,8 @@ largest pair (PP PAOs, VP PNOs).
 """
 import numpy as np
 import cupy as cp
+from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx
 
 from electrolites.dlpno.ragged import padded
@@ -291,7 +293,8 @@ class TriplesGPU:
         A = int(-(-self._naux_t[ch].max() // 32) * 32)
         L = int(padded(max(1, self._nl_t[ch].max())))
         per = 8 * (A * V * V + 3 * A * Pv + A * A + 14 * V ** 3
-                   + 3 * L * V * V + nbf * V + 3 * A * V)
+                   + 3 * L * V * V + nbf * V + 3 * A * V
+                   + 3 * L * self._pt["PP"] * V)
         sub = max(1, int(self._chunk_bytes() // per))
         for s0 in range(0, len(ch), sub):
             sl = slice(s0, s0 + sub)
@@ -342,7 +345,7 @@ class TriplesGPU:
             # ---- metric -------------------------------------------------
             J = dfi.J2c[ga[:, :, None], ga[:, None, :]] * (gam[:, :, None] * gam[:, None, :])
             J += cp.eye(A)[None] * (1 - gam)[:, :, None]
-            Linv = cp.linalg.inv(cp.linalg.cholesky(J))
+            Linv = chol_inv_batched(J)
             # ---- (Q|r a), (Q|r l) for r in i, j, k --------------------------
             qv, qo = [], []
             for r in range(3):
@@ -374,9 +377,7 @@ class TriplesGPU:
                 step = max(1, int((1 << 28) // (8 * na * P * P)))
                 for r0 in range(0, len(rows), step):
                     sl = slice(r0, r0 + step)
-                    blk = qa[:, gpos[sl][:, :, None], gpos[sl][:, None, :]]  # (na, b, P, P)
-                    blk = blk.transpose(1, 0, 2, 3)
-                    blk = blk * (mrow[sl][:, :, None] * mrow[sl][:, None, :])[:, None]
+                    blk = gather_blocks(qa, gpos[sl], gpos[sl], mrow[sl], mrow[sl])   # (b, na, P, P)
                     xr = Xr[sl]
                     tq = cp.matmul(cp.matmul(xr.transpose(0, 2, 1)[:, None], blk), xr[:, None])
                     oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]

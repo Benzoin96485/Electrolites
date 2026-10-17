@@ -48,8 +48,12 @@ def enable_peer(devs):
 def replicate(x):
     """x (cupy array, or dict / list / tuple of them) on the current device."""
     if isinstance(x, cp.ndarray):
-        if x.device.id == cp.cuda.Device().id:
+        cur = cp.cuda.Device().id
+        if x.device.id == cur:
             return x
+        if not x.flags.c_contiguous:
+            with cp.cuda.Device(x.device.id):
+                x = cp.ascontiguousarray(x)
         return cp.asarray(x)
     if isinstance(x, dict):
         return {k: replicate(v) for k, v in x.items()}
@@ -112,6 +116,33 @@ def run_queue(items, work, devs=None, setup=None):
     if errs:
         raise errs[0]
     return ctxs
+
+
+def run_per_device(fn, devs):
+    """fn(dev) in one thread per device (current device set), concurrently."""
+    if len(devs) == 1:
+        with cp.cuda.Device(devs[0]):
+            fn(devs[0])
+        return
+    enable_peer(devs)
+    errs = []
+    alloc = cp.cuda.get_allocator()
+
+    def run(d):
+        try:
+            cp.cuda.set_allocator(alloc)
+            with cp.cuda.Device(d):
+                fn(d)
+                cp.cuda.Device(d).synchronize()
+        except BaseException as e:     # noqa: B902 - re-raised below
+            errs.append(e)
+    th = [threading.Thread(target=run, args=(d,)) for d in devs]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    if errs:
+        raise errs[0]
 
 
 def lock():

@@ -22,6 +22,8 @@ import itertools
 
 import numpy as np
 import cupy as cp
+from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx
 
 from electrolites.dlpno.ragged import padded
@@ -295,7 +297,8 @@ class UTriplesGPU:
         L = int(padded(max(1, self._nl_t[ch].max())))
         Vm = max(Va, Vb)
         per = 8 * (2 * A * A + 14 * A * Vm + 18 * Vm ** 3
-                   + 8 * L * Vm * Vm + 2 * nbf * Vm + 4 * A * Pv)
+                   + 8 * L * Vm * Vm + 2 * nbf * Vm + 4 * A * Pv
+                   + 4 * L * self._pt["PP"] * Vm)
         sub = max(1, int(self._chunk_bytes() // per))
         for s0 in range(0, len(ch), sub):
             sl = slice(s0, s0 + sub)
@@ -338,7 +341,7 @@ class UTriplesGPU:
         ijk = trip[ch]
         J = dfi.J2c[ga[:, :, None], ga[:, None, :]] * (gam[:, :, None] * gam[:, None, :])
         J += cp.eye(A)[None] * (1 - gam)[:, :, None]
-        Linv = cp.linalg.inv(cp.linalg.cholesky(J))
+        Linv = chol_inv_batched(J)
         del J
         so_idx = cp.asarray(self.somo_idx)
         tr = lambda Y: Y.swapaxes(-1, -2)
@@ -382,8 +385,7 @@ class UTriplesGPU:
                 sl = slice(r0, r0 + step)
                 g_ = gr[sl]
                 nr = len(rows[sl])
-                blk = qa_[:, gpos[sl][:, :, None], gpos[sl][:, None, :]].transpose(1, 0, 2, 3)
-                blk = blk * (mrow[sl][:, :, None] * mrow[sl][:, None, :])[:, None]
+                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl])
                 oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                 for s_, Xs in ((0, Xa), (1, Xbp)):
                     xr = Xs[g_]
@@ -742,41 +744,54 @@ class UTriplesGPU:
             SU.append(R_)
             LU.append(lay)
             del gen
-        plan = []
-        split = []
+        # coupling groups: destination bucket part x permuted (padded) source
+        # shape; every coupling carries its own source pointer / strides and
+        # its three TNO-overlap blocks (gathered by pointer each sweep), so a
+        # group is a handful of kernels however its permutations and spin
+        # patterns mix
+        from electrolites.dlpno.gather import gather2d, gather3p
+        bucket_of = {}
         for (sn, su, perm, _), lst0 in groups.items():
-            per = 8 * 6 * max(int(np.prod(sn[:3])), int(np.prod(su[:3])))
+            up = tuple(su[perm[q]] for q in range(3))
+            for (n, u, f) in lst0:
+                bucket_of.setdefault((sn, up), []).append((n, u, f, perm, su))
+        plan = []
+        for (sn, up), lst0 in bucket_of.items():
+            per = 8 * 6 * max(int(np.prod(sn[:3])), int(np.prod(up)))
             step = max(1, int((1 << 28) // per))
             for i0 in range(0, len(lst0), step):
-                split.append(((sn, su, perm), lst0[i0:i0 + step]))
-        for (sn, su, perm), lst in split:
-            axes = []
-            for q in range(3):
-                sg = so[Os[lst[0][0]][q]][1]
-                ids = np.array([need[sg][(keys[n][0], keys[u][0])] for (n, u, f) in lst], np.int64)
-                lay = LU[sg]
-                gg = lay.group[ids]
-                parts = []
-                for g_ in np.unique(gg):
-                    sel_ = np.where(gg == g_)[0]
-                    pr, pc = lay.shapes[g_]
-                    parts.append((int(g_), cp.asarray(sel_), cp.asarray(lay.slot[ids[sel_]]), pr, pc))
-                axes.append((sg, parts, sn[q], su[perm[q]]))
-            plan.append(dict(sn=sn, su=su, perm=perm, axes=axes, c=len(lst),
-                             st=cp.asarray(slot[[l[0] for l in lst]]), suo=cp.asarray(slot[[l[1] for l in lst]]),
-                             w=cp.asarray(np.array([l[2] for l in lst]))))
+                lst = lst0[i0:i0 + step]
+                c = len(lst)
+                src = np.empty(c, np.int64)
+                strd = np.empty((c, 3), np.int64)
+                sp = [np.empty(c, np.int64) for _ in range(3)]
+                sld = [np.empty(c, np.int32) for _ in range(3)]
+                snr = [np.empty(c, np.int32) for _ in range(3)]
+                snc = [np.empty(c, np.int32) for _ in range(3)]
+                for r, (n, u, f, perm, su) in enumerate(lst):
+                    d0, d1, d2 = su[0], su[1], su[2]
+                    full = (d1 * d2, d2, 1)
+                    src[r] = T[su].data.ptr + 8 * int(slot[u]) * d0 * d1 * d2
+                    strd[r] = [full[perm[q]] for q in range(3)]
+                    for q in range(3):
+                        sg = so[Os[n][q]][1]
+                        ids = need[sg][(keys[n][0], keys[u][0])]
+                        lay = LU[sg]
+                        g_ = lay.group[ids]
+                        pr, pc = lay.shapes[g_]
+                        sp[q][r] = SU[sg].data[g_].data.ptr + 8 * int(lay.slot[ids]) * pr * pc
+                        sld[q][r] = pc
+                        snr[q][r] = lay.rows[ids]
+                        snc[q][r] = lay.cols[ids]
+                plan.append(dict(sn=sn, up=up, c=c, src=cp.asarray(src), strd=cp.asarray(strd),
+                                 S=[(cp.asarray(sp[q]), cp.asarray(sld[q]), cp.asarray(snr[q]),
+                                     cp.asarray(snc[q])) for q in range(3)],
+                                 st=cp.asarray(slot[[l[0] for l in lst]]),
+                                 w=cp.asarray(np.array([l[2] for l in lst]))))
 
         self.log(f'  U(T): {len(keys)} spin triples in {len(bk)} buckets, '
                  f'{sum(g["c"] for g in plan)} couplings in {len(plan)} groups')
 
-        def gather_S(g):
-            out = []
-            for sg, parts, a_, b_ in g['axes']:
-                M = cp.zeros((g['c'], a_, b_))
-                for g_, sel_, sl_, pr, pc in parts:
-                    M[sel_, :min(pr, a_), :min(pc, b_)] = SU[sg].data[g_][sl_, :min(pr, a_), :min(pc, b_)]
-                out.append(M)
-            return out
         e_prev = 0.
         ntrip = len(self.trip)
         by_sn = {}
@@ -794,9 +809,9 @@ class UTriplesGPU:
                 Rs = to_dev(W[s]) - Ds * T[s]
                 for g in by_sn.get(s, []):
                     prof('perm')
-                    Au = T[g['su']][g['suo']].transpose((0,) + tuple(1 + p for p in g['perm']))
+                    Au = gather3p(g['src'], g['strd'], *g['up'])
                     prof('gatherS')
-                    S0, S1, S2 = gather_S(g)
+                    S0, S1, S2 = (gather2d(*g['S'][q], g['sn'][q], g['up'][q]) for q in range(3))
                     prof('mm')
                     c_, a0, a1, a2 = Au.shape
                     t0, t1, t2 = S0.shape[1], S1.shape[1], S2.shape[1]

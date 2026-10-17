@@ -1,0 +1,126 @@
+"""Gathers of per-item sub-blocks of the per-atom (Q|uv) tensors.
+
+``blocks(qa, rpos, cpos, rmask, cmask)`` returns
+    out[b, q, u, v] = qa[q, rpos[b, u], cpos[b, v]] * rmask[b, u] * cmask[b, v]
+in one kernel pass (CuPy's advanced indexing needs a gather, a transposed
+copy and a masking pass, at a fraction of the memory bandwidth).
+"""
+import numpy as np
+import cupy as cp
+
+_SRC = r'''
+extern "C" __global__ void gather_blocks(const double* __restrict__ qa, const long long N,
+                                         const int* __restrict__ rpos, const int* __restrict__ cpos,
+                                         const double* __restrict__ rmask, const double* __restrict__ cmask,
+                                         double* __restrict__ out, const int nq, const int R, const int C)
+{
+    // one block per (b, q, u) row of the output
+    const long long row = blockIdx.x;
+    const int u = (int)(row % R);
+    const long long bq = row / R;
+    const int q = (int)(bq % nq);
+    const int b = (int)(bq / nq);
+    double* o = out + row * C;
+    const double rm = rmask[(long long)b * R + u];
+    if (rm == 0.) {
+        for (int v = threadIdx.x; v < C; v += blockDim.x) o[v] = 0.;
+        return;
+    }
+    const double* src = qa + ((long long)q * N + rpos[(long long)b * R + u]) * N;
+    const int* cp_ = cpos + (long long)b * C;
+    const double* cm = cmask + (long long)b * C;
+    for (int v = threadIdx.x; v < C; v += blockDim.x)
+        o[v] = rm * cm[v] * src[cp_[v]];
+}
+'''
+_k = None
+
+
+def blocks(qa, rpos, cpos, rmask, cmask, out=None):
+    """qa (nq, N, N) device; rpos (b, R), cpos (b, C) int positions (any
+    value where the mask is 0); masks float (b, R), (b, C)."""
+    global _k
+    if _k is None:
+        _k = cp.RawKernel(_SRC, 'gather_blocks')
+    qa = cp.ascontiguousarray(qa)
+    nq, N = qa.shape[0], qa.shape[1]
+    b, R = rpos.shape
+    C = cpos.shape[1]
+    if out is None:
+        out = cp.empty((b, nq, R, C))
+    if b == 0:
+        return out
+    rp = cp.ascontiguousarray(cp.where(rmask > 0, rpos, 0).astype(cp.int32))
+    cq = cp.ascontiguousarray(cp.where(cmask > 0, cpos, 0).astype(cp.int32))
+    nt = 128 if C <= 128 else 256
+    _k((b * nq * R,), (nt,), (qa, np.int64(N), rp, cq, cp.ascontiguousarray(rmask, dtype=cp.float64),
+                             cp.ascontiguousarray(cmask, dtype=cp.float64), out,
+                             np.int32(nq), np.int32(R), np.int32(C)))
+    return out
+
+
+_SRC2 = r'''
+// out[c, i, j] = src_c[i * ld_c + j] for i < nr_c, j < nc_c, else 0
+extern "C" __global__ void gather2d(const long long* __restrict__ ptr, const int* __restrict__ ld,
+                                    const int* __restrict__ nr, const int* __restrict__ nc,
+                                    double* __restrict__ out, const int R, const int C)
+{
+    const int c = blockIdx.x;
+    const double* src = (const double*)ptr[c];
+    const int r = nr[c], k = nc[c], l = ld[c];
+    double* o = out + (long long)c * R * C;
+    for (int e = threadIdx.x; e < R * C; e += blockDim.x) {
+        const int i = e / C, j = e % C;
+        o[e] = (i < r && j < k) ? src[(long long)i * l + j] : 0.;
+    }
+}
+// out[c, x0, x1, x2] = src_c[x0 * s0_c + x1 * s1_c + x2 * s2_c]   (permuted 3-index copy)
+extern "C" __global__ void gather3p(const long long* __restrict__ ptr, const long long* __restrict__ st,
+                                    double* __restrict__ out, const int A0, const int A1, const int A2)
+{
+    const int c = blockIdx.y;
+    const double* src = (const double*)ptr[c];
+    const long long s0 = st[3 * c], s1 = st[3 * c + 1], s2 = st[3 * c + 2];
+    const long long n = (long long)A0 * A1 * A2;
+    double* o = out + (long long)c * n;
+    for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x; e < n;
+         e += (long long)gridDim.x * blockDim.x) {
+        const int x2 = (int)(e % A2);
+        const long long t = e / A2;
+        const int x1 = (int)(t % A1), x0 = (int)(t / A1);
+        o[e] = src[x0 * s0 + x1 * s1 + x2 * s2];
+    }
+}
+'''
+_m2 = None
+
+
+def _mod2():
+    global _m2
+    if _m2 is None:
+        _m2 = cp.RawModule(code=_SRC2)
+    return _m2
+
+
+def gather2d(ptr, ld, nr, nc, R, C, out=None):
+    """stack of padded (R, C) blocks from device pointer tables (static)."""
+    c = int(ptr.shape[0])
+    if out is None:
+        out = cp.empty((c, R, C))
+    if c:
+        _mod2().get_function('gather2d')((c,), (128,), (ptr, ld, nr, nc, out, np.int32(R), np.int32(C)))
+    return out
+
+
+def gather3p(ptr, strides, A0, A1, A2, out=None):
+    """stack of (A0, A1, A2) blocks read through per-item strides (c, 3)."""
+    c = int(ptr.shape[0])
+    if out is None:
+        out = cp.empty((c, A0, A1, A2))
+    n = A0 * A1 * A2
+    gx = max(1, min(64, (n + 255) // 256))
+    for c0 in range(0, c, 65535):
+        c1 = min(c, c0 + 65535)
+        _mod2().get_function('gather3p')((gx, c1 - c0), (256,), (ptr[c0:c1], strides[c0:c1], out[c0:c1],
+                                                                np.int32(A0), np.int32(A1), np.int32(A2)))
+    return out

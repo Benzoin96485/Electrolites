@@ -251,6 +251,9 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
     # ------------------------------------------------------------------
     def lccsd_iterations(self):
         t0 = time.perf_counter()
+        # the (Q|uv) device cache is not needed again before the triples
+        self.dfi.cache_clear()
+        cp.get_default_memory_pool().free_all_blocks()
         self.cc = cc = CCSDGPU(self, None)
         self.timings['cc_build'] = time.perf_counter() - t0
         self.e_lccsd, self.de_weak = cc.kernel(verbose=self.verbose >= 4)

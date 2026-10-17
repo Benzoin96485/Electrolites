@@ -785,6 +785,11 @@ class UCCSDGPUv(UCCSDGPU):
         inv = inv.reshape(-1)
         self.dfg = []
         bmap = {}
+        # several GPUs: the groups (and their DF tensors) are spread over them
+        from electrolites.dlpno import mgpu
+        devs = mgpu.devices()
+        load = np.zeros(len(devs))
+        home = cp.cuda.Device().id
         for gi in range(len(uk)):
             A = int(uk[gi][0])
             R = [int(uk[gi][1]), int(uk[gi][2])]
@@ -793,7 +798,14 @@ class UCCSDGPUv(UCCSDGPU):
             step = max(1, self.MAX_DF_CHUNK_BYTES // per)
             allm = np.array(sc)[inv == gi]
             for c0 in range(0, len(allm), step):
-                self.dfg.append(self._df_group(allm[c0:c0 + step], A, R, V, bmap))
+                r = int(np.argmin(load))
+                mem_ = allm[c0:c0 + step]
+                load[r] += len(mem_) * per
+                with cp.cuda.Device(devs[r]):
+                    d = self._df_group(mem_, A, R, V, bmap)
+                d['dev'] = devs[r]
+                self.dfg.append(d)
+        cp.cuda.Device(home).use()
         # beta entries -> (group, combo, which matrix, member, rK, rL)
         self.beta_src = bmap
 
@@ -1048,6 +1060,9 @@ class UCCSDGPUv(UCCSDGPU):
 
     # ------------------------------------------------------------------
     def residuals(self, T, T1):
+        from electrolites.dlpno.devmem import Prof
+        prof = self.__dict__.setdefault('_prof', Prof('ULCCSD residual'))
+        prof('tn')
         sp = self.spin
         st = self.stores(T, T1)
         Tn = [self.p_tn[s].run(self._tmp(('Tn', s), self.LTn[s]), st) for s in (0, 1)]
@@ -1060,8 +1075,9 @@ class UCCSDGPUv(UCCSDGPU):
         R = self._tmp('R', self.LT)
         R1 = self._tmp('R1', self.LT1)
         beta = cp.zeros(self.nbeta)
-        for gi, d in enumerate(self.dfg):
-            self._df_run(gi, d, T, T1, Tn, Fv, Fbov, R, R1, beta)
+        prof('df')
+        self._df_all(T, T1, Tn, Fv, Fbov, R, R1, beta)
+        prof('kl')
         st['Fv'] = Fv
         # F'_vv projections and the oooo ladder, with S(kl, c) generated per chunk
         for d in self.klchunks:
@@ -1072,6 +1088,7 @@ class UCCSDGPUv(UCCSDGPU):
             if d['p_rb'].n:
                 d['p_rb'].run(R, st, w=beta[d['beta']] * d['w'])
         st.pop('Sc', None)
+        prof('fpp')
         # Fbar_KJ, F'_KJ
         Fpp = self.F0.copy()
         for s in (0, 1):
@@ -1086,16 +1103,19 @@ class UCCSDGPUv(UCCSDGPU):
             dots = self.p_fp.dots(st, self.p_fp.n)
             cupyx.scatter_add(Fpp, self.fp_f, dots * self.fp.fd('w'))
         # R2 projection terms
+        prof('e1rg')
         if self.p_e1.n:
             self.p_e1.run(R, st)
             self.p_e2.run(R, st)
         if self.p_rg.n:
             self.p_rg.run(R, st, w=Fpp[self.rg_f] * self.rg.fd('w'))
         # ring
+        prof('k3')
         Z = self._tmp('Z', self.LZ)
         V1 = self._tmp('V1', self.LV1)
         self.k3.run_all([('c3', 'Pt', 'Z', Pt, Z), ('c2', 'Pt', 'Z', Pt, Z), ('a', 'T', 'V1', T, V1)])
         st['K1Z'] = self.K1Z
+        prof('ring')
         self.p_zk1.run(Z, st, w=cp.full(self.p_zk1.n, -1.) if self.p_zk1.n else None)
         self.p_zj1.run(Z, st)
         for p_, t_ in zip(self.p_zkx, self.zkx):
@@ -1110,6 +1130,7 @@ class UCCSDGPUv(UCCSDGPU):
             if self.p_ring_z[tr].n:
                 self.p_ring_z[tr].run(R, st, w=self.ring_z[tr].fd('w'))
         # R1
+        prof('r1')
         Fk = self.Fk0.copy()
         st['Fk'] = Fk
         if self.p_fkc.n:
@@ -1129,8 +1150,46 @@ class UCCSDGPUv(UCCSDGPU):
         if self.p_r1b.n:
             self.p_r1b.run(R1, st, w=self.r1b.fd('w'))
         R = self._mask_strong(R)
+        prof(None)
         self.last = dict(Fpp=Fpp, beta=beta, Z=Z, Tn=Tn, Fv=Fv, Fk=Fk, U=Uv)
         return R1, R
+
+    def _df_all(self, T, T1, Tn, Fv, Fbov, R, R1, beta):
+        """DF terms of all groups; with several GPUs every device runs its
+        own groups on replicas of T, Tn and its outputs are added into the
+        home device's."""
+        home = cp.cuda.Device().id
+        devs = sorted({d.get('dev', home) for d in self.dfg})
+        if devs in ([home], []):
+            for gi, d in enumerate(self.dfg):
+                self._df_run(gi, d, T, T1, Tn, Fv, Fbov, R, R1, beta)
+            return
+        from electrolites.dlpno import mgpu
+        res = {}
+
+        def work(dv):
+            idx = [gi for gi, d in enumerate(self.dfg) if d.get('dev', home) == dv]
+            if dv == home:
+                for gi in idx:
+                    self._df_run(gi, self.dfg[gi], T, T1, Tn, Fv, Fbov, R, R1, beta)
+                return
+
+            def rep(X):
+                return Ragged(X.layout, mgpu.replicate(X.data))
+            T_, T1_, Tn_ = rep(T), rep(T1), [rep(x) for x in Tn]
+            Fv_, Fb_ = [Ragged(x.layout) for x in Fv], [Ragged(x.layout) for x in Fbov]
+            R_, R1_, b_ = Ragged(R.layout), Ragged(R1.layout), cp.zeros(beta.shape)
+            for gi in idx:
+                self._df_run(gi, self.dfg[gi], T_, T1_, Tn_, Fv_, Fb_, R_, R1_, b_)
+            res[dv] = (Fv_ + Fb_ + [R_, R1_], b_)
+        mgpu.run_per_device(work, devs)
+        dst = list(Fv) + list(Fbov) + [R, R1]
+        for outs, b_ in res.values():
+            for D, S_ in zip(dst, outs):
+                for g in range(len(D.data)):
+                    if D.data[g].size:
+                        D.data[g] += cp.asarray(S_.data[g])
+            beta += cp.asarray(b_)
 
     def _df_run(self, gi, d, T, T1, Tn, Fv, Fbov, R, R1, beta):
         if self.offload:

@@ -30,6 +30,51 @@ def padded(n):
     return np.where(n == 1, 1, np.where(n == 0, 1, out))
 
 
+_GATHER = r'''
+// dst[s][i, j] = src_s[i * rs_s + j * cs_s]  for i < nr[s], j < nc[s]
+extern "C" __global__ void gather_items(const long long* __restrict__ srcp, const long long* __restrict__ rs,
+                                        const long long* __restrict__ cs, const int* __restrict__ nr,
+                                        const int* __restrict__ nc, double* __restrict__ dst,
+                                        const int pr, const int pc)
+{
+    const int s = blockIdx.x;
+    const double* src = (const double*)srcp[s];
+    const int r = nr[s], c = nc[s];
+    const long long a = rs[s], b = cs[s];
+    double* d = dst + (long long)s * pr * pc;
+    for (int e = threadIdx.x; e < r * c; e += blockDim.x) {
+        const int i = e / c, j = e % c;
+        d[(long long)i * pc + j] = src[i * a + j * b];
+    }
+}
+'''
+_gk = None
+
+
+def _gather_items(out, items, rows, cols):
+    """out[s, :rows[s], :cols[s]] = items[s] (device arrays, any strides; an
+    item may be stored flat with rows[s] * cols[s] elements)."""
+    global _gk
+    if _gk is None:
+        _gk = cp.RawKernel(_GATHER, 'gather_items')
+    n = len(items)
+    ptr = np.empty(n, np.int64)
+    rs = np.empty(n, np.int64)
+    cs = np.empty(n, np.int64)
+    for s, a in enumerate(items):
+        if a.ndim != 2 or a.shape != (rows[s], cols[s]):
+            a = cp.ascontiguousarray(a).reshape(int(rows[s]), int(cols[s]))
+            items[s] = a           # keep alive until the kernel ran
+        ptr[s] = a.data.ptr
+        rs[s] = a.strides[0] // 8
+        cs[s] = a.strides[1] // 8
+    pr, pc = out.shape[1], out.shape[2]
+    _gk((n,), (128,), (cp.asarray(ptr), cp.asarray(rs), cp.asarray(cs),
+                       cp.asarray(np.asarray(rows, np.int32)), cp.asarray(np.asarray(cols, np.int32)),
+                       out, np.int32(pr), np.int32(pc)))
+    cp.cuda.get_current_stream().synchronize()
+
+
 class Layout:
     """Shapes and storage slots of a list of (rows[i], cols[i]) blocks."""
 
@@ -87,10 +132,16 @@ class Ragged:
     @classmethod
     def from_list(cls, layout, mats):
         r = cls(layout)
+        dev = cp.cuda.Device().id
         for g, m in enumerate(layout.members):
             if len(m) == 0:
                 continue
             pr, pc = layout.shapes[g]
+            if all(isinstance(mats[it], cp.ndarray) and mats[it].device.id == dev for it in m):
+                # device items: one copy kernel for the whole group (no per-item sync)
+                _gather_items(r.data[g], [mats[it] for it in m],
+                              layout.rows[m], layout.cols[m])
+                continue
             buf = np.zeros((len(m), pr, pc))
             for s, it in enumerate(m):
                 a = mats[it]

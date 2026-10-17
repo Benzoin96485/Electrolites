@@ -11,6 +11,8 @@ visible GPUs (``mgpu``).
 """
 import numpy as np
 import cupy as cp
+from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno.linalg import chol_inv_batched
 
 from electrolites.dlpno import setup as su
 from electrolites.dlpno.ragged import padded
@@ -79,9 +81,25 @@ class PNOIntsGPU:
                 for p, v in d.items():
                     lst[p] = v
         chunks.sort(key=lambda c: -len(c[0]))
-        mgpu.run_queue(chunks, work, devs, setup=lambda d: mgpu.device_view(
+        ctxs = mgpu.run_queue(chunks, work, devs, setup=lambda d: mgpu.device_view(
             self, ('S_pao_d',), sub={'dfi': ('qia', 'qij', 'J2c')}))
+        for c in ctxs:
+            if getattr(c, '_prof', None) is not None:
+                c._prof.report()
         self._ext = None
+        if getattr(self, 'verbose', 0) >= 2:
+            if getattr(self.dfi, 'qab_host', False):
+                print('[mem] (Q|uv) cache', self.dfi.cache_stats, flush=True)
+            sz = {}
+            for name in ('K_mibj', 'J_ijmb', 'K_ivvv', 'J_ikac', 'K_iakc', 'iQk', 'iQa', 'Qma', 'Qab'):
+                seen, tot = set(), 0
+                for v in getattr(self, name):
+                    for x in (v if isinstance(v, list) else [v]):
+                        if x is not None and id(x) not in seen:
+                            seen.add(id(x))
+                            tot += x.nbytes
+                sz[name] = round(tot / 1e9, 2)
+            print('[mem] PNO integrals GB', sz, 'DF offload', self.df_offload, flush=True)
         for p, (i, j) in enumerate(self.pl.pairs):
             if i <= j:
                 q = self.pl.ji[p]
@@ -95,6 +113,9 @@ class PNOIntsGPU:
         domain P).  Returns {list name: {pair: array}}."""
         pl, dfi, ext = self.pl, self.dfi, self.dfi.ext
         B = len(ch)
+        from electrolites.dlpno.devmem import Prof
+        prof = self.__dict__.setdefault('_prof', Prof('pno_ints'))
+        prof('setup')
         auxs = [dfi.aux_index(self.riatoms[p]) for p in ch]
         nla = np.array([len(self.lmos[p]) for p in ch])
         nva = np.array([self.X[p].shape[1] for p in ch])
@@ -122,9 +143,10 @@ class PNOIntsGPU:
         gl, glm = cp.asarray(lidx), cp.asarray(lmk)
         ga, gam = cp.asarray(aidx), cp.asarray(am)
         X = cp.asarray(Xh)
+        prof('metric')
         J = dfi.J2c[ga[:, :, None], ga[:, None, :]] * (gam[:, :, None] * gam[:, None, :])
         J += cp.eye(A)[None] * (1 - gam)[:, :, None]
-        Linv = cp.linalg.inv(cp.linalg.cholesky(J))
+        Linv = chol_inv_batched(J)
         del J
 
         def H(x, Li=Linv):           # half fit  L^-1 x
@@ -133,13 +155,16 @@ class PNOIntsGPU:
         def C(x, Li=Linv):           # full fit  J^-1 x
             return cp.matmul(_tr(Li), H(x, Li).reshape(x.shape[0], A, -1)).reshape(x.shape)
         gi, gj = cp.asarray(ii), cp.asarray(jj)
+        prof('gather_o')
         q_pair = dfi.qij[ga, gi[:, None], gj[:, None]] * gam                       # (B, A)
         mo = gam[:, :, None] * glm[:, None, :]
         q_io = dfi.qij[ga[:, :, None], gi[:, None, None], gl[:, None, :]] * mo       # (B, A, L)
         q_jo = dfi.qij[ga[:, :, None], gj[:, None, None], gl[:, None, :]] * mo
         mp = gam[:, :, None] * gpm[:, None, :]
+        prof('gather_v')
         q_iv = cp.matmul(dfi.qia[ga[:, :, None], gi[:, None, None], gp[:, None, :]] * mp, X)
         q_jv = cp.matmul(dfi.qia[ga[:, :, None], gj[:, None, None], gp[:, None, :]] * mp, X)
+        prof('gather_ov')
         q_ov = cp.matmul(dfi.qia[ga[:, :, None, None], gl[:, None, :, None], gp[:, None, None, :]]
                          * (mo[:, :, :, None] * gpm[:, None, None, :]), X[:, None])   # (B, A, L, V)
         st = np.array([bool(self.strong[p]) for p in ch])
@@ -147,6 +172,7 @@ class PNOIntsGPU:
         ns = len(srow)
         srank = -np.ones(B, np.int64)
         srank[srow] = np.arange(ns)
+        prof('fit')
         if ns:
             q_io_c, q_jo_c = C(q_io), C(q_jo)
             E = int(padded(max(len(self._ext[ch[s]]) for s in srow)))
@@ -160,7 +186,9 @@ class PNOIntsGPU:
         q_vv = cp.zeros((B, A, V, V))
         atoms = sorted({a for o_ in offs for a in o_})
         for a in atoms:
+            prof('qab_get')
             qa = dfi.qab_get(a)
+            prof('vv')
             if qa is None:
                 continue
             na = qa.shape[0]
@@ -174,8 +202,7 @@ class PNOIntsGPU:
             for r0 in range(0, len(rows), step):
                 sl = slice(r0, r0 + step)
                 g_ = gr[sl]
-                blk = qa[:, gpos[sl][:, :, None], gpos[sl][:, None, :]].transpose(1, 0, 2, 3)
-                blk = blk * (gpm[g_][:, :, None] * gpm[g_][:, None, :])[:, None]
+                blk = gather_blocks(qa, gpos[sl], gpos[sl], gpm[g_], gpm[g_])
                 xr = X[g_]
                 oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                 q_vv[g_[:, None], oo] = cp.matmul(cp.matmul(_tr(xr)[:, None], blk), xr[:, None])
@@ -183,6 +210,7 @@ class PNOIntsGPU:
             srows = rows[st[rows]]
             if not len(srows):
                 continue
+            prof('Kio')
             soff = np.array([offs[r][a] for r in srows], np.int64)
             sr = srank[srows]
             ppos = ext.pao_pos[a][pidx[srows]]
@@ -195,8 +223,7 @@ class PNOIntsGPU:
             for r0 in range(0, len(srows), step):
                 sl = slice(r0, r0 + step)
                 g_, s_ = gsr[sl], gsr2[sl]
-                blk = qa[:, gpp[sl][:, :, None], gep[sl][:, None, :]].transpose(1, 0, 2, 3)  # (b, na, P, E)
-                blk = blk * (gpm[g_][:, :, None] * gem[s_][:, None, :])[:, None]
+                blk = gather_blocks(qa, gpp[sl], gep[sl], gpm[g_], gem[s_])      # (b, na, P, E)
                 b_ = blk.shape[0]
                 ve = cp.matmul(_tr(X[g_])[:, None], blk).reshape(b_, na, V * E)        # (b, na, V E)
                 del blk
@@ -204,6 +231,7 @@ class PNOIntsGPU:
                 Kio[s_] += cp.matmul(_tr(q_io_c[g_[:, None], oo]), ve).reshape(b_, L, V, E)
                 Kjo[s_] += cp.matmul(_tr(q_jo_c[g_[:, None], oo]), ve).reshape(b_, L, V, E)
                 del ve
+        prof('rest')
         if ns:
             del q_io_c, q_jo_c
             # (k a'| i a) with a' over the extended domain
@@ -224,6 +252,7 @@ class PNOIntsGPU:
         J_ijmb = cp.einsum('bA,bAlv->blv', q_pair, q_ov)
         K_ivvv = cp.matmul(_tr(q_iv), q_vv.reshape(B, A, V * V)).reshape(B, V, V, V)
         K_jvvv = cp.matmul(_tr(q_jv), q_vv.reshape(B, A, V * V)).reshape(B, V, V, V)
+        prof('out')
         names = ('K_mibj', 'J_ijmb', 'K_ivvv', 'J_ikac', 'K_iakc', 'iQk', 'iQa', 'Qma', 'Qab')
         out = {k: {} for k in names}
         cc = cp.ascontiguousarray
@@ -263,4 +292,5 @@ class PNOIntsGPU:
             if q != p:
                 out['iQk'][q], out['iQa'][q] = vq
                 out['Qma'][q], out['Qab'][q] = vals[2], vals[3]
+        prof(None)
         return out

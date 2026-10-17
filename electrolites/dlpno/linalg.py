@@ -201,3 +201,27 @@ def eigh_batched(a, overwrite=False):
         raise RuntimeError(f'cusolverDnXsyevBatched failed ({st})')
     # A now holds eigenvectors column-major: A[b] (row-major view) = V^T
     return W, A.transpose(0, 2, 1)
+
+
+def chol_inv_batched(J):
+    """L^-1 for the Cholesky factors L of a stack of SPD matrices J[b]
+    (batched potrf, then one batched triangular solve against the identity;
+    cupy.linalg.inv on a stack goes through getrf/getri and is much slower)."""
+    from cupy_backends.cuda.libs import cublas
+    L = cp.ascontiguousarray(cp.linalg.cholesky(J))
+    b, n = L.shape[0], L.shape[-1]
+    if b == 0:
+        return L
+    X = cp.ascontiguousarray(cp.broadcast_to(cp.eye(n), (b, n, n)))
+    step = n * n * 8
+    Lp = cp.arange(b, dtype=cp.uint64) * step + L.data.ptr
+    Xp = cp.arange(b, dtype=cp.uint64) * step + X.data.ptr
+    one = np.array(1., np.float64)
+    handle = cp.cuda.device.get_cublas_handle()
+    # row-major L is the column-major upper factor U = L^T; X L^T... in column
+    # major the buffer of X^T solves  X^T U = I  (side right, upper)
+    cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
+    cublas.dtrsmBatched(handle, cublas.CUBLAS_SIDE_RIGHT, cublas.CUBLAS_FILL_MODE_UPPER,
+                        cublas.CUBLAS_OP_N, cublas.CUBLAS_DIAG_NON_UNIT, n, n,
+                        one.ctypes.data, Lp.data.ptr, n, Xp.data.ptr, n, b)
+    return X

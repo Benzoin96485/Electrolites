@@ -1016,6 +1016,8 @@ class UCCSDGPU:
             T1.set_flat(x[:n1])
             T.set_flat(x[n1:])
             e, ew = self.energy(T, T1)
+            if getattr(self, '_prof', None) is not None and it % 10 == 0:
+                self._prof.report()
             if verbose:
                 print(f'  GPU ULCCSD iter {it:3d} {e:.12f} {e - e_prev:.3e} {r1:.3e} {r2:.3e} '
                       f'{time.perf_counter() - t0:.2f}s', flush=True)

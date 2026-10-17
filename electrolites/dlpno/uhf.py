@@ -25,6 +25,8 @@ import time
 import numpy as np
 import scipy.linalg
 import cupy as cp
+from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx.scipy.linalg as cpla
 
 from pyscf import df, scf
@@ -290,7 +292,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         ga, gam = cp.asarray(aidx), cp.asarray(am)
         J = dfi.J2c[ga[:, :, None], ga[:, None, :]] * (gam[:, :, None] * gam[:, None, :])
         J += cp.eye(A)[None] * (1 - gam)[:, :, None]
-        Linv = cp.linalg.inv(cp.linalg.cholesky(J))
+        Linv = chol_inv_batched(J)
         mq = gam[:, :, None] * gpm[:, None, :]
         iq = cp.matmul(Linv, dfi.qia[ga[:, :, None], cp.asarray(xx)[:, None, None], gp[:, None, :]] * mq)
         jq = cp.matmul(Linv, dfi.qia[ga[:, :, None], cp.asarray(yy)[:, None, None], gp[:, None, :]] * mq)
@@ -381,11 +383,20 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
     def sc_mp2_pair_energies(self):
         pl = self.pl
         e = np.zeros(len(pl))
-        for ch in self._pair_chunks(self._canon_pairs()):
-            v = self._sc_chunk(ch)
+
+        def work(w, ch):
+            v = w._sc_chunk(ch)
             e[ch] = v
             e[pl.ji[ch]] = v
+        self._run_chunks(self._pair_chunks(self._canon_pairs()), work)
         return e
+
+    def _run_chunks(self, chunks, work):
+        """work(view, chunk) for every pair chunk, over the visible GPUs."""
+        from electrolites.dlpno import mgpu
+        chunks = sorted(chunks, key=lambda c: -len(c))
+        mgpu.run_queue(chunks, work, setup=lambda d: mgpu.device_view(
+            self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c')}))
 
     # ------------------------------------------------------------------
     # PNO spaces (alpha: PNOs, beta: PNOs + SOMOs), batched
@@ -463,13 +474,14 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         pno = (opt['T_CUT_PNO_MP2'], opt['T_CUT_TRACE_MP2'], opt['T_CUT_ENERGY_MP2'], True)
         sc = {}
         plist, Xps = [], []
-        for ch in self._pair_chunks(self._canon_pairs()):
-            _, res = self._sc_chunk(ch, pno)
+        def work(w, ch):
+            _, res = w._sc_chunk(ch, pno)
             for p, Xp, de, amps, Xa_sc, Xb_sc in res:
                 self.de_pno[p] = self.de_pno[pl.ji[p]] = de
                 sc[p] = (amps, Xa_sc, Xb_sc)
                 plist.append(p)
                 Xps.append(Xp)
+        self._run_chunks(self._pair_chunks(self._canon_pairs()), work)
         self._store_all(plist, Xps)
         self.de_pno_total = self.de_pno.sum()
         self._so_pairs()
@@ -614,11 +626,20 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         ec, rc = 0.01 * opt['E_CONVERGENCE'], 0.01 * opt['R_CONVERGENCE']
         e_prev = 0.
         gm = [cp.asarray(cmask[m]) for m in LT.members]
+        # keep the overlaps when they fit comfortably, else regenerate them per iteration
+        import os
+        need = sum(Pa['LS'].nbytes() + Pb['LS'].nbytes() for Pa, Pb, _, _ in lmp2_chunks)
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        mode = os.environ.get('DLPNO_ONFLY_S', 'auto')
+        onfly = (need > 0.5 * free) if mode == 'auto' else mode == '1'
+        Skept = None if onfly else [(gA.run(Pa), gB.run(Pb)) if pl_.n else None
+                                    for Pa, Pb, pl_, _ in lmp2_chunks]
         for it in range(1, opt['MAXITER'] + 1):
             R = Gr + D * T
-            for Pa, Pb, pl_, w_ in lmp2_chunks:
+            for c_, (Pa, Pb, pl_, w_) in enumerate(lmp2_chunks):
                 if pl_.n:
-                    pl_.run(R, dict(S=[gA.run(Pa), gB.run(Pb)], T=T), w=w_)
+                    Sab = Skept[c_] if Skept is not None else (gA.run(Pa), gB.run(Pb))
+                    pl_.run(R, dict(S=list(Sab), T=T), w=w_)
             for g, z in enumerate(gm):
                 R.data[g][~z] = 0.
             rms = float(R.rms_per_item().max())
@@ -790,7 +811,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         Xa_d, Xbp_d, Xbs_d = cp.asarray(Xa), cp.asarray(Xbp), cp.asarray(Xbs)
         J = dfi.J2c[ga[:, :, None], ga[:, None, :]] * (gam[:, :, None] * gam[:, None, :])
         J += cp.eye(A)[None] * (1 - gam)[:, :, None]
-        Linv = cp.linalg.inv(cp.linalg.cholesky(J))
+        Linv = chol_inv_batched(J)
         del J
         mq = (gam[:, :, None, None] * glm[:, None, :, None]) * gpm[:, None, None, :]
         q = dfi.qia[ga[:, :, None, None], gl[:, None, :, None], gp[:, None, None, :]] * mq     # (B,A,L,P)
@@ -825,8 +846,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             step = max(1, int((1 << 28) // (8 * na * P * P)))
             for r0 in range(0, len(rows), step):
                 sl = slice(r0, r0 + step)
-                blk = qa_[:, gpos[sl][:, :, None], gpos[sl][:, None, :]].transpose(1, 0, 2, 3)
-                blk = blk * (mrow[sl][:, :, None] * mrow[sl][:, None, :])[:, None]
+                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl])
                 oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                 for s, Xs in ((0, Xa_d), (1, Xbp_d)):
                     xr = Xs[gr[sl]]
@@ -1047,6 +1067,9 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         t0 = time.perf_counter()
         self.ucc = g = UCCSDGPU(self)
         g.build()
+        # the (Q|uv) device cache is not needed again before the triples
+        self.dfi.cache_clear()
+        cp.get_default_memory_pool().free_all_blocks()
         self.timings['cc_build'] = time.perf_counter() - t0
         self.log('  CC stores (GB):', getattr(g, 'mem_report', None))
         self.mem_cc = getattr(g, 'mem_report', None)

@@ -431,6 +431,9 @@ class CCSDGPU:
         self.p_rc1 = P(LP, pk_p, [op(LJ, cid), op(LP, rc['kj'], True), op(LS, rc['s3'])])
         self.p_rd1 = P(LP, pk_p, [op(LJ, cid), op(LP, rd['jk'], True), op(LS, rd['s3'])])
         # DF groups over strong canonical pairs; the per-pair copies are then dropped
+        # the per-pair lists are no longer needed: free them before the DF groups
+        for name in ('K_mibj', 'J_ijmb', 'K_ivvv', 'J_ikac', 'K_iakc'):
+            setattr(ref, name, None)
         self._load_df()
         for name in ('Qma', 'Qab', 'iQk', 'iQa'):
             setattr(ref, name, [None] * len(getattr(ref, name)))
@@ -456,10 +459,25 @@ class CCSDGPU:
             allm = sel[inv == u]
             for c0 in range(0, len(allm), step):
                 chunks.append((u, allm[c0:c0 + step]))
+        from electrolites.dlpno import mgpu
+        self.devs = mgpu.devices()
+        load = np.zeros(len(self.devs))
+        home = cp.cuda.Device().id
         for u, mem in chunks:
             A = int(uk[u][0])
             Lp, Vp = self.LN.shapes[int(uk[u][2])]
             g = len(mem)
+            # several GPUs: the groups (and their DF tensors) are spread
+            r = int(np.argmin(load))
+            load[r] += g * A * (Vp * Vp + Lp * Vp)
+            with cp.cuda.Device(self.devs[r]):
+                self._load_df_group(u, uk, mem, A, Lp, Vp, g)
+        self.df_dev = sorted({d['dev'] for d in self.df})
+        cp.cuda.Device(home).use()
+
+    def _load_df_group(self, u, uk, mem, A, Lp, Vp, g):
+        ref = self.ref
+        if True:
             off = getattr(ref, 'df_offload', False)
             if off:
                 from electrolites.dlpno.devmem import pinned_empty
@@ -486,6 +504,9 @@ class CCSDGPU:
                 Qk[s, 1, :na, :nl] = cv(ref.iQk[q])
                 Qa[s, 0, :na, :nv] = cv(ref.iQa[p])
                 Qa[s, 1, :na, :nv] = cv(ref.iQa[q])
+                # release the per-pair copies as soon as they are grouped
+                ref.Qma[p] = ref.Qab[p] = ref.iQk[p] = ref.iQa[p] = None
+                ref.Qma[q] = ref.Qab[q] = ref.iQk[q] = ref.iQa[q] = None
             q = self.ji[mem]
             pos = ref.lmo_pos
             gL = self.LL.group[mem]
@@ -507,7 +528,7 @@ class CCSDGPU:
                 rj=cp.asarray([pos[p][self.pj[p]] for p in mem]),
                 dsel=cp.asarray(np.where(dmask)[0]), di=self.pi[mem][dmask],
                 ev=cp.asarray(ev), lm_idx=cp.asarray(lm_idx), lm_msk=cp.asarray(lm_msk),
-                Qma=Qma, Qab=Qab, Qk=Qk, Qa=Qa))
+                Qma=Qma, Qab=Qab, Qk=Qk, Qa=Qa, dev=cp.cuda.Device().id))
 
     # ------------------------------------------------------------------
     # elementwise helpers
@@ -606,6 +627,9 @@ class CCSDGPU:
         return V3
 
     def residuals(self):
+        from electrolites.dlpno.devmem import Prof
+        prof = self.__dict__.setdefault('_prof', Prof('LCCSD residual'))
+        prof('tn')
         T, T1, S = self.T, self.T1, self.S
         LP, LN, LV, LL, LT1, L11 = self.LP, self.LN, self.LV, self.LL, self.LT1, self.L11
         n = self.n
@@ -623,8 +647,90 @@ class CCSDGPU:
         beta = Ragged(LL)
         Rsym = Ragged(LP)
         Fai = Ragged(LT1)
+        prof('df')
+        diag_items = self._df_all(T, Tn, Fkc_bar, Fab, beta, Rsym)
+        prof('fock')
+        v = self.p_fkj.run(Ragged(L11), [Fkc_bar, T1])
+        Fkj = Fij_bar.copy()
+        cupyx.scatter_add(Fkj.ravel(), pij, self._scal(v))
+        Fkc = self.p_fkc.run(Ragged(LV), [S, self.Lij, S, T1])
+        for d, ds, fai, fab, fkc, Tnd in diag_items:
+            di = d['di']
+            g1, sl1 = LT1.group[di], LT1.slot[di]
+            t1 = cp.stack([T1.data[g][s][:, 0] for g, s in zip(g1, sl1)])
+            col = Fij_bar[d['lm_idx'][ds], cp.asarray(di)[:, None]] * d['lm_msk'][ds]
+            fai = (fai + cp.einsum('gab,gb->ga', fab, t1)
+                   - cp.einsum('gka,gk->ga', Tnd, cp.einsum('gkb,gb->gk', fkc, t1))
+                   - cp.einsum('gka,gk->ga', Tnd, col))
+            for k, (g, s) in enumerate(zip(g1, sl1)):
+                Fai.data[g][s, :, 0] = fai[k]
+        # ---- gamma, delta, F'' ------------------------------------------------
+        prof('gamma_delta')
+        K3 = self.K3
+        ps = self.pslot[id(LP)]
+        G = Ragged(LP)
+        self.p_g1.run(G, [Tn, self.Jijmb], alpha=-1.)
+        for g in range(LP.ngroups):
+            if G.data[g].shape[0]:
+                G.data[g] += cp.einsum('gb,gbac->gac', TjP.data[g][:, :, 0], K3[g])
+        self.p_g3.run(G, [S, T1, T1, S, self.K, S], alpha=-1.)
+        self.p_g4.run(G, [S, T, S, self.K, S], alpha=-.5)
+        Dl = Ragged(LP)
+        self.p_d1.run(Dl, [Tn, self.Kmibj], alpha=-2.)
+        self.p_d1.run(Dl, [Tn, self.Jijmb], alpha=1.)
+        for g in range(LP.ngroups):
+            if Dl.data[g].shape[0]:
+                Kq = K3[g][ps[g]]
+                tiv = TiP.data[g][:, :, 0]
+                Dl.data[g] += 2 * cp.einsum('gcab,gb->gac', Kq, tiv)
+                Dl.data[g] -= cp.einsum('gb,gbac->gac', tiv, Kq)
+        self.p_d3.run(Dl, [S, T1, T1, S, self.Lij, S], alpha=-1.)
+        self.p_d4.run(Dl, [S, Tt, S, self.Lij, S], alpha=.5)
+        Fdd = Fkj.copy()
+        cupyx.scatter_add(Fdd.ravel(), self.fdd_flat, self.p_fdd.run([self.K], [S, Tt, S]))
+        # ---- R1 ---------------------------------------------------------------
+        prof('r1')
+        R1 = Fai
+        Fai = Fai.copy()
+        self.p_r1a.run(R1, [S, self._v3(Tt)])
+        w = self.p_r1b_w.run([self.K], [S, Tt, S])
+        self.p_r1b.run(R1, [S, T1], w=w, alpha=-1.)
+        self.p_r1c.run(R1, [S, Tt, Fkc])
+        B = Ragged(LN)
+        self.p_B1.run(B, [self.Kmibj, Tt])
+        self.p_B2.run(B, [Tn, self.K, Tt])
+        self.p_r1d.run(R1, [S, B], alpha=-1.)
+        # ---- R2 ---------------------------------------------------------------
+        prof('r2_b_f')
+        self.p_rb.run(Rsym, [S, T, S], w=self._beta_w(beta))
+        Fbc = Fab
+        self.p_rf.run(Fbc, [S, Tt, self.K, S], alpha=-1.)
+        for g in range(LP.ngroups):
+            if Rsym.data[g].shape[0]:
+                Tg, Fg = T.data[g], Fbc.data[g]
+                Rsym.data[g] += cp.matmul(Tg, Fg.transpose(0, 2, 1)) + cp.matmul(Fg, Tg)
+        R = Rsym + self.masked(self.swapT(Rsym), self.offdiag)
+        prof('r2_cd')
+        Cm = Ragged(LP)
+        self.p_rc1.run(Cm, [self.Jikac, T, S], alpha=-1.)
+        self.p_rc2.run(Cm, [S, G, S, T, S], alpha=-1.)
+        Dm = Ragged(LP)
+        self.p_rd1.run(Dm, [self.Kiakc, Tt, S], alpha=2.)
+        self.p_rd1.run(Dm, [self.Jikac, Tt, S], alpha=-1.)
+        self.p_rd3.run(Dm, [S, Dl, S, Tt, S])
+        Rn = Cm * .5 + Cm.T() + Dm * .5
+        self.p_rg.run(Rn, [S, T, S], w=Fdd.ravel()[self.rg_f], alpha=-1.)
+        R = R + Rn + self.swapT(Rn)
+        R = self.masked(R, self.strong)
+        prof(None)
+        self.last = dict(Fkj=Fkj, Fdd=Fdd, G=G, Dl=Dl, beta=beta, Fai=Fai, Tn=Tn)
+        return R1, R
+
+    def _df_groups(self, groups, T, Tn, Fkc_bar, Fab, beta, Rsym):
+        """T1-dressed DF terms of the strong pairs of ``groups`` (all on the
+        current device) into the given outputs; returns the diagonal items."""
         diag_items = []
-        for d in self.df:
+        for d in groups:
             gP, gN, gL = d['gP'], d['gN'], d['gL']
             Tnp = Tn.data[gN][d['sN']]
             Tnq = Tn.data[gN][d['sNq']]
@@ -662,76 +768,40 @@ class CCSDGPU:
                 fai = 2 * cp.einsum('gA,gAa->ga', gam[ds], Qa[ds, 0])
                 fai -= cp.einsum('gAam,gAm->ga', Y[ds], Qk[ds, 0])
                 diag_items.append((d, ds, fai, fab[ds], fkc[ds], Tnp[ds]))
-        v = self.p_fkj.run(Ragged(L11), [Fkc_bar, T1])
-        Fkj = Fij_bar.copy()
-        cupyx.scatter_add(Fkj.ravel(), pij, self._scal(v))
-        Fkc = self.p_fkc.run(Ragged(LV), [S, self.Lij, S, T1])
-        for d, ds, fai, fab, fkc, Tnd in diag_items:
-            di = d['di']
-            g1, sl1 = LT1.group[di], LT1.slot[di]
-            t1 = cp.stack([T1.data[g][s][:, 0] for g, s in zip(g1, sl1)])
-            col = Fij_bar[d['lm_idx'][ds], cp.asarray(di)[:, None]] * d['lm_msk'][ds]
-            fai = (fai + cp.einsum('gab,gb->ga', fab, t1)
-                   - cp.einsum('gka,gk->ga', Tnd, cp.einsum('gkb,gb->gk', fkc, t1))
-                   - cp.einsum('gka,gk->ga', Tnd, col))
-            for k, (g, s) in enumerate(zip(g1, sl1)):
-                Fai.data[g][s, :, 0] = fai[k]
-        # ---- gamma, delta, F'' ------------------------------------------------
-        K3 = self.K3
-        ps = self.pslot[id(LP)]
-        G = Ragged(LP)
-        self.p_g1.run(G, [Tn, self.Jijmb], alpha=-1.)
-        for g in range(LP.ngroups):
-            if G.data[g].shape[0]:
-                G.data[g] += cp.einsum('gb,gbac->gac', TjP.data[g][:, :, 0], K3[g])
-        self.p_g3.run(G, [S, T1, T1, S, self.K, S], alpha=-1.)
-        self.p_g4.run(G, [S, T, S, self.K, S], alpha=-.5)
-        Dl = Ragged(LP)
-        self.p_d1.run(Dl, [Tn, self.Kmibj], alpha=-2.)
-        self.p_d1.run(Dl, [Tn, self.Jijmb], alpha=1.)
-        for g in range(LP.ngroups):
-            if Dl.data[g].shape[0]:
-                Kq = K3[g][ps[g]]
-                tiv = TiP.data[g][:, :, 0]
-                Dl.data[g] += 2 * cp.einsum('gcab,gb->gac', Kq, tiv)
-                Dl.data[g] -= cp.einsum('gb,gbac->gac', tiv, Kq)
-        self.p_d3.run(Dl, [S, T1, T1, S, self.Lij, S], alpha=-1.)
-        self.p_d4.run(Dl, [S, Tt, S, self.Lij, S], alpha=.5)
-        Fdd = Fkj.copy()
-        cupyx.scatter_add(Fdd.ravel(), self.fdd_flat, self.p_fdd.run([self.K], [S, Tt, S]))
-        # ---- R1 ---------------------------------------------------------------
-        R1 = Fai
-        Fai = Fai.copy()
-        self.p_r1a.run(R1, [S, self._v3(Tt)])
-        w = self.p_r1b_w.run([self.K], [S, Tt, S])
-        self.p_r1b.run(R1, [S, T1], w=w, alpha=-1.)
-        self.p_r1c.run(R1, [S, Tt, Fkc])
-        B = Ragged(LN)
-        self.p_B1.run(B, [self.Kmibj, Tt])
-        self.p_B2.run(B, [Tn, self.K, Tt])
-        self.p_r1d.run(R1, [S, B], alpha=-1.)
-        # ---- R2 ---------------------------------------------------------------
-        self.p_rb.run(Rsym, [S, T, S], w=self._beta_w(beta))
-        Fbc = Fab
-        self.p_rf.run(Fbc, [S, Tt, self.K, S], alpha=-1.)
-        for g in range(LP.ngroups):
-            if Rsym.data[g].shape[0]:
-                Tg, Fg = T.data[g], Fbc.data[g]
-                Rsym.data[g] += cp.matmul(Tg, Fg.transpose(0, 2, 1)) + cp.matmul(Fg, Tg)
-        R = Rsym + self.masked(self.swapT(Rsym), self.offdiag)
-        Cm = Ragged(LP)
-        self.p_rc1.run(Cm, [self.Jikac, T, S], alpha=-1.)
-        self.p_rc2.run(Cm, [S, G, S, T, S], alpha=-1.)
-        Dm = Ragged(LP)
-        self.p_rd1.run(Dm, [self.Kiakc, Tt, S], alpha=2.)
-        self.p_rd1.run(Dm, [self.Jikac, Tt, S], alpha=-1.)
-        self.p_rd3.run(Dm, [S, Dl, S, Tt, S])
-        Rn = Cm * .5 + Cm.T() + Dm * .5
-        self.p_rg.run(Rn, [S, T, S], w=Fdd.ravel()[self.rg_f], alpha=-1.)
-        R = R + Rn + self.swapT(Rn)
-        R = self.masked(R, self.strong)
-        self.last = dict(Fkj=Fkj, Fdd=Fdd, G=G, Dl=Dl, beta=beta, Fai=Fai, Tn=Tn)
-        return R1, R
+        return diag_items
+
+    def _df_all(self, T, Tn, Fkc_bar, Fab, beta, Rsym):
+        """DF terms of all groups; with several GPUs every device runs its own
+        groups on replicas of T, Tn and adds its outputs into the home ones."""
+        devs = getattr(self, 'df_dev', [cp.cuda.Device().id])
+        home = cp.cuda.Device().id
+        if devs == [home]:
+            return self._df_groups(self.df, T, Tn, Fkc_bar, Fab, beta, Rsym)
+        from electrolites.dlpno import mgpu
+        res = {}
+
+        def work(ctx, d_):
+            grp = [d for d in self.df if d['dev'] == d_]
+            if d_ == home:
+                res[d_] = (self._df_groups(grp, T, Tn, Fkc_bar, Fab, beta, Rsym), None)
+                return
+            T_, Tn_ = Ragged(T.layout, mgpu.replicate(T.data)), Ragged(Tn.layout, mgpu.replicate(Tn.data))
+            outs = [Ragged(x.layout) for x in (Fkc_bar, Fab, beta, Rsym)]
+            di = self._df_groups(grp, T_, Tn_, *outs)
+            res[d_] = (di, outs)
+        mgpu.run_per_device(lambda d_: work(None, d_), devs)
+        diag_items = []
+        for d_ in devs:
+            di, outs = res[d_]
+            if outs is not None:
+                for dst, src in zip((Fkc_bar, Fab, beta, Rsym), outs):
+                    for g in range(len(dst.data)):
+                        if dst.data[g].size:
+                            dst.data[g] += cp.asarray(src.data[g])
+                di = [(d, cp.asarray(ds), cp.asarray(a), cp.asarray(b), cp.asarray(c), cp.asarray(e))
+                      for d, ds, a, b, c, e in di]
+            diag_items += di
+        return diag_items
 
     def energy(self):
         TiP = self.p_ti.run(Ragged(self.LV), [self.S, self.T1])
@@ -758,6 +828,8 @@ class CCSDGPU:
             self.T1.set_flat(x[:n1])
             self.T.set_flat(x[n1:])
             e = self.energy()
+            if it % 10 == 0:
+                self._prof.report()
             e_cur = float(e.sum())
             e_weak = float(e[weak].sum())
             if verbose:
@@ -772,27 +844,57 @@ class CCSDGPU:
 
 
 class _DeviceDIIS:
+    """DIIS on device vectors.  The Gram matrix of the error vectors is kept
+    on the host and extended by one row per update; the extrapolation is
+    accumulated vector by vector (no stacked copies of the history).  When
+    the history would take more than a quarter of the free device memory it
+    is kept in pinned host memory."""
+
     def __init__(self, nvec=6):
         self.nvec = nvec
         self.x, self.e = [], []
+        self.G = np.zeros((0, 0))
+        self.host = None
+
+    def _keep(self, v):
+        if self.host is None:
+            free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+            self.host = 2 * self.nvec * v.nbytes > 0.25 * free
+        if self.host:
+            from electrolites.dlpno.devmem import to_pinned
+            return to_pinned(v)
+        return v.copy()
+
+    @staticmethod
+    def _dev(v):
+        return v if isinstance(v, cp.ndarray) else cp.asarray(v)
 
     def update(self, x, e):
-        self.x.append(x.copy())
-        self.e.append(e.copy())
+        g = np.array([float(cp.dot(e, self._dev(v))) for v in self.e] + [float(cp.dot(e, e))])
+        n0 = len(self.e)
+        G = np.zeros((n0 + 1, n0 + 1))
+        G[:n0, :n0] = self.G
+        G[n0, :] = G[:, n0] = g
+        self.G = G
+        self.x.append(self._keep(x))
+        self.e.append(self._keep(e))
         if len(self.x) > self.nvec:
-            k = int(np.argmax([float(cp.dot(v, v)) for v in self.e]))
+            k = int(np.argmax(np.diag(self.G)))
             del self.x[k], self.e[k]
+            self.G = np.delete(np.delete(self.G, k, 0), k, 1)
         n = len(self.x)
         if n < 2:
             return x
         B = -np.ones((n + 1, n + 1))
         B[n, n] = 0
-        E = cp.stack(self.e)
-        B[:n, :n] = (E @ E.T).get()
+        B[:n, :n] = self.G
         rhs = np.zeros(n + 1)
         rhs[n] = -1
         try:
             c = np.linalg.solve(B, rhs)[:n]
         except np.linalg.LinAlgError:
             return x
-        return cp.asarray(c) @ cp.stack(self.x)
+        out = self._dev(self.x[0]) * c[0]
+        for ci, v in zip(c[1:], self.x[1:]):
+            out += ci * self._dev(v)
+        return out
