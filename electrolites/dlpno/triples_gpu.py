@@ -12,7 +12,7 @@ largest pair (PP PAOs, VP PNOs).
 """
 import numpy as np
 import cupy as cp
-from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno.gather import blocks as gather_blocks, xtbx
 from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx
 
@@ -388,9 +388,9 @@ class TriplesGPU:
                 step = max(1, int((1 << 28) // (8 * na * P * P)))
                 for r0 in range(0, len(rows), step):
                     sl = slice(r0, r0 + step)
-                    blk = gather_blocks(qa, gpos[sl], gpos[sl], mrow[sl], mrow[sl])   # (b, na, P, P)
+                    blk = gather_blocks(qa, gpos[sl], gpos[sl], mrow[sl], mrow[sl], ru=True)   # (b, P, na, P)
                     xr = Xr[sl]
-                    tq = cp.matmul(cp.matmul(xr.transpose(0, 2, 1)[:, None], blk), xr[:, None])
+                    tq = xtbx(blk, xr, xr)
                     oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                     qvv[gr[sl][:, None], oo] = tq
             qvv = cp.matmul(Linv, qvv.reshape(B, A, V * V)).reshape(B, A, V, V)

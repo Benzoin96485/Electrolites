@@ -22,7 +22,7 @@ import itertools
 
 import numpy as np
 import cupy as cp
-from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno.gather import blocks as gather_blocks, xtbx
 from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx
 
@@ -392,11 +392,11 @@ class UTriplesGPU:
                 sl = slice(r0, r0 + step)
                 g_ = gr[sl]
                 nr = len(rows[sl])
-                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl])
+                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl], ru=True)
                 oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                 for s_, Xs in ((0, Xa), (1, Xbp)):
                     xr = Xs[g_]
-                    q_ = cp.matmul(cp.matmul(tr(xr)[:, None], blk), xr[:, None])      # (nr, na, V, V)
+                    q_ = xtbx(blk, xr, xr)                                            # (nr, na, V, V)
                     q_ = q_.reshape(nr, na, -1).transpose(0, 2, 1)                     # (nr, V*V, na)
                     for (r, s2, t), K in K3.items():
                         if s2 != s_:

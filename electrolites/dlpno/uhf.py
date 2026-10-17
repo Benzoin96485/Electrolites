@@ -25,7 +25,7 @@ import time
 import numpy as np
 import scipy.linalg
 import cupy as cp
-from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno.gather import blocks as gather_blocks, xtbx
 from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx.scipy.linalg as cpla
 
@@ -846,11 +846,11 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             step = max(1, int((1 << 28) // (8 * na * P * P)))
             for r0 in range(0, len(rows), step):
                 sl = slice(r0, r0 + step)
-                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl])
+                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl], ru=True)
                 oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                 for s, Xs in ((0, Xa_d), (1, Xbp_d)):
                     xr = Xs[gr[sl]]
-                    qvv[s][gr[sl][:, None], oo] = cp.matmul(cp.matmul(tr(xr)[:, None], blk), xr[:, None])
+                    qvv[s][gr[sl][:, None], oo] = xtbx(blk, xr, xr)
         if ns:
             qsu = dfi.qia[ga[:, :, None, None], so[None, None, :, None], gp[:, None, None, :]]
             qsu = qsu * (gam[:, :, None, None] * gpm[:, None, None, :])

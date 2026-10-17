@@ -12,7 +12,8 @@ _SRC = r'''
 extern "C" __global__ void gather_blocks(const double* __restrict__ qa, const long long N,
                                          const int* __restrict__ rpos, const int* __restrict__ cpos,
                                          const double* __restrict__ rmask, const double* __restrict__ cmask,
-                                         double* __restrict__ out, const int nq, const int R, const int C)
+                                         double* __restrict__ out, const int nq, const int R, const int C,
+                                         const int ru)
 {
     // one block per (b, q, u) row of the output
     const long long row = blockIdx.x;
@@ -20,7 +21,8 @@ extern "C" __global__ void gather_blocks(const double* __restrict__ qa, const lo
     const long long bq = row / R;
     const int q = (int)(bq % nq);
     const int b = (int)(bq / nq);
-    double* o = out + row * C;
+    // ru: output laid out (b, u, q, v) instead of (b, q, u, v)
+    double* o = ru ? out + (((long long)b * R + u) * nq + q) * C : out + row * C;
     const double rm = rmask[(long long)b * R + u];
     if (rm == 0.) {
         for (int v = threadIdx.x; v < C; v += blockDim.x) o[v] = 0.;
@@ -36,9 +38,10 @@ extern "C" __global__ void gather_blocks(const double* __restrict__ qa, const lo
 _k = None
 
 
-def blocks(qa, rpos, cpos, rmask, cmask, out=None):
+def blocks(qa, rpos, cpos, rmask, cmask, out=None, ru=False):
     """qa (nq, N, N) device; rpos (b, R), cpos (b, C) int positions (any
-    value where the mask is 0); masks float (b, R), (b, C)."""
+    value where the mask is 0); masks float (b, R), (b, C).  ``ru``: output
+    (b, R, nq, C) (row index ahead of the aux index)."""
     global _k
     if _k is None:
         _k = cp.RawKernel(_SRC, 'gather_blocks')
@@ -47,7 +50,7 @@ def blocks(qa, rpos, cpos, rmask, cmask, out=None):
     b, R = rpos.shape
     C = cpos.shape[1]
     if out is None:
-        out = cp.empty((b, nq, R, C))
+        out = cp.empty((b, R, nq, C) if ru else (b, nq, R, C))
     if b == 0:
         return out
     rp = cp.ascontiguousarray(cp.where(rmask > 0, rpos, 0).astype(cp.int32))
@@ -55,7 +58,7 @@ def blocks(qa, rpos, cpos, rmask, cmask, out=None):
     nt = 128 if C <= 128 else 256
     _k((b * nq * R,), (nt,), (qa, np.int64(N), rp, cq, cp.ascontiguousarray(rmask, dtype=cp.float64),
                              cp.ascontiguousarray(cmask, dtype=cp.float64), out,
-                             np.int32(nq), np.int32(R), np.int32(C)))
+                             np.int32(nq), np.int32(R), np.int32(C), np.int32(1 if ru else 0)))
     return out
 
 
@@ -128,3 +131,13 @@ def gather3p(ptr, strides, nn, A0, A1, A2, out=None):
         _mod2().get_function('gather3p')((gx, c1 - c0), (256,), (ptr[c0:c1], strides[c0:c1], nn[c0:c1], out[c0:c1],
                                                                 np.int32(A0), np.int32(A1), np.int32(A2)))
     return out
+
+
+def xtbx(blk, X1, X2):
+    """out[b, q] = X1[b]^T blk[b, :, q, :] X2[b] for a (b, R, nq, C) block
+    stack (``blocks(..., ru=True)``): two large batched GEMMs.  -> (b, nq, V1, V2)."""
+    b, R, nq, C = blk.shape
+    V1, V2 = X1.shape[2], X2.shape[2]
+    Y = cp.matmul(X1.transpose(0, 2, 1), blk.reshape(b, R, nq * C))          # (b, V1, nq*C)
+    Y = cp.matmul(Y.reshape(b, V1 * nq, C), X2).reshape(b, V1, nq, V2)
+    return Y.transpose(0, 2, 1, 3)

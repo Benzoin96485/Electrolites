@@ -207,11 +207,16 @@ class PNOIntsGPU:
             for r0 in range(0, len(rows), step):
                 sl = slice(r0, r0 + step)
                 g_ = gr[sl]
-                blk = gather_blocks(qa, gpos[sl], gpos[sl], gpm[g_], gpm[g_])
+                # (b, u, q, v) layout: both contractions are single large GEMMs
+                blk = gather_blocks(qa, gpos[sl], gpos[sl], gpm[g_], gpm[g_], ru=True)
+                b_ = blk.shape[0]
                 xr = X[g_]
-                oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
-                q_vv[g_[:, None], oo] = cp.matmul(cp.matmul(_tr(xr)[:, None], blk), xr[:, None])
+                Y = cp.matmul(_tr(xr), blk.reshape(b_, P, na * P))                  # (b, V, na*P)
                 del blk
+                Y = cp.matmul(Y.reshape(b_, V * na, P), xr).reshape(b_, V, na, V)    # (b, V, na, V)
+                oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
+                q_vv[g_[:, None], oo] = Y.transpose(0, 2, 1, 3)
+                del Y
             srows = rows[st[rows]]
             if not len(srows):
                 continue
@@ -228,10 +233,11 @@ class PNOIntsGPU:
             for r0 in range(0, len(srows), step):
                 sl = slice(r0, r0 + step)
                 g_, s_ = gsr[sl], gsr2[sl]
-                blk = gather_blocks(qa, gpp[sl], gep[sl], gpm[g_], gem[s_])      # (b, na, P, E)
+                blk = gather_blocks(qa, gpp[sl], gep[sl], gpm[g_], gem[s_], ru=True)   # (b, P, na, E)
                 b_ = blk.shape[0]
-                ve = cp.matmul(_tr(X[g_])[:, None], blk).reshape(b_, na, V * E)        # (b, na, V E)
+                ve = cp.matmul(_tr(X[g_]), blk.reshape(b_, P, na * E))                # (b, V, na*E)
                 del blk
+                ve = cp.ascontiguousarray(ve.reshape(b_, V, na, E).transpose(0, 2, 1, 3)).reshape(b_, na, V * E)
                 oo = cp.asarray(soff[sl])[:, None] + cp.arange(na)[None, :]
                 Kio[s_] += cp.matmul(_tr(q_io_c[g_[:, None], oo]), ve).reshape(b_, L, V, E)
                 Kjo[s_] += cp.matmul(_tr(q_jo_c[g_[:, None], oo]), ve).reshape(b_, L, V, E)
