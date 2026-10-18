@@ -208,10 +208,12 @@ def _mp_worker(path, dev, tasks, results, setup_name, work_name):
     try:
         import cupy as cp_
         cp_.cuda.Device(dev).use()
-        pool = cp_.get_default_memory_pool()
-        cp_.cuda.set_allocator(pool.malloc)
         with open(path, 'rb') as f:
             ctx = _ArrUnpickler(f).load()
+        # after the imports of the unpickling (GPU4PySCF installs an allocator
+        # that sends large requests to cudaMalloc): the plain CuPy pool
+        pool = cp_.get_default_memory_pool()
+        cp_.cuda.set_allocator(pool.malloc)
         getattr(ctx, setup_name)()
         work = getattr(ctx, work_name)
         while True:

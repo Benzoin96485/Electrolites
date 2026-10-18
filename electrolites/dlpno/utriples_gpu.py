@@ -325,7 +325,7 @@ class UTriplesGPU:
         mpdevs = os.environ.get('DLPNO_MP_DEVS')       # testing: e.g. "0,0" on one GPU
         if mpdevs:
             devs = [int(x) for x in mpdevs.split(',')]
-        if not save and len(devs) > 1 and os.environ.get('DLPNO_MP', '1') == '1':
+        if not save and (len(devs) > 1 or os.environ.get('DLPNO_MP_FORCE')) and os.environ.get('DLPNO_MP', '1') == '1':
             # one process per GPU: the triplet chunks are Python / launch bound
             # and threads would share one interpreter lock
             busy = {}
