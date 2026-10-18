@@ -144,6 +144,13 @@ class UTriplesGPU:
             D *= .5
         return D
 
+    def _nvs_tab(self):
+        """(npair, 2) alpha / beta virtual counts of every pair (cached)."""
+        t = getattr(self, '_nvs_cache', None)
+        if t is None or len(t) != len(self.pl):
+            t = self._nvs_cache = np.array([[self.nva(p), self.nvb(p)] for p in range(len(self.pl))], np.int64)
+        return t
+
     def _proj(self, Z, s, bidx, pidx):
         """S(triplet b, pair p)^T for spin s: (n, VP_s, V_s) = X_p^T Z_b[rows of p]."""
         pt = self._pt
@@ -556,8 +563,24 @@ class UTriplesGPU:
                     return S.reshape((n * L,) + S.shape[2:])
                 S1 = lproj(s1)
                 S2 = lproj(s2)
-                Tm = pt['TS'][cp.asarray(items.reshape(-1))][:, :S1.shape[1], :S2.shape[1]]
-                v = cp.matmul(tr(S1), cp.matmul(Tm, S2)) * cp.asarray(signs.reshape(-1))[:, None, None]
+                # only the couples that exist, bucketed by their pair's PNO
+                # count (the pair tables are padded to the largest pair)
+                okf = ok.reshape(-1)
+                pf = pil.reshape(-1)
+                nvt = self._nvs_tab()
+                nb = np.maximum(nvt[pf, s1], nvt[pf, s2])
+                bkt = np.where(okf, -(-nb // 16) * 16, 0)
+                itf = items.reshape(-1)
+                sgf = signs.reshape(-1)
+                v = cp.zeros((n * L, S1.shape[2], S2.shape[2]))
+                for vb in np.unique(bkt[bkt > 0]):
+                    q = np.flatnonzero(bkt == vb)
+                    gq = cp.asarray(q)
+                    vb = int(min(vb, S1.shape[1], S2.shape[1]))
+                    a1 = S1[gq, :vb]
+                    a2 = S2[gq, :vb]
+                    Tq = pt['TS'][cp.asarray(itf[q]), :vb, :vb]
+                    v[gq] = cp.matmul(tr(a1), cp.matmul(Tq, a2)) * cp.asarray(sgf[q])[:, None, None]
                 v = v.reshape(n, L, S1.shape[2], S2.shape[2])
                 cache[key] = v
                 return v
