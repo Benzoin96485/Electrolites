@@ -182,7 +182,10 @@ class _SpinPlan:
             spin_cols = [dot_left[2]] + spin_cols
         if spin_cols:
             km = np.stack([terms.a(c) for c in spin_cols], 1)
-            ukeys, inv = np.unique(km, axis=0, return_inverse=True)
+            # spins are 0 / 1: one integer code per term (np.unique on rows is slow)
+            code = (km << np.arange(km.shape[1], dtype=np.int64)[None, :]).sum(axis=1)
+            ucode, inv = np.unique(code, return_inverse=True)
+            ukeys = (ucode[:, None] >> np.arange(km.shape[1], dtype=np.int64)[None, :]) & 1
             inv = inv.reshape(-1)
             order = np.argsort(inv, kind='stable')
             bounds = np.searchsorted(inv[order], np.arange(len(ukeys) + 1))

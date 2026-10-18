@@ -1119,25 +1119,21 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                         v[:, :, :ne] += cp.matmul(Xbs.T[None], qsu)
                         v[:, :, ne:] += cp.matmul(Xbs.T[None], qss)
                 Vx.append(_half(L, v))
-            Xcc = {}
+            xq = self.__dict__.setdefault('_xq_dev', {})
 
-            def xc(q, c_):
-                X = Xcc.get((q, c_))
+            def xdev(q, c_):
+                """pair q's virtual coefficients (rows: its PAOs, then the
+                SOMOs for beta) on this device, cached."""
+                key = (q, c_, cp.cuda.Device().id)
+                X = xq.get(key)
                 if X is None:
-                    npo = len(self.pao[q])
-                    if c_ == 0:
-                        X = np.zeros((ne + ns, self.nva(q)))
-                        X[epos[self.pao[q]]] = self.Xa[q]
-                    else:
-                        X = np.zeros((ne + ns, self.nvb(q)))
-                        X[epos[self.pao[q]]] = self.Xb[q][:npo]
-                        X[ne:] = self.Xb[q][npo:]
-                    Xcc[(q, c_)] = X
+                    X = xq[key] = cp.asarray(self.Xa[q] if c_ == 0 else self.Xb[q])
                 return X
             grp = {}
             for n in idx:
                 (_, K, Q, bp, c_, q) = keys[n]
                 grp.setdefault((so[Q][0], bp), []).append(n)
+            somo_cols = np.arange(ne, ne + ns, dtype=np.int64)
             for (qo, bp), lst in grp.items():
                 c1 = np.zeros(len(lst))
                 c2 = np.zeros(len(lst))
@@ -1148,6 +1144,12 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                     lk[r_] = lpos[so[K][0]]
                     c1[r_] = 1. if (sK == c_ and bp == sQ) else 0.
                     c2[r_] = 1. if (sK == sQ and bp == c_) else 0.
+                nvp = self.nva(p) if bp == 0 else self.nvb(p)
+                if not c1.any() and not c2.any():
+                    for n in lst:
+                        q, c_ = keys[n][5], keys[n][4]
+                        out[n] = cp.zeros((nvp, self.nva(q) if c_ == 0 else self.nvb(q)))
+                    continue
                 glk = cp.asarray(lk)
                 Z = 0.
                 if c1.any():        # (k u|B q) for the domain LMOs k
@@ -1156,18 +1158,19 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                 if c2.any():        # (k q|B u)
                     t2 = cp.einsum('Qk,Qbu->kbu', Boo[:, :, lpos[qo]], Vx[bp])
                     Z = Z - t2[glk] * cp.asarray(c2)[:, None, None]
-                ws = [xc(keys[n][5], keys[n][4]).shape[1] for n in lst]
-                Wm = max(ws)
-                Xs = np.zeros((len(lst), ne + ns, Wm))
+                # contract with each target pair's coefficients over its own
+                # PAO (+ SOMO) rows of the extended domain: no dense embedding
+                byq = {}
                 for r_, n in enumerate(lst):
-                    Xs[r_, :, :ws[r_]] = xc(keys[n][5], keys[n][4])
-                nvp = self.nva(p) if bp == 0 else self.nvb(p)
-                if isinstance(Z, float):
-                    res = cp.zeros((len(lst), nvp, Wm))
-                else:
-                    res = cp.matmul(Z, cp.asarray(Xs))
-                for r_, n in enumerate(lst):
-                    out[n] = res[r_, :, :ws[r_]].copy()
+                    byq.setdefault((keys[n][5], keys[n][4]), []).append(r_)
+                for (q, c_), rows in byq.items():
+                    cols = epos[self.pao[q]]
+                    if c_ == 1 and ns:
+                        cols = np.concatenate([cols, somo_cols])
+                    gr = cp.asarray(np.asarray(rows, np.int64))
+                    res = cp.matmul(Z[gr][:, :, cp.asarray(cols)], xdev(q, c_))
+                    for k_, r_ in enumerate(rows):
+                        out[lst[r_]] = res[k_]
         return [out[n] for n in idx]
 
     # ------------------------------------------------------------------
