@@ -38,8 +38,10 @@ DEFAULTS = dict(
     T_CUT_ITER=1e-5, MIN_TNOS=9,
     # convergence
     E_CONVERGENCE=1e-6, R_CONVERGENCE=1e-6, MAXITER=50, DIIS_MAX_VECS=6,
-    # residual measure: largest per-pair RMS (Psi4) or largest element (R_NORM="max", ORCA)
-    R_NORM="rms",
+    # residual criterion: "rms" = Psi4 (largest per-pair RMS < R_CONVERGENCE),
+    # "max" = ORCA (largest element < R_CONVERGENCE_MAX), "both" = the tighter
+    # of the two (default); comparisons with a program use its own criterion
+    R_NORM="both", R_CONVERGENCE_MAX=1e-5,
     LOCAL_CONVERGENCE=1e-12,
     # DOI grid (radial, angular) -- Psi4 uses 25 radial x 50 Lebedev
     DOI_GRID=(25, 50),

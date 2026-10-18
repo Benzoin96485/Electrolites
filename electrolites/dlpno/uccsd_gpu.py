@@ -25,7 +25,7 @@ import cupyx
 
 from electrolites.dlpno.ragged import Layout, Ragged, op
 from electrolites.dlpno.vbatch import VChainPlan, VDotPlan
-from electrolites.dlpno.ccsd_gpu import _DeviceDIIS, _rnorm
+from electrolites.dlpno.ccsd_gpu import _DeviceDIIS, _rnorm, _converged
 
 
 class _Reg:
@@ -1049,7 +1049,7 @@ class UCCSDGPU:
         for it in range(1, opt['MAXITER'] + 1):
             t0 = time.perf_counter()
             R1, R = self.residuals(T, T1)
-            r1, r2 = _rnorm(R1, opt), _rnorm(R, opt)
+            rn = _rnorm(R1, R)
             import os
             if os.environ.get('DLPNO_DEBUG_R1'):
                 rr = R1.rms_per_item().get()
@@ -1067,9 +1067,9 @@ class UCCSDGPU:
             if getattr(self, '_prof', None) is not None and it % 10 == 0:
                 self._prof.report()
             if verbose:
-                print(f'  GPU ULCCSD iter {it:3d} {e:.12f} {e - e_prev:.3e} {r1:.3e} {r2:.3e} '
+                print(f'  GPU ULCCSD iter {it:3d} {e:.12f} {e - e_prev:.3e} {rn[0]:.3e} {rn[1]:.3e} '
                       f'{time.perf_counter() - t0:.2f}s', flush=True)
-            if abs(e - e_prev) < opt['E_CONVERGENCE'] and max(r1, r2) < opt['R_CONVERGENCE']:
+            if _converged(e - e_prev, rn, opt):
                 break
             e_prev = e
         else:

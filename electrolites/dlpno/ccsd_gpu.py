@@ -46,12 +46,26 @@ def _wsum(w, M):
     return cp.matmul(w[:, None, :], M.reshape(g, A, -1)).reshape((g,) + M.shape[2:])
 
 
-def _rnorm(R, opt):
-    """residual measure: largest per-pair RMS (Psi4, default) or, with
-    R_NORM='max', the largest absolute element (ORCA's "max. residuum")."""
-    if opt.get('R_NORM', 'rms') == 'max':
-        return float(max(float(cp.abs(d).max()) for d in R.data if d.size))
-    return float(R.rms_per_item().max())
+def _rnorm(*Rs):
+    """residual measures of the residual blocks ``Rs``: (largest per-pair
+    RMS -- Psi4's measure, largest absolute element -- ORCA's "max.
+    residuum")."""
+    rms = max(float(R.rms_per_item().max()) for R in Rs)
+    mx = [cp.abs(d).max() for R in Rs for d in R.data if d.size]
+    return rms, (float(cp.stack(mx).max()) if mx else 0.)
+
+
+def _converged(de, rn, opt):
+    """CC convergence: |dE| < E_CONVERGENCE and the residual criterion of
+    R_NORM -- 'rms' (Psi4: per-pair RMS < R_CONVERGENCE), 'max' (ORCA:
+    largest element < R_CONVERGENCE_MAX) or 'both' (default, the tighter
+    of the two: both must hold)."""
+    mode = opt.get('R_NORM', 'both')
+    ok_rms = rn[0] < opt['R_CONVERGENCE']
+    ok_max = rn[1] < opt.get('R_CONVERGENCE_MAX', 1e-5)
+    ok = {'rms': ok_rms, 'max': ok_max, 'both': ok_rms and ok_max}[mode]
+    return abs(de) < opt['E_CONVERGENCE'] and ok
+
 
 class _ChunkedPlan:
     """A chain (or dot) plan whose PNO-overlap operands (layout ``LS``) are
@@ -1089,7 +1103,7 @@ class CCSDGPU:
         for it in range(1, opt['MAXITER'] + 1):
             t0 = time.perf_counter()
             R1, R2 = self.residuals()
-            r1, r2 = _rnorm(R1, opt), _rnorm(R2, opt)
+            rn = _rnorm(R1, R2)
             self.T1 = self.T1 - R1 / self.D1
             self.T = self.T - R2 / self.D2
             n1 = self.T1.flat().size
@@ -1104,8 +1118,8 @@ class CCSDGPU:
             e_weak = float(e[weak].sum())
             if verbose:
                 print(f'  GPU LCCSD iter {it:3d} {e_cur:.12f} {e_cur - e_prev:.3e} '
-                      f'{r1:.3e} {r2:.3e}  {time.perf_counter() - t0:.2f}s', flush=True)
-            if abs(e_cur - e_prev) < opt['E_CONVERGENCE'] and max(r1, r2) < opt['R_CONVERGENCE']:
+                      f'{rn[0]:.3e} {rn[1]:.3e}  {time.perf_counter() - t0:.2f}s', flush=True)
+            if _converged(e_cur - e_prev, rn, opt):
                 break
             e_prev = e_cur
         else:
