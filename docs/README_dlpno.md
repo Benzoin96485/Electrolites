@@ -128,7 +128,7 @@ convergence ORCA's (`R_NORM='max'`, max. residuum 1e-5).
 
 | system | basis | GPU x1 | GPU x4 | ORCA 64 cores | ORCA 128 cores |
 |---|---|---|---|---|---|
-| taxol (RHF) | cc-pVDZ | -- | 359 | 640 | -- |
+| taxol (RHF) | cc-pVDZ | -- | 359 (Psi4 criterion) | 640 | -- |
 | Ni dithiolene (ROHF, doublet) | def2-SVP | 345 | 296 | 607 | 691 |
 | Cu macrocycle (ROHF, doublet) | def2-SVP | -- | 925 | 986 | 1158 |
 
