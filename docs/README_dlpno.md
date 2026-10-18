@@ -96,11 +96,13 @@ All visible GPUs of a node are used (one Python thread per device;
 | LCCSD, open shell | DF groups and the F'_vv / oooo-ladder chunks (with their overlap generators and workspaces) per device, same reduction |
 | open-shell (T0) passes | one spawned process per GPU (`mgpu.run_queue_mp`): the triplet chunks are launch / Python bound, so threads sharing one interpreter lock left the GPUs at ~20 % utilisation; the workers get a small picklable context (large arrays shared through memory-mapped node-local files) and rebuild their device tables; `DLPNO_MP=0` falls back to threads |
 
-Convergence: by default the CC iterations stop when the energy change and
-the largest per-pair residual RMS are below `E_CONVERGENCE` /
-`R_CONVERGENCE` (Psi4's measure).  `R_NORM='max'` uses the largest residual
-element instead (ORCA's "max. residuum"; with `R_CONVERGENCE=1e-5` this is
-ORCA's default criterion), which is what the ORCA comparisons quote.
+Convergence: the CC iterations stop when |dE| < `E_CONVERGENCE` (1e-6) and
+the residual criterion of `R_NORM` holds: `'rms'` -- Psi4's (largest
+per-pair residual RMS < `R_CONVERGENCE`, 1e-6), `'max'` -- ORCA's (largest
+residual element < `R_CONVERGENCE_MAX`, 1e-5, ORCA's "max. residuum"), or
+`'both'` (default) -- the tighter of the two, both must hold.  Comparisons
+use the other program's own criterion: `R_NORM='rms'` against Psi4,
+`R_NORM='max'` against ORCA.
 
 So the device memory that grows fastest (overlaps, DF tensors) is spread
 over the GPUs, and with 4 GPUs overlaps that would have to be regenerated
