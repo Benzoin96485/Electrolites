@@ -169,15 +169,15 @@ class TriplesGPU:
         n = len(pidx)
         PP, VP, V = pt['PP'], pt['VP'], Z.shape[2]
         step = max(1, int((1 << 28) // (8 * PP * (VP + V))))
-        if n <= step:
-            Zg = Z[bidx[:, None], pt['dom'][pidx]] * pt['dmk'][pidx][:, :, None]
-            return cp.matmul(pt['X'][pidx].transpose(0, 2, 1), Zg)
-        # bounded temporaries: the gathered PAO rows are (couples, PP, VP + V)
+        from electrolites.dlpno.gather import gather_rows, xT_z_by_pointer
+        bidx, pidx = cp.asarray(bidx), cp.asarray(pidx)
+        # one row-gather pass and a pointer-batched GEMM on the pair table;
+        # bounded temporaries: the gathered PAO rows are (couples, PP, V)
         out = cp.empty((n, VP, V))
         for c0 in range(0, n, step):
             b_, p_ = bidx[c0:c0 + step], pidx[c0:c0 + step]
-            Zg = Z[b_[:, None], pt['dom'][p_]] * pt['dmk'][p_][:, :, None]
-            out[c0:c0 + step] = cp.matmul(pt['X'][p_].transpose(0, 2, 1), Zg)
+            Zg = gather_rows(Z, b_, pt['dom'][p_], pt['dmk'][p_])
+            out[c0:c0 + step] = xT_z_by_pointer(pt['X'], p_, Zg)
         return out
 
     # ---- TNOs ------------------------------------------------------------

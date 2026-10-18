@@ -156,16 +156,19 @@ class UTriplesGPU:
             # bounded temporaries: the gathered PAO rows are (couples, PP, VP + V)
             parts = [self._proj(Z, s, bidx[c0:c0 + step], pidx[c0:c0 + step]) for c0 in range(0, n, step)]
             return cp.concatenate(parts, axis=0)
+        from electrolites.dlpno.gather import gather_rows, xT_z_by_pointer
         dom, dmk = pt['dom'][pidx], pt['dmk'][pidx]
         if s == 0:
-            Zg = Z[0][bidx[:, None], dom] * dmk[:, :, None]
-            return cp.matmul(pt['XA'][pidx].transpose(0, 2, 1), Zg)
-        nbf = self.orb.nbf
-        Zg = Z[1][bidx[:, None], dom] * dmk[:, :, None]
-        if self.ns:
-            Zs = Z[1][bidx, nbf:]                                     # (n, ns, V)
-            Zg = cp.concatenate([Zg, Zs], axis=1)
-        return cp.matmul(pt['XB'][pidx].transpose(0, 2, 1), Zg)
+            Zg = gather_rows(Z[0], bidx, dom, dmk)
+            return xT_z_by_pointer(pt['XA'], pidx, Zg)
+        nbf, ns = self.orb.nbf, self.ns
+        if ns:
+            # the SOMO rows of the beta virtuals follow the PAO rows
+            so_rows = cp.broadcast_to(nbf + cp.arange(ns, dtype=cp.int64), (n, ns))
+            dom = cp.concatenate([dom, so_rows], axis=1)
+            dmk = cp.concatenate([dmk, cp.ones((n, ns))], axis=1)
+        Zg = gather_rows(Z[1], bidx, dom, dmk)
+        return xT_z_by_pointer(pt['XB'], pidx, Zg)
 
     # ------------------------------------------------------------------
     def tno_transform(self, t_cut):

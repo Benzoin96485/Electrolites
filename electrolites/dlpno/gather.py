@@ -141,3 +141,72 @@ def xtbx(blk, X1, X2):
     Y = cp.matmul(X1.transpose(0, 2, 1), blk.reshape(b, R, nq * C))          # (b, V1, nq*C)
     Y = cp.matmul(Y.reshape(b, V1 * nq, C), X2).reshape(b, V1, nq, V2)
     return Y.transpose(0, 2, 1, 3)
+
+
+_SRC3 = r'''
+// out[i, r, :] = Z[b[i], rows[i, r], :] * mask[i, r]      (Z: (nb, NR, C))
+extern "C" __global__ void gather_rows(const double* __restrict__ Z, const long long NR, const int C,
+                                       const long long* __restrict__ b, const long long* __restrict__ rows,
+                                       const double* __restrict__ mask, double* __restrict__ out,
+                                       const int R, const long long ldr)
+{
+    const long long ir = blockIdx.x;             // (i, r) row of the output
+    const long long i = ir / R;
+    const int r = (int)(ir % R);
+    double* o = out + ir * C;
+    const double m = mask[i * ldr + r];
+    if (m == 0.) {
+        for (int c = threadIdx.x; c < C; c += blockDim.x) o[c] = 0.;
+        return;
+    }
+    const double* z = Z + ((long long)b[i] * NR + rows[i * ldr + r]) * C;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) o[c] = m * z[c];
+}
+'''
+_m3 = None
+
+
+def gather_rows(Z, bidx, rows, mask):
+    """out[i, r] = Z[bidx[i], rows[i, r]] * mask[i, r]  (one pass; rows may be
+    a row view of a larger table).  Z (nb, NR, C) contiguous."""
+    global _m3
+    if _m3 is None:
+        _m3 = cp.RawKernel(_SRC3, 'gather_rows')
+    Z = cp.ascontiguousarray(Z)
+    n, R = rows.shape
+    C = Z.shape[2]
+    out = cp.empty((n, R, C))
+    if n == 0:
+        return out
+    rows = cp.ascontiguousarray(rows, dtype=cp.int64)
+    mask = cp.ascontiguousarray(mask, dtype=cp.float64)
+    nt = 64 if C <= 64 else 128
+    _m3((n * R,), (nt,), (Z, np.int64(Z.shape[1]), np.int32(C), cp.ascontiguousarray(bidx, dtype=cp.int64),
+                          rows, mask, out, np.int32(R), np.int64(R)))
+    return out
+
+
+def xT_z_by_pointer(tab, pidx, Zg):
+    """out[i] = tab[pidx[i]]^T Zg[i] with tab (np, P, VP) and Zg (n, P, V),
+    as one pointer-batched GEMM (no gathered copy of the table rows)."""
+    from cupy_backends.cuda.libs import cublas
+    n, P, V = Zg.shape
+    VP = tab.shape[2]
+    out = cp.empty((n, VP, V))
+    if n == 0:
+        return out
+    tab = cp.ascontiguousarray(tab)
+    Zg = cp.ascontiguousarray(Zg)
+    pidx = cp.asarray(pidx, dtype=cp.uint64)
+    Ap = Zg.data.ptr + cp.arange(n, dtype=cp.uint64) * np.uint64(P * V * 8)
+    Bp = tab.data.ptr + pidx * np.uint64(tab.shape[1] * VP * 8)
+    Cp = out.data.ptr + cp.arange(n, dtype=cp.uint64) * np.uint64(VP * V * 8)
+    one = np.array(1., np.float64)
+    zero = np.array(0., np.float64)
+    handle = cp.cuda.device.get_cublas_handle()
+    cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
+    # column-major: C^T (V x VP) = Zg^T (V x P) . tab_i (P x VP)
+    cublas.dgemmBatched(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_T, V, VP, P,
+                        one.ctypes.data, Ap.data.ptr, V, Bp.data.ptr, VP,
+                        zero.ctypes.data, Cp.data.ptr, V, n)
+    return out
