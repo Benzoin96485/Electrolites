@@ -175,9 +175,35 @@ def to_device(x):
     return x
 
 
+import pickle as _pickle
+
+
+class _ArrPickler(_pickle.Pickler):
+    """large numpy arrays go to node-local files (shared, memory mapped by
+    every worker) instead of the pickle stream."""
+
+    def __init__(self, f, prefix):
+        super().__init__(f, protocol=_pickle.HIGHEST_PROTOCOL)
+        self.prefix = prefix
+        self.files = []
+
+    def persistent_id(self, obj):
+        if isinstance(obj, np.ndarray) and obj.dtype != object and obj.nbytes > (1 << 20):
+            path = f'{self.prefix}_{len(self.files)}.npy'
+            np.save(path, np.ascontiguousarray(obj))
+            self.files.append(path)
+            return ('npy', path)
+        return None
+
+
+class _ArrUnpickler(_pickle.Unpickler):
+    def persistent_load(self, pid):
+        kind, path = pid
+        return np.load(path, mmap_mode='r')
+
+
 def _mp_worker(path, dev, tasks, results, setup_name, work_name):
     import os
-    import pickle
     import traceback
     try:
         import cupy as cp_
@@ -185,7 +211,7 @@ def _mp_worker(path, dev, tasks, results, setup_name, work_name):
         pool = cp_.get_default_memory_pool()
         cp_.cuda.set_allocator(pool.malloc)
         with open(path, 'rb') as f:
-            ctx = pickle.load(f)
+            ctx = _ArrUnpickler(f).load()
         getattr(ctx, setup_name)()
         work = getattr(ctx, work_name)
         while True:
@@ -210,11 +236,14 @@ def run_queue_mp(items, ctx, setup_name, work_name, devs, collect):
     sp = mp.get_context('spawn')
     tmpd = '/dev/shm' if os.path.isdir('/dev/shm') else None
     fd, path = tempfile.mkstemp(prefix='dlpno_ctx_', suffix='.pkl', dir=tmpd)
+    pk = None
     try:
         with os.fdopen(fd, 'wb') as f:
-            pickle.dump(ctx, f, protocol=pickle.HIGHEST_PROTOCOL)
+            pk = _ArrPickler(f, path[:-4])
+            pk.dump(ctx)
         if getattr(ctx, 'verbose', 0) >= 2:
-            print(f'[mem] worker context {os.path.getsize(path) / 1e9:.2f} GB x {len(devs)} processes', flush=True)
+            nb = os.path.getsize(path) + sum(os.path.getsize(p) for p in pk.files)
+            print(f'[mem] worker context {nb / 1e9:.2f} GB (shared by {len(devs)} processes)', flush=True)
         tasks, results = sp.Queue(), sp.Queue()
         for it in items:
             tasks.put(it)
@@ -255,7 +284,8 @@ def run_queue_mp(items, ctx, setup_name, work_name, devs, collect):
         if err:
             raise RuntimeError('worker failed: ' + err)
     finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        for p in [path] + (pk.files if pk is not None else []):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
