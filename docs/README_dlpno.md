@@ -94,6 +94,13 @@ All visible GPUs of a node are used (one Python thread per device;
 | SC-MP2 / LMP2 PNOs, PNO integrals, open-shell pair integrals, (T0) | work queue of pair / triplet chunks; per device a view of the driver with replicas of the small device tables (qia, qij, metric, S_pao, pair tables); (Q|uv) through the per-device cache |
 | LCCSD, closed shell | DF groups of the strong pairs live on (and are dressed by) their device; every plan whose operands include PNO overlaps is chunked, its chunks spread over the devices, each device keeping the overlaps of its chunks (up to `DLPNO_S_KEEP` of its free memory, rest regenerated); dynamic operands replicated per call, static integrals once; partial outputs added on the home device |
 | LCCSD, open shell | DF groups and the F'_vv / oooo-ladder chunks (with their overlap generators and workspaces) per device, same reduction |
+| open-shell (T0) passes | one spawned process per GPU (`mgpu.run_queue_mp`): the triplet chunks are launch / Python bound, so threads sharing one interpreter lock left the GPUs at ~20 % utilisation; the workers get a small picklable context (large arrays shared through memory-mapped node-local files) and rebuild their device tables; `DLPNO_MP=0` falls back to threads |
+
+Convergence: by default the CC iterations stop when the energy change and
+the largest per-pair residual RMS are below `E_CONVERGENCE` /
+`R_CONVERGENCE` (Psi4's measure).  `R_NORM='max'` uses the largest residual
+element instead (ORCA's "max. residuum"; with `R_CONVERGENCE=1e-5` this is
+ORCA's default criterion), which is what the ORCA comparisons quote.
 
 So the device memory that grows fastest (overlaps, DF tensors) is spread
 over the GPUs, and with 4 GPUs overlaps that would have to be regenerated

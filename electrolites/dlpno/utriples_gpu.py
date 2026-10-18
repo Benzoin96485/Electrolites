@@ -331,7 +331,22 @@ class UTriplesGPU:
             def collect(res):
                 ch_, e_ = res
                 self.e_ijk[ch_] = e_
-            mgpu.run_queue_mp(items, _T0Ctx.from_driver(self), '_mp_setup', '_mp_work', devs, collect)
+            ctx = _T0Ctx.from_driver(self)
+            # the workers build their own device tables: release ours (and the
+            # pooled blocks on every device) first
+            self._pt = None
+            self.dfi.cache_clear()
+            import gc
+            gc.collect()
+            used = []
+            for d_ in sorted(set(devs)):
+                with cp.cuda.Device(d_):
+                    cp.get_default_memory_pool().free_all_blocks()
+                    fr, tt = cp.cuda.runtime.memGetInfo()
+                    used.append(round((tt - fr) / 1e9, 1))
+            if getattr(self, 'verbose', 0) >= 2:
+                print('[mem] (T0) workers start; parent device use (GB):', used, flush=True)
+            mgpu.run_queue_mp(items, ctx, '_mp_setup', '_mp_work', devs, collect)
             return float(self.e_ijk.sum())
         ctxs = mgpu.run_queue(items, lambda w, it: w._ut0_item(*it, save=save), devs,
                               setup=lambda d: mgpu.device_view(
@@ -1085,7 +1100,7 @@ class _T0Ctx(UTriplesGPU):
             setattr(f, a, cp.asarray(getattr(f, a)))
         nab = sum(q.nbytes for q in f.qab if q is not None)
         free = cp.cuda.runtime.memGetInfo()[0]
-        if nab < 0.35 * free:
+        if nab < 0.25 * free:
             f.qab = [None if q is None else cp.asarray(q) for q in f.qab]
             f.qab_host = False
         else:
