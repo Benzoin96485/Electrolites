@@ -267,7 +267,13 @@ class UTriplesGPU:
     def lccsd_t0(self, save=False):
         # the (Q|uv) device caches and pooled blocks of the previous pass go first
         self.dfi.cache_clear()
+        self._pt = None                   # the previous pass's pair tables
+        import gc
+        gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
+        if getattr(self, 'verbose', 0) >= 2:
+            free, tot = cp.cuda.runtime.memGetInfo()
+            print(f'[mem] (T0) pass start: device used {(tot - free) / 1e9:.1f} GB', flush=True)
         self._upair_tables()
         ntrip = len(self.trip)
         self.e_ijk = np.zeros(ntrip)

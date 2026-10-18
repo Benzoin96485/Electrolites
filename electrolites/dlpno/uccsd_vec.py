@@ -236,27 +236,40 @@ class ChunkedSpinPlan:
             codes.append(sp * BIG + terms.a(c))
         codes = np.stack(codes, 1)
         order = np.argsort(terms.a(out_col), kind='stable') if out_col is not None else np.arange(n)
-        def nbytes(code):
-            s_, i = int(code // BIG), int(code % BIG)
-            return 8 * int(nvs[kp[s_][i], s_]) * int(nvs[kq[s_][i], s_])
-        bounds, cur, tot = [], set(), 0
-        start = 0
-        for pos, t in enumerate(order):
-            new = [c for c in codes[t] if c not in cur]
-            add = sum(nbytes(c) for c in set(new))
-            if cur and tot + add > self.MAX_BYTES:
-                bounds.append((start, pos))
-                start, cur, tot = pos, set(), 0
-                new = list(codes[t])
-                add = sum(nbytes(c) for c in set(new))
-            cur.update(new)
-            tot += add
-        bounds.append((start, n))
+        # bytes of every couple code
+        def nbytes_arr(cd):
+            s_, i = cd // BIG, cd % BIG
+            out = np.empty(len(cd))
+            for sv in (0, 1):
+                m = s_ == sv
+                if m.any():
+                    out[m] = 8. * nvs[kp[sv][i[m]], sv] * nvs[kq[sv][i[m]], sv]
+            return out
+        # greedy chunks whose distinct overlaps stay within MAX_BYTES
+        # (vectorised: first uses counted within a window from the chunk start)
+        bounds, start = [], 0
+        k = codes.shape[1]
+        W0 = 4096
+        while start < n:
+            W = min(n - start, W0)
+            ids = codes[order[start:start + W]].ravel()
+            _, first = np.unique(ids, return_index=True)
+            add = np.zeros(W * k)
+            add[first] = nbytes_arr(ids[first])
+            cum = np.cumsum(add.reshape(W, k).sum(axis=1))
+            over = np.flatnonzero(cum > self.MAX_BYTES)
+            if not len(over) and W < n - start:
+                W0 *= 2
+                continue
+            L = max(1, int(over[0])) if len(over) else W
+            bounds.append((start, start + L))
+            start += L
         gens = owner._ovgens
+        colarr = {k: np.asarray(v) for k, v in terms._mat().items()}
         for (a, b) in bounds:
             sel = order[a:b]
             loc_terms = _Terms()
-            sub = {k: [v[i] for i in sel] for k, v in terms._mat().items()}
+            sub = {k: v[sel] for k, v in colarr.items()}
             lays = dict(layouts)
             LSc, preps = [], []
             for s in (0, 1):
@@ -275,11 +288,11 @@ class ChunkedSpinPlan:
                 for j, (c, sc) in enumerate(scols):
                     msk = (codes[sel, j] // BIG) == s
                     loc = np.searchsorted(uni, codes[sel, j][msk] % BIG)
-                    col = np.asarray(sub[c])
+                    col = np.array(sub[c], dtype=np.int64)
                     col[msk] = loc
-                    sub[c] = col.tolist()
+                    sub[c] = col
             loc_terms._keys = tuple(sub)
-            loc_terms._cols = {k: list(v) for k, v in sub.items()}
+            loc_terms._cols = dict(sub)
             loc_terms._rows = None
             lays['S'] = LSc
             plan = _SpinPlan(lays, out_layout, loc_terms, out_col, specs, out_row=out_row,
