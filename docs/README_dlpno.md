@@ -118,8 +118,22 @@ on one device are kept.
 * open shell: GPU = host reference to 1e-10 Eh (ethyl, triplet CH2O);
   canonical limit = PySCF UCCSD(T) to 1e-10 Eh (CH3); closed-shell limit =
   closed-shell code.
-* ORCA 6.1.1 (ROHF, same SCF state) on transition-metal complexes: see the
-  report in the PR.
+* ORCA 6.1.1 (ROHF) on transition-metal complexes: see the report in the
+  PR.
+
+## Timings vs ORCA (Perlmutter, DLPNO-CCSD(T0), Normal PNO, post-SCF wall s)
+
+GPU: A100-80GB, ORCA 6.1.1 RIJCOSX/DLPNO on one 2x64-core CPU node; CC
+convergence ORCA's (`R_NORM='max'`, max. residuum 1e-5).
+
+| system | basis | GPU x1 | GPU x4 | ORCA 64 cores | ORCA 128 cores |
+|---|---|---|---|---|---|
+| taxol (RHF) | cc-pVDZ | -- | 359 | 640 | -- |
+| Ni dithiolene (ROHF, doublet) | def2-SVP | 345 | 296 | 607 | 691 |
+| Cu macrocycle (ROHF, doublet) | def2-SVP | -- | 925 | 986 | 1158 |
+
+The two open-shell SCF solutions are not the same state as ORCA's (Ni:
+ours 9 mEh lower; Cu: ORCA's 49 mEh lower), so only the timings compare.
 
 ## Files
 
