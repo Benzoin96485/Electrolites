@@ -328,9 +328,15 @@ class UTriplesGPU:
         if not save and len(devs) > 1 and os.environ.get('DLPNO_MP', '1') == '1':
             # one process per GPU: the triplet chunks are Python / launch bound
             # and threads would share one interpreter lock
+            busy = {}
+
             def collect(res):
-                ch_, e_ = res
+                ch_, e_, dv, dt = res
                 self.e_ijk[ch_] = e_
+                b = busy.setdefault(dv, [0, 0., 0])
+                b[0] += 1
+                b[1] += dt
+                b[2] += len(ch_)
             ctx = _T0Ctx.from_driver(self)
             # the workers build their own device tables: release ours (and the
             # pooled blocks on every device) first
@@ -346,7 +352,12 @@ class UTriplesGPU:
                     used.append(round((tt - fr) / 1e9, 1))
             if getattr(self, 'verbose', 0) >= 2:
                 print('[mem] (T0) workers start; parent device use (GB):', used, flush=True)
+            import time
+            t_mp = time.perf_counter()
             mgpu.run_queue_mp(items, ctx, '_mp_setup', '_mp_work', devs, collect)
+            if getattr(self, 'verbose', 0) >= 2:
+                print(f'[mp] (T0) {time.perf_counter() - t_mp:.1f} s; per device (chunks, busy s, triplets):',
+                      {k: (v[0], round(v[1], 1), v[2]) for k, v in sorted(busy.items())}, flush=True)
             return float(self.e_ijk.sum())
         ctxs = mgpu.run_queue(items, lambda w, it: w._ut0_item(*it, save=save), devs,
                               setup=lambda d: mgpu.device_view(
@@ -1109,8 +1120,10 @@ class _T0Ctx(UTriplesGPU):
             f.qab_host = True
 
     def _mp_work(self, it):
+        import time
+        t0 = time.perf_counter()
         Pv, ch = it
         self._ut0_item(Pv, ch, save=False)
         e = self.e_ijk[ch].copy()
         self.e_ijk[ch] = 0.
-        return ch, e
+        return ch, e, cp.cuda.Device().id, time.perf_counter() - t0
