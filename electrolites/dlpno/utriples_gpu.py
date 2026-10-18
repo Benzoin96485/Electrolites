@@ -81,9 +81,11 @@ class UTriplesGPU:
         npo = np.array([len(p) for p in self.pao[:npair]])
         npn = np.array([self.Xpno[p].shape[1] for p in range(npair)])
         VA, VB, PP, VN = (int(padded(x.max())) for x in (nva, nvb, npo, npn))
-        XA = np.zeros((npair, PP, VA))
-        XB = np.zeros((npair, PP + ns, VB))
-        XN = np.zeros((npair, PP, VN))
+        # padded tables assembled on the device (host copies of these padded
+        # tables would cost tens of GB per process for large systems)
+        XA = cp.zeros((npair, PP, VA))
+        XB = cp.zeros((npair, PP + ns, VB))
+        XN = cp.zeros((npair, PP, VN))
         dom = np.zeros((npair, PP), np.int64)
         dmk = np.zeros((npair, PP))
         # the pair densities depend on the amplitudes only: computed once and
@@ -96,10 +98,11 @@ class UTriplesGPU:
             DN = dc[1]
         for p in range(npair):
             n_ = npo[p]
-            XA[p, :n_, :nva[p]] = self.Xa[p]
-            XB[p, :n_, :nvb[p]] = self.Xb[p][:n_]
-            XB[p, PP:, :nvb[p]] = self.Xb[p][n_:]
-            XN[p, :n_, :npn[p]] = self.Xpno[p]
+            XA[p, :n_, :nva[p]] = cp.asarray(self.Xa[p])
+            xb = cp.asarray(self.Xb[p])
+            XB[p, :n_, :nvb[p]] = xb[:n_]
+            XB[p, PP:, :nvb[p]] = xb[n_:]
+            XN[p, :n_, :npn[p]] = cp.asarray(self.Xpno[p])
             dom[p, :n_] = self.pao[p]
             dmk[p, :n_] = 1.
             if fresh and pl.pairs[p][0] <= pl.pairs[p][1]:
@@ -112,18 +115,18 @@ class UTriplesGPU:
         sop = list(self.T2b)
         self._tsidx = {k: n for n, k in enumerate(sop)}
         VM = max(VA, VB)
-        TS = np.zeros((len(sop), VM, VM))
+        TS = cp.zeros((len(sop), VM, VM))
         for n, k in enumerate(sop):
             M = self.T2b[k]
-            TS[n, :M.shape[0], :M.shape[1]] = M
+            TS[n, :M.shape[0], :M.shape[1]] = cp.asarray(M)
         T1 = np.zeros((len(self.so), VM))
         for I, (x, s) in enumerate(self.so):
             dd = pl.ij[x, x]
             t = self.T1[I][self._vslice(dd, s)]
             T1[I, :len(t)] = t
-        self._pt = dict(VA=VA, VB=VB, PP=PP, VN=VN, XA=cp.asarray(XA), XB=cp.asarray(XB),
-                        XN=cp.asarray(XN), DN=cp.asarray(DN), dom=cp.asarray(dom),
-                        dmk=cp.asarray(dmk), TS=cp.asarray(TS), T1=cp.asarray(T1))
+        self._pt = dict(VA=VA, VB=VB, PP=PP, VN=VN, XA=XA, XB=XB,
+                        XN=XN, DN=cp.asarray(DN), dom=cp.asarray(dom),
+                        dmk=cp.asarray(dmk), TS=TS, T1=cp.asarray(T1))
         self.Fa_lp_d, self.Fb_lp_d = cp.asarray(self.Fa_lp), cp.asarray(self.Fb_lp)
 
     def _pair_density_blocks(self, p):
