@@ -323,7 +323,7 @@ class UTriplesGPU:
         # the K3 phase (raw (Q|ab)) and the W phase (W, V, T, D and the
         # pattern caches) do not overlap
         per = 8 * (common + max(2 * A * Vm * Vm, 8 * Vm ** 3 + 8 * L * Vm * Vm))
-        sub = max(1, int(2 * self._chunk_bytes() // per))
+        sub = max(1, int(self._chunk_bytes() // per))
         for s0 in range(0, len(ch), sub):
             sl = slice(s0, s0 + sub)
             part = {k: v[sl] for k, v in tn.items()}
@@ -494,6 +494,7 @@ class UTriplesGPU:
                 key = ('t', rB, rC, s1, s2)
                 if key in cache:
                     return cache[key]
+                prof('w:tproj')
                 sB, sC = pat[rB], pat[rC]
                 KB, KC = Oarr[:, rB], Oarr[:, rC]
                 if (s1, s2) == (sB, sC):
@@ -522,6 +523,7 @@ class UTriplesGPU:
                 key = ('l', rA, sm, s1, s2)
                 if key in cache:
                     return cache[key]
+                prof('w:tal')
                 sA = pat[rA]
                 if (s1, s2) == (sA, sm):
                     rev, sg = False, 1.
@@ -599,6 +601,7 @@ class UTriplesGPU:
                         t = tproj(oB, oC, sx, se)
                         if t is not None:
                             if se == sy and sA == sz:
+                                prof('w:k3c')
                                 Y = cp.matmul(t, k3(oA, sy, sA).reshape(n, Vs[se], ny * nz)).reshape(n, nx, ny, nz)
                                 X = Y if X is None else X + Y
                             if se == sz and sA == sy:
@@ -608,6 +611,7 @@ class UTriplesGPU:
                     if sx == sC:
                         tl = tal(oA, sB, sy, sz)
                         if tl is not None:
+                            prof('w:ovc')
                             Y = cp.matmul(tr(kov(oB, oC, sx) * glm[gsb][:, :, None]),
                                           tl.reshape(n, L, ny * nz)).reshape(n, nx, ny, nz)
                             X = -Y if X is None else X - Y
@@ -632,11 +636,13 @@ class UTriplesGPU:
                         if tbc is not None:
                             Y = fov[(oA, sx)][gsb][:, :, None, None] * tbc[:, None]
                             Xv = Y if Xv is None else Xv + Y
+                    prof('w:acc')
                     back = (0,) + tuple(int(a) + 1 for a in np.argsort(rho))
                     if X is not None:
                         Wt += (eo * ev_) * X.transpose(back)
                     if Xv is not None:
                         Vt += (eo * ev_) * Xv.transpose(back)
+            prof('w:energy')
             fs = cp.asarray(np.array([sum(fdiag[pat[r]][lm3[q, r]] for r in range(3)) for q in range(n)]))
             e = [tn['ea'][gsb], tn['eb'][gsb]]
             Dn = (fs[:, None, None, None] - e[pat[0]][:, :, None, None]

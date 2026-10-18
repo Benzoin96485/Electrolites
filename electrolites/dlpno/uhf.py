@@ -1188,8 +1188,12 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         t0 = time.perf_counter()
         self.ucc = g = UCCSDGPU(self)
         g.build()
-        # the (Q|uv) device cache is not needed again before the triples
+        # the (Q|uv) device cache and the pair metric factors are not needed
+        # again before the triples (thousands of small live blocks would keep
+        # the pool fragmented)
         self.dfi.cache_clear()
+        self._chol = {}
+        getattr(self.dfi, '_chol', {}).clear()
         cp.get_default_memory_pool().free_all_blocks()
         self.timings['cc_build'] = time.perf_counter() - t0
         self.log('  CC stores (GB):', getattr(g, 'mem_report', None))
@@ -1216,7 +1220,31 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         cp.get_default_memory_pool().free_all_blocks()
         import os
         if os.environ.get('DLPNO_DEBUG_MEM'):
-            big = [o for o in gc.get_objects() if isinstance(o, cp.ndarray) and o.nbytes > (1 << 27)]
+            alln = [o for o in gc.get_objects() if isinstance(o, cp.ndarray)]
+            pool = cp.get_default_memory_pool()
+            print('[mem] all live ndarrays:', len(alln), round(sum(o.nbytes for o in alln) / 1e9, 2), 'GB;',
+                  'pool used', round(pool.used_bytes() / 1e9, 2), 'total', round(pool.total_bytes() / 1e9, 2),
+                  flush=True)
+            # group the live arrays by the attribute path of their first referrer
+            grp = {}
+            for o in alln:
+                rs = gc.get_referrers(o)
+                key = 'other'
+                for r in rs:
+                    if isinstance(r, dict):
+                        for k, v in r.items():
+                            if v is o:
+                                key = 'dict:' + str(k)[:30]
+                                break
+                        if key != 'other':
+                            break
+                    elif isinstance(r, (list, tuple)):
+                        key = type(r).__name__ + f'[{len(r)}]'
+                        break
+                grp[key] = grp.get(key, 0) + o.nbytes
+            for k, v in sorted(grp.items(), key=lambda kv: -kv[1])[:15]:
+                print('    ', k, round(v / 1e9, 3), 'GB', flush=True)
+            big = [o for o in alln if o.nbytes > (1 << 27)]
             print('[mem] live arrays > 128 MB after LCCSD:', len(big),
                   round(sum(o.nbytes for o in big) / 1e9, 2), 'GB', flush=True)
             for o in sorted(big, key=lambda x: -x.nbytes)[:12]:
