@@ -84,9 +84,16 @@ class UTriplesGPU:
         XA = np.zeros((npair, PP, VA))
         XB = np.zeros((npair, PP + ns, VB))
         XN = np.zeros((npair, PP, VN))
-        DN = np.zeros((npair, VN, VN))
         dom = np.zeros((npair, PP), np.int64)
         dmk = np.zeros((npair, PP))
+        # the pair densities depend on the amplitudes only: computed once and
+        # kept for the later (T0) passes (and shipped to worker processes)
+        dc = getattr(self, '_dn_cache', None)
+        fresh = dc is None or (not getattr(self, '_dn_frozen', False) and dc[0] is not self.T2b)
+        if fresh:
+            DN = np.zeros((npair, VN, VN))
+        else:
+            DN = dc[1]
         for p in range(npair):
             n_ = npo[p]
             XA[p, :n_, :nva[p]] = self.Xa[p]
@@ -95,11 +102,13 @@ class UTriplesGPU:
             XN[p, :n_, :npn[p]] = self.Xpno[p]
             dom[p, :n_] = self.pao[p]
             dmk[p, :n_] = 1.
-            if pl.pairs[p][0] <= pl.pairs[p][1]:
+            if fresh and pl.pairs[p][0] <= pl.pairs[p][1]:
                 DN[p, :npn[p], :npn[p]] = self._pair_density_blocks(p)
-        for p in range(npair):
-            if pl.pairs[p][0] > pl.pairs[p][1]:
-                DN[p] = DN[pl.ji[p]]
+        if fresh:
+            for p in range(npair):
+                if pl.pairs[p][0] > pl.pairs[p][1]:
+                    DN[p] = DN[pl.ji[p]]
+            self._dn_cache = (self.T2b, DN)
         sop = list(self.T2b)
         self._tsidx = {k: n for n, k in enumerate(sop)}
         VM = max(VA, VB)
@@ -996,7 +1005,7 @@ class _T0Ctx(UTriplesGPU):
     """The (T0) inputs of a driver, host only and picklable, for the worker
     processes of ``mgpu.run_queue_mp``."""
 
-    ATTRS = ('_pt', 't_riatoms', 'pl', 'ns', '_npao_t', '_trip_arr', 'trip', 't_ribfs', 'S_pao_d',
+    ATTRS = ('t_riatoms', 'Xa', 'Xb', 'Xpno', 'pao', 'T2b', 'T1', 'Fa_lp', 'Fb_lp', 'pl', 'ns', '_npao_t', '_trip_arr', 'trip', 't_ribfs', 'S_pao_d',
              '_nl_t', '_naux_t', 't_paos', 't_lmos', '_t_cut_tno', 'somo_idx', 'is_somo', 'Fa_lmo',
              'Fb_lmo', 'tno_scale', 'so_index', 'ribf_atom', 'opt', 'Fb_ss', 'Fb_ps', 'Fa_pao_d',
              'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d', 'so', '_tsidx', 'MAX_CHUNK_BYTES', 'verbose')
@@ -1008,7 +1017,7 @@ class _T0Ctx(UTriplesGPU):
         import pickle
         c = object.__new__(cls)
         skip = {'mf', 'mol', 'auxmol', 'ucc', 'cc', 'dfi', 'orb', '_prof', 'T2', 'G_lmp2', 'st', 'tno',
-                '_ring_gens', '_xq_dev', '_chol'}
+                '_ring_gens', '_xq_dev', '_chol', '_pt', '_dn_cache', 'Fa_lp_d', 'Fb_lp_d'}
         def size(v):
             if isinstance(v, (np.ndarray, cp.ndarray)):
                 return v.nbytes
@@ -1031,6 +1040,11 @@ class _T0Ctx(UTriplesGPU):
                 continue
             setattr(c, a, v)
         c.orb = _Orb(d.orb.nbf)
+        c.orb.S_pao = d.orb.S_pao
+        # the pair densities are shipped; the padded device tables are rebuilt
+        # by every worker (_mp_setup)
+        c._dn_cache = (None, d._dn_cache[1])
+        c._dn_frozen = True
         c._nva = np.array([d.nva(p) for p in range(len(d.pl))], np.int64)
         c._nvb = np.array([d.nvb(p) for p in range(len(d.pl))], np.int64)
         f = copy.copy(d.dfi)
@@ -1053,9 +1067,14 @@ class _T0Ctx(UTriplesGPU):
     def log(self, *a):
         pass
 
+    def _vslice(self, p, s):
+        na = self.nva(p)
+        return slice(0, na) if s == 0 else slice(na, na + self.nvb(p))
+
     def _mp_setup(self):
         from electrolites.dlpno import mgpu
-        for a in ('_pt', 'S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d'):
+        self._upair_tables()
+        for a in ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'):
             if hasattr(self, a):
                 setattr(self, a, mgpu.to_device(getattr(self, a)))
         f = self.dfi
