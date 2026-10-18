@@ -62,7 +62,10 @@ class _Terms:
             self._keys = tuple(kw)
         if self._cols is not None:
             for k, v in kw.items():
-                self._cols[k].append(v)
+                c = self._cols[k]
+                if isinstance(c, np.ndarray):
+                    c = self._cols[k] = c.tolist()
+                c.append(v)
             self._np = {}
         else:
             self._rows.append(tuple(kw.values()))
@@ -71,9 +74,22 @@ class _Terms:
         if self._cols is None:
             if self._keys is None:
                 self._cols = {}
+            elif not self._rows:
+                self._cols = {k: [] for k in self._keys}
             else:
-                cols = list(zip(*self._rows)) if self._rows else [() for _ in self._keys]
-                self._cols = {k: list(c) for k, c in zip(self._keys, cols)}
+                # one C-level conversion of the row tuples, then numpy columns
+                # (integer columns exact: indices < 2**53)
+                first = self._rows[0]
+                M = np.array(self._rows, dtype=np.float64)
+                self._cols = {}
+                for j, k in enumerate(self._keys):
+                    v = first[j]
+                    if isinstance(v, (bool, np.bool_)):
+                        self._cols[k] = M[:, j].astype(bool)
+                    elif isinstance(v, (int, np.integer)):
+                        self._cols[k] = M[:, j].astype(np.int64)
+                    else:
+                        self._cols[k] = M[:, j].copy()
             self._rows = None
         return self._cols
 
