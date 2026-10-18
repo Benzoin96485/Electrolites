@@ -556,22 +556,46 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         sidx = {k: n for n, k in enumerate(sop)}
         sp_of, nvs, LT = self._so_layout()
         spin = np.array([s for (x, s) in self.so])
-        Creg = _Reg()
-        rows_ = []
         canon = [k for k in sop if k[0] < k[1]]
-        for (I, J) in canon:
-            o = sidx[(I, J)]
-            p = sp_of[o]
-            (x, a), (y, b) = self.so[I], self.so[J]
-            for K in range(len(self.so)):
-                k = self.so[K][0]
-                ik, kj = pl.ij[x, k], pl.ij[k, y]
-                f = self._fock_oo(K, J)
-                if K != J and K != I and ik >= 0 and abs(f) > opt['F_CUT']:
-                    rows_.append((o, Creg((p, ik)), sidx[(I, K)], a, b, -f))
-                f = self._fock_oo(K, I)
-                if K != I and K != J and kj >= 0 and abs(f) > opt['F_CUT']:
-                    rows_.append((o, Creg((p, kj)), sidx[(K, J)], a, b, -f))
+        # couplings, vectorised over (canonical spin-orbital pair, K)
+        nso = len(self.so)
+        so_l = np.array([x for x, _ in self.so], np.int64)
+        so_s = np.array([t for _, t in self.so], np.int64)
+        SIDX = -np.ones((nso, nso), np.int64)
+        for n_, k_ in enumerate(sop):
+            SIDX[k_[0], k_[1]] = n_
+        Fso = np.zeros((nso, nso))                       # spin-orbital occupied Fock
+        for sg, Fm in ((0, self.Fa_lmo), (1, self.Fb_lmo)):
+            m = np.flatnonzero(so_s == sg)
+            Fso[np.ix_(m, m)] = Fm[np.ix_(so_l[m], so_l[m])]
+        CI = np.array([k_[0] for k_ in canon], np.int64)
+        CJ = np.array([k_[1] for k_ in canon], np.int64)
+        CO = SIDX[CI, CJ]
+        CP = sp_of[CO]
+        Kall = np.arange(nso)
+        parts_ = []
+        for side in (0, 1):
+            # side 0: T_IK coupled through f_KJ (pair (x, k));  side 1: T_KJ through f_KI (pair (k, y))
+            F = Fso[:, CJ].T if side == 0 else Fso[:, CI].T              # (ncanon, nso): f(K, J or I)
+            pr = pl.ij[so_l[CI][:, None], so_l[Kall][None, :]] if side == 0 else \
+                pl.ij[so_l[Kall][None, :], so_l[CJ][:, None]]
+            ok = ((Kall[None, :] != CI[:, None]) & (Kall[None, :] != CJ[:, None]) & (pr >= 0)
+                  & (np.abs(F) > opt['F_CUT']))
+            r, K = np.nonzero(ok)
+            tt = SIDX[CI[r], K] if side == 0 else SIDX[K, CJ[r]]
+            parts_.append((r, pr[r, K], tt, -F[r, K]))
+        rr = np.concatenate([q[0] for q in parts_])
+        assert all((q[2] >= 0).all() for q in parts_), "coupled amplitude block missing"
+        qp = np.concatenate([q[1] for q in parts_])
+        tt = np.concatenate([q[2] for q in parts_])
+        ww = np.concatenate([q[3] for q in parts_])
+        npl = len(pl)
+        cc_code, cid_ = np.unique(CP[rr] * npl + qp, return_inverse=True)
+        Creg = _Reg()
+        Creg.keys = [(int(c // npl), int(c % npl)) for c in cc_code]
+        Creg.ids = {k_: n_ for n_, k_ in enumerate(Creg.keys)}
+        rows_ = np.stack([CO[rr].astype(np.float64), cid_.reshape(-1).astype(np.float64), tt.astype(np.float64),
+                          so_s[CI[rr]].astype(np.float64), so_s[CJ[rr]].astype(np.float64), ww], 1)
         # couple chunks of S(p, ik) per spin; with several GPUs the chunks
         # (their generators, kept overlaps and GEMM plans) are spread over them
         from electrolites.dlpno.ovgen import OverlapGen
