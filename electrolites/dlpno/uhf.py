@@ -1119,21 +1119,23 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                         v[:, :, :ne] += cp.matmul(Xbs.T[None], qsu)
                         v[:, :, ne:] += cp.matmul(Xbs.T[None], qss)
                 Vx.append(_half(L, v))
-            xq = self.__dict__.setdefault('_xq_dev', {})
-
-            def xdev(q, c_):
-                """pair q's virtual coefficients (rows: its PAOs, then the
-                SOMOs for beta) on this device, cached."""
-                key = (q, c_, cp.cuda.Device().id)
-                X = xq.get(key)
-                if X is None:
-                    X = xq[key] = cp.asarray(self.Xa[q] if c_ == 0 else self.Xb[q])
-                return X
+            # compact virtual coefficients of every pair on this device (one
+            # overlap generator per spin); a group's target coefficients are
+            # scattered into the extended domain by one kernel
+            gens = self.__dict__.setdefault('_ring_gens', {})
+            dv = cp.cuda.Device().id
+            if dv not in gens:
+                from electrolites.dlpno.ovgen import OverlapGen
+                npair = len(self.pl)
+                Sd = self.S_pao_d
+                gens[dv] = (OverlapGen(Sd, self.pao, [self.Xa[q] for q in range(npair)]),
+                            OverlapGen(Sd, self.pao, [self.Xb[q] for q in range(npair)], ne=ns))
+            from electrolites.dlpno.ovgen import _scatter_kernel
+            posU = cp.asarray(epos.astype(np.int32))
             grp = {}
             for n in idx:
                 (_, K, Q, bp, c_, q) = keys[n]
                 grp.setdefault((so[Q][0], bp), []).append(n)
-            somo_cols = np.arange(ne, ne + ns, dtype=np.int64)
             for (qo, bp), lst in grp.items():
                 c1 = np.zeros(len(lst))
                 c2 = np.zeros(len(lst))
@@ -1145,10 +1147,12 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                     c1[r_] = 1. if (sK == c_ and bp == sQ) else 0.
                     c2[r_] = 1. if (sK == sQ and bp == c_) else 0.
                 nvp = self.nva(p) if bp == 0 else self.nvb(p)
+                qq = np.array([keys[n][5] for n in lst], np.int64)
+                cc = np.array([keys[n][4] for n in lst], np.int64)
+                ws = np.where(cc == 0, [self.nva(q) for q in qq], [self.nvb(q) for q in qq])
                 if not c1.any() and not c2.any():
-                    for n in lst:
-                        q, c_ = keys[n][5], keys[n][4]
-                        out[n] = cp.zeros((nvp, self.nva(q) if c_ == 0 else self.nvb(q)))
+                    for r_, n in enumerate(lst):
+                        out[n] = cp.zeros((nvp, int(ws[r_])))
                     continue
                 glk = cp.asarray(lk)
                 Z = 0.
@@ -1158,19 +1162,25 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                 if c2.any():        # (k q|B u)
                     t2 = cp.einsum('Qk,Qbu->kbu', Boo[:, :, lpos[qo]], Vx[bp])
                     Z = Z - t2[glk] * cp.asarray(c2)[:, None, None]
-                # contract with each target pair's coefficients over its own
-                # PAO (+ SOMO) rows of the extended domain: no dense embedding
-                byq = {}
+                Wm = int(ws.max())
+                Xs = cp.zeros((len(lst), ne + ns, Wm))
+                for c_ in (0, 1):
+                    rr = np.where(cc == c_)[0]
+                    if not len(rr):
+                        continue
+                    g = gens[dv][c_]
+                    dst = Xs.data.ptr + 8 * rr.astype(np.int64) * (ne + ns) * Wm
+                    _scatter_kernel()((len(rr),), (128,),
+                                      (cp.asarray(g._src_ptrs(qq[rr])), cp.asarray(dst),
+                                       cp.asarray(g.c_ld[qq[rr]].astype(np.int32)),
+                                       cp.asarray(np.full(len(rr), Wm, np.int32)),
+                                       cp.asarray(g.npao[qq[rr]].astype(np.int32)),
+                                       cp.asarray(g.nv[qq[rr]].astype(np.int32)),
+                                       cp.asarray(g.off[qq[rr]]), g.pao_flat, posU,
+                                       np.int32(ne), np.int32(ns if c_ == 1 else 0)))
+                res = cp.matmul(Z, Xs)
                 for r_, n in enumerate(lst):
-                    byq.setdefault((keys[n][5], keys[n][4]), []).append(r_)
-                for (q, c_), rows in byq.items():
-                    cols = epos[self.pao[q]]
-                    if c_ == 1 and ns:
-                        cols = np.concatenate([cols, somo_cols])
-                    gr = cp.asarray(np.asarray(rows, np.int64))
-                    res = cp.matmul(Z[gr][:, :, cp.asarray(cols)], xdev(q, c_))
-                    for k_, r_ in enumerate(rows):
-                        out[lst[r_]] = res[k_]
+                    out[n] = res[r_, :, :int(ws[r_])]
         return [out[n] for n in idx]
 
     # ------------------------------------------------------------------
