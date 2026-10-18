@@ -618,18 +618,21 @@ class UTriplesGPU:
                 okf = ok.reshape(-1)
                 pf = pil.reshape(-1)
                 nvt = self._nvs_tab()
-                nb = np.maximum(nvt[pf, s1], nvt[pf, s2])
-                bkt = np.where(okf, -(-nb // 16) * 16, 0)
+                # bucket key: the two spins' PNO counts rounded up to 16
+                # (alpha and beta spaces differ by the SOMOs)
+                n1 = np.minimum(-(-nvt[pf, s1] // 16) * 16, S1.shape[1])
+                n2 = np.minimum(-(-nvt[pf, s2] // 16) * 16, S2.shape[1])
+                bkt = np.where(okf, n1 * (S2.shape[1] + 1) + n2, -1)
                 itf = items.reshape(-1)
                 sgf = signs.reshape(-1)
                 v = cp.zeros((n * L, S1.shape[2], S2.shape[2]))
-                for vb in np.unique(bkt[bkt > 0]):
-                    q = np.flatnonzero(bkt == vb)
+                for key_ in np.unique(bkt[bkt >= 0]):
+                    q = np.flatnonzero(bkt == key_)
                     gq = cp.asarray(q)
-                    vb = int(min(vb, S1.shape[1], S2.shape[1]))
-                    a1 = S1[gq, :vb]
-                    a2 = S2[gq, :vb]
-                    Tq = pt['TS'][cp.asarray(itf[q]), :vb, :vb]
+                    v1, v2 = int(n1[q[0]]), int(n2[q[0]])
+                    a1 = S1[gq, :v1]
+                    a2 = S2[gq, :v2]
+                    Tq = pt['TS'][cp.asarray(itf[q]), :v1, :v2]
                     v[gq] = cp.matmul(tr(a1), cp.matmul(Tq, a2)) * cp.asarray(sgf[q])[:, None, None]
                 v = v.reshape(n, L, S1.shape[2], S2.shape[2])
                 cache[key] = v
