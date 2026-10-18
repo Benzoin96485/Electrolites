@@ -309,6 +309,18 @@ class UTriplesGPU:
                 step = max(1, min(step, -(-len(sel) // (2 * len(devs)))))
             items += [(Pv, sel[c0:c0 + step]) for c0 in range(0, len(sel), step)]
         items.sort(key=lambda it: -len(it[1]) * it[0] ** 2)
+        import os
+        mpdevs = os.environ.get('DLPNO_MP_DEVS')       # testing: e.g. "0,0" on one GPU
+        if mpdevs:
+            devs = [int(x) for x in mpdevs.split(',')]
+        if not save and len(devs) > 1 and os.environ.get('DLPNO_MP', '1') == '1':
+            # one process per GPU: the triplet chunks are Python / launch bound
+            # and threads would share one interpreter lock
+            def collect(res):
+                ch_, e_ = res
+                self.e_ijk[ch_] = e_
+            mgpu.run_queue_mp(items, _T0Ctx.from_driver(self), '_mp_setup', '_mp_work', devs, collect)
+            return float(self.e_ijk.sum())
         ctxs = mgpu.run_queue(items, lambda w, it: w._ut0_item(*it, save=save), devs,
                               setup=lambda d: mgpu.device_view(
                                   self, ('_pt', 'S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d'),
@@ -973,3 +985,83 @@ class UTriplesGPU:
         else:
             raise RuntimeError('(T) iterations did not converge')
         return E
+
+
+class _Orb:
+    def __init__(self, nbf):
+        self.nbf = nbf
+
+
+class _T0Ctx(UTriplesGPU):
+    """The (T0) inputs of a driver, host only and picklable, for the worker
+    processes of ``mgpu.run_queue_mp``."""
+
+    ATTRS = ('_pt', 't_riatoms', 'pl', 'ns', '_npao_t', '_trip_arr', 'trip', 't_ribfs', 'S_pao_d',
+             '_nl_t', '_naux_t', 't_paos', 't_lmos', '_t_cut_tno', 'somo_idx', 'is_somo', 'Fa_lmo',
+             'Fb_lmo', 'tno_scale', 'so_index', 'ribf_atom', 'opt', 'Fb_ss', 'Fb_ps', 'Fa_pao_d',
+             'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d', 'so', '_tsidx', 'MAX_CHUNK_BYTES', 'verbose')
+
+    @classmethod
+    def from_driver(cls, d):
+        import copy
+        from electrolites.dlpno import mgpu
+        import pickle
+        c = object.__new__(cls)
+        skip = {'mf', 'mol', 'auxmol', 'ucc', 'cc', 'dfi', 'orb', '_prof', 'T2', 'G_lmp2', 'st', 'tno',
+                '_ring_gens', '_xq_dev', '_chol'}
+        for a, v in d.__dict__.items():
+            if a in skip:
+                continue
+            v = mgpu.to_host(v)
+            try:
+                pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL) if not isinstance(v, np.ndarray) else None
+            except Exception:
+                continue
+            setattr(c, a, v)
+        c.orb = _Orb(d.orb.nbf)
+        c._nva = np.array([d.nva(p) for p in range(len(d.pl))], np.int64)
+        c._nvb = np.array([d.nvb(p) for p in range(len(d.pl))], np.int64)
+        f = copy.copy(d.dfi)
+        f.mol = f.auxmol = None
+        for a in ('qia', 'qij', 'J2c'):
+            setattr(f, a, cp.asnumpy(getattr(d.dfi, a)))
+        f.qab = [None if q is None else (q if isinstance(q, np.ndarray) else cp.asnumpy(q)) for q in d.dfi.qab]
+        f._cache, f._cache_bytes, f._chol = {}, {}, {}
+        f.cache_stats = dict(hit=0, miss=0, bytes=0.)
+        c.dfi = f
+        c.e_ijk = np.zeros(len(d.trip))
+        return c
+
+    def nva(self, p):
+        return int(self._nva[p])
+
+    def nvb(self, p):
+        return int(self._nvb[p])
+
+    def log(self, *a):
+        pass
+
+    def _mp_setup(self):
+        from electrolites.dlpno import mgpu
+        for a in ('_pt', 'S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d'):
+            if hasattr(self, a):
+                setattr(self, a, mgpu.to_device(getattr(self, a)))
+        f = self.dfi
+        for a in ('qia', 'qij', 'J2c'):
+            setattr(f, a, cp.asarray(getattr(f, a)))
+        nab = sum(q.nbytes for q in f.qab if q is not None)
+        free = cp.cuda.runtime.memGetInfo()[0]
+        if nab < 0.35 * free:
+            f.qab = [None if q is None else cp.asarray(q) for q in f.qab]
+            f.qab_host = False
+        else:
+            from electrolites.dlpno.devmem import to_pinned
+            f.qab = [None if q is None else to_pinned(q) for q in f.qab]
+            f.qab_host = True
+
+    def _mp_work(self, it):
+        Pv, ch = it
+        self._ut0_item(Pv, ch, save=False)
+        e = self.e_ijk[ch].copy()
+        self.e_ijk[ch] = 0.
+        return ch, e

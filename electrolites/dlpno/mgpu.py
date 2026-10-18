@@ -147,3 +147,113 @@ def run_per_device(fn, devs):
 
 def lock():
     return _lock
+
+
+# ----------------------------------------------------------------------
+# one process per GPU (no shared GIL): for stages whose chunks only need
+# read-only tables and return small results
+# ----------------------------------------------------------------------
+def to_host(x):
+    """x with every cupy array (also inside dict / list / tuple) on the host."""
+    if isinstance(x, cp.ndarray):
+        return cp.asnumpy(x)
+    if isinstance(x, dict):
+        return {k: to_host(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(to_host(v) for v in x)
+    return x
+
+
+def to_device(x):
+    """inverse of to_host for numeric numpy arrays (current device)."""
+    if isinstance(x, np.ndarray) and x.dtype != object:
+        return cp.asarray(x)
+    if isinstance(x, dict):
+        return {k: to_device(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(to_device(v) for v in x)
+    return x
+
+
+def _mp_worker(path, dev, tasks, results, setup_name, work_name):
+    import os
+    import pickle
+    import traceback
+    try:
+        import cupy as cp_
+        cp_.cuda.Device(dev).use()
+        pool = cp_.get_default_memory_pool()
+        cp_.cuda.set_allocator(pool.malloc)
+        with open(path, 'rb') as f:
+            ctx = pickle.load(f)
+        getattr(ctx, setup_name)()
+        work = getattr(ctx, work_name)
+        while True:
+            it = tasks.get()
+            if it is None:
+                break
+            results.put(('ok', work(it)))
+    except BaseException:                  # noqa: B902 - reported to the parent
+        results.put(('err', f'device {dev}:\n' + traceback.format_exc()))
+    finally:
+        results.put(('done', dev))
+
+
+def run_queue_mp(items, ctx, setup_name, work_name, devs, collect):
+    """work_name(item) of the (picklable, host-only) ``ctx`` for every item in
+    one spawned process per device; ``setup_name()`` runs once per process
+    (moving its tables to the device); ``collect(result)`` in the parent."""
+    import multiprocessing as mp
+    import os
+    import pickle
+    import tempfile
+    sp = mp.get_context('spawn')
+    tmpd = '/dev/shm' if os.path.isdir('/dev/shm') else None
+    fd, path = tempfile.mkstemp(prefix='dlpno_ctx_', suffix='.pkl', dir=tmpd)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            pickle.dump(ctx, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tasks, results = sp.Queue(), sp.Queue()
+        for it in items:
+            tasks.put(it)
+        for _ in devs:
+            tasks.put(None)
+        procs = [sp.Process(target=_mp_worker, args=(path, d, tasks, results, setup_name, work_name),
+                            daemon=True) for d in devs]
+        # spawned children must not re-run the user's main script
+        import sys
+        main = sys.modules.get('__main__')
+        saved = {k: getattr(main, k) for k in ('__file__', '__spec__') if hasattr(main, k)}
+        if '__file__' in saved:
+            del main.__file__
+        main.__spec__ = None
+        try:
+            for p in procs:
+                p.start()
+        finally:
+            for k, v in saved.items():
+                setattr(main, k, v)
+        done, err = 0, None
+        import queue as _q
+        while done < len(devs):
+            try:
+                kind, val = results.get(timeout=30)
+            except _q.Empty:
+                if not any(p.is_alive() for p in procs):
+                    raise RuntimeError('worker processes died without reporting')
+                continue
+            if kind == 'ok':
+                collect(val)
+            elif kind == 'err':
+                err = val
+            else:
+                done += 1
+        for p in procs:
+            p.join()
+        if err:
+            raise RuntimeError('worker failed: ' + err)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
