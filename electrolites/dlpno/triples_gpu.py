@@ -250,6 +250,8 @@ class TriplesGPU:
 
     def lccsd_t0(self, save=False):
         """TNOs and (T0) energy of every triplet, chunk by chunk."""
+        self.dfi.cache_clear()
+        cp.get_default_memory_pool().free_all_blocks()
         self._pair_tables()
         if getattr(self, 'F_pao_d', None) is None:
             self.F_pao_d = cp.asarray(self.orb.F_pao)
