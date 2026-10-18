@@ -1009,12 +1009,24 @@ class _T0Ctx(UTriplesGPU):
         c = object.__new__(cls)
         skip = {'mf', 'mol', 'auxmol', 'ucc', 'cc', 'dfi', 'orb', '_prof', 'T2', 'G_lmp2', 'st', 'tno',
                 '_ring_gens', '_xq_dev', '_chol'}
+        def size(v):
+            if isinstance(v, (np.ndarray, cp.ndarray)):
+                return v.nbytes
+            if isinstance(v, dict):
+                return sum(size(x) for x in v.values())
+            if isinstance(v, (list, tuple)):
+                return sum(size(x) for x in v)
+            return 0
         for a, v in d.__dict__.items():
             if a in skip:
                 continue
+            # the tables (T0) needs, plus everything small (scalars, maps)
+            if a not in cls.ATTRS and size(v) > (16 << 20):
+                continue
             v = mgpu.to_host(v)
             try:
-                pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL) if not isinstance(v, np.ndarray) else None
+                if not isinstance(v, np.ndarray):
+                    pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
             except Exception:
                 continue
             setattr(c, a, v)

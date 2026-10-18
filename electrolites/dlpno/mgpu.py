@@ -213,6 +213,8 @@ def run_queue_mp(items, ctx, setup_name, work_name, devs, collect):
     try:
         with os.fdopen(fd, 'wb') as f:
             pickle.dump(ctx, f, protocol=pickle.HIGHEST_PROTOCOL)
+        if getattr(ctx, 'verbose', 0) >= 2:
+            print(f'[mem] worker context {os.path.getsize(path) / 1e9:.2f} GB x {len(devs)} processes', flush=True)
         tasks, results = sp.Queue(), sp.Queue()
         for it in items:
             tasks.put(it)
