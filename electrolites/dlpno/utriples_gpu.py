@@ -309,7 +309,7 @@ class UTriplesGPU:
         A = int(-(-self._naux_t[ch].max() // 32) * 32)
         L = int(padded(max(1, self._nl_t[ch].max())))
         Vm = max(Va, Vb)
-        per = 8 * (2 * A * A + 14 * A * Vm + 18 * Vm ** 3
+        per = 8 * (2 * A * A + 14 * A * Vm + 18 * Vm ** 3 + 2 * A * Vm * Vm
                    + 8 * L * Vm * Vm + 2 * nbf * Vm + 4 * A * Pv
                    + 8 * L * self._pt["PP"] * Vm)
         sub = max(1, int(self._chunk_bytes() // per))
@@ -381,8 +381,9 @@ class UTriplesGPU:
         # fitting step is needed.
         wq = [[cp.matmul(Linv.transpose(0, 2, 1), qv[r][t]) for t in (0, 1)] for r in range(3)]
         r_spins = [(0,) if np.all(self.is_somo[ijk[:, r]]) else (0, 1) for r in range(3)]
-        K3 = {(r, s_, t): cp.zeros((B, Vs[s_], Vs[s_], Vs[t]))
-              for r in range(3) for s_ in (0, 1) for t in r_spins[r]}
+        # raw (Q|e y) per spin over the triplet's aux functions, filled atom by
+        # atom, then every K3 block is one batched GEMM with K = A
+        qvv = [cp.zeros((B, A, Va, Va)), cp.zeros((B, A, Vb, Vb))]
         prof('k3')
         atoms = sorted({int(a) for t in ch for a in self.t_riatoms[t]})
         for a in atoms:
@@ -401,18 +402,11 @@ class UTriplesGPU:
             for r0 in range(0, len(rows), step):
                 sl = slice(r0, r0 + step)
                 g_ = gr[sl]
-                nr = len(rows[sl])
                 blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl], ru=True)
                 oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                 for s_, Xs in ((0, Xa), (1, Xbp)):
                     xr = Xs[g_]
-                    q_ = xtbx(blk, xr, xr)                                            # (nr, na, V, V)
-                    q_ = q_.reshape(nr, na, -1).transpose(0, 2, 1)                     # (nr, V*V, na)
-                    for (r, s2, t), K in K3.items():
-                        if s2 != s_:
-                            continue
-                        w = wq[r][t][g_[:, None], oo]                                  # (nr, na, Vt)
-                        K[g_] += cp.matmul(q_, w).reshape(nr, Vs[s_], Vs[s_], Vs[t])
+                    qvv[s_][g_[:, None], oo] = xtbx(blk, xr, xr)                    # (nr, na, V, V)
                 del blk
         if ns:
             # SOMO parts of the beta (Q|ab): (Q|u s), (Q|s t), dense in Q
@@ -424,12 +418,14 @@ class UTriplesGPU:
                 qss = dfi.qij[ga_[:, :, None, None], so_idx[None, None, :, None], so_idx[None, None, None, :]]
                 qss = qss * gam_[:, :, None, None]
                 m1 = cp.matmul(cp.matmul(tr(Xbp)[:, None], tr(qsu)), Xbs[:, None])
-                mq = m1 + tr(m1) + cp.matmul(cp.matmul(tr(Xbs)[:, None], qss), Xbs[:, None])
-                nq = mq.shape[1]
-                mq = mq.reshape(B, nq, -1).transpose(0, 2, 1)
-                for (r, s2, t), K in K3.items():
-                    if s2 == 1:
-                        K += cp.matmul(mq, wq[r][t][:, qs_]).reshape(B, Vb, Vb, Vs[t])
+                qvv[1][:, qs_] += m1 + tr(m1) + cp.matmul(cp.matmul(tr(Xbs)[:, None], qss), Xbs[:, None])
+        K3 = {}
+        for r in range(3):
+            for s_ in (0, 1):
+                qt = qvv[s_].reshape(B, A, -1).transpose(0, 2, 1)                          # (B, V*V, A)
+                for t in r_spins[r]:
+                    K3[(r, s_, t)] = cp.matmul(qt, wq[r][t]).reshape(B, Vs[s_], Vs[s_], Vs[t])
+        del qvv
         prof('w')
         # ---- Fock (occupied position r -> triplet virtuals) and singles -----
         nbf = self.orb.nbf
