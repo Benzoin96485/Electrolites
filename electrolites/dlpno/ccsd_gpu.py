@@ -45,6 +45,14 @@ def _wsum(w, M):
     g, A = M.shape[:2]
     return cp.matmul(w[:, None, :], M.reshape(g, A, -1)).reshape((g,) + M.shape[2:])
 
+
+def _rnorm(R, opt):
+    """residual measure: largest per-pair RMS (Psi4, default) or, with
+    R_NORM='max', the largest absolute element (ORCA's "max. residuum")."""
+    if opt.get('R_NORM', 'rms') == 'max':
+        return float(max(float(cp.abs(d).max()) for d in R.data if d.size))
+    return float(R.rms_per_item().max())
+
 class _ChunkedPlan:
     """A chain (or dot) plan whose PNO-overlap operands (layout ``LS``) are
     generated on the device per chunk of terms (``ovgen``) instead of being
@@ -1081,8 +1089,7 @@ class CCSDGPU:
         for it in range(1, opt['MAXITER'] + 1):
             t0 = time.perf_counter()
             R1, R2 = self.residuals()
-            r1 = float(R1.rms_per_item().max())
-            r2 = float(R2.rms_per_item().max())
+            r1, r2 = _rnorm(R1, opt), _rnorm(R2, opt)
             self.T1 = self.T1 - R1 / self.D1
             self.T = self.T - R2 / self.D2
             n1 = self.T1.flat().size

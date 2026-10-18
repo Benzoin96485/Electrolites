@@ -25,7 +25,7 @@ import cupyx
 
 from electrolites.dlpno.ragged import Layout, Ragged, op
 from electrolites.dlpno.vbatch import VChainPlan, VDotPlan
-from electrolites.dlpno.ccsd_gpu import _DeviceDIIS
+from electrolites.dlpno.ccsd_gpu import _DeviceDIIS, _rnorm
 
 
 class _Reg:
@@ -1049,8 +1049,7 @@ class UCCSDGPU:
         for it in range(1, opt['MAXITER'] + 1):
             t0 = time.perf_counter()
             R1, R = self.residuals(T, T1)
-            r1 = float(R1.rms_per_item().max())
-            r2 = float(R.rms_per_item().max())
+            r1, r2 = _rnorm(R1, opt), _rnorm(R, opt)
             import os
             if os.environ.get('DLPNO_DEBUG_R1'):
                 rr = R1.rms_per_item().get()
