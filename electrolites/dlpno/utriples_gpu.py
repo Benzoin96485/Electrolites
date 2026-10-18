@@ -315,10 +315,15 @@ class UTriplesGPU:
         A = int(-(-self._naux_t[ch].max() // 32) * 32)
         L = int(padded(max(1, self._nl_t[ch].max())))
         Vm = max(Va, Vb)
-        per = 8 * (2 * A * A + 14 * A * Vm + 18 * Vm ** 3 + 2 * A * Vm * Vm
-                   + 8 * L * Vm * Vm + 2 * nbf * Vm + 4 * A * Pv
-                   + 8 * L * self._pt["PP"] * Vm)
-        sub = max(1, int(self._chunk_bytes() // per))
+        VP = max(self._pt['VA'], self._pt['VB'])
+        # live for the whole sub-chunk: metric, fitted (Q|r a), (Q|r l), K3,
+        # projected TNO basis, the pair projections kept per chunk
+        common = (2 * A * A + 14 * A * Vm + 12 * Vm ** 3 + 2 * nbf * Vm + 4 * A * Pv
+                  + 6 * L * VP * Vm)
+        # the K3 phase (raw (Q|ab)) and the W phase (W, V, T, D and the
+        # pattern caches) do not overlap
+        per = 8 * (common + max(2 * A * Vm * Vm, 8 * Vm ** 3 + 8 * L * Vm * Vm))
+        sub = max(1, int(2 * self._chunk_bytes() // per))
         for s0 in range(0, len(ch), sub):
             sl = slice(s0, s0 + sub)
             part = {k: v[sl] for k, v in tn.items()}

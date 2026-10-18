@@ -1035,6 +1035,12 @@ class UCCSDGPU:
             R1, R = self.residuals(T, T1)
             r1 = float(R1.rms_per_item().max())
             r2 = float(R.rms_per_item().max())
+            import os
+            if os.environ.get('DLPNO_DEBUG_R1'):
+                rr = R1.rms_per_item().get()
+                top = np.argsort(rr)[::-1][:4]
+                print('   r1 top:', [(int(I), self.so[I], bool(self.u.is_somo[self.so[I][0]]), f'{rr[I]:.2e}',
+                                     f'D1min {float(cp.min(cp.abs(_get(self.D1, I)))):.3f}') for I in top], flush=True)
             T1 = T1 - R1 / self.D1
             T = T - R / self.D2
             T = self._symmetrize(T)

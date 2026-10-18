@@ -1214,6 +1214,15 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         import gc
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
+        import os
+        if os.environ.get('DLPNO_DEBUG_MEM'):
+            big = [o for o in gc.get_objects() if isinstance(o, cp.ndarray) and o.nbytes > (1 << 27)]
+            print('[mem] live arrays > 128 MB after LCCSD:', len(big),
+                  round(sum(o.nbytes for o in big) / 1e9, 2), 'GB', flush=True)
+            for o in sorted(big, key=lambda x: -x.nbytes)[:12]:
+                refs = [type(r).__name__ + (':' + ','.join(list(r.keys())[:6]) if isinstance(r, dict) else '')
+                        for r in gc.get_referrers(o)[:3]]
+                print('   ', o.shape, o.device.id, round(o.nbytes / 1e9, 2), refs, flush=True)
 
 
 def _transpose_index(lay, src, dst):
