@@ -83,6 +83,11 @@ class _ChunkedPlan:
     def __init__(self, gens, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=None, left=None,
                  devs=None, budget=None, store=None):
         self.store = store
+        if 'MAX_BYTES' not in self.__dict__ and type(self).MAX_BYTES == (1 << 29):
+            # large systems: fewer, larger chunks (each builds a plan and a
+            # generator chunk); 6% of the free device memory, 0.5 .. 4 GB
+            fr = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+            self.MAX_BYTES = int(min(4 << 30, max(1 << 29, 0.06 * fr)))
         n = len(out_idx) if left is None else len(left[0].idx)
         self.n = self.nterms = n
         self.gens = gens if callable(gens) else (lambda d, g=gens: g)
@@ -554,7 +559,9 @@ class CCSDGPU:
             def gen(d):
                 if d not in gens:
                     with cp.cuda.Device(d):
-                        gens[d] = OverlapGen(cp.asarray(ref.orb.S_pao), ref.pao, ref.X)
+                        fr = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+                        gens[d] = OverlapGen(cp.asarray(ref.orb.S_pao), ref.pao, ref.X,
+                                             max_bytes=int(min(4 << 30, max(1 << 29, 0.1 * fr))))
                 return gens[d]
             frac = float(os.environ.get('DLPNO_S_KEEP', '0.45' if len(devs) > 1 else '0.3'))
             per = {}
