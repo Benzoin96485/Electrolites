@@ -694,7 +694,9 @@ class CCSDGPU:
             for s, p in enumerate(m):
                 v = self.nv[p]
                 buf[s, :v, :v, :v] = cp.asarray(ref.K_ivvv[p]).reshape(v, v, v)
-            self.K3.append(cp.asarray(buf))
+                ref.K_ivvv[p] = None          # grouped now: the per-pair copy goes
+            self.K3.append(buf)
+            cp.get_default_memory_pool().free_all_blocks()
         # non-projected integrals, per (strong p, k in lmos[p])
         pk_p, pk_k, pk_r = [], [], []
         for p in np.where(self.strong)[0]:
