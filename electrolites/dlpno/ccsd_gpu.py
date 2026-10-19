@@ -158,10 +158,27 @@ class _ChunkedPlan:
             return S
         if self.store is not None:
             return self.store.gather(ch['LS'], ch['preps'])
-        S = Ragged(ch['LS'])
+        keep = self.budget is not None and self.budget.take(ch['dev'], ch['LS'].nbytes())
+        if keep:
+            S = Ragged(ch['LS'])
+        else:
+            # regenerated every use: one zeroed workspace per device, no
+            # allocation per chunk and iteration
+            ws_ = self.__dict__.setdefault('_sws', {})
+            n = ch['LS'].nbytes() // 8
+            w = ws_.get(ch['dev'])
+            if w is None or w.size < n:
+                w = ws_[ch['dev']] = cp.empty(max(n, 1))
+            w[:n].fill(0.)
+            data, off = [], 0
+            for m, (r, c) in zip(ch['LS'].members, ch['LS'].shapes):
+                k = len(m) * r * c
+                data.append(w[off:off + k].reshape(len(m), r, c))
+                off += k
+            S = Ragged(ch['LS'], data)
         for P in ch['preps']:
             ch['gen'].run(P, S)
-        if self.budget is not None and self.budget.take(ch['dev'], ch['LS'].nbytes()):
+        if keep:
             ch['S'] = S                   # kept: this chunk's overlaps are not regenerated
         return S
 

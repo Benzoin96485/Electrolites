@@ -160,7 +160,15 @@ class OverlapGen:
         """evaluate one prepared chunk into ``out`` (accumulates: zero it first),
         by default a new Ragged(P['LS']), which is returned."""
         if out is None:
-            out = Ragged(P['LS'])
+            # persistent output workspace, zeroed per chunk (consumed before
+            # the next chunk is generated on this stream): no allocation per call
+            LS = P['LS']
+            nout = LS.nbytes() // 8
+            ows = getattr(self, '_ows', None)
+            if ows is None or ows.size < nout:
+                self._ows = ows = cp.empty(max(nout, 1))
+            ows[:nout].fill(0.)
+            out, _ = self._views(LS, ows)
         LXu = P['LXu']
         need = LXu.nbytes() // 8
         ws = getattr(self, '_ws', None)
