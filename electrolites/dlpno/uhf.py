@@ -60,8 +60,12 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
 
     def kernel(self):
         from electrolites.dlpno.devmem import pooled
-        with pooled():
-            return super().kernel()
+        from electrolites.dlpno import mgpu
+        try:
+            with pooled():
+                return super().kernel()
+        finally:
+            mgpu.close_pools()
 
     MAX_PAIR_CHUNK_BYTES = 1 << 30
     PAO_ORTHO = 'pivchol'
@@ -1209,6 +1213,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
 
     # ------------------------------------------------------------------
     def lccsd_iterations(self):
+        if self.triples:
+            self.t0_pool_start()
         t0 = time.perf_counter()
         self.ucc = g = UCCSDGPU(self)
         g.build()
@@ -1220,6 +1226,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         getattr(self.dfi, '_chol', {}).clear()
         cp.get_default_memory_pool().free_all_blocks()
         self.timings['cc_build'] = time.perf_counter() - t0
+        if self.verbose >= 2:
+            print('[phase] cc_build steps (s):', {k: round(v, 1) for k, v in g.t_build.items()}, flush=True)
         self.log('  CC stores (GB):', getattr(g, 'mem_report', None))
         self.mem_cc = getattr(g, 'mem_report', None)
         self.e_lccsd, self.de_weak = g.kernel(verbose=self.verbose >= 4)

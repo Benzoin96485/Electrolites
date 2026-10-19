@@ -202,92 +202,195 @@ class _ArrUnpickler(_pickle.Unpickler):
         return np.load(path, mmap_mode='r')
 
 
-def _mp_worker(path, dev, tasks, results, setup_name, work_name):
-    import os
+def _mp_worker(dev, ctrl, tasks, results, warm):
+    """one GPU worker of an ``MPPool``: interpreter, imports and CUDA context
+    set up once; then for every pass (('pass', path, setup, work) on
+    ``ctrl``) the context is loaded, its setup run and items pulled from the
+    shared ``tasks`` queue up to a None.  The context and its device memory
+    are released after each pass."""
+    import gc
+    import importlib
+    import time
     import traceback
-    try:
-        import cupy as cp_
-        cp_.cuda.Device(dev).use()
-        with open(path, 'rb') as f:
-            ctx = _ArrUnpickler(f).load()
-        # after the imports of the unpickling (GPU4PySCF installs an allocator
-        # that sends large requests to cudaMalloc): the plain CuPy pool
-        pool = cp_.get_default_memory_pool()
-        cp_.cuda.set_allocator(pool.malloc)
-        getattr(ctx, setup_name)()
-        work = getattr(ctx, work_name)
-        while True:
-            it = tasks.get()
-            if it is None:
-                break
-            results.put(('ok', work(it)))
-    except BaseException:                  # noqa: B902 - reported to the parent
-        results.put(('err', f'device {dev}:\n' + traceback.format_exc()))
-    finally:
-        results.put(('done', dev))
+    import cupy as cp_
+    cp_.cuda.Device(dev).use()
+    for m in warm:                          # the modules the passes unpickle
+        importlib.import_module(m)
+    cp_.zeros(1).sum()
+    # GPU4PySCF installs an allocator that sends large requests to
+    # cudaMalloc: the plain CuPy pool for the passes
+    pool = cp_.get_default_memory_pool()
+    cp_.cuda.set_allocator(pool.malloc)
+    results.put(('ready', dev, None))
+    while True:
+        msg = ctrl.get()
+        if msg is None:
+            break
+        _, path, setup_name, work_name = msg
+        ctx = work = None
+        try:
+            t0 = time.perf_counter()
+            with open(path, 'rb') as f:
+                ctx = _ArrUnpickler(f).load()
+            cp_.cuda.set_allocator(pool.malloc)
+            t1 = time.perf_counter()
+            getattr(ctx, setup_name)()
+            cp_.cuda.Device(dev).synchronize()
+            results.put(('info', dev, dict(load=t1 - t0, setup=time.perf_counter() - t1)))
+            work = getattr(ctx, work_name)
+            while True:
+                it = tasks.get()
+                if it is None:
+                    break
+                results.put(('ok', dev, work(it)))
+        except BaseException:              # noqa: B902 - reported to the parent
+            results.put(('err', dev, f'device {dev}:\n' + traceback.format_exc()))
+        finally:
+            ctx = work = None
+            gc.collect()
+            pool.free_all_blocks()
+            cp_.get_default_pinned_memory_pool().free_all_blocks()
+            results.put(('done', dev, None))
 
 
-def run_queue_mp(items, ctx, setup_name, work_name, devs, collect):
-    """work_name(item) of the (picklable, host-only) ``ctx`` for every item in
-    one spawned process per device; ``setup_name()`` runs once per process
-    (moving its tables to the device); ``collect(result)`` in the parent."""
-    import multiprocessing as mp
-    import os
-    import pickle
-    import tempfile
-    sp = mp.get_context('spawn')
-    tmpd = '/dev/shm' if os.path.isdir('/dev/shm') else None
-    fd, path = tempfile.mkstemp(prefix='dlpno_ctx_', suffix='.pkl', dir=tmpd)
-    pk = None
-    try:
-        with os.fdopen(fd, 'wb') as f:
-            pk = _ArrPickler(f, path[:-4])
-            pk.dump(ctx)
-        if getattr(ctx, 'verbose', 0) >= 2:
-            nb = os.path.getsize(path) + sum(os.path.getsize(p) for p in pk.files)
-            print(f'[mem] worker context {nb / 1e9:.2f} GB (shared by {len(devs)} processes)', flush=True)
-        tasks, results = sp.Queue(), sp.Queue()
-        for it in items:
-            tasks.put(it)
-        for _ in devs:
-            tasks.put(None)
-        procs = [sp.Process(target=_mp_worker, args=(path, d, tasks, results, setup_name, work_name),
-                            daemon=True) for d in devs]
-        # spawned children must not re-run the user's main script
+class MPPool:
+    """one spawned process per GPU, reused by every pass of a stage: the
+    interpreter start, the imports and the CUDA context are paid once, and
+    overlap the parent's work when the pool is started early (``warm``:
+    modules to import up front)."""
+
+    def __init__(self, devs, warm=()):
+        import multiprocessing as mp
         import sys
+        self.devs = list(devs)
+        sp = mp.get_context('spawn')
+        self.tasks, self.results = sp.Queue(), sp.Queue()
+        self.ctrl = [sp.Queue() for _ in self.devs]
+        # never block the interpreter exit on items no worker will read
+        for q in [self.tasks, self.results] + self.ctrl:
+            q.cancel_join_thread()
+        self.procs =[sp.Process(target=_mp_worker, args=(d, q, self.tasks, self.results, tuple(warm)),
+                                 daemon=True) for d, q in zip(self.devs, self.ctrl)]
+        # spawned children must not re-run the user's main script
         main = sys.modules.get('__main__')
         saved = {k: getattr(main, k) for k in ('__file__', '__spec__') if hasattr(main, k)}
         if '__file__' in saved:
             del main.__file__
         main.__spec__ = None
         try:
-            for p in procs:
+            for p in self.procs:
                 p.start()
         finally:
             for k, v in saved.items():
                 setattr(main, k, v)
-        done, err = 0, None
+        self.ready = 0
+
+    def _get(self):
         import queue as _q
-        while done < len(devs):
+        while True:
             try:
-                kind, val = results.get(timeout=30)
+                return self.results.get(timeout=30)
             except _q.Empty:
-                if not any(p.is_alive() for p in procs):
-                    raise RuntimeError('worker processes died without reporting')
-                continue
-            if kind == 'ok':
-                collect(val)
-            elif kind == 'err':
-                err = val
-            else:
-                done += 1
-        for p in procs:
-            p.join()
-        if err:
-            raise RuntimeError('worker failed: ' + err)
-    finally:
-        for p in [path] + (pk.files if pk is not None else []):
+                if not all(p.is_alive() for p in self.procs):
+                    raise RuntimeError('a worker process died without reporting')
+
+    def run(self, items, ctx, setup_name, work_name, collect, verbose=0):
+        import os
+        import queue as _q
+        import tempfile
+        import time
+        t0 = time.perf_counter()
+        tmpd = '/dev/shm' if os.path.isdir('/dev/shm') else None
+        fd, path = tempfile.mkstemp(prefix='dlpno_ctx_', suffix='.pkl', dir=tmpd)
+        pk = None
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                pk = _ArrPickler(f, path[:-4])
+                pk.dump(ctx)
+            t_dump = time.perf_counter() - t0
+            if verbose >= 2:
+                nb = os.path.getsize(path) + sum(os.path.getsize(p) for p in pk.files)
+                print(f'[mem] worker context {nb / 1e9:.2f} GB (shared by {len(self.devs)} processes)',
+                      flush=True)
+            for it in items:
+                self.tasks.put(it)
+            for _ in self.devs:
+                self.tasks.put(None)
+            t1 = time.perf_counter()
+            while self.ready < len(self.devs):          # interpreters / imports done
+                kind, dev, val = self._get()
+                if kind == 'ready':
+                    self.ready += 1
+            t_wait = time.perf_counter() - t1
+            for q in self.ctrl:
+                q.put(('pass', path, setup_name, work_name))
+            done, err, info = 0, None, {}
+            while done < len(self.devs):
+                kind, dev, val = self._get()
+                if kind == 'ok':
+                    collect(val)
+                elif kind == 'info':
+                    info[dev] = (round(val['load'], 1), round(val['setup'], 1))
+                elif kind == 'err':
+                    err = val
+                    try:                    # the failed worker stopped pulling
+                        while True:
+                            self.tasks.get_nowait()
+                    except _q.Empty:
+                        pass
+                    for _ in self.devs:
+                        self.tasks.put(None)
+                elif kind == 'done':
+                    done += 1
+            # sentinels left over after a failure
             try:
-                os.unlink(p)
-            except OSError:
+                while True:
+                    self.tasks.get_nowait()
+            except _q.Empty:
                 pass
+            if verbose >= 2:
+                print(f'[mp] context write {t_dump:.1f} s, waited for worker start {t_wait:.1f} s, '
+                      f'per worker (load, setup) s: {info}', flush=True)
+            if err:
+                raise RuntimeError('worker failed: ' + err)
+        finally:
+            for p in [path] + (pk.files if pk is not None else []):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def close(self):
+        for q in self.ctrl:
+            q.put(None)
+        for p in self.procs:
+            p.join(timeout=60)
+            if p.is_alive():
+                p.terminate()
+
+
+_pools = {}
+
+
+def mp_pool(devs, warm=(), start=True):
+    """the persistent worker pool of ``devs`` (started on first use)."""
+    key = tuple(devs)
+    if key not in _pools and start:
+        _pools[key] = MPPool(devs, warm)
+    return _pools.get(key)
+
+
+def close_pools():
+    for k in list(_pools):
+        _pools.pop(k).close()
+
+
+import atexit as _atexit
+_atexit.register(close_pools)
+
+
+def run_queue_mp(items, ctx, setup_name, work_name, devs, collect):
+    """work_name(item) of the (picklable, host-only) ``ctx`` for every item in
+    one process per device (the persistent pool of ``devs``); ``setup_name()``
+    runs once per process and pass; ``collect(result)`` in the parent."""
+    mp_pool(devs).run(items, ctx, setup_name, work_name, collect, getattr(ctx, 'verbose', 0))

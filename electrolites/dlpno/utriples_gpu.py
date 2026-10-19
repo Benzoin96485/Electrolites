@@ -286,6 +286,26 @@ class UTriplesGPU:
                 out.append(pat)
         return out
 
+    def t0_mp_devs(self):
+        """the devices of the process-per-GPU (T0) passes, None for threads."""
+        import os
+        from electrolites.dlpno import mgpu
+        devs = mgpu.devices()
+        mpdevs = os.environ.get('DLPNO_MP_DEVS')       # testing: e.g. "0,0" on one GPU
+        if mpdevs:
+            devs = [int(x) for x in mpdevs.split(',')]
+        if (len(devs) > 1 or os.environ.get('DLPNO_MP_FORCE')) and os.environ.get('DLPNO_MP', '1') == '1':
+            return devs
+        return None
+
+    def t0_pool_start(self):
+        """start the (T0) worker processes ahead of time (their interpreter
+        start and imports then overlap the CC iterations)."""
+        devs = self.t0_mp_devs()
+        if devs is not None:
+            from electrolites.dlpno import mgpu
+            mgpu.mp_pool(devs, warm=('electrolites.dlpno.utriples_gpu', 'electrolites.dlpno.uhf'))
+
     def lccsd_t0(self, save=False):
         # the (Q|uv) device caches and pooled blocks of the previous pass go first
         self.dfi.cache_clear()
@@ -321,11 +341,9 @@ class UTriplesGPU:
                 step = max(1, min(step, -(-len(sel) // (2 * len(devs)))))
             items += [(Pv, sel[c0:c0 + step]) for c0 in range(0, len(sel), step)]
         items.sort(key=lambda it: -len(it[1]) * it[0] ** 2)
-        import os
-        mpdevs = os.environ.get('DLPNO_MP_DEVS')       # testing: e.g. "0,0" on one GPU
-        if mpdevs:
-            devs = [int(x) for x in mpdevs.split(',')]
-        if not save and (len(devs) > 1 or os.environ.get('DLPNO_MP_FORCE')) and os.environ.get('DLPNO_MP', '1') == '1':
+        mpdevs = self.t0_mp_devs()
+        if not save and mpdevs is not None:
+            devs = mpdevs
             # one process per GPU: the triplet chunks are Python / launch bound
             # and threads would share one interpreter lock
             busy = {}

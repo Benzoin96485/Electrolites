@@ -96,8 +96,17 @@ class _Terms:
     def __getitem__(self, k):
         return self._mat()[k]
 
+    @classmethod
+    def from_columns(cls, **cols):
+        """a term list from numpy columns (no row tuples)."""
+        t = cls()
+        t._keys = tuple(cols)
+        t._rows = None
+        t._cols = {k: np.asarray(v) for k, v in cols.items()}
+        return t
+
     def __setitem__(self, k, v):
-        self._mat()[k] = list(v)
+        self._mat()[k] = np.asarray(v) if isinstance(v, np.ndarray) else list(v)
         self._np = {}
 
     def __contains__(self, k):

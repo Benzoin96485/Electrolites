@@ -642,24 +642,19 @@ class UCCSDGPUv(UCCSDGPU):
             fvt = []
             for s in (0, 1):
                 fs, li = loc_idx[s][0], loc_idx[s][1]
-                t_ = _Terms()
-                t_._keys = ('c', 's1', 'it', 'sa')
-                t_._rows = list(zip(fvn[fs, 0].tolist(), li.tolist(), fvn[fs, 3].tolist(), [s] * len(fs)))
-                fvt.append(t_)
+                fvt.append(_Terms.from_columns(
+                    c=fvn[fs, 0].astype(np.int64), s1=np.asarray(li, np.int64),
+                    it=fvn[fs, 3].astype(np.int64), sa=np.full(len(fs), s, np.int64)))
             # oooo ladder rows of the chunk: S column of spin a and of spin b
+            # (rsel is ascending, ra / rbs are subsets of it)
             s1 = np.zeros(len(rsel), np.int64)
             s2 = np.zeros(len(rsel), np.int64)
-            pos = {r: q for q, r in enumerate(rsel)}
             for s in (0, 1):
                 _, _, ra, la, rbs, lb = loc_idx[s]
-                for r_, l_ in zip(ra, la):
-                    s1[pos[r_]] = l_
-                for r_, l_ in zip(rbs, lb):
-                    s2[pos[r_]] = l_
-            rt = _Terms()
-            rt._keys = ('o', 's1', 't', 's2', 'a', 'b')
-            rt._rows = list(zip(rb_o[rsel].tolist(), s1.tolist(), rbn[rsel, 4].astype(np.int64).tolist(),
-                                s2.tolist(), rb_a[rsel].tolist(), rb_b[rsel].tolist()))
+                s1[np.searchsorted(rsel, ra)] = la
+                s2[np.searchsorted(rsel, rbs)] = lb
+            rt = _Terms.from_columns(o=rb_o[rsel], s1=s1, t=rbn[rsel, 4].astype(np.int64), s2=s2,
+                                     a=rb_a[rsel], b=rb_b[rsel])
             d['fv'], d['rb'] = fvt, rt
             d['beta_n'] = rsel
             d['rb_w'] = .5 * rbn[rsel, 5]
@@ -698,25 +693,31 @@ class UCCSDGPUv(UCCSDGPU):
             tot = sum(len(v) for v in names.values())
             print('S couples per term list:', sorted((len(v) for v in names.values()), reverse=True)[:12],
                   'total refs', tot, 'unique', len(set().union(*names.values())) if names else 0)
-        used = [set(), set()]
+        # (numpy) the overlap couples still referenced, renumbered in order
+        refs = []
         for t_, col, sc in cols:
             if not len(t_) or col not in t_:
                 continue
-            spins = [sc] * len(t_[col]) if isinstance(sc, int) else t_[sc]
-            for i, s in zip(t_[col], spins):
-                used[s].add(i)
+            ii = np.asarray(t_[col], np.int64)
+            ss = np.full(len(ii), sc, np.int64) if isinstance(sc, int) else np.asarray(t_[sc], np.int64)
+            refs.append((t_, col, ii, ss))
         new = [_Reg(), _Reg()]
-        mp = []
+        remap = []
         for s in (0, 1):
-            m = {}
-            for i in sorted(used[s]):
-                m[i] = new[s](self.Sreg[s].keys[i])
-            mp.append(m)
-        for t_, col, sc in cols:
-            if not len(t_) or col not in t_:
-                continue
-            spins = [sc] * len(t_[col]) if isinstance(sc, int) else t_[sc]
-            t_[col] = [mp[s][i] for i, s in zip(t_[col], spins)]
+            ids = [ii[ss == s] for _, _, ii, ss in refs]
+            used = np.unique(np.concatenate(ids)) if ids else np.zeros(0, np.int64)
+            keys = self.Sreg[s].keys
+            new[s].keys = [keys[i] for i in used.tolist()]
+            new[s].ids = {k: n for n, k in enumerate(new[s].keys)}
+            m = -np.ones(len(keys), np.int64)
+            m[used] = np.arange(len(used))
+            remap.append(m)
+        for t_, col, ii, ss in refs:
+            out = np.empty_like(ii)
+            for s in (0, 1):
+                m = ss == s
+                out[m] = remap[s][ii[m]]
+            t_[col] = out
         self.Sreg = new
 
     def _kl_tables_dev(self, dev):
@@ -1329,6 +1330,41 @@ class UCCSDGPUv(UCCSDGPU):
             if d['p_rb'].n:
                 d['p_rb'].run(R, st, w=beta[d['beta']] * d['w'])
 
+    def _dev_rep(self, dv, name, X):
+        """X (a Ragged of the home device) copied into a persistent buffer on
+        device ``dv`` (the current one): stable addresses keep the plans'
+        cached pointer tables valid across iterations."""
+        c = self.__dict__.setdefault('_reps', {}).setdefault(dv, {})
+        r = c.get(name)
+        if r is None or r.layout is not X.layout:
+            r = c[name] = Ragged(X.layout)
+        for d_, s_ in zip(r.data, X.data):
+            if s_.size:
+                d_.data.copy_from_device_async(s_.data, s_.nbytes)
+        return r
+
+    def _dev_out(self, dv, name, layout):
+        """persistent zeroed output Ragged on device ``dv``."""
+        c = self.__dict__.setdefault('_reps', {}).setdefault(dv, {})
+        r = c.get(name)
+        if r is None or r.layout is not layout:
+            r = c[name] = Ragged(layout)
+        else:
+            for d_ in r.data:
+                d_.fill(0.)
+        return r
+
+    def _dev_vec(self, dv, name, x, zero=False):
+        c = self.__dict__.setdefault('_reps', {}).setdefault(dv, {})
+        r = c.get(name)
+        if r is None or r.shape != x.shape:
+            r = c[name] = cp.empty(x.shape)
+        if zero:
+            r.fill(0.)
+        else:
+            r.data.copy_from_device_async(x.data, x.nbytes)
+        return r
+
     def _kl_all(self, st, Fv, R, beta):
         """F'_vv projections and the oooo ladder of all kl chunks; with
         several GPUs every device runs its chunks on replicas of T (and of the
@@ -1345,6 +1381,8 @@ class UCCSDGPUv(UCCSDGPU):
         from electrolites.dlpno import mgpu
         res = {}
         Gd = self.__dict__.setdefault('_G_dev', {})
+        # the replicas are copied on the other devices' streams
+        cp.cuda.get_current_stream().synchronize()
 
         def work(dv):
             chs = [d for d in self.klchunks if d.get('dev', home) == dv]
@@ -1353,10 +1391,10 @@ class UCCSDGPUv(UCCSDGPU):
                 return
             if dv not in Gd:
                 Gd[dv] = Ragged(self.G.layout, mgpu.replicate(self.G.data))
-            st_ = dict(T=Ragged(st['T'].layout, mgpu.replicate(st['T'].data)), G=Gd[dv])
-            Fv_ = [Ragged(x.layout) for x in Fv]
-            R_ = Ragged(R.layout)
-            self._kl_run(chs, st_, Fv_, R_, cp.asarray(beta))
+            st_ = dict(T=self._dev_rep(dv, 'kl.T', st['T']), G=Gd[dv])
+            Fv_ = [self._dev_out(dv, ('kl.Fv', s), x.layout) for s, x in enumerate(Fv)]
+            R_ = self._dev_out(dv, 'kl.R', R.layout)
+            self._kl_run(chs, st_, Fv_, R_, self._dev_vec(dv, 'kl.beta', beta))
             res[dv] = Fv_ + [R_]
         mgpu.run_per_device(work, devs)
         for outs in res.values():
@@ -1377,6 +1415,8 @@ class UCCSDGPUv(UCCSDGPU):
             return
         from electrolites.dlpno import mgpu
         res = {}
+        # the replicas are copied on the other devices' streams
+        cp.cuda.get_current_stream().synchronize()
 
         def work(dv):
             idx = [gi for gi, d in enumerate(self.dfg) if d.get('dev', home) == dv]
@@ -1384,12 +1424,12 @@ class UCCSDGPUv(UCCSDGPU):
                 for gi in idx:
                     self._df_run(gi, self.dfg[gi], T, T1, Tn, Fv, Fbov, R, R1, beta)
                 return
-
-            def rep(X):
-                return Ragged(X.layout, mgpu.replicate(X.data))
-            T_, T1_, Tn_ = rep(T), rep(T1), [rep(x) for x in Tn]
-            Fv_, Fb_ = [Ragged(x.layout) for x in Fv], [Ragged(x.layout) for x in Fbov]
-            R_, R1_, b_ = Ragged(R.layout), Ragged(R1.layout), cp.zeros(beta.shape)
+            T_, T1_ = self._dev_rep(dv, 'df.T', T), self._dev_rep(dv, 'df.T1', T1)
+            Tn_ = [self._dev_rep(dv, ('df.Tn', s), x) for s, x in enumerate(Tn)]
+            Fv_ = [self._dev_out(dv, ('df.Fv', s), x.layout) for s, x in enumerate(Fv)]
+            Fb_ = [self._dev_out(dv, ('df.Fb', s), x.layout) for s, x in enumerate(Fbov)]
+            R_, R1_ = self._dev_out(dv, 'df.R', R.layout), self._dev_out(dv, 'df.R1', R1.layout)
+            b_ = self._dev_vec(dv, 'df.beta', beta, zero=True)
             for gi in idx:
                 self._df_run(gi, self.dfg[gi], T_, T1_, Tn_, Fv_, Fb_, R_, R1_, b_)
             res[dv] = (Fv_ + Fb_ + [R_, R1_], b_)
