@@ -299,6 +299,8 @@ class UTriplesGPU:
             devs = [int(x) for x in mpdevs.split(',')]
         if getattr(getattr(self, 'dfi', None), 'qia', None) is not None and getattr(self.dfi.qia, 'host', False):
             return None                 # host (Q|i u) is pinned in this process: threads
+        if getattr(getattr(self, 'dfi', None), 'qab_direct', False):
+            return None                 # direct (Q|uv): regions of this process, threads
         if (len(devs) > 1 or os.environ.get('DLPNO_MP_FORCE')) and os.environ.get('DLPNO_MP', '1') == '1':
             return devs
         return None
@@ -382,6 +384,26 @@ class UTriplesGPU:
             if getattr(self, 'verbose', 0) >= 2:
                 print(f'[mp] (T0) {time.perf_counter() - t_mp:.1f} s; per device (chunks, busy s, triplets):',
                       {k: (v[0], round(v[1], 1), v[2]) for k, v in sorted(busy.items())}, flush=True)
+            return float(self.e_ijk.sum())
+        twork = lambda w, it: w._ut0_item(*it, save=save)
+        tsetup = lambda d: mgpu.device_view(
+                                  self, ('_pt', 'S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d'),
+                                  sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')})
+        if getattr(self.dfi, 'qab_direct', False):
+            order = self.dfi.spatial_order([np.unique(np.concatenate([self.t_riatoms[t] for t in it[1]]))
+                                            for it in items])
+            items = [items[k] for k in order]
+            needs = []
+            for _, ch in items:
+                nd = {}
+                for t in ch:
+                    for a in self.t_riatoms[t]:
+                        nd.setdefault(int(a), []).append(self.t_paos[t])
+                needs.append({a: np.concatenate(v) for a, v in nd.items()})
+            ctxs = self.dfi.run_regions(items, needs, twork, tsetup, devs, getattr(self, 'verbose', 0))
+            for c in ctxs:
+                if getattr(c, '_prof', None) is not None:
+                    c._prof.report()
             return float(self.e_ijk.sum())
         ctxs = mgpu.run_queue(items, lambda w, it: w._ut0_item(*it, save=save), devs,
                               setup=lambda d: mgpu.device_view(

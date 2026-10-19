@@ -156,19 +156,24 @@ class OverlapGen:
             off += n
         return Ragged(LXu, data), off
 
+    def run_tmp(self, P):
+        """like run(P), into a persistent zeroed workspace of this generator:
+        valid only until its next run_tmp (the caller consumes it at once);
+        no allocation per call."""
+        LS = P['LS']
+        nout = LS.nbytes() // 8
+        ows = getattr(self, '_ows', None)
+        if ows is None or ows.size < nout:
+            self._ows = ows = cp.empty(max(nout, 1))
+        ows[:nout].fill(0.)
+        out, _ = self._views(LS, ows)
+        return self.run(P, out)
+
     def run(self, P, out=None):
         """evaluate one prepared chunk into ``out`` (accumulates: zero it first),
         by default a new Ragged(P['LS']), which is returned."""
         if out is None:
-            # persistent output workspace, zeroed per chunk (consumed before
-            # the next chunk is generated on this stream): no allocation per call
-            LS = P['LS']
-            nout = LS.nbytes() // 8
-            ows = getattr(self, '_ows', None)
-            if ows is None or ows.size < nout:
-                self._ows = ows = cp.empty(max(nout, 1))
-            ows[:nout].fill(0.)
-            out, _ = self._views(LS, ows)
+            out = Ragged(P['LS'])
         LXu = P['LXu']
         need = LXu.nbytes() // 8
         ws = getattr(self, '_ws', None)

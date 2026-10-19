@@ -712,7 +712,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                     if dd != d or not pl_.n:
                         continue
                     ga_, gb_ = gens_on(d)
-                    Sab = Skept[c_] if Skept[c_] is not None else (ga_.run(Pa), gb_.run(Pb))
+                    Sab = Skept[c_] if Skept[c_] is not None else (ga_.run_tmp(Pa), gb_.run_tmp(Pb))
                     pl_.run(R_, dict(S=list(Sab), T=T_), w=w_)
                 parts_[d] = R_
             mgpu.run_per_device(work, cdevs)
@@ -1001,9 +1001,24 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                 with cp.cuda.Device(home):
                     res = [(c2, mgpu.replicate(e)) for c2, e in res]
             out.extend(res)
+        setup = lambda d: mgpu.device_view(
+            self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')})
+        if getattr(self.dfi, 'qab_direct', False):
+            # direct (Q|uv): spatial order, regions evaluated once per atom
+            order = self.dfi.spatial_order([np.unique(self.ribf_atom[np.concatenate([self.ribfs[c] for c in ch])])
+                                            for ch in chunks])
+            chunks = [chunks[k] for k in order]
+            needs = []
+            for ch in chunks:
+                nd = {}
+                for c in ch:
+                    for a in np.unique(self.ribf_atom[self.ribfs[c]]):
+                        nd.setdefault(int(a), []).append(self.pao[c])
+                needs.append({a: np.concatenate(v) for a, v in nd.items()})
+            self.dfi.run_regions(chunks, needs, work, setup, mgpu.devices(), getattr(self, 'verbose', 0))
+            return out
         chunks.sort(key=lambda c: -len(c))
-        mgpu.run_queue(chunks, work, setup=lambda d: mgpu.device_view(
-            self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')}))
+        mgpu.run_queue(chunks, work, setup=setup)
         return out
 
     def gpu_pair_ints(self, c, rows, strong, host=False, core=None):
@@ -1099,6 +1114,16 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                     res = mgpu.replicate(res)
             for n, v in zip(idx, res):
                 out[n] = v
+        if getattr(self.dfi, 'qab_direct', False):
+            items = list(by_p.items())
+            order = self.dfi.spatial_order([np.unique(self.ribf_atom[self.ribfs[p]]) for p, _ in items])
+            items = [items[k] for k in order]
+            needs = []
+            for p, idx in items:
+                u = np.concatenate([self.pao[p]] + [self.pao[keys[n][5]] for n in idx])
+                needs.append({int(a): u for a in np.unique(self.ribf_atom[self.ribfs[p]])})
+            self.dfi.run_regions(items, needs, work, setup, mgpu.devices(), getattr(self, 'verbose', 0))
+            return out
         items = sorted(by_p.items(), key=lambda kv: -len(kv[1]))
         mgpu.run_queue(items, work, setup=setup)
         return out

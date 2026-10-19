@@ -390,7 +390,7 @@ class LMP2GPU:
         def coupling(R, T):
             if cdevs in ([home], []):
                 for P in chunks:
-                    Sc = P['S'] if 'S' in P else P['gen'].run(P)
+                    Sc = P['S'] if 'S' in P else P['gen'].run_tmp(P)
                     P['res'].run(R, [Sc, T, Sc], w=P['w'])
                 return
             outs = {}
@@ -402,7 +402,7 @@ class LMP2GPU:
                     R_, T_ = Ragged(R.layout), Ragged(T.layout, mgpu.replicate(T.data))
                 for P in chunks:
                     if P['dev'] == d:
-                        Sc = P['S'] if 'S' in P else P['gen'].run(P)
+                        Sc = P['S'] if 'S' in P else P['gen'].run_tmp(P)
                         P['res'].run(R_, [Sc, T_, Sc], w=P['w'])
                 outs[d] = R_
             mgpu.run_per_device(work, cdevs)
