@@ -282,8 +282,8 @@ class TriplesGPU:
             if len(devs) > 1:
                 step = max(1, min(step, -(-len(sel) // (2 * len(devs)))))
             items += [(Pv, sel[c0:c0 + step]) for c0 in range(0, len(sel), step)]
-        run = lambda its: mgpu.run_queue(its, lambda w, it: w._t0_item(*it, save=save), devs,
-                                         setup=lambda d: self._dev_view())
+        twork = lambda w, it: w._t0_item(*it, save=save)
+        run = lambda its: mgpu.run_queue(its, twork, devs, setup=lambda d: self._dev_view())
         if getattr(dfi, 'qab_direct', False):
             # direct (Q|uv): spatial order, regions evaluated once per atom
             order = dfi.spatial_order([np.unique(np.concatenate([self.t_riatoms[t] for t in it[1]]))
@@ -296,7 +296,8 @@ class TriplesGPU:
                     for a in self.t_riatoms[t]:
                         nd.setdefault(int(a), []).append(self.t_paos[t])
                 needs.append({a: np.concatenate(v) for a, v in nd.items()})
-            dfi.run_regions(items, needs, run, getattr(self, 'verbose', 0))
+            dfi.run_regions(items, needs, twork, lambda d: self._dev_view(), devs,
+                            getattr(self, 'verbose', 0))
         else:
             # largest chunks first (load balance of the device queue)
             items.sort(key=lambda it: -len(it[1]) * it[0] ** 2)

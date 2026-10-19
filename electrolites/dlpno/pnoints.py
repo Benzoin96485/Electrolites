@@ -103,9 +103,7 @@ class PNOIntsGPU:
                     for a in self.riatoms[p]:
                         nd.setdefault(int(a), []).append(u)
                 needs.append({a: np.concatenate(v) for a, v in nd.items()})
-            self.dfi.run_regions(chunks, needs,
-                                 lambda its: ctxs.extend(mgpu.run_queue(its, work, devs, setup=setup)),
-                                 getattr(self, 'verbose', 0))
+            ctxs = self.dfi.run_regions(chunks, needs, work, setup, devs, getattr(self, 'verbose', 0))
         else:
             chunks.sort(key=lambda c: -len(c[0]))
             ctxs = mgpu.run_queue(chunks, work, devs, setup=setup)

@@ -287,6 +287,7 @@ class DFInts:
             self.qab_host = False
             self._shard = None
         self._ao_cache, self._ao_bytes = {}, {}
+        self._regions = {}             # device -> region blocks (direct mode)
         self._cache = {}               # device -> OrderedDict(atom -> block)
         self._cache_bytes = {}
         self.cache_stats = dict(hit=0, miss=0, bytes=0.)
@@ -386,7 +387,8 @@ class DFInts:
         their union), from the AO integrals of ``a``.  (None, None) if empty."""
         if not self.qab_direct:
             return self.qab_get(a), self.ext.pao_pos[a]
-        reg = getattr(self, '_region', None)
+        reg = getattr(self, '_regions', None)
+        reg = reg.get(cp.cuda.Device().id) if reg else None
         if reg is not None and a in reg:
             blk, pmap = reg[a]
             return self._region_dev(a, blk), pmap
@@ -458,16 +460,18 @@ class DFInts:
         return regions
 
     def region_begin(self, needs, verbose=0):
-        """(Q_a|uv) over needs[a] for every atom a, each from one evaluation of
-        its AO integrals; kept on the device when they fit (30% of the free
-        memory), else in pinned host memory behind the device LRU cache."""
+        """(Q_a|uv) over needs[a] for every atom a, on the current device, each
+        from one evaluation of its AO integrals; kept on the device when they
+        fit (30% of its free memory), else in pinned host memory behind the
+        device LRU cache."""
         import time
         t0 = time.perf_counter()
+        dev = cp.cuda.Device().id
+        self._dev_clear(dev)
         na = {a: len(self.atom_ribfs[a]) for a in needs}
         tot = sum(8. * na[a] * len(u) ** 2 for a, u in needs.items())
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         on_dev = tot < 0.3 * free
-        self.cache_clear()
         reg = {}
         for a in sorted(needs):
             if na[a] == 0 or len(needs[a]) == 0:
@@ -475,20 +479,27 @@ class DFInts:
             blk, pmap = self._direct_block(a, [needs[a]], cache=False)
             reg[a] = (blk if on_dev else to_pinned(blk), pmap)
             del blk
-        self._region = reg
+        self._regions[dev] = reg
         if verbose >= 2:
-            print(f'[mem] (Q|uv) region: {len(reg)} atoms, {tot / 1e9:.1f} GB on the '
+            print(f'[mem] (Q|uv) region on GPU {dev}: {len(reg)} atoms, {tot / 1e9:.1f} GB on the '
                   f'{"device" if on_dev else "host"}, built in {time.perf_counter() - t0:.1f} s', flush=True)
 
     def region_end(self):
-        self._region = None
-        self.cache_clear()
-        # the pinned blocks go back to the OS (the pinned pool would keep them,
-        # and the next region's blocks have other sizes)
+        dev = cp.cuda.Device().id
+        self._regions.pop(dev, None)
+        self._dev_clear(dev)
         import gc
         gc.collect()
+        # pinned blocks back to the OS (the pinned pool would keep them, and the
+        # next region's blocks have other sizes); this device's pool too
         cp.get_default_pinned_memory_pool().free_all_blocks()
         cp.get_default_memory_pool().free_all_blocks()
+
+    def _dev_clear(self, dev):
+        from electrolites.dlpno.mgpu import lock
+        with lock():
+            for d in (self._cache, self._cache_bytes, self._ao_cache, self._ao_bytes):
+                d.pop(dev, None)
 
     def _region_dev(self, a, blk):
         """a region block on the current device (LRU cache for host / peer blocks)."""
@@ -516,23 +527,39 @@ class DFInts:
             self._cache_bytes[dev] = nb + d.nbytes
         return d
 
-    def run_regions(self, items, item_needs, run, verbose=0):
-        """run(region items) for every region of ``items`` (direct (Q|uv));
-        the region budget is a third of the available host memory
-        (DLPNO_REGION_GB overrides)."""
+    def run_regions(self, items, item_needs, work, setup, devs, verbose=0):
+        """work(ctx, item) for every item, the items grouped into regions
+        (direct (Q|uv)); the regions go to the devices through a work queue
+        (``setup(dev)`` -> ctx), each device building its region's blocks and
+        running its items.  Region budget: a quarter of the smallest free
+        device memory (DLPNO_REGION_GB overrides)."""
+        from electrolites.dlpno import mgpu
+        free = []
+        for d in devs:
+            with cp.cuda.Device(d):
+                cp.get_default_memory_pool().free_all_blocks()
+                free.append(cp.cuda.runtime.memGetInfo()[0])
         env = os.environ.get('DLPNO_REGION_GB')
-        budget = float(env) * 1e9 if env else 0.33 * _host_available()
+        budget = float(env) * 1e9 if env else 0.25 * min(free)
         regions = self.plan_regions(item_needs, budget)
         if verbose >= 2:
             print(f'[mem] (Q|uv) regions: {len(regions)} for {len(items)} batches '
-                  f'(budget {budget / 1e9:.0f} GB)', flush=True)
+                  f'(budget {budget / 1e9:.1f} GB per region)', flush=True)
+        self._regions = {}
+
+        def rwork(ctx, region):
+            idx, needs = region
+            dv = getattr(ctx, 'dfi', None) or self        # this device's view
+            dv.region_begin(needs, verbose)
+            try:
+                for k in idx:
+                    work(ctx, items[k])
+            finally:
+                dv.region_end()
         try:
-            for idx, needs in regions:
-                self.region_begin(needs, verbose)
-                run([items[k] for k in idx])
-                self.region_end()
+            return mgpu.run_queue(regions, rwork, devs, setup=setup)
         finally:
-            self._region = None
+            self._regions = {}
 
     def _ao_j3c(self, a):
         """AO (mu nu|Q_a) of aux atom ``a`` (nao, nao, na), from a per-device
