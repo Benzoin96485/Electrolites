@@ -67,6 +67,55 @@ def _converged(de, rn, opt):
     return abs(de) < opt['E_CONVERGENCE'] and ok
 
 
+_PAD = cp.RawKernel(r'''
+extern "C" __global__ void pad_members(const double* src, const long long* off, const int* dims,
+                                       double* out, int X, int Y, int Z) {
+    // member m = blockIdx.y: its (x, y, z) block at src + off[m] into out[m, :x, :y, :z]
+    int m = blockIdx.y;
+    int x = dims[3 * m], y = dims[3 * m + 1], z = dims[3 * m + 2];
+    long long n = (long long)x * y * z;
+    const double* s = src + off[m];
+    double* o = out + (long long)m * X * Y * Z;
+    for (long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+         t += (long long)gridDim.x * blockDim.x) {
+        int c = t % z, b = (t / z) % y, a = t / ((long long)z * y);
+        o[((long long)a * Y + b) * Z + c] = s[t];
+    }
+}
+''', 'pad_members')
+
+
+class _Packed:
+    """host-resident group tensor without padding: the members' blocks back to
+    back in pinned memory; ``device()`` uploads them and pads to the group's
+    shape (members, [sub,] A, R, C) on the current device."""
+
+    def __init__(self, blocks, shape, sub=1):
+        from electrolites.dlpno.devmem import pinned_empty
+        dims = np.array([(b.shape + (1,) * (3 - b.ndim)) for b in blocks], np.int32).reshape(-1, 3)
+        sz = dims.astype(np.int64).prod(axis=1)
+        self.off = np.concatenate([[0], np.cumsum(sz)[:-1]]).astype(np.int64)
+        self.buf = pinned_empty(int(sz.sum()))
+        for b, o, n in zip(blocks, self.off, sz):
+            self.buf[o:o + n] = (b if isinstance(b, np.ndarray) else cp.asnumpy(b)).ravel()
+        self.dims = dims
+        self.shape = (len(blocks) // sub,) + ((sub,) if sub > 1 else ()) + tuple(shape)
+        self.inner = (tuple(shape) + (1,))[:3]
+        self.nbytes = self.buf.nbytes
+
+    def device(self):
+        X, Y, Z = self.inner
+        m = len(self.dims)
+        out = cp.zeros(self.shape)
+        nmax = int(self.dims.astype(np.int64).prod(axis=1).max()) if m else 0
+        if nmax:
+            src = cp.asarray(self.buf)
+            _PAD((min(1024, -(-nmax // 256)), m), (256,),
+                 (src, cp.asarray(self.off), cp.asarray(self.dims.ravel()), out,
+                  np.int32(X), np.int32(Y), np.int32(Z)))
+        return out
+
+
 def _malloc_trim():
     try:
         import ctypes
@@ -753,11 +802,7 @@ class CCSDGPU:
         sel = np.where(self.strong & self.canon)[0]
         naux = np.array([ref.Qma[p].shape[0] for p in sel], np.int64)
         bk = lambda n, q: np.maximum(q, -(-np.asarray(n) // q) * q)
-        if getattr(ref, 'df_offload', False):
-            # host-resident groups: finer buckets (less zero padding in host memory)
-            Ab, Lb, Vb = bk(naux, 64), bk(self.nl[sel], 8), bk(self.nv[sel], 8)
-        else:
-            Ab, Lb, Vb = bk(naux, 128), bk(self.nl[sel], 16), bk(self.nv[sel], 32)
+        Ab, Lb, Vb = bk(naux, 128), bk(self.nl[sel], 16), bk(self.nv[sel], 32)
         key = np.stack([Ab, Lb, Vb], 1)
         uk, inv = np.unique(key, axis=0, return_inverse=True)
         inv = inv.reshape(-1)
@@ -833,35 +878,34 @@ class CCSDGPU:
     def _load_df_group(self, mem, A, Lp, Vp, g):
         ref = self.ref
         off = getattr(ref, 'df_offload', False)
+        q = self.ji[mem]
         if off:
-            from electrolites.dlpno.devmem import pinned_empty
-
-            def _z(shape):
-                a_ = pinned_empty(shape)
-                a_[...] = 0.
-                return a_
-            Qma, Qab = _z((g, A, Lp, Vp)), _z((g, A, Vp, Vp))
-            Qk, Qa = _z((g, 2, A, Lp)), _z((g, 2, A, Vp))
-            cv = lambda x: x if isinstance(x, np.ndarray) else cp.asnumpy(x)
+            # host memory: the members' blocks back to back (no padding), padded
+            # on the device when the group is used
+            Qma = _Packed([ref.Qma[p] for p in mem], (A, Lp, Vp))
+            Qab = _Packed([ref.Qab[p] for p in mem], (A, Vp, Vp))
+            Qk = _Packed([x for p, r in zip(mem, q) for x in (ref.iQk[p], ref.iQk[r])], (A, Lp), 2)
+            Qa = _Packed([x for p, r in zip(mem, q) for x in (ref.iQa[p], ref.iQa[r])], (A, Vp), 2)
+            for p, r in zip(mem, q):
+                ref.Qma[p] = ref.Qab[p] = ref.iQk[p] = ref.iQa[p] = None
+                ref.Qma[r] = ref.Qab[r] = ref.iQk[r] = ref.iQa[r] = None
         else:
             Qma = cp.zeros((g, A, Lp, Vp))
             Qab = cp.zeros((g, A, Vp, Vp))
             Qk = cp.zeros((g, 2, A, Lp))
             Qa = cp.zeros((g, 2, A, Vp))
-            cv = cp.asarray
-        for s, p in enumerate(mem):
-            q = self.ji[p]
-            na, nl, nv = ref.Qma[p].shape
-            Qma[s, :na, :nl, :nv] = cv(ref.Qma[p])
-            Qab[s, :na, :nv, :nv] = cv(ref.Qab[p])
-            Qk[s, 0, :na, :nl] = cv(ref.iQk[p])
-            Qk[s, 1, :na, :nl] = cv(ref.iQk[q])
-            Qa[s, 0, :na, :nv] = cv(ref.iQa[p])
-            Qa[s, 1, :na, :nv] = cv(ref.iQa[q])
-            # release the per-pair copies as soon as they are grouped
-            ref.Qma[p] = ref.Qab[p] = ref.iQk[p] = ref.iQa[p] = None
-            ref.Qma[q] = ref.Qab[q] = ref.iQk[q] = ref.iQa[q] = None
-        q = self.ji[mem]
+            for s, p in enumerate(mem):
+                r = q[s]
+                na, nl, nv = ref.Qma[p].shape
+                Qma[s, :na, :nl, :nv] = cp.asarray(ref.Qma[p])
+                Qab[s, :na, :nv, :nv] = cp.asarray(ref.Qab[p])
+                Qk[s, 0, :na, :nl] = cp.asarray(ref.iQk[p])
+                Qk[s, 1, :na, :nl] = cp.asarray(ref.iQk[r])
+                Qa[s, 0, :na, :nv] = cp.asarray(ref.iQa[p])
+                Qa[s, 1, :na, :nv] = cp.asarray(ref.iQa[r])
+                # release the per-pair copies as soon as they are grouped
+                ref.Qma[p] = ref.Qab[p] = ref.iQk[p] = ref.iQa[p] = None
+                ref.Qma[r] = ref.Qab[r] = ref.iQk[r] = ref.iQa[r] = None
         pos = ref.lmo_pos
         dmask = self.pi[mem] == self.pj[mem]
         ev = np.zeros((g, Vp))
@@ -1094,7 +1138,8 @@ class CCSDGPU:
             Tnq = gat(Tn, d['Nq'], g, Lb, Vb)
             Tp = gat(T, d['P'], g, Vb, Vb)
             Tq = gat(T, d['Pq'], g, Vb, Vb)
-            Qma, Qab, Qk, Qa = (cp.asarray(d[k_]) for k_ in ('Qma', 'Qab', 'Qk', 'Qa'))
+            Qma, Qab, Qk, Qa = (d[k_].device() if isinstance(d[k_], _Packed) else d[k_]
+                                for k_ in ('Qma', 'Qab', 'Qk', 'Qa'))
             ar = cp.arange(len(d['p']))
             ti = Tnp[ar, d['ri']]
             tj = Tnq[ar, d['rj']]
