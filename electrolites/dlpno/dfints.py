@@ -386,13 +386,23 @@ class DFInts:
         their union), from the AO integrals of ``a``.  (None, None) if empty."""
         if not self.qab_direct:
             return self.qab_get(a), self.ext.pao_pos[a]
+        reg = getattr(self, '_region', None)
+        if reg is not None and a in reg:
+            blk, pmap = reg[a]
+            return self._region_dev(a, blk), pmap
+        return self._direct_block(a, need)
+
+    def _direct_block(self, a, need, cache=True):
         na = len(self.atom_ribfs[a])
         need = [np.asarray(x, np.int64).ravel() for x in need]
         need = np.unique(np.concatenate(need)) if need else np.zeros(0, np.int64)
         if na == 0 or len(need) == 0:
             return None, None
-        J = self._ao_j3c(a)                                         # (nao, nao, na)
+        import time
+        t0 = time.perf_counter()
+        J = self._ao_j3c(a) if cache else cp.ascontiguousarray(aux_e2_atoms(self.mol, self.auxmol, [a]))
         nao = J.shape[0]
+        t1 = time.perf_counter()
         gn = cp.asarray(need)
         Pn = self.C_pao_d[:, gn]
         u = cp.matmul(Pn.T, J.reshape(nao, nao * na)).reshape(len(need), nao, na)
@@ -400,8 +410,123 @@ class DFInts:
         u *= self.mask_uv_d[gn[:, None], gn[None, :]][None]
         pmap = -np.ones(self.nbf, np.int64)
         pmap[need] = np.arange(len(need))
-        self.cache_stats['direct'] = self.cache_stats.get('direct', 0) + 1
+        st = self.cache_stats
+        st['direct'] = st.get('direct', 0) + 1
+        st['direct_m'] = st.get('direct_m', 0) + len(need)
+        if os.environ.get('DLPNO_PROF') == '1':
+            cp.cuda.Device().synchronize()
+        st['t_ao'] = st.get('t_ao', 0.) + (t1 - t0)
+        st['t_tr'] = st.get('t_tr', 0.) + (time.perf_counter() - t1)
         return u, pmap
+
+    # ---- regions: direct (Q|uv) evaluated once per atom for a group of batches
+    def plan_regions(self, item_needs, budget):
+        """split items (in order) into regions: consecutive items whose
+        (Q_a|uv) blocks over the union of their PAOs per atom stay within
+        ``budget`` bytes.  item_needs[k]: {atom: PAO index array}.  Returns
+        [(item indices, {atom: PAO indices})]."""
+        natm, nbf = len(self.atom_ribfs), self.nbf
+        na = np.array([len(self.atom_ribfs[a]) for a in range(natm)], np.float64)
+        regions = []
+
+        def fresh():
+            return [], np.zeros((natm, nbf), bool), np.zeros(natm, np.int64), 0.
+
+        def grow(mask, nd):
+            add = {}
+            for a, u in nd.items():
+                m = add[a] if a in add else mask[a].copy()
+                m[np.asarray(u, np.int64)] = True
+                add[a] = m
+            return add
+        cur, mask, cnt, tot = fresh()
+        for k, nd in enumerate(item_needs):
+            add = grow(mask, nd)
+            new = tot + sum(8. * na[a] * (int(m.sum()) ** 2 - int(cnt[a]) ** 2) for a, m in add.items())
+            if cur and new > budget:
+                regions.append((cur, {a: np.flatnonzero(mask[a]) for a in range(natm) if cnt[a]}))
+                cur, mask, cnt, tot = fresh()
+                add = grow(mask, nd)
+                new = sum(8. * na[a] * int(m.sum()) ** 2 for a, m in add.items())
+            for a, m in add.items():
+                mask[a] = m
+                cnt[a] = int(m.sum())
+            tot = new
+            cur.append(k)
+        if cur:
+            regions.append((cur, {a: np.flatnonzero(mask[a]) for a in range(natm) if cnt[a]}))
+        return regions
+
+    def region_begin(self, needs, verbose=0):
+        """(Q_a|uv) over needs[a] for every atom a, each from one evaluation of
+        its AO integrals; kept on the device when they fit (30% of the free
+        memory), else in pinned host memory behind the device LRU cache."""
+        import time
+        t0 = time.perf_counter()
+        na = {a: len(self.atom_ribfs[a]) for a in needs}
+        tot = sum(8. * na[a] * len(u) ** 2 for a, u in needs.items())
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        on_dev = tot < 0.3 * free
+        self.cache_clear()
+        reg = {}
+        for a in sorted(needs):
+            if na[a] == 0 or len(needs[a]) == 0:
+                continue
+            blk, pmap = self._direct_block(a, [needs[a]], cache=False)
+            reg[a] = (blk if on_dev else to_pinned(blk), pmap)
+            del blk
+        self._region = reg
+        if verbose >= 2:
+            print(f'[mem] (Q|uv) region: {len(reg)} atoms, {tot / 1e9:.1f} GB on the '
+                  f'{"device" if on_dev else "host"}, built in {time.perf_counter() - t0:.1f} s', flush=True)
+
+    def region_end(self):
+        self._region = None
+        self.cache_clear()
+
+    def _region_dev(self, a, blk):
+        """a region block on the current device (LRU cache for host / peer blocks)."""
+        dev = cp.cuda.Device().id
+        if isinstance(blk, cp.ndarray) and blk.device.id == dev:
+            return blk
+        from electrolites.dlpno.mgpu import lock
+        with lock():
+            cache = self._cache.setdefault(dev, OrderedDict())
+            d = cache.get(a)
+            if d is not None:
+                cache.move_to_end(a)
+                self.cache_stats['hit'] += 1
+                return d
+            budget = self.cache_budget()
+            nb = self._cache_bytes.get(dev, 0)
+            while cache and nb + blk.nbytes > budget:
+                _, old = cache.popitem(last=False)
+                nb -= old.nbytes
+            self.cache_stats['miss'] += 1
+            self.cache_stats['bytes'] += blk.nbytes
+        d = cp.asarray(blk)
+        with lock():
+            cache[a] = d
+            self._cache_bytes[dev] = nb + d.nbytes
+        return d
+
+    def run_regions(self, items, item_needs, run, verbose=0):
+        """run(region items) for every region of ``items`` (direct (Q|uv));
+        the region budget is a third of the available host memory
+        (DLPNO_REGION_GB overrides)."""
+        env = os.environ.get('DLPNO_REGION_GB')
+        budget = float(env) * 1e9 if env else 0.33 * _host_available()
+        regions = self.plan_regions(item_needs, budget)
+        if verbose >= 2:
+            print(f'[mem] (Q|uv) regions: {len(regions)} for {len(items)} batches '
+                  f'(budget {budget / 1e9:.0f} GB)', flush=True)
+        try:
+            for idx, needs in regions:
+                self.region_begin(needs, verbose)
+                run([items[k] for k in idx])
+                self.region_end()
+        finally:
+            self._region = None
 
     def _ao_j3c(self, a):
         """AO (mu nu|Q_a) of aux atom ``a`` (nao, nao, na), from a per-device

@@ -361,10 +361,13 @@ class LMP2GPU:
             if not len(sel_d):
                 continue
             with cp.cuda.Device(d):
-                gen = OverlapGen(cp.asarray(self.S_pao_d), self.pao, self.X)
                 cp_d, cq_d = cps[sel_d], cqs[sel_d]
                 need = float(np.sum(8. * nv[cp_d] * nv[cq_d]))
                 free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+                # large systems: few large chunks (every chunk builds a plan and
+                # regenerates its overlaps per iteration)
+                mb = int(min(4 << 30, max(1 << 29, 0.1 * free)))
+                gen = OverlapGen(cp.asarray(self.S_pao_d), self.pao, self.X, max_bytes=mb)
                 onfly = (need > 0.5 * free) if mode == 'auto' else mode == '1'
                 if onfly:
                     ch = gen.prepare(cp_d, cq_d)

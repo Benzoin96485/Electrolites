@@ -36,6 +36,9 @@ class PNOIntsGPU:
                 self._ext[p] = su.union(self.pao[p], *[self.dom.lmo_paos[k] for k in self.lmos[p]])
         npao = np.array([len(self.pao[p]) for p in canon])
         P = padded(npao)
+        # direct (Q|uv): every chunk evaluates the AO integrals of its aux atoms,
+        # so fewer, larger chunks
+        cap = self.MAX_INT_CHUNK_BYTES * (4 if getattr(self.dfi, 'qab_direct', False) else 1)
         chunks = []
         for Pv in np.unique(P):
             sel = [p for p, pv in zip(canon, P) if pv == Pv]
@@ -52,7 +55,7 @@ class PNOIntsGPU:
                     E = int(padded(len(self._ext[p])))
                     per += 4 * L * V * E + 2 * A * L * E
                 per *= 8
-                if ch and tot + per > self.MAX_INT_CHUNK_BYTES:
+                if ch and tot + per > cap:
                     chunks.append((ch, int(Pv)))
                     ch, tot = [], 0
                 ch.append(p)
@@ -85,16 +88,38 @@ class PNOIntsGPU:
                 lst = getattr(self, name)
                 for p, v in d.items():
                     lst[p] = v
-        chunks.sort(key=lambda c: -len(c[0]))
-        ctxs = mgpu.run_queue(chunks, work, devs, setup=lambda d: mgpu.device_view(
-            self, ('S_pao_d',), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')}))
+        setup = lambda d: mgpu.device_view(
+            self, ('S_pao_d',), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')})
+        ctxs = []
+        if getattr(self.dfi, 'qab_direct', False):
+            # direct (Q|uv): chunks in spatial order, grouped into regions whose
+            # (Q|uv) blocks are evaluated once per atom
+            order = self.dfi.spatial_order([np.unique(np.concatenate([self.riatoms[p] for p in c[0]]))
+                                            for c in chunks])
+            chunks = [chunks[k] for k in order]
+            needs = []
+            for ch, _ in chunks:
+                nd = {}
+                for p in ch:
+                    u = self.pao[p] if not self.strong[p] else np.union1d(self.pao[p], self._ext[p])
+                    for a in self.riatoms[p]:
+                        nd.setdefault(int(a), []).append(u)
+                needs.append({a: np.concatenate(v) for a, v in nd.items()})
+            self.dfi.run_regions(chunks, needs,
+                                 lambda its: ctxs.extend(mgpu.run_queue(its, work, devs, setup=setup)),
+                                 getattr(self, 'verbose', 0))
+        else:
+            chunks.sort(key=lambda c: -len(c[0]))
+            ctxs = mgpu.run_queue(chunks, work, devs, setup=setup)
         for c in ctxs:
             if getattr(c, '_prof', None) is not None:
                 c._prof.report()
         self._ext = None
         if getattr(self, 'verbose', 0) >= 2:
-            if getattr(self.dfi, 'qab_host', False) or getattr(self.dfi, '_shard', None):
-                print('[mem] (Q|uv) cache', self.dfi.cache_stats, flush=True)
+            if (getattr(self.dfi, 'qab_host', False) or getattr(self.dfi, '_shard', None)
+                    or getattr(self.dfi, 'qab_direct', False)):
+                print('[mem] (Q|uv) cache', {k: (round(v, 1) if isinstance(v, float) else v)
+                                            for k, v in self.dfi.cache_stats.items()}, flush=True)
         # the CC build does not read (Q|uv): the device cache (up to a quarter
         # of the device) is refilled by the triples
         self.dfi.cache_clear()

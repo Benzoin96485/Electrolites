@@ -967,10 +967,13 @@ class CCSDGPU:
         self.p_d1.run(Dl, [Tn, self.Jijmb], alpha=1.)
         for g in range(LP.ngroups):
             if Dl.data[g].shape[0]:
-                Kq = K3[g][ps[g]]
-                tiv = TiP.data[g][:, :, 0]
-                Dl.data[g] += 2 * _mv(Kq, tiv).transpose(0, 2, 1)
-                Dl.data[g] -= _wsum(tiv, Kq)
+                # K3[ji(p)] contracted with t_p: the partner map is an
+                # involution, so permute the vectors and results instead of
+                # gathering a copy of the (large) 3-external group
+                pg = ps[g]
+                tivp = TiP.data[g][:, :, 0][pg]
+                Dl.data[g] += 2 * _mv(K3[g], tivp)[pg].transpose(0, 2, 1)
+                Dl.data[g] -= _wsum(tivp, K3[g])[pg]
         self.p_d3.run(Dl, [S, T1, T1, S, self.Lij, S], alpha=-1.)
         self.p_d4.run(Dl, [S, Tt, S, self.Lij, S], alpha=.5)
         Fdd = Fkj.copy()
