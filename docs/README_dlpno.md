@@ -88,6 +88,11 @@ Memory (what grows with system size, and what is done about it):
   when even that exceeds a quarter of the device it lives in pinned host
   memory and the gather kernel reads it directly over PCIe (zero copy,
   `DLPNO_QIA_HOST`).
+* (Q|i j): the complete tensor in pinned host memory, read zero-copy by the
+  same gather kernel, when the dense one would take more than 10% of the
+  device (`DLPNO_QIJ_HOST`, exact).  A block-sparse (Q|i j) over the
+  extended LMO sets exists (`DLPNO_QIJ_SPARSE=1`) but is off: it is not
+  exact (1e-7 Eh in the LMP2 of (Gly)10).
 * (Q|uv) direct (`DLPNO_QAB_DIRECT=auto|0|1`; auto when the stored per-atom
   blocks would not fit the host either).  Every consumer (PNO integrals,
   pair / ring integrals, (T0)) asks `DFInts.qab_block(atom, PAOs)`.  The
@@ -159,13 +164,12 @@ on one GPU with stored blocks), identical energies.
 
 **Trp-cage on one node (4 x A100-80GB)**, DLPNO-CCSD(T0)/def2-SVP, Normal
 PNO, 304 atoms, 2906 basis functions, 36533 pairs (6977 strong), 36791
-triplets: 2301 s post-SCF (SCF 139 s on one GPU).  DF integrals 102 s,
-LMP2 138 s, PNO integrals 1093 s (394 regions, AO integrals dominate),
+triplets: **2163 s post-SCF** (SCF 139 s on one GPU).  DF integrals 116 s,
+LMP2 138 s, PNO integrals 982 s (394 regions, AO integrals dominate),
 LCCSD 497 s (the 83.5 GB of PNO overlaps stored over the four GPUs),
-(T0) 154 + 269 s.  Peak host memory ~200 GB ((Q|iu) 49 GB pinned, DF
-tensors of the strong pairs offloaded).  On one GPU the same run gets
-through the DF integrals and LMP2 but the overlaps (83.5 GB) must be
-regenerated every CC iteration.
+(T0) 131 + 253 s; E_corr(CCSD) = -24.043310, (T0) = -0.766814 Eh.  Device:
+6.9 GB after the DF integrals ((Q|iu) 49 GB and (Q|ij) 13.7 GB in pinned
+host memory), peak 67.4 GB on the home GPU; host ~205 GB resident.
 
 ## Known issue
 
