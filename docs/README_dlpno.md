@@ -143,7 +143,7 @@ on one device are kept.
 | taxol (closed), cc-pVDZ | 113 / 1123 | runs: 1841 s post-SCF, peak 78.4 GB (LCCSD 1535 s: the 34 GB of PNO overlaps are regenerated per chunk) |
 | (Gly)20 (closed), def2-SVP | 143 / 1444 | runs: 1172 s post-SCF, peak 78.5 GB (23.5 GB of overlaps regenerated per chunk) |
 | (Gly)40, def2-SVP | 283 / 2864 | stored mode: out of memory building the per-atom (Q|uv) blocks; direct + regions: through LMP2 (995 s) and into the PNO integrals |
-| Trp-cage 1L2Y (closed, +1), def2-SVP | 304 / 2906 | stored mode: out of memory; direct + regions: DF integrals 126 s at 20.6 GB, LMP2 ~50 min (overlaps regenerated every iteration on one device) |
+| Trp-cage 1L2Y (closed, +1), def2-SVP | 304 / 2906 | stored mode: out of memory; direct + regions + host (Q\|iu), (Q\|ij): DF integrals 111 s, device 6.9 GB; LMP2 1527 s at 24 GB (overlaps regenerated every iteration: the S_UU X GEMMs of the generator); PNO integrals 302 regions; the CC would regenerate 83.5 GB of overlaps per iteration on one device -- one node (4 GPUs) stores them |
 
 What the stored tensors would need (closed shell, Normal PNO):
 
