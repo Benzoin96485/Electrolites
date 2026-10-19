@@ -31,8 +31,33 @@ def sub_auxmol(auxmol, atoms):
     return sub
 
 
+_QCOND = {}
+
+
+def _memo_qcond():
+    """GPU4PySCF's Int3c2eOpt.build() recomputes the AO shell-pair Schwarz
+    screening of the whole molecule for every call, although it depends only
+    on the AO basis: memoised per (molecule, device), so that evaluating the
+    integrals of one aux atom at a time costs only the integrals."""
+    m = int3c2e_bdiv
+    if getattr(m, '_dlpno_qcond_memo', False):
+        return
+    orig = m._cache_q_cond_and_non0pairs
+
+    def memo(mol, rys_envs, precision=1e-14, tile=4, tril=True):
+        key = (mol.natm, mol.nbas, round(float(np.asarray(mol.atom_coords()).sum()), 8),
+               precision, tile, tril, cp.cuda.Device().id)
+        r = _QCOND.get(key)
+        if r is None:
+            r = _QCOND[key] = orig(mol, rys_envs, precision, tile, tril)
+        return r
+    m._cache_q_cond_and_non0pairs = memo
+    m._dlpno_qcond_memo = True
+
+
 def aux_e2_atoms(mol, auxmol, atoms):
     """(mu nu|Q) for the aux functions on ``atoms``, as (nao, nao, naux_sub)."""
+    _memo_qcond()
     sub = sub_auxmol(auxmol, atoms)
     return int3c2e_bdiv.aux_e2(mol, sub)
 
@@ -626,7 +651,10 @@ class DFInts:
         free, tot = cp.cuda.runtime.memGetInfo()
         free += cp.get_default_memory_pool().free_bytes()
         mine = self._cache_bytes.get(cp.cuda.Device().id, 0)
-        return max(0.2 * tot, min(0.55 * tot, free + mine - 0.35 * tot))
+        # the floor never exceeds half of what is actually available (a busy
+        # device: other stores, region temporaries)
+        floor = min(0.2 * tot, 0.5 * (free + mine))
+        return max(floor, min(0.55 * tot, free + mine - 0.35 * tot))
 
     def spatial_order(self, atom_sets):
         """order of items (given by their aux-atom sets) along a Morton curve
