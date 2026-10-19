@@ -90,9 +90,9 @@ Memory (what grows with system size, and what is done about it):
   `DLPNO_QIA_HOST`).
 * (Q|i j): the complete tensor in pinned host memory, read zero-copy by the
   same gather kernel, when the dense one would take more than 10% of the
-  device (`DLPNO_QIJ_HOST`, exact).  A block-sparse (Q|i j) over the
-  extended LMO sets exists (`DLPNO_QIJ_SPARSE=1`) but is off: it is not
-  exact (1e-7 Eh in the LMP2 of (Gly)10).
+  device (`DLPNO_QIJ_HOST`, exact; open shell).  Closed shell: block-sparse
+  over the aux atoms' extended LMO sets (`DLPNO_QIJ_SPARSE=auto`), exact
+  (`DLPNO_DEBUG_QIJ=1` checks every gather against the dense tensor).
 * (Q|uv) direct (`DLPNO_QAB_DIRECT=auto|0|1`; auto when the stored per-atom
   blocks would not fit the host either).  Every consumer (PNO integrals,
   pair / ring integrals, (T0)) asks `DFInts.qab_block(atom, PAOs)`.  The

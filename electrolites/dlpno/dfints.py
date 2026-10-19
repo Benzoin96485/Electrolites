@@ -31,6 +31,17 @@ def sub_auxmol(auxmol, atoms):
     return sub
 
 
+def sub_mol_shells(mol, shells):
+    """mol restricted to the AO shells ``shells`` (order preserved) and the
+    AO indices they span."""
+    sub = mol.copy(deep=False)
+    shells = np.asarray(shells, np.int64)
+    sub._bas = mol._bas[shells]
+    loc = mol.ao_loc_nr()
+    ao = np.concatenate([np.arange(loc[i], loc[i + 1]) for i in shells]) if len(shells) else np.zeros(0, np.int64)
+    return sub, ao
+
+
 _QCOND = {}
 
 
@@ -46,9 +57,11 @@ def _memo_qcond():
 
     def memo(mol, rys_envs, precision=1e-14, tile=4, tril=True):
         key = (mol.natm, mol.nbas, round(float(np.asarray(mol.atom_coords()).sum()), 8),
-               precision, tile, tril, cp.cuda.Device().id)
+               hash(np.asarray(mol._bas).tobytes()), precision, tile, tril, cp.cuda.Device().id)
         r = _QCOND.get(key)
         if r is None:
+            if len(_QCOND) > 64:              # sub-molecules of the AO-screened regions
+                _QCOND.pop(next(iter(_QCOND)))
             r = _QCOND[key] = orig(mol, rys_envs, precision, tile, tril)
         return r
     m._cache_q_cond_and_non0pairs = memo
@@ -208,6 +221,41 @@ def _decide_qab_direct(nbytes, host):
     return bool(host) and nbytes > 0.4 * _host_available()
 
 
+class _CheckedQ:
+    """debug: a BlockQ whose gathers are compared with the dense tensor."""
+
+    def __init__(self, bq, dense):
+        self.bq, self.dense = bq, dense
+        self.shape, self.ndim, self.nbytes = bq.shape, 3, bq.nbytes
+        self.host = False
+
+    def __getitem__(self, key):
+        a = self.bq[key]
+        k = tuple(cp.asarray(x, dtype=cp.int64) for x in key)
+        b = self.dense[k]
+        # padded slots use index 0 (masked by the callers): ignored here
+        valid = (k[0] != 0) & (k[1] != 0) & (k[2] != 0)
+        d = float(cp.abs((a - b) * valid).max()) if a.size else 0.
+        if a.size and os.environ.get('DLPNO_DEBUG_QIJ') == '2':
+            e = cp.abs(a - b)
+            parts = []
+            for nm, cond in (('Q=0', (k[0] == 0) & (k[1] != 0) & (k[2] != 0)),
+                             ('i=0', (k[1] == 0) & (k[0] != 0) & (k[2] != 0)),
+                             ('j=0', (k[2] == 0) & (k[0] != 0) & (k[1] != 0))):
+                c = cp.broadcast_to(cond, e.shape)
+                parts.append((nm, float((e * c).max())))
+            if any(v > 1e-12 for _, v in parts):
+                print('[debug qij idx0]', parts, flush=True)
+        if d > 1e-12:
+            import traceback
+            print(f'[debug qij] max |sparse - dense| = {d:.2e}; shape {a.shape}', flush=True)
+            traceback.print_stack(limit=6)
+        return b
+
+    def replicate(self):
+        return self
+
+
 def _decide_qia_host(nbytes):
     """block-sparse (Q|i u) in pinned host memory (read zero-copy by the
     gathers) when it would take more than a quarter of the free device
@@ -276,11 +324,12 @@ class DFInts:
                               host=_decide_qia_host(8. * float(np.sum(na_ * nl_ * np_))))
         else:
             self.qia = cp.empty((naux, n, nbf))
-        # (Q|i j) block-sparse over the aux atoms' extended LMO domains
-        # (DLPNO_QIJ_SPARSE=1, closed shell; off by default: the pairs' LMO
-        # domains reach LMOs outside these sets, 1e-7 Eh in the LMP2 for (Gly)10;
-        # auto: when the dense tensor would take more than 10% of the device)
-        env = os.environ.get('DLPNO_QIJ_SPARSE', '0')
+        # (Q|i j) block-sparse over the aux atoms' extended LMO domains when the
+        # dense tensor would take more than 10% of the free device memory
+        # (closed shell; exact: every gather is checked against the dense
+        # tensor with DLPNO_DEBUG_QIJ=1; the open-shell code also reads SOMO
+        # columns for every aux atom and uses the complete host tensor)
+        env = os.environ.get('DLPNO_QIJ_SPARSE', 'auto')
         if env == 'auto':
             free_ = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
             self.qij_sparse = sparse_ij and 8. * naux * n * n > 0.1 * free_
@@ -310,6 +359,16 @@ class DFInts:
         mask_uv = cp.asarray(doi_uv > t_cut_do_uv) if need_ab else None
         # the PAO coefficients and the DOI mask: kept for the direct (Q|uv)
         self.C_pao_d, self.mask_uv_d = P, mask_uv
+        # AO screening of the direct (Q|uv): AOs carrying |C_pao| above
+        # DLPNO_AO_CUT x (largest |C| of that PAO); the region integrals are
+        # evaluated only over the shells of the union of its PAOs' supports
+        self.ao_cut = float(os.environ.get('DLPNO_AO_CUT', '1e-8'))
+        self._pao_sup = None
+        if self.ao_cut > 0:
+            Cp = np.abs(np.asarray(C_pao))
+            self._pao_sup = Cp > self.ao_cut * Cp.max(axis=0)[None, :]      # (nao, nbf)
+            loc = mol.ao_loc_nr()
+            self._ao_shell = np.repeat(np.arange(mol.nbas), np.diff(loc))
         natm = mol.natm
         # (Q|uv) blocks: on the device when they fit, else in pinned host
         # memory behind a device cache (``qab_get``)
@@ -419,6 +478,19 @@ class DFInts:
                     del u
                     off += na
             del j3c
+        if os.environ.get('DLPNO_DEBUG_QIJ') and isinstance(self.qij, BlockQ) and not self.qij.host:
+            # debug: every gather of the sparse (Q|i j) checked against the dense tensor
+            dense = cp.empty((naux, n, n))
+            for atoms in groups:
+                idx = np.concatenate([atom_ribfs[a] for a in atoms])
+                if len(idx) == 0:
+                    continue
+                j3c = aux_e2_atoms(mol, auxmol, atoms)
+                nq = j3c.shape[2]
+                t = cp.matmul(L.T, j3c.reshape(nao, nao * nq)).reshape(n, nao, nq).transpose(2, 0, 1)
+                dense[cp.asarray(idx)] = cp.matmul(t, L)
+                del j3c, t
+            self.qij = _CheckedQ(self.qij, dense)
         self.J2c = cp.asarray(auxmol.intor('int2c2e'))
         self.nbytes = dict(ia=self.qia.nbytes, ij=self.qij.nbytes,
                            ab=sum(q.nbytes for q in self.qab if q is not None))
@@ -458,7 +530,7 @@ class DFInts:
             return self._region_dev(a, blk), pmap
         return self._direct_block(a, need)
 
-    def _direct_block(self, a, need, cache=True):
+    def _direct_block(self, a, need, cache=True, aosub=None):
         na = len(self.atom_ribfs[a])
         need = [np.asarray(x, np.int64).ravel() for x in need]
         need = np.unique(np.concatenate(need)) if need else np.zeros(0, np.int64)
@@ -466,11 +538,17 @@ class DFInts:
             return None, None
         import time
         t0 = time.perf_counter()
-        J = self._ao_j3c(a) if cache else cp.ascontiguousarray(aux_e2_atoms(self.mol, self.auxmol, [a]))
+        gn = cp.asarray(need)
+        if aosub is not None:
+            # AO-screened: (mu nu|Q_a) over the region's AO support only
+            smol, ao = aosub
+            J = cp.ascontiguousarray(aux_e2_atoms(smol, self.auxmol, [a]))
+            Pn = self.C_pao_d[cp.asarray(ao)][:, gn]
+        else:
+            J = self._ao_j3c(a) if cache else cp.ascontiguousarray(aux_e2_atoms(self.mol, self.auxmol, [a]))
+            Pn = self.C_pao_d[:, gn]
         nao = J.shape[0]
         t1 = time.perf_counter()
-        gn = cp.asarray(need)
-        Pn = self.C_pao_d[:, gn]
         u = cp.matmul(Pn.T, J.reshape(nao, nao * na)).reshape(len(need), nao, na)
         u = cp.matmul(u.transpose(2, 0, 1), Pn)                     # (na, m, m)
         u *= self.mask_uv_d[gn[:, None], gn[None, :]][None]
@@ -536,17 +614,26 @@ class DFInts:
         tot = sum(8. * na[a] * len(u) ** 2 for a, u in needs.items())
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         on_dev = tot < 0.3 * free
+        aosub = None
+        if self._pao_sup is not None and needs:
+            allp = np.unique(np.concatenate([np.asarray(u, np.int64) for u in needs.values()]))
+            ao_used = self._pao_sup[:, allp].any(axis=1)
+            shells = np.unique(self._ao_shell[ao_used])
+            if len(shells) < self.mol.nbas:
+                aosub = sub_mol_shells(self.mol, shells)
         reg = {}
         for a in sorted(needs):
             if na[a] == 0 or len(needs[a]) == 0:
                 continue
-            blk, pmap = self._direct_block(a, [needs[a]], cache=False)
+            blk, pmap = self._direct_block(a, [needs[a]], cache=False, aosub=aosub)
             reg[a] = (blk if on_dev else to_pinned(blk), pmap)
             del blk
         self._regions[dev] = reg
         if verbose >= 2:
+            nd = len(aosub[1]) if aosub is not None else self.mol.nao
             print(f'[mem] (Q|uv) region on GPU {dev}: {len(reg)} atoms, {tot / 1e9:.1f} GB on the '
-                  f'{"device" if on_dev else "host"}, built in {time.perf_counter() - t0:.1f} s', flush=True)
+                  f'{"device" if on_dev else "host"}, {nd} of {self.mol.nao} AOs, '
+                  f'built in {time.perf_counter() - t0:.1f} s', flush=True)
 
     def region_end(self):
         dev = cp.cuda.Device().id
