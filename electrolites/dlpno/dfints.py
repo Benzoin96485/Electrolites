@@ -483,6 +483,12 @@ class DFInts:
     def region_end(self):
         self._region = None
         self.cache_clear()
+        # the pinned blocks go back to the OS (the pinned pool would keep them,
+        # and the next region's blocks have other sizes)
+        import gc
+        gc.collect()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        cp.get_default_memory_pool().free_all_blocks()
 
     def _region_dev(self, a, blk):
         """a region block on the current device (LRU cache for host / peer blocks)."""
