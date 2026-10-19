@@ -81,6 +81,13 @@ Memory (what grows with system size, and what is done about it):
   strong pairs' (k i|a e) over the extended domain are accumulated atom by
   atom from (Q|uv), never as a (Q|a e) tensor; per-pair lists are released
   as soon as the CC stores are assembled.
+* (Q|i u) is stored block-sparse (`dfints.BlockQ`) when the dense
+  (naux, nLMO, nPAO) tensor would exceed a quarter of the free device
+  memory: per auxiliary atom over that atom's extended LMO and PAO domains,
+  indexed like the dense array by one gather kernel (`DLPNO_QIA_SPARSE`).
+* closed shell: the (Q|uv) device cache is dropped after the PNO
+  integrals; the DF offload decision subtracts that cache; the overlap
+  store decision counts only half of the (fragmented) pooled free memory.
 * DIIS keeps a host Gram matrix and extrapolates vector by vector (no
   stacked copies of the history; pinned host history when it is large).
 
@@ -94,7 +101,7 @@ All visible GPUs of a node are used (one Python thread per device;
 | SC-MP2 / LMP2 PNOs, PNO integrals, open-shell pair integrals, (T0) | work queue of pair / triplet chunks; per device a view of the driver with replicas of the small device tables (qia, qij, metric, S_pao, pair tables); (Q|uv) through the per-device cache |
 | LCCSD, closed shell | DF groups of the strong pairs live on (and are dressed by) their device; every plan whose operands include PNO overlaps is chunked, its chunks spread over the devices, each device keeping the overlaps of its chunks (up to `DLPNO_S_KEEP` of its free memory, rest regenerated); dynamic operands replicated per call, static integrals once; partial outputs added on the home device |
 | LCCSD, open shell | DF groups and the F'_vv / oooo-ladder chunks (with their overlap generators and workspaces) per device, same reduction |
-| open-shell (T0) passes | one spawned process per GPU (`mgpu.run_queue_mp`): the triplet chunks are launch / Python bound, so threads sharing one interpreter lock left the GPUs at ~20 % utilisation; the workers get a small picklable context (large arrays shared through memory-mapped node-local files) and rebuild their device tables; `DLPNO_MP=0` falls back to threads |
+| open-shell (T0) passes | one spawned process per GPU (`mgpu.run_queue_mp`): the triplet chunks are launch / Python bound, so threads sharing one interpreter lock left the GPUs at ~20 % utilisation; the workers get a small picklable context (large arrays shared through memory-mapped node-local files) and rebuild their device tables; one persistent pool per run (`mgpu.MPPool`), started when the LCCSD starts, so interpreter start, imports and CUDA contexts overlap the CC iterations and both (T0) passes reuse the workers; `DLPNO_MP=0` falls back to threads |
 
 Convergence: the CC iterations stop when |dE| < `E_CONVERGENCE` (1e-6) and
 the residual criterion of `R_NORM` holds: `'rms'` -- Psi4's (largest
@@ -107,6 +114,32 @@ use the other program's own criterion: `R_NORM='rms'` against Psi4,
 So the device memory that grows fastest (overlaps, DF tensors) is spread
 over the GPUs, and with 4 GPUs overlaps that would have to be regenerated
 on one device are kept.
+
+## One GPU: how large (A100-80GB, Normal PNO, (T0))
+
+| system | atoms / basis functions | result |
+|---|---|---|
+| Cu macrocycle (open), def2-SVP | 60 / ~510 | runs (2513 s, older code) |
+| taxol (closed), cc-pVDZ | 113 / 1123 | runs: 1841 s post-SCF, peak 78.4 GB (LCCSD 1535 s: the 34 GB of PNO overlaps are regenerated per chunk) |
+| (Gly)20 (closed), def2-SVP | 143 / 1444 | runs: 1172 s post-SCF, peak 78.5 GB (23.5 GB of overlaps regenerated per chunk) |
+| (Gly)40, def2-SVP | 283 / ~2000 | out of memory building the per-atom (Q|uv) blocks |
+| Trp-cage 1L2Y (closed, +1), def2-SVP | 304 / 2906 | SCF 139 s; out of memory building the per-atom (Q|uv) blocks |
+
+The limit at ~300 atoms is the stored (Q|uv) over each auxiliary atom's
+extended PAO domain: for a compact 300-atom protein those domains cover most
+of the molecule, so the blocks approach naux x nbf^2 (far beyond one device,
+and beyond host memory).  Mini-proteins need these integrals evaluated on the
+fly per pair / triplet batch (ORCA's approach) instead of stored.
+
+## Known issue
+
+Open-shell (T0): per-triplet energies depend on which triplets are batched
+together (Ni dithiolene, identical orbitals: -0.1145582 / -0.1145911 /
+-0.1145528 / -0.1145534 Eh for default, 2-way, 8-way and one-per-chunk
+batching; ~500 of 6193 triplets differ by up to 5 %).  Padding sizes, the
+L-domain bucketing, the projection cache and the batched linear algebra are
+ruled out; tools: `DLPNO_DBG_T0_SPLIT`, `DLPNO_DBG_PADMAX`,
+`DLPNO_DBG_NOBUCKET`, `DLPNO_DBG_QORD`.
 
 ## Validation
 
