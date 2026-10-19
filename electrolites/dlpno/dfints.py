@@ -258,7 +258,7 @@ class DFInts:
     """Device three-index integrals for one set of LMOs/PAOs."""
 
     def __init__(self, mol, auxmol, C_lmo, C_pao, ext, doi_uv, t_cut_do_uv,
-                 ribf_atom, atom_ribfs, group_mem=2 << 30, need_ab=True):
+                 ribf_atom, atom_ribfs, group_mem=2 << 30, need_ab=True, sparse_ij=True):
         self.mol, self.auxmol = mol, auxmol
         nao = mol.nao
         naux = auxmol.nao
@@ -276,7 +276,20 @@ class DFInts:
                               host=_decide_qia_host(8. * float(np.sum(na_ * nl_ * np_))))
         else:
             self.qia = cp.empty((naux, n, nbf))
-        self.qij = cp.empty((naux, n, n))
+        # (Q|i j) block-sparse over the aux atoms' extended LMO domains
+        # (DLPNO_QIJ_SPARSE=1, closed shell; off by default: the pairs' LMO
+        # domains reach LMOs outside these sets, 1e-7 Eh in the LMP2 for (Gly)10;
+        # auto: when the dense tensor would take more than 10% of the device)
+        env = os.environ.get('DLPNO_QIJ_SPARSE', '0')
+        if env == 'auto':
+            free_ = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+            self.qij_sparse = sparse_ij and 8. * naux * n * n > 0.1 * free_
+        else:
+            self.qij_sparse = env == '1'
+        if self.qij_sparse:
+            self.qij = BlockQ(naux, n, n, ribf_atom, atom_ribfs, ext.lmos, ext.lmos)
+        else:
+            self.qij = cp.empty((naux, n, n))
         self.qab = [None] * mol.natm
         self.ext = ext
         mask_uv = cp.asarray(doi_uv > t_cut_do_uv) if need_ab else None
@@ -350,7 +363,17 @@ class DFInts:
                     off += na
             else:
                 self.qia[gi] = cp.matmul(t, P)
-            self.qij[gi] = cp.matmul(t, L)
+            if self.qij_sparse:
+                off = 0
+                for a in atoms:
+                    na = len(atom_ribfs[a])
+                    la = ext.lmos[a]
+                    if na and len(la):
+                        gla = cp.asarray(la)
+                        self.qij.set_block(a, cp.matmul(t[off:off + na][:, gla], L[:, gla]))
+                    off += na
+            else:
+                self.qij[gi] = cp.matmul(t, L)
             del t
             if need_ab and not self.qab_direct:
                 off = 0

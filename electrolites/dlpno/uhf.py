@@ -134,7 +134,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         pairs = [(i, j) for i in range(n) for j in range(n) if mask[i, j]]
         self.ext = ExtDomains(mol.natm, dom.lmo_riatoms, dom.lmo_paos, pairs, orb.nbf)
         self.dfi = DFInts(mol, auxmol, L, P, self.ext, self.doi_uv, opt['T_CUT_DO_UV'],
-                          self.ribf_atom, self.atom_ribfs)
+                          self.ribf_atom, self.atom_ribfs, sparse_ij=False)
         if self.verbose >= 2:
             print('[mem] DF ints GB:', {k: round(v / 1e9, 2) for k, v in self.dfi.nbytes.items()}, flush=True)
         self.J2c = self.dfi.J2c
