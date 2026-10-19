@@ -84,7 +84,22 @@ Memory (what grows with system size, and what is done about it):
 * (Q|i u) is stored block-sparse (`dfints.BlockQ`) when the dense
   (naux, nLMO, nPAO) tensor would exceed a quarter of the free device
   memory: per auxiliary atom over that atom's extended LMO and PAO domains,
-  indexed like the dense array by one gather kernel (`DLPNO_QIA_SPARSE`).
+  indexed like the dense array by one gather kernel (`DLPNO_QIA_SPARSE`);
+  when even that exceeds a quarter of the device it lives in pinned host
+  memory and the gather kernel reads it directly over PCIe (zero copy,
+  `DLPNO_QIA_HOST`).
+* (Q|uv) direct (`DLPNO_QAB_DIRECT=auto|0|1`; auto when the stored per-atom
+  blocks would not fit the host either).  Every consumer (PNO integrals,
+  pair / ring integrals, (T0)) asks `DFInts.qab_block(atom, PAOs)`.  The
+  batches of a stage are put in spatial (Morton) order and grouped into
+  *regions* whose blocks over the union of their PAOs fit a quarter of a
+  device; per region each aux atom's AO integrals (mu nu|Q_a) are evaluated
+  once and transformed to the region's PAOs; regions are distributed over
+  the GPUs (each GPU builds and consumes its own).  Exact (same energies as
+  the stored blocks to the last printed digit); for small molecules a
+  single region, so no extra cost.  Measured AO-support of the PAOs is
+  nearly global (projection tails), so restricting the AO integrals to the
+  PAO support would save little.
 * closed shell: the (Q|uv) device cache is dropped after the PNO
   integrals; the DF offload decision subtracts that cache; the overlap
   store decision counts only half of the (fragmented) pooled free memory.
@@ -122,14 +137,28 @@ on one device are kept.
 | Cu macrocycle (open), def2-SVP | 60 / ~510 | runs (2513 s, older code) |
 | taxol (closed), cc-pVDZ | 113 / 1123 | runs: 1841 s post-SCF, peak 78.4 GB (LCCSD 1535 s: the 34 GB of PNO overlaps are regenerated per chunk) |
 | (Gly)20 (closed), def2-SVP | 143 / 1444 | runs: 1172 s post-SCF, peak 78.5 GB (23.5 GB of overlaps regenerated per chunk) |
-| (Gly)40, def2-SVP | 283 / ~2000 | out of memory building the per-atom (Q|uv) blocks |
-| Trp-cage 1L2Y (closed, +1), def2-SVP | 304 / 2906 | SCF 139 s; out of memory building the per-atom (Q|uv) blocks |
+| (Gly)40, def2-SVP | 283 / 2864 | stored mode: out of memory building the per-atom (Q|uv) blocks; direct + regions: through LMP2 (995 s) and into the PNO integrals |
+| Trp-cage 1L2Y (closed, +1), def2-SVP | 304 / 2906 | stored mode: out of memory; direct + regions: DF integrals 126 s at 20.6 GB, LMP2 ~50 min (overlaps regenerated every iteration on one device) |
 
-The limit at ~300 atoms is the stored (Q|uv) over each auxiliary atom's
-extended PAO domain: for a compact 300-atom protein those domains cover most
-of the molecule, so the blocks approach naux x nbf^2 (far beyond one device,
-and beyond host memory).  Mini-proteins need these integrals evaluated on the
-fly per pair / triplet batch (ORCA's approach) instead of stored.
+What the stored tensors would need (closed shell, Normal PNO):
+
+| system | ext. PAOs per aux atom (mean / all) | stored (Q\|uv) | (Q\|iu) block-sparse | (Q\|ij) |
+|---|---|---|---|---|
+| taxol | 1096 / 1123 | 40.7 GB | 5.5 GB | 0.9 GB |
+| (Gly)20 | 953 / 1444 | 37.4 GB | 4.8 GB | 1.9 GB |
+| (Gly)40 | 2117 / 2864 | 368 GB | 42.5 GB | 14.9 GB |
+| Trp-cage | 2328 / 2906 | 445 GB | 49 GB | 13.7 GB |
+
+A pair needs only ~150-300 PAOs; the extended domain of an aux atom is the
+union over every LMO that pairs through it, i.e. nearly the whole molecule
+for a compact protein.  Hence the direct (Q|uv) with regions and the host
+(Q|iu): the device then holds ~20 GB of integrals for Trp-cage.
+
+Several GPUs, direct mode: (Gly)20 (143 atoms) 346 s total on 2 GPUs (1555 s
+on one GPU with stored blocks), identical energies; Trp-cage on 2 GPUs:
+LMP2 159 s (the overlaps fit spread over two devices), PNO integrals 2254 s
+(372 regions; the AO integral evaluation dominates: 3467 GPU-s vs 22 s of
+transforms).
 
 ## Known issue
 
