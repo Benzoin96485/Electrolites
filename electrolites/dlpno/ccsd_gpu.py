@@ -572,6 +572,7 @@ class CCSDGPU:
             sbud = _SBudget(per) if mode != '1' else None
             self.S = None
             store = None
+            cdevs = devs
             need = float(np.sum(8. * nv[cp_] * nv[cq_]))
             if len(devs) > 1 and mode != '1' and need < sum(per.values()):
                 # the home device keeps the PNO integrals and the plans: the
@@ -580,6 +581,10 @@ class CCSDGPU:
                 sdevs = others if need < sum(per[d] for d in others) else devs
                 store = _SStore(ref.orb.S_pao, ref.pao, ref.X, cp_, cq_, nv, sdevs)
                 sbud = None
+                if sdevs == others and os.environ.get('DLPNO_CC_HOME_CHUNKS', '0') != '1':
+                    # the home device is the fullest (integrals, amplitudes):
+                    # the chunks (gathered overlaps, plan tables) run on the others
+                    cdevs = others
                 cp.cuda.Device(home).use()
             if getattr(ref, 'verbose', 0) >= 2:
                 print(f'[mem] PNO overlaps {need / 1e9:.1f} GB:',
@@ -593,12 +598,12 @@ class CCSDGPU:
         def P(out_layout, out_idx, operands, out_row=None):
             if onfly and any(o.layout is LS for o in operands):
                 return _ChunkedPlan(gen, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=out_row,
-                                    devs=devs, budget=sbud, store=store)
+                                    devs=cdevs, budget=sbud, store=store)
             return ChainPlan(out_layout, out_idx, operands, out_row=out_row)
 
         def DotPlan_(left, right):
             if onfly and any(o.layout is LS for o in right):
-                return _ChunkedPlan(gen, LS, cp_, cq_, nv, None, None, right, left=left, devs=devs, budget=sbud,
+                return _ChunkedPlan(gen, LS, cp_, cq_, nv, None, None, right, left=left, devs=cdevs, budget=sbud,
                                     store=store)
             return DotPlan(left, right)
         self._P = P
