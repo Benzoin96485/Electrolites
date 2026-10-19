@@ -521,7 +521,10 @@ class CCSDGPU:
             # store the overlaps when they fit comfortably, else regenerate them;
             # several GPUs: always chunked, the chunks (and their overlaps) spread
             need = float(np.sum(8. * nv[cp_] * nv[cq_]))
-            onfly = need > 0.5 * free or len(devs) > 1
+            # pooled free blocks are fragmented after the PNO integrals: only
+            # half of them is counted (the store needs large contiguous groups)
+            free_c = cp.cuda.runtime.memGetInfo()[0] + 0.5 * cp.get_default_memory_pool().free_bytes()
+            onfly = need > 0.5 * free_c or len(devs) > 1
         else:
             onfly = mode == '1'
         self.onfly_s = onfly

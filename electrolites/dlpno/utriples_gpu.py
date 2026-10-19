@@ -230,6 +230,8 @@ class UTriplesGPU:
         nkeep, cnt = nkeep.get(), cnt.get()
         nfin = np.maximum(1, np.maximum(cnt, np.minimum(opt['MIN_TNOS'], nkeep)))
         Nt = int(nfin.max())
+        if os.environ.get('DLPNO_DBG_PADMAX'):
+            Nt = min(Pv, max(Nt, int(os.environ['DLPNO_DBG_PADMAX'])))
         cm = (cp.arange(Nt)[None, :] < cp.asarray(nfin)[:, None]).astype(cp.float64)
         Uq = cp.matmul(X, Vt[:, :, :Nt]) * cm[:, None, :]
         tr_ = lambda Y: Y.transpose(0, 2, 1)
@@ -426,6 +428,9 @@ class UTriplesGPU:
         nlv = self._nl_t
         L = int(padded(max(1, nlv[ch].max())))
         A = int(-(-self._naux_t[ch].max() // 32) * 32)
+        if os.environ.get('DLPNO_DBG_PADMAX'):          # chunk-independent padding
+            L = int(padded(max(1, nlv.max())))
+            A = int(-(-self._naux_t.max() // 32) * 32)
         lidx = np.zeros((B, L), np.int64)
         lmk = np.zeros((B, L))
         aidx = np.zeros((B, A), np.int64)
@@ -555,7 +560,7 @@ class UTriplesGPU:
             return ccache[kp]
 
         def chunk_pproj(rB, rC, sp_):
-            kp = ('Q', min(rB, rC), max(rB, rC), sp_)
+            kp = ('Q', rB, rC, sp_) if os.environ.get('DLPNO_DBG_QORD') else ('Q', min(rB, rC), max(rB, rC), sp_)
             if kp not in ccache:
                 ccache[kp] = self._proj(Zt, sp_, Ball, pl.ij[ijk[:, rB], ijk[:, rC]])
             return ccache[kp]

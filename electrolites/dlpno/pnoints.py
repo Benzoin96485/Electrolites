@@ -95,6 +95,12 @@ class PNOIntsGPU:
         if getattr(self, 'verbose', 0) >= 2:
             if getattr(self.dfi, 'qab_host', False) or getattr(self.dfi, '_shard', None):
                 print('[mem] (Q|uv) cache', self.dfi.cache_stats, flush=True)
+        # the CC build does not read (Q|uv): the device cache (up to a quarter
+        # of the device) is refilled by the triples
+        self.dfi.cache_clear()
+        for d in devs:
+            with cp.cuda.Device(d):
+                cp.get_default_memory_pool().free_all_blocks()
             sz = {}
             for name in ('K_mibj', 'J_ijmb', 'K_ivvv', 'J_ikac', 'K_iakc', 'iQk', 'iQa', 'Qma', 'Qab'):
                 seen, tot = set(), 0
