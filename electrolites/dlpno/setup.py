@@ -299,6 +299,24 @@ def mulliken_atom_pops(mol, S, C_lmo):
     bf_atom = np.array([s[0] for s in mol.ao_labels(fmt=False)])
     natm = mol.natm
     out = np.zeros((natm, C_lmo.shape[1]))
+    if mol.nao > 3000:
+        # large systems: on the device, each LMO over the AOs carrying
+        # |c| > 1e-12 max|c| (the rest contributes below 1e-12 relative)
+        import cupy as cp
+        Sd = cp.asarray(S)
+        Cd = cp.asarray(C_lmo)
+        bfa = cp.asarray(bf_atom)
+        for i in range(C_lmo.shape[1]):
+            c = Cd[:, i]
+            sel = cp.flatnonzero(cp.abs(c) > 1e-12 * cp.abs(c).max())
+            cs = c[sel]
+            p = cs[:, None] * Sd[sel[:, None], sel[None, :]] * cs[None, :]
+            dd = cp.diag(p)
+            den = dd[:, None] + dd[None, :]
+            w = cp.where(den != 0, dd[:, None] / cp.where(den != 0, den, 1.), 0.)
+            per_bf = 2 * cp.sum(p * w, axis=1)
+            out[:, i] = cp.bincount(bfa[sel], weights=per_bf, minlength=natm).get()
+        return out
     for i in range(C_lmo.shape[1]):
         c = C_lmo[:, i]
         p = c[:, None] * S * c[None, :]
