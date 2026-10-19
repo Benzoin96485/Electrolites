@@ -83,7 +83,7 @@ class _ChunkedPlan:
     def __init__(self, gens, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=None, left=None,
                  devs=None, budget=None, store=None):
         self.store = store
-        if 'MAX_BYTES' not in self.__dict__ and type(self).MAX_BYTES == (1 << 29):
+        if store is None and 'MAX_BYTES' not in self.__dict__ and type(self).MAX_BYTES == (1 << 29):
             # large systems: fewer, larger chunks (each builds a plan and a
             # generator chunk); 6% of the free device memory, 0.5 .. 4 GB
             fr = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
