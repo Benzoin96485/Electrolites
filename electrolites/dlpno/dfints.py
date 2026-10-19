@@ -23,9 +23,13 @@ from pyscf import gto
 from gpu4pyscf.df import int3c2e_bdiv
 
 
-def sub_auxmol(auxmol, atoms):
-    """auxmol restricted to the shells on ``atoms`` (AO order preserved)."""
+def sub_auxmol(auxmol, atoms, shells=None):
+    """auxmol restricted to the shells on ``atoms`` (AO order preserved), or
+    to the given shell indices."""
     sub = auxmol.copy(deep=False)
+    if shells is not None:
+        sub._bas = auxmol._bas[np.asarray(shells, np.int64)]
+        return sub
     sel = np.isin(auxmol._bas[:, gto.ATOM_OF], atoms)
     sub._bas = auxmol._bas[sel]
     return sub
@@ -669,8 +673,48 @@ class DFInts:
         if aosub is not None:
             # AO-screened: (mu nu|Q_a) over the region's AO support only
             smol, ao = aosub
-            J = cp.ascontiguousarray(aux_e2_atoms(smol, self.auxmol, [a]))
             Pn = self.C_pao_d[cp.asarray(ao)][:, gn]
+            nd, m = len(ao), len(need)
+            free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+            per_q = 8. * (nd * nd + m * nd + m * m)            # J column + both transforms
+            lim = min(1.5e9, 0.1 * free)
+            if os.environ.get('DLPNO_AUXCHUNK_GB'):           # testing
+                lim = float(os.environ['DLPNO_AUXCHUNK_GB']) * 1e9
+            if na * per_q > lim:
+                # large AO domains (triple zeta): the atom's aux shells in chunks
+                _memo_qcond()
+                shl = np.flatnonzero(self.auxmol._bas[:, gto.ATOM_OF] == a)
+                aloc = self.auxmol.ao_loc_nr()
+                out = cp.empty((na, m, m))
+                q0, cur = 0, []
+                chunks = []
+                cap = max(1, int(lim // per_q))
+                for sh in shl:
+                    w = aloc[sh + 1] - aloc[sh]
+                    if cur and sum(aloc[c + 1] - aloc[c] for c in cur) + w > cap:
+                        chunks.append(cur)
+                        cur = []
+                    cur.append(sh)
+                if cur:
+                    chunks.append(cur)
+                for ch in chunks:
+                    Jc = cp.ascontiguousarray(int3c2e_bdiv.aux_e2(smol, sub_auxmol(self.auxmol, None, ch)))
+                    nc = Jc.shape[2]
+                    t1 = time.perf_counter()
+                    uc = cp.matmul(Pn.T, Jc.reshape(nd, nd * nc)).reshape(m, nd, nc)
+                    del Jc
+                    out[q0:q0 + nc] = cp.matmul(uc.transpose(2, 0, 1), Pn)
+                    del uc
+                    q0 += nc
+                assert q0 == na
+                out *= self.mask_uv_d[gn[:, None], gn[None, :]][None]
+                pmap = -np.ones(self.nbf, np.int64)
+                pmap[need] = np.arange(len(need))
+                st = self.cache_stats
+                st['direct'] = st.get('direct', 0) + 1
+                st['t_ao'] = st.get('t_ao', 0.) + (time.perf_counter() - t0)
+                return out, pmap
+            J = cp.ascontiguousarray(aux_e2_atoms(smol, self.auxmol, [a]))
         else:
             J = self._ao_j3c(a) if cache else cp.ascontiguousarray(aux_e2_atoms(self.mol, self.auxmol, [a]))
             Pn = self.C_pao_d[:, gn]
