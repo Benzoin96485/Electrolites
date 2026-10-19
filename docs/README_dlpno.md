@@ -163,7 +163,7 @@ convergence ORCA's (`R_NORM='max'`, max. residuum 1e-5).
 |---|---|---|---|---|---|
 | taxol (RHF) | cc-pVDZ | -- | 359 (Psi4 criterion) | 640 | -- |
 | Ni dithiolene (ROHF, doublet) | def2-SVP | 345 | 296 | 607 | 691 |
-| Cu macrocycle (ROHF, doublet) | def2-SVP | -- | 925 | 986 | 1158 |
+| Cu macrocycle (ROHF, doublet) | def2-SVP | -- | 843 (3 GPUs: 947) | 986 | 1158 |
 
 The two open-shell SCF solutions are not the same state as ORCA's (Ni:
 ours 9 mEh lower; Cu: ORCA's 49 mEh lower), so only the timings compare.
