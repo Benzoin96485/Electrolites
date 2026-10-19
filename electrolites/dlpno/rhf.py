@@ -172,7 +172,8 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         # host / peer (Q|uv): its device LRU cache shares the device with the
         # integrals being built
-        if getattr(self.dfi, 'qab_host', False) or getattr(self.dfi, '_shard', None):
+        if (getattr(self.dfi, 'qab_host', False) or getattr(self.dfi, '_shard', None)
+                or getattr(self.dfi, 'qab_direct', False)):
             free -= self.dfi.cache_budget()
         return nb > free / 3.
 

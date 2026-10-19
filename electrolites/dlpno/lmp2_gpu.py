@@ -296,7 +296,7 @@ class LMP2GPU:
         from electrolites.dlpno import mgpu
         chunks = sorted(chunks, key=lambda c: -len(c))
         mgpu.run_queue(chunks, work, setup=lambda d: mgpu.device_view(
-            self, ('S_pao_d', 'F_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c')}))
+            self, ('S_pao_d', 'F_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')}))
 
     def _prep_dev(self):
         if getattr(self, 'F_pao_d', None) is None:

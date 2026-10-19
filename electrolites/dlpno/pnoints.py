@@ -87,7 +87,7 @@ class PNOIntsGPU:
                     lst[p] = v
         chunks.sort(key=lambda c: -len(c[0]))
         ctxs = mgpu.run_queue(chunks, work, devs, setup=lambda d: mgpu.device_view(
-            self, ('S_pao_d',), sub={'dfi': ('qia', 'qij', 'J2c')}))
+            self, ('S_pao_d',), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')}))
         for c in ctxs:
             if getattr(c, '_prof', None) is not None:
                 c._prof.report()
@@ -197,15 +197,19 @@ class PNOIntsGPU:
         q_vv = cp.zeros((B, A, V, V))
         atoms = sorted({a for o_ in offs for a in o_})
         for a in atoms:
+            rows = np.array([r for r in range(B) if a in offs[r]], np.int64)
+            off = np.array([offs[r][a] for r in rows], np.int64)
+            need = [pidx[rows][pm[rows] > 0]]
+            if ns:
+                sr_ = srank[rows[st[rows]]]
+                need.append(eidx[sr_][emk[sr_] > 0])
             prof('qab_get')
-            qa = dfi.qab_get(a)
+            qa, pmap = dfi.qab_block(a, need)
             prof('vv')
             if qa is None:
                 continue
             na = qa.shape[0]
-            rows = np.array([r for r in range(B) if a in offs[r]], np.int64)
-            off = np.array([offs[r][a] for r in rows], np.int64)
-            pos = ext.pao_pos[a][pidx[rows]]
+            pos = pmap[pidx[rows]]
             pos = np.where(pm[rows] > 0, pos, 0)
             assert (pos >= 0).all(), 'pair PAO outside the extended domain'
             gr, gpos = cp.asarray(rows), cp.asarray(pos)
@@ -229,9 +233,9 @@ class PNOIntsGPU:
             prof('Kio')
             soff = np.array([offs[r][a] for r in srows], np.int64)
             sr = srank[srows]
-            ppos = ext.pao_pos[a][pidx[srows]]
+            ppos = pmap[pidx[srows]]
             ppos = np.where(pm[srows] > 0, ppos, 0)
-            epos = ext.pao_pos[a][eidx[sr]]
+            epos = pmap[eidx[sr]]
             epos = np.where(emk[sr] > 0, epos, 0)
             assert (epos >= 0).all(), 'extended PAO outside the aux atom domain'
             gsr, gpp, gep, gsr2 = cp.asarray(srows), cp.asarray(ppos), cp.asarray(epos), cp.asarray(sr)

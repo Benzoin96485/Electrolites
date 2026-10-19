@@ -400,7 +400,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         from electrolites.dlpno import mgpu
         chunks = sorted(chunks, key=lambda c: -len(c))
         mgpu.run_queue(chunks, work, setup=lambda d: mgpu.device_view(
-            self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c')}))
+            self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')}))
 
     # ------------------------------------------------------------------
     # PNO spaces (alpha: PNOs, beta: PNOs + SOMOs), batched
@@ -927,13 +927,13 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         atoms = sorted({a for o_ in offs for a in o_})
         tr = lambda Y: Y.swapaxes(-1, -2)
         for a in atoms:
-            qa_ = dfi.qab_get(a)
+            rows = np.array([r for r in range(B) if a in offs[r]], np.int64)
+            off = np.array([offs[r][a] for r in rows], np.int64)
+            qa_, pmap = dfi.qab_block(a, [pidx[rows][pm[rows] > 0]])
             if qa_ is None:
                 continue
             na = qa_.shape[0]
-            rows = np.array([r for r in range(B) if a in offs[r]], np.int64)
-            off = np.array([offs[r][a] for r in rows], np.int64)
-            pos = ext.pao_pos[a][pidx[rows]]
+            pos = pmap[pidx[rows]]
             pos = np.where(pm[rows] > 0, pos, 0)
             assert (pos >= 0).all(), 'pair PAO outside the extended domain'
             gr, gpos = cp.asarray(rows), cp.asarray(pos)
@@ -1003,7 +1003,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             out.extend(res)
         chunks.sort(key=lambda c: -len(c))
         mgpu.run_queue(chunks, work, setup=lambda d: mgpu.device_view(
-            self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c')}))
+            self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')}))
         return out
 
     def gpu_pair_ints(self, c, rows, strong, host=False, core=None):
@@ -1087,7 +1087,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
 
         def setup(d):
             w = mgpu.device_view(self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'J2c'),
-                                 sub={'dfi': ('qia', 'qij', 'J2c')})
+                                 sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')})
             w._chol = {}
             return w
 

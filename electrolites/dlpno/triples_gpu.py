@@ -292,7 +292,7 @@ class TriplesGPU:
         """this object with its device tables on the current device."""
         from electrolites.dlpno import mgpu
         return mgpu.device_view(self, ('_pt', 'S_pao_d', 'F_pao_d'),
-                                sub={'dfi': ('qia', 'qij', 'J2c')})
+                                sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')})
 
     def _t0_item(self, Pv, ch, save):
         nbf = self.orb.nbf
@@ -374,13 +374,13 @@ class TriplesGPU:
             qvv = cp.zeros((B, A, V, V))
             atoms = sorted({int(a) for t in ch for a in self.t_riatoms[t]})
             for a in atoms:
-                qa = dfi.qab_get(a)
+                rows = np.array([s for s, t in enumerate(ch) if a in offs[s]], np.int64)
+                off = np.array([offs[s][a] for s in rows], np.int64)
+                qa, pmap = dfi.qab_block(a, [pidx[rows][pm[rows] > 0]])
                 if qa is None:
                     continue
                 na = qa.shape[0]
-                rows = np.array([s for s, t in enumerate(ch) if a in offs[s]], np.int64)
-                off = np.array([offs[s][a] for s in rows], np.int64)
-                pos = ext.pao_pos[a][pidx[rows]]
+                pos = pmap[pidx[rows]]
                 pos = np.where(pm[rows] > 0, pos, 0)
                 assert (pos >= 0).all(), 'triplet PAO outside the extended domain'
                 gr = cp.asarray(rows)

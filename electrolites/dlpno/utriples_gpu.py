@@ -297,6 +297,8 @@ class UTriplesGPU:
         mpdevs = os.environ.get('DLPNO_MP_DEVS')       # testing: e.g. "0,0" on one GPU
         if mpdevs:
             devs = [int(x) for x in mpdevs.split(',')]
+        if getattr(getattr(self, 'dfi', None), 'qia', None) is not None and getattr(self.dfi.qia, 'host', False):
+            return None                 # host (Q|i u) is pinned in this process: threads
         if (len(devs) > 1 or os.environ.get('DLPNO_MP_FORCE')) and os.environ.get('DLPNO_MP', '1') == '1':
             return devs
         return None
@@ -384,7 +386,7 @@ class UTriplesGPU:
         ctxs = mgpu.run_queue(items, lambda w, it: w._ut0_item(*it, save=save), devs,
                               setup=lambda d: mgpu.device_view(
                                   self, ('_pt', 'S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'Fa_lp_d', 'Fb_lp_d'),
-                                  sub={'dfi': ('qia', 'qij', 'J2c')}))
+                                  sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')}))
         for c in ctxs:
             if getattr(c, '_prof', None) is not None:
                 c._prof.report()
@@ -483,13 +485,13 @@ class UTriplesGPU:
         prof('k3')
         atoms = sorted({int(a) for t in ch for a in self.t_riatoms[t]})
         for a in atoms:
-            qa_ = dfi.qab_get(a)
+            rows = np.array([s for s, t in enumerate(ch) if a in offs[s]], np.int64)
+            off = np.array([offs[s][a] for s in rows], np.int64)
+            qa_, pmap = dfi.qab_block(a, [pidx[rows][pm[rows] > 0]])
             if qa_ is None:
                 continue
             na = qa_.shape[0]
-            rows = np.array([s for s, t in enumerate(ch) if a in offs[s]], np.int64)
-            off = np.array([offs[s][a] for s in rows], np.int64)
-            pos = ext.pao_pos[a][pidx[rows]]
+            pos = pmap[pidx[rows]]
             pos = np.where(pm[rows] > 0, pos, 0)
             assert (pos >= 0).all(), 'triplet PAO outside the extended domain'
             gr, gpos = cp.asarray(rows), cp.asarray(pos)
@@ -1111,7 +1113,12 @@ class _T0Ctx(UTriplesGPU):
         c._nva = np.array([d.nva(p) for p in range(len(d.pl))], np.int64)
         c._nvb = np.array([d.nvb(p) for p in range(len(d.pl))], np.int64)
         f = copy.copy(d.dfi)
-        f.mol = f.auxmol = None
+        if not getattr(d.dfi, 'qab_direct', False):
+            f.mol = f.auxmol = None                 # (direct (Q|uv) evaluates integrals)
+        for a in ('C_pao_d', 'mask_uv_d'):
+            if getattr(d.dfi, a, None) is not None:
+                setattr(f, a, cp.asnumpy(getattr(d.dfi, a)))
+        f._ao_cache, f._ao_bytes = {}, {}
         for a in ('qia', 'qij', 'J2c'):
             x = getattr(d.dfi, a)
             setattr(f, a, x.to_host() if isinstance(x, BlockQ) else cp.asnumpy(x))
@@ -1142,6 +1149,9 @@ class _T0Ctx(UTriplesGPU):
             if hasattr(self, a):
                 setattr(self, a, mgpu.to_device(getattr(self, a)))
         f = self.dfi
+        for a in ('C_pao_d', 'mask_uv_d'):
+            if getattr(f, a, None) is not None:
+                setattr(f, a, cp.asarray(getattr(f, a)))
         for a in ('qia', 'qij', 'J2c'):
             x = getattr(f, a)
             setattr(f, a, x.to_device() if isinstance(x, BlockQ) else cp.asarray(x))
