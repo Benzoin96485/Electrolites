@@ -170,6 +170,10 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
                 nv, nl = self.X[p].shape[1], len(self.lmos[p])
                 nb += 8. * A * (nv * nv + nl * nv + 2 * nl + 2 * nv)
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        # host / peer (Q|uv): its device LRU cache shares the device with the
+        # integrals being built
+        if getattr(self.dfi, 'qab_host', False) or getattr(self.dfi, '_shard', None):
+            free -= self.dfi.cache_budget()
         return nb > free / 3.
 
     def pno_integrals(self):

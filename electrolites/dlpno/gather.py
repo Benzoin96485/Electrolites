@@ -210,3 +210,60 @@ def xT_z_by_pointer(tab, pidx, Zg):
                         one.ctypes.data, Ap.data.ptr, V, Bp.data.ptr, VP,
                         zero.ctypes.data, Cp.data.ptr, V, n)
     return out
+
+
+_SRC4 = r'''
+extern "C" __global__ void pad_copy(const long long* __restrict__ ptr, const int* __restrict__ dims,
+    const long long* __restrict__ str, const long long* __restrict__ iptr, const long long* __restrict__ slot,
+    double* __restrict__ out, const int D0, const int D1, const int D2)
+{
+    // block (item, q): out[slot, q, j, k] = src[q * s0 + j * s1 + col(k) * s2]
+    const int m = blockIdx.x, q = blockIdx.y;
+    const int d0 = dims[3 * m], d1 = dims[3 * m + 1], d2 = dims[3 * m + 2];
+    if (q >= d0) return;
+    const double* src = (const double*) ptr[m];
+    const long long s0 = str[3 * m], s1 = str[3 * m + 1], s2 = str[3 * m + 2];
+    const long long* col = (const long long*) iptr[m];
+    double* dst = out + ((slot[m] * D0 + q) * (long long) D1) * D2;
+    for (int e = threadIdx.x; e < d1 * d2; e += blockDim.x) {
+        const int j = e / d2, k = e % d2;
+        const long long kk = col ? col[k] : k;
+        dst[(long long) j * D2 + k] = src[q * s0 + j * s1 + kk * s2];
+    }
+}
+'''
+_m4 = None
+
+
+def pad_copy(out, items, slots, cols=None):
+    """out[slots[i], :d0, :d1, :d2] = items[i] (arrays of ndim <= 3, on this or a
+    peer device; any strides) in one launch; ``cols[i]`` (device int64, or
+    None) indexes the last axis of item i.  ``out`` is (n, D0, D1, D2) or
+    lower-dimensional (leading unit axes implied).  Synchronises (the items
+    must stay alive until the copy ran)."""
+    global _m4
+    if _m4 is None:
+        _m4 = cp.RawKernel(_SRC4, 'pad_copy')
+    n = len(items)
+    if n == 0:
+        return out
+    D = (1,) * (4 - out.ndim) + tuple(out.shape[1:])
+    ptr = np.empty(n, np.int64)
+    dims = np.empty((n, 3), np.int32)
+    st = np.empty((n, 3), np.int64)
+    ip = np.zeros(n, np.int64)
+    for i, a in enumerate(items):
+        sh = (1,) * (3 - a.ndim) + a.shape
+        sr = (0,) * (3 - a.ndim) + tuple(s // 8 for s in a.strides)
+        ptr[i] = a.data.ptr
+        dims[i] = sh
+        st[i] = sr
+        if cols is not None and cols[i] is not None:
+            ip[i] = cols[i].data.ptr
+            dims[i, 2] = len(cols[i])
+    assert out.flags.c_contiguous and out.dtype == np.float64
+    _m4((n, max(1, int(dims[:, 0].max()))), (128,),
+        (cp.asarray(ptr), cp.asarray(dims), cp.asarray(st), cp.asarray(ip),
+         cp.asarray(np.asarray(slots, np.int64)), out, np.int32(D[0]), np.int32(D[1]), np.int32(D[2])))
+    cp.cuda.get_current_stream().synchronize()
+    return out

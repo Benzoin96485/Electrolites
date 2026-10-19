@@ -899,6 +899,7 @@ class UCCSDGPUv(UCCSDGPU):
         if len(devs) > 1:
             # the home device keeps the overlaps, 3-external tensors and plans
             load[devs.index(home)] = np.inf
+            mgpu.enable_peer(devs)        # the groups copy the per-pair blocks by pointer
         for gi in range(len(uk)):
             A = int(uk[gi][0])
             R = [int(uk[gi][1]), int(uk[gi][2])]
@@ -907,7 +908,7 @@ class UCCSDGPUv(UCCSDGPU):
             step = max(1, self.MAX_DF_CHUNK_BYTES // per)
             allm = np.array(sc)[inv == gi]
             for c0 in range(0, len(allm), step):
-                r = int(np.argmin(load))
+                r = devs.index(home) if os.environ.get('DLPNO_DBG_DF_HOME') else int(np.argmin(load))
                 mem_ = allm[c0:c0 + step]
                 load[r] += len(mem_) * per
                 with cp.cuda.Device(devs[r]):
@@ -976,7 +977,7 @@ class UCCSDGPUv(UCCSDGPU):
         if len(devs) > 1:
             load[devs.index(home)] = np.inf
         for d in self.klchunks:
-            r = int(np.argmin(load))
+            r = devs.index(home) if os.environ.get('DLPNO_DBG_KL_HOME') else int(np.argmin(load))
             load[r] += len(d['rb']) + len(d['fv'][0]) + len(d['fv'][1]) + 1
             d['dev'] = devs[r]
             with cp.cuda.Device(devs[r]):
@@ -1121,23 +1122,53 @@ class UCCSDGPUv(UCCSDGPU):
             Qaz = zeros((g, 2, A, V[s]))
             zrow = np.zeros((g, 2), np.int64)
             zm = np.zeros((g, 2))
+            on_dev = not self.offload and all(isinstance(fx[c]['Qov'][s], cp.ndarray) for c in mem)
+            # device sources: one batched padded copy per tensor (the per-pair
+            # blocks may live on a peer device)
+            bat = dict(ov=[], vv=[], fov=[], ev=[], mz=[], mzc=[], az=[]) if on_dev else None
             for m, c in enumerate(mem):
                 f = fx[c]
                 x, y = pl.pairs[c]
                 na, nr = f['Qov'][s].shape[0], f['Qov'][s].shape[1]
                 nv = f['Qvv'][s].shape[1]
-                Qov[m, :na, :nr, :nv] = f['Qov'][s]
-                Qvv[m, :na, :nv, :nv] = f['Qvv'][s]
-                fov[m, :nr, :nv] = f['fov'][s]
-                ev[m, :nv] = f['ev'][s]
-                rp = xp.asarray(np.asarray(f['rowsp'][s], np.int64))
+                if on_dev:
+                    bat['ov'].append((m, f['Qov'][s]))
+                    bat['vv'].append((m, f['Qvv'][s]))
+                    bat['fov'].append((m, cp.asarray(f['fov'][s])))
+                    bat['ev'].append((m, cp.asarray(f['ev'][s])))
+                else:
+                    Qov[m, :na, :nr, :nv] = f['Qov'][s]
+                    Qvv[m, :na, :nv, :nv] = f['Qvv'][s]
+                    fov[m, :nr, :nv] = f['fov'][s]
+                    ev[m, :nv] = f['ev'][s]
+                rp = None
                 for side, z in enumerate((x, y)):
                     if nr:
-                        Qmz[m, side, :na, :nr] = f['Qmz'][z][:, rp]
+                        if on_dev:
+                            if rp is None:
+                                with cp.cuda.Device(f['Qmz'][z].device.id):
+                                    rp = cp.asarray(np.asarray(f['rowsp'][s], np.int64))
+                            bat['mz'].append((2 * m + side, f['Qmz'][z]))
+                            bat['mzc'].append(rp)
+                        else:
+                            rp = xp.asarray(np.asarray(f['rowsp'][s], np.int64))
+                            Qmz[m, side, :na, :nr] = f['Qmz'][z][:, rp]
                     if (z, s) in si:
-                        Qaz[m, side, :na, :nv] = f['Qaz'][(z, s)]
+                        if on_dev:
+                            bat['az'].append((2 * m + side, f['Qaz'][(z, s)]))
+                        else:
+                            Qaz[m, side, :na, :nv] = f['Qaz'][(z, s)]
                         zrow[m, side] = self.rows[c][s].index(si[(z, s)])
                         zm[m, side] = 1.
+            if on_dev:
+                from electrolites.dlpno.gather import pad_copy
+                for key, dst in (('ov', Qov), ('vv', Qvv), ('fov', fov), ('ev', ev)):
+                    pad_copy(dst, [a for _, a in bat[key]], [m for m, _ in bat[key]])
+                gA = (2 * g,) + Qmz.shape[2:]
+                pad_copy(Qmz.reshape(gA), [a for _, a in bat['mz']], [m for m, _ in bat['mz']], bat['mzc'])
+                pad_copy(Qaz.reshape((2 * g,) + Qaz.shape[2:]), [a for _, a in bat['az']],
+                         [m for m, _ in bat['az']])
+                bat = None
             d[('Qov', s)], d[('Qvv', s)], d[('fov', s)], d[('ev', s)] = Qov, Qvv, fov, ev
             d[('Qmz', s)], d[('Qaz', s)] = Qmz, Qaz
 

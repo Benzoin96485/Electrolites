@@ -55,6 +55,8 @@ def replicate(x):
             with cp.cuda.Device(x.device.id):
                 x = cp.ascontiguousarray(x)
         return cp.asarray(x)
+    if type(x).__name__ == 'BlockQ':     # block-sparse (Q|i u)
+        return x.replicate()
     if isinstance(x, dict):
         return {k: replicate(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
@@ -86,6 +88,7 @@ def run_queue(items, work, devs=None, setup=None):
             ctx = setup(devs[0]) if setup else None
             for it in items:
                 work(ctx, it)
+            cp.cuda.Device(devs[0]).synchronize()
         return [ctx]
     enable_peer(devs)
     q = queue.Queue()
@@ -121,8 +124,11 @@ def run_queue(items, work, devs=None, setup=None):
 def run_per_device(fn, devs):
     """fn(dev) in one thread per device (current device set), concurrently."""
     if len(devs) == 1:
+        # synchronised like the threaded path: callers read the results from
+        # other devices (peer gathers) right after
         with cp.cuda.Device(devs[0]):
             fn(devs[0])
+            cp.cuda.Device(devs[0]).synchronize()
         return
     enable_peer(devs)
     errs = []

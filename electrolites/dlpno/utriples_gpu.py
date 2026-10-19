@@ -19,6 +19,7 @@ form one batch.  TNOs, the metric, the three-index integrals in the TNO
 basis and the projected pair amplitudes are batched over the chunk.
 """
 import itertools
+import os
 
 import numpy as np
 import cupy as cp
@@ -337,8 +338,9 @@ class UTriplesGPU:
             Pv = int(Pv)
             per = 8 * (12 * Pv * Pv + 2 * nbf * Pv)
             step = max(1, int(self._chunk_bytes() // per))
-            if len(devs) > 1:
-                step = max(1, min(step, -(-len(sel) // (2 * len(devs)))))
+            nsp = int(os.environ.get('DLPNO_DBG_T0_SPLIT', len(devs)))
+            if nsp > 1:
+                step = max(1, min(step, -(-len(sel) // (2 * nsp))))
             items += [(Pv, sel[c0:c0 + step]) for c0 in range(0, len(sel), step)]
         items.sort(key=lambda it: -len(it[1]) * it[0] ** 2)
         mpdevs = self.t0_mp_devs()
@@ -640,6 +642,9 @@ class UTriplesGPU:
                 # (alpha and beta spaces differ by the SOMOs)
                 n1 = np.minimum(-(-nvt[pf, s1] // 16) * 16, S1.shape[1])
                 n2 = np.minimum(-(-nvt[pf, s2] // 16) * 16, S2.shape[1])
+                if os.environ.get('DLPNO_DBG_NOBUCKET'):
+                    n1 = np.full_like(n1, S1.shape[1])
+                    n2 = np.full_like(n2, S2.shape[1])
                 bkt = np.where(okf, n1 * (S2.shape[1] + 1) + n2, -1)
                 itf = items.reshape(-1)
                 sgf = signs.reshape(-1)
@@ -1051,6 +1056,9 @@ class _Orb:
         self.nbf = nbf
 
 
+from electrolites.dlpno.dfints import BlockQ  # noqa: E402
+
+
 class _T0Ctx(UTriplesGPU):
     """The (T0) inputs of a driver, host only and picklable, for the worker
     processes of ``mgpu.run_queue_mp``."""
@@ -1100,7 +1108,8 @@ class _T0Ctx(UTriplesGPU):
         f = copy.copy(d.dfi)
         f.mol = f.auxmol = None
         for a in ('qia', 'qij', 'J2c'):
-            setattr(f, a, cp.asnumpy(getattr(d.dfi, a)))
+            x = getattr(d.dfi, a)
+            setattr(f, a, x.to_host() if isinstance(x, BlockQ) else cp.asnumpy(x))
         f.qab = [None if q is None else (q if isinstance(q, np.ndarray) else cp.asnumpy(q)) for q in d.dfi.qab]
         f._cache, f._cache_bytes, f._chol = {}, {}, {}
         f.cache_stats = dict(hit=0, miss=0, bytes=0.)
@@ -1129,7 +1138,8 @@ class _T0Ctx(UTriplesGPU):
                 setattr(self, a, mgpu.to_device(getattr(self, a)))
         f = self.dfi
         for a in ('qia', 'qij', 'J2c'):
-            setattr(f, a, cp.asarray(getattr(f, a)))
+            x = getattr(f, a)
+            setattr(f, a, x.to_device() if isinstance(x, BlockQ) else cp.asarray(x))
         nab = sum(q.nbytes for q in f.qab if q is not None)
         free = cp.cuda.runtime.memGetInfo()[0]
         if nab < 0.25 * free:

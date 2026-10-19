@@ -47,6 +47,103 @@ def _decide_qab_host(nbytes):
     return nbytes > 0.35 * free
 
 
+_BQ_GATHER = None
+
+
+def _bq_kernel():
+    global _BQ_GATHER
+    if _BQ_GATHER is None:
+        _BQ_GATHER = cp.ElementwiseKernel(
+            'int64 qq, int64 ii, int64 uu, raw float64 buf, raw int32 atom_of, raw int64 aoff, '
+            'raw int32 a0, raw int32 nl, raw int32 npo, raw int32 lpos, raw int32 ppos, int32 n, int32 nbf',
+            'float64 y',
+            '''
+            const int a = atom_of[qq];
+            const int li = lpos[(long long) a * n + ii];
+            const int pu = ppos[(long long) a * nbf + uu];
+            y = (li < 0 || pu < 0) ? 0.0
+                : buf[aoff[a] + ((long long) (qq - a0[a]) * nl[a] + li) * npo[a] + pu];
+            ''', 'dlpno_bq_gather')
+    return _BQ_GATHER
+
+
+class BlockQ:
+    """(Q|i u) stored per auxiliary atom A over A's extended LMO and PAO
+    domains (the domains every pair / triplet using A lies in) instead of
+    densely over all (Q, i, u): linear in the system size.  ``bq[Q, i, u]``
+    with broadcastable integer index arrays gathers in one kernel (entries
+    outside the domains are 0)."""
+
+    def __init__(self, naux, n, nbf, ribf_atom, atom_ribfs, ext_lmos, ext_paos, buf=None):
+        natm = len(atom_ribfs)
+        self.shape = (naux, n, nbf)
+        self.ndim = 3
+        self.n, self.nbf = n, nbf
+        self.lmos, self.paos = ext_lmos, ext_paos
+        self.nl = np.array([len(ext_lmos[a]) for a in range(natm)], np.int32)
+        self.npo = np.array([len(ext_paos[a]) for a in range(natm)], np.int32)
+        self.na = np.array([len(atom_ribfs[a]) for a in range(natm)], np.int64)
+        self.a0 = np.array([atom_ribfs[a][0] if len(atom_ribfs[a]) else 0 for a in range(natm)], np.int32)
+        sz = self.na * self.nl * self.npo
+        self.aoff = np.concatenate([[0], np.cumsum(sz)[:-1]]).astype(np.int64)
+        self.size = int(sz.sum())
+        self.nbytes = 8 * self.size
+        lpos = -np.ones((natm, n), np.int32)
+        ppos = -np.ones((natm, nbf), np.int32)
+        for a in range(natm):
+            lpos[a, ext_lmos[a]] = np.arange(len(ext_lmos[a]))
+            ppos[a, ext_paos[a]] = np.arange(len(ext_paos[a]))
+        self._host = dict(atom_of=np.asarray(ribf_atom, np.int32), aoff=self.aoff, a0=self.a0,
+                          nl=self.nl, npo=self.npo, lpos=lpos.ravel(), ppos=ppos.ravel())
+        self.buf = cp.zeros(max(self.size, 1)) if buf is None else buf
+        self._tabs = None
+
+    def block(self, a):
+        """the stored (na, nl, np) block of aux atom ``a`` (a view)."""
+        o, s = int(self.aoff[a]), int(self.na[a] * self.nl[a] * self.npo[a])
+        return self.buf[o:o + s].reshape(int(self.na[a]), int(self.nl[a]), int(self.npo[a]))
+
+    def _dev_tabs(self):
+        dev = cp.cuda.Device().id
+        if self._tabs is None or self._tabs[0] != dev:
+            self._tabs = (dev, {k: cp.asarray(v) for k, v in self._host.items()})
+        return self._tabs[1]
+
+    def __getitem__(self, key):
+        Q, i, u = (cp.asarray(k, dtype=cp.int64) for k in key)
+        t = self._dev_tabs()
+        return _bq_kernel()(Q, i, u, self.buf, t['atom_of'], t['aoff'], t['a0'], t['nl'], t['npo'],
+                            t['lpos'], t['ppos'], np.int32(self.n), np.int32(self.nbf))
+
+    def _with(self, buf):
+        c = object.__new__(BlockQ)
+        c.__dict__.update(self.__dict__)
+        c.buf, c._tabs = buf, None
+        return c
+
+    def replicate(self):
+        """a view whose storage is on the current device."""
+        if isinstance(self.buf, cp.ndarray) and self.buf.device.id == cp.cuda.Device().id:
+            return self
+        return self._with(cp.asarray(self.buf))
+
+    def to_host(self):
+        return self._with(cp.asnumpy(self.buf) if isinstance(self.buf, cp.ndarray) else self.buf)
+
+    def to_device(self):
+        return self._with(cp.asarray(self.buf))
+
+
+def _decide_qia_sparse(nbytes):
+    """block-sparse (Q|i u) when the dense tensor would take more than a
+    quarter of the free device memory (DLPNO_QIA_SPARSE=auto|0|1)."""
+    env = os.environ.get('DLPNO_QIA_SPARSE', 'auto')
+    if env != 'auto':
+        return env == '1'
+    free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+    return nbytes > 0.25 * free
+
+
 class ExtDomains:
     """Psi4's extended LMO / PAO domains of each auxiliary atom."""
 
@@ -85,7 +182,11 @@ class DFInts:
         self.naux, self.n, self.nbf = naux, n, nbf
         L = cp.asarray(C_lmo)
         P = cp.asarray(C_pao)
-        self.qia = cp.empty((naux, n, nbf))
+        self.qia_sparse = _decide_qia_sparse(8. * naux * n * nbf)
+        if self.qia_sparse:
+            self.qia = BlockQ(naux, n, nbf, ribf_atom, atom_ribfs, ext.lmos, ext.paos)
+        else:
+            self.qia = cp.empty((naux, n, nbf))
         self.qij = cp.empty((naux, n, n))
         self.qab = [None] * mol.natm
         self.ext = ext
@@ -139,7 +240,17 @@ class DFInts:
             t = cp.matmul(L.T, j3c.reshape(nao, nao * nq)).reshape(n, nao, nq)
             t = t.transpose(2, 0, 1)                               # (nq, n, nao)
             gi = cp.asarray(idx)
-            self.qia[gi] = cp.matmul(t, P)
+            if self.qia_sparse:
+                off = 0
+                for a in atoms:
+                    na = len(atom_ribfs[a])
+                    la, pa = ext.lmos[a], ext.paos[a]
+                    if na and len(la) and len(pa):
+                        tq = t[off:off + na][:, cp.asarray(la)]                  # (na, nl, nao)
+                        self.qia.block(a)[...] = cp.matmul(tq, P[:, cp.asarray(pa)])
+                    off += na
+            else:
+                self.qia[gi] = cp.matmul(t, P)
             self.qij[gi] = cp.matmul(t, L)
             del t
             if need_ab:

@@ -1228,6 +1228,10 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         self.timings['cc_build'] = time.perf_counter() - t0
         if self.verbose >= 2:
             print('[phase] cc_build steps (s):', {k: round(v, 1) for k, v in g.t_build.items()}, flush=True)
+        import os
+        if os.environ.get('DLPNO_DEBUG_CC_SUMS'):
+            _cc_checksums(g)
+            raise SystemExit(0)
         self.log('  CC stores (GB):', getattr(g, 'mem_report', None))
         self.mem_cc = getattr(g, 'mem_report', None)
         self.e_lccsd, self.de_weak = g.kernel(verbose=self.verbose >= 4)
@@ -1326,3 +1330,41 @@ def _transpose_items(T, src, dst):
         blk[:, :r, :c] = Ms[:, :r, :c]
         out.data[g2][b] = blk
     return out
+
+
+def _cc_checksums(g):
+    """debug: sums of |x| of the CC stores (compare single / multi GPU builds)."""
+    def s(x):
+        if x is None:
+            return 0.
+        if isinstance(x, cp.ndarray):
+            with cp.cuda.Device(x.device.id):
+                return float(cp.abs(x).sum())
+        if isinstance(x, np.ndarray):
+            return float(np.abs(x).sum())
+        if isinstance(getattr(x, 'data', None), list):
+            return sum(s(d) for d in x.data)
+        if isinstance(x, dict):
+            return sum(s(v) for v in x.values())
+        if isinstance(x, (list, tuple)):
+            return sum(s(v) for v in x)
+        return 0.
+    out = {}
+    for name in ('G', 'Kx', 'NP', 'K1Z', 'U0', 'Fk0', 'F1', 'D2', 'D1', 'J1R', 'Sd'):
+        out[name] = s(getattr(g, name, None))
+    for key in ('Kx', 'K1', 'J1', 'fov', 'ev'):
+        out['fix.' + key] = sum(s(g.fix[c].get(key)) for c in g.canon_sp if g.fix[c] is not None)
+    out['dfg'] = sum(s({k: v for k, v in d.items()
+                        if isinstance(k, tuple) and k[0] in ('Qov', 'Qvv', 'Qmz', 'Qaz', 'fov', 'ev')})
+                     for d in g.dfg)
+    k3 = getattr(g, 'k3', None)
+    out['k3'] = s(getattr(k3, '__dict__', {})) if k3 is not None else 0.
+    for sp_ in (0, 1):
+        keys = g.Sreg[sp_].keys
+        out[f'nS{sp_}'] = float(len(keys))
+        out[f'hS{sp_}'] = float(sum((a * 7919 + b) % 1000003 for a, b in keys))
+        if g.LS[sp_] is not None:
+            out[f'LS{sp_}'] = float(np.sum(g.LS[sp_].rows * g.LS[sp_].cols))
+            if g.Sd[sp_] is not None:
+                out[f'Sd{sp_}'] = s(g.Sd[sp_])
+    print('CCSUMS', {k: f'{v:.12e}' for k, v in out.items()}, flush=True)
