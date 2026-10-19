@@ -415,6 +415,40 @@ class DFInts:
             cur_n += na
         if cur:
             groups.append(cur)
+        # block-sparse (Q|i u), (Q|i j) and no stored (Q|uv): per aux atom from
+        # the AO integrals over the shells carrying its extended LMOs and PAOs
+        # (AO screening: linear in the system size for extended molecules)
+        if (self.qia_sparse and self.qij_sparse and self._qij_lmos is None and self._pao_sup is not None
+                and (self.qab_direct or not need_ab)):
+            Lh = np.abs(np.asarray(C_lmo))
+            lmo_sup = Lh > self.ao_cut * Lh.max(axis=0)[None, :]
+            nd_tot = 0
+            for a in range(natm):
+                na = len(atom_ribfs[a])
+                la, pa = ext.lmos[a], ext.paos[a]
+                if na == 0 or len(la) == 0:
+                    continue
+                sup = lmo_sup[:, la].any(axis=1)
+                if len(pa):
+                    sup |= self._pao_sup[:, pa].any(axis=1)
+                shells = np.unique(self._ao_shell[sup])
+                smol, ao = sub_mol_shells(mol, shells)
+                nd = len(ao)
+                nd_tot += nd
+                J = cp.ascontiguousarray(aux_e2_atoms(smol, auxmol, [a]))      # (nd, nd, na)
+                gao = cp.asarray(ao)
+                Ls = L[gao][:, cp.asarray(la)]
+                t = cp.matmul(Ls.T, J.reshape(nd, nd * na)).reshape(len(la), nd, na).transpose(2, 0, 1)
+                del J
+                if len(pa):
+                    self.qia.set_block(a, cp.matmul(t, P[gao][:, cp.asarray(pa)]))
+                self.qij.set_block(a, cp.matmul(t, Ls))
+                del t
+            self.ao_screened_build = nd_tot / max(1, natm)
+            groups = []
+            # one sub-molecule per aux atom: their screening tables are not reused
+            _QCOND.clear()
+            cp.get_default_memory_pool().free_all_blocks()
         for atoms in groups:
             idx = np.concatenate([atom_ribfs[a] for a in atoms])
             if len(idx) == 0:

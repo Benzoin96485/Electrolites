@@ -145,6 +145,23 @@ class Orbitals:
 # --------------------------------------------------------------------------
 
 def doi_grid(mol, grid=(25, 50)):
+    """the DOI quadrature (Treutler radial x Lebedev, Becke partition).  On the
+    GPU when GPU4PySCF is present: the same grid (weights equal to 1e-13; the
+    CPU Becke partition costs O(atoms x points), 90 s for 450 atoms); points
+    with zero weight (padding, < 1e-22) dropped."""
+    try:
+        from gpu4pyscf.dft import gen_grid as ggrid
+        h = ggrid.Grids(mol)
+        h.atom_grid = grid
+        h.radi_method = radi.treutler
+        h.prune = None
+        h.verbose = 0
+        h.build(with_non0tab=False)
+        c, w = h.coords.get(), h.weights.get()
+        nz = w != 0
+        return np.ascontiguousarray(c[nz]), np.ascontiguousarray(w[nz])
+    except ImportError:
+        pass
     g = gen_grid.Grids(mol)
     g.atom_grid = grid
     g.radi_method = radi.treutler
@@ -174,14 +191,37 @@ def compute_doi(mol, C_lmo, C_pao, grid=(25, 50), blksize=4096, need_uv=True):
     iu = cp.zeros((nl, nu))
     uv = cp.zeros((nu, nu)) if need_uv else None
     wd = cp.asarray(weights)
+    # screening (DLPNO_DOI_SCREEN, relative coefficient cut; 0: off): per grid
+    # block only the AOs that are non-negligible on it and the LMOs / PAOs whose
+    # AO support touches those AOs (local blocks: linear cost for large systems)
+    cut = float(os.environ.get('DLPNO_DOI_SCREEN', '1e-8'))
+    screen = cut > 0 and nl + nu > 2000
+    if screen:
+        La, Pa = cp.abs(L), cp.abs(P)
+        lsup = La > cut * La.max(axis=0)[None, :]
+        psup = Pa > cut * Pa.max(axis=0)[None, :]
+        del La, Pa
     for p0 in range(0, len(weights), blksize):
         p1 = min(p0 + blksize, len(weights))
         ao = ev(coords[p0:p1])
         if ao.shape[0] != p1 - p0:
             ao = ao.T
+        w = wd[p0:p1, None]
+        if screen:
+            sig = cp.abs(ao).max(axis=0) > 1e-10
+            sa = cp.flatnonzero(sig)
+            ls = cp.flatnonzero(lsup[sa].any(axis=0))
+            us = cp.flatnonzero(psup[sa].any(axis=0))
+            aos = ao[:, sa]
+            li = (aos @ L[sa][:, ls]) ** 2
+            lu = (aos @ P[sa][:, us]) ** 2
+            ij[ls[:, None], ls[None, :]] += (li * w).T @ li
+            iu[ls[:, None], us[None, :]] += (li * w).T @ lu
+            if need_uv:
+                uv[us[:, None], us[None, :]] += (lu * w).T @ lu
+            continue
         li = (ao @ L) ** 2
         lu = (ao @ P) ** 2
-        w = wd[p0:p1, None]
         ij += (li * w).T @ li
         iu += (li * w).T @ lu
         if need_uv:
