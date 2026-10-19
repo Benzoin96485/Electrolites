@@ -181,7 +181,8 @@ core): C150H302/def2-TZVP 13.7 h DLPNO-CCSD(T) + 14.9 h RIJCOSX-HF.
 | C50H102 / def2-SVP | 1210 | 1 | 10 s | 60 s | |
 | C100H202 / def2-SVP | 2410 | 1 | 18 s | 162 s | |
 | C150H302 / def2-SVP | 3610 | 2 | 21 s | 327 s | |
-| C150H302 / def2-TZVP | 6462 | 4 | 171 s | **1875 s** | E_corr -28.0121 Eh (paper -27.990) |
+| C150H302 / def2-TZVP | 6462 | 4 | 171 s | **1076 s** (1875 s before the per-group AO domains) | E_corr -28.0121 Eh (paper -27.990) |
+| C300H602 / def2-TZVP | 12912 | 4 | 291 s | through LCCSD (684 s) | node host memory (235 GB) was the limit, see below |
 
 What made the chains scale: the DOI grid built on the GPU (the CPU Becke
 partition was 90 s for 450 atoms) and screened per grid block; the DF build
@@ -189,9 +190,20 @@ with AO screening (`DLPNO_DF_SCREEN`: consecutive aux atoms on the union of
 the AO supports of their extended LMOs / PAOs, `DLPNO_AO_CUT` relative
 coefficient cut, default 1e-8); the direct (Q|uv) regions on their AO support
 (chunked over aux shells when an atom's block is large); block-sparse
-(Q|ij).  All exact to the printed digits on C50 / C100 / C150.  In
-C150/def2-TZVP the (T0) dominates (614 + 516 s: the triplet regions still span
-~70% of the AOs at the 1e-8 cut).
+(Q|ij); inside a region, aux atoms grouped by neighbourhood, each group
+integrated and transformed over the AO shells supporting its own PAOs
+(`DLPNO_REGION_SPLIT`; at the 1e-8 cut one TZVP PAO spans ~1660 of 6462 AOs,
+a region's union ~70%): C150/def2-TZVP (T0) 614 + 516 s -> 268 + 261 s.  All
+exact to the printed digits on C50 / C100 / C150.
+
+Host memory (C300H602/def2-TZVP, 902 atoms): the strong pairs' (Q|ab) and
+(Q|ma) are 87 GB in host memory.  Two traps doubled that: freed CUDA pinned
+memory is not returned to the OS (only reused by allocations that fit), and
+the C heap keeps freed numpy blocks.  The per-pair copies are therefore
+pageable (`malloc_trim` while the CC groups them) and the CC groups are
+stored packed in pinned memory (padded on the device per use; C150/TZVP
+40.4 GB instead of 53 GB, host peak 73 GB).  A region that no longer fits
+the device when it starts is split instead of going to pinned memory.
 
 ## Known issue
 
