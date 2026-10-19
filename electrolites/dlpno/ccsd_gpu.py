@@ -745,7 +745,11 @@ class CCSDGPU:
         sel = np.where(self.strong & self.canon)[0]
         naux = np.array([ref.Qma[p].shape[0] for p in sel], np.int64)
         bk = lambda n, q: np.maximum(q, -(-np.asarray(n) // q) * q)
-        Ab, Lb, Vb = bk(naux, 128), bk(self.nl[sel], 16), bk(self.nv[sel], 32)
+        if getattr(ref, 'df_offload', False):
+            # host-resident groups: finer buckets (less zero padding in host memory)
+            Ab, Lb, Vb = bk(naux, 64), bk(self.nl[sel], 8), bk(self.nv[sel], 8)
+        else:
+            Ab, Lb, Vb = bk(naux, 128), bk(self.nl[sel], 16), bk(self.nv[sel], 32)
         key = np.stack([Ab, Lb, Vb], 1)
         uk, inv = np.unique(key, axis=0, return_inverse=True)
         inv = inv.reshape(-1)
@@ -762,6 +766,8 @@ class CCSDGPU:
         self.devs = mgpu.devices()
         load = np.zeros(len(self.devs))
         home = cp.cuda.Device().id
+        off = getattr(ref, 'df_offload', False)
+        pin = cp.get_default_pinned_memory_pool()
         for A, Lp, Vp, mem in chunks:
             g = len(mem)
             # several GPUs: the groups (and their DF tensors) are spread
@@ -769,6 +775,14 @@ class CCSDGPU:
             load[r] += g * A * (Vp * Vp + Lp * Vp)
             with cp.cuda.Device(self.devs[r]):
                 self._load_df_group(mem, A, Lp, Vp, g)
+            if off:
+                # the released per-pair pinned copies back to the OS: the pinned
+                # pool would keep them (other sizes than the groups'), doubling
+                # the host footprint of the DF tensors
+                pin.free_all_blocks()
+        if off and getattr(ref, 'verbose', 0) >= 2:
+            nb = sum(sum(d[k].nbytes for k in ('Qma', 'Qab', 'Qk', 'Qa')) for d in self.df)
+            print(f'[mem] CC DF groups in pinned host memory: {nb / 1e9:.1f} GB', flush=True)
         self.df_dev = sorted({d['dev'] for d in self.df})
         cp.cuda.Device(home).use()
 
