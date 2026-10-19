@@ -97,7 +97,8 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
         self.dfi = DFInts(mol, auxmol, orb.C_lmo, orb.C_pao, self.ext, self.doi_uv,
                           opt['T_CUT_DO_UV'], self.ribf_atom, self.atom_ribfs)
         if self.verbose >= 2:
-            print('[mem] DF ints GB:', {k: round(v / 1e9, 2) for k, v in self.dfi.nbytes.items()}, flush=True)
+            print('[mem] DF ints GB:', {k: round(v / 1e9, 2) for k, v in self.dfi.nbytes.items()},
+                  'AO-screened build:', getattr(self.dfi, 'df_screen_frac', None), flush=True)
         self.J2c = self.dfi.J2c
         self.S_pao_d = cp.asarray(orb.S_pao)
         t = self._tick('df_ints', t)

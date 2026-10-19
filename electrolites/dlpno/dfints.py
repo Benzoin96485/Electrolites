@@ -415,36 +415,129 @@ class DFInts:
             cur_n += na
         if cur:
             groups.append(cur)
-        # block-sparse (Q|i u), (Q|i j) and no stored (Q|uv): per aux atom from
-        # the AO integrals over the shells carrying its extended LMOs and PAOs
-        # (AO screening: linear in the system size for extended molecules)
-        if (self.qia_sparse and self.qij_sparse and self._qij_lmos is None and self._pao_sup is not None
-                and (self.qab_direct or not need_ab)):
+        # AO screening of the DF build: per aux atom, (mu nu|Q_a) only over the
+        # shells carrying its extended LMOs and PAOs (relative cut ao_cut);
+        # linear for extended molecules.  Used when those supports are local
+        # (mean below 60% of the AOs; DLPNO_DF_SCREEN=auto|0|1); compact
+        # molecules keep the grouped full-AO evaluation (fewer, larger calls).
+        env_s = os.environ.get('DLPNO_DF_SCREEN', 'auto')
+        sups = None
+        if self._pao_sup is not None and env_s != '0':
             Lh = np.abs(np.asarray(C_lmo))
             lmo_sup = Lh > self.ao_cut * Lh.max(axis=0)[None, :]
-            nd_tot = 0
+            lm_sets = self._qij_lmos if self._qij_lmos is not None else ext.lmos
+            sups = []
             for a in range(natm):
-                na = len(atom_ribfs[a])
-                la, pa = ext.lmos[a], ext.paos[a]
-                if na == 0 or len(la) == 0:
-                    continue
-                sup = lmo_sup[:, la].any(axis=1)
+                la, pa = lm_sets[a], ext.paos[a]
+                sup = lmo_sup[:, la].any(axis=1) if len(la) else np.zeros(nao, bool)
+                if len(ext.lmos[a]):
+                    sup |= lmo_sup[:, ext.lmos[a]].any(axis=1)
                 if len(pa):
                     sup |= self._pao_sup[:, pa].any(axis=1)
-                shells = np.unique(self._ao_shell[sup])
-                smol, ao = sub_mol_shells(mol, shells)
-                nd = len(ao)
-                nd_tot += nd
-                J = cp.ascontiguousarray(aux_e2_atoms(smol, auxmol, [a]))      # (nd, nd, na)
-                gao = cp.asarray(ao)
-                Ls = L[gao][:, cp.asarray(la)]
-                t = cp.matmul(Ls.T, J.reshape(nd, nd * na)).reshape(len(la), nd, na).transpose(2, 0, 1)
+                sups.append(sup)
+            # consecutive aux atoms grouped while the union of their supports
+            # grows by less than 30% over the largest member and the group's
+            # (nd, nd, nq) block stays within group_mem: one integral call each
+            sgroups, cur, cu, cq = [], [], None, 0
+            for a in range(natm):
+                na_ = len(atom_ribfs[a])
+                if cur:
+                    un = cu | sups[a]
+                    big = max(int(sups[b_].sum()) for b_ in cur + [a])
+                    if (un.sum() > 1.3 * big or 8. * un.sum() ** 2 * (cq + na_) > group_mem):
+                        sgroups.append((cur, cu))
+                        cur, cu, cq = [], None, 0
+                if not cur:
+                    cur, cu, cq = [a], sups[a].copy(), na_
+                else:
+                    cur.append(a)
+                    cu = cu | sups[a]
+                    cq += na_
+            if cur:
+                sgroups.append((cur, cu))
+            cost_s = sum(8. * float(u.sum()) ** 2 for _, u in sgroups)
+            cost_f = 8. * nao ** 2 * len(groups)
+            frac = float(np.mean([u.sum() for _, u in sgroups])) / nao
+            self.df_screen_frac = frac
+            if env_s == 'auto' and cost_s > 0.7 * cost_f:
+                sups = None
+        if sups is not None:
+            if not self.qia_sparse:
+                self.qia = None
+                self.qia = cp.zeros((naux, n, nbf))
+            if not self.qij_sparse:
+                self.qij = None
+                self.qij = cp.zeros((naux, n, n))
+            for g_atoms, g_sup in sgroups:
+              g_atoms = [a for a in g_atoms if len(atom_ribfs[a])]
+              if not g_atoms:
+                  continue
+              shells = np.unique(self._ao_shell[g_sup])
+              smol, ao = sub_mol_shells(mol, shells)
+              nd = len(ao)
+              Jg = cp.ascontiguousarray(aux_e2_atoms(smol, auxmol, g_atoms))       # (nd, nd, nq)
+              gao = cp.asarray(ao)
+              goff = 0
+              for a in g_atoms:
+                na = len(atom_ribfs[a])
+                J = cp.ascontiguousarray(Jg[:, :, goff:goff + na])
+                goff += na
+                la, pa = ext.lmos[a], ext.paos[a]
+                lj = (self._qij_lmos[a] if self._qij_lmos is not None else la)
+                if na == 0 or (len(la) == 0 and len(lj) == 0):
+                    continue
+                ga_ = cp.asarray(atom_ribfs[a])
+                gla = cp.asarray(la)
+                Lr = L[gao]
+                if len(la):
+                    Ls = Lr[:, gla]
+                    t = cp.matmul(Ls.T, J.reshape(nd, nd * na)).reshape(len(la), nd, na).transpose(2, 0, 1)
+                    if len(pa):
+                        q = cp.matmul(t, P[gao][:, cp.asarray(pa)])            # (na, nl, np)
+                        if self.qia_sparse:
+                            self.qia.set_block(a, q)
+                        else:
+                            self.qia[ga_[:, None, None], gla[None, :, None], cp.asarray(pa)[None, None, :]] = q
+                        del q
+                    if lj is la:
+                        q = cp.matmul(t, Ls)
+                    else:
+                        q = None
+                    del t
+                else:
+                    q = None
+                if q is None and len(lj):
+                    glj = cp.asarray(lj)
+                    Lj = Lr[:, glj]
+                    tj = cp.matmul(Lj.T, J.reshape(nd, nd * na)).reshape(len(lj), nd, na).transpose(2, 0, 1)
+                    q = cp.matmul(tj, Lj)
+                    del tj
+                if q is not None:
+                    glj = cp.asarray(lj)
+                    if self.qij_sparse:
+                        self.qij.set_block(a, q)
+                    else:
+                        self.qij[ga_[:, None, None], glj[None, :, None], glj[None, None, :]] = q
+                    del q
+                if need_ab and not self.qab_direct and len(pa):
+                    gpa = cp.asarray(pa)
+                    Pa = P[gao][:, gpa]
+                    u = cp.matmul(Pa.T, J.reshape(nd, nd * na)).reshape(len(pa), nd, na)
+                    u = cp.matmul(u.transpose(2, 0, 1), Pa)                    # (na, npa, npa)
+                    u *= mask_uv[gpa[:, None], gpa[None, :]][None]
+                    if self.qab_host:
+                        self.qab[a] = to_pinned(u)
+                    elif self._shard is not None:
+                        sh = self._shard
+                        r = int(np.argmin(sh['load']))
+                        sh['load'][r] += u.nbytes
+                        with cp.cuda.Device(sh['devs'][r]):
+                            self.qab[a] = cp.asarray(u)
+                    else:
+                        self.qab[a] = u
+                    del u
                 del J
-                if len(pa):
-                    self.qia.set_block(a, cp.matmul(t, P[gao][:, cp.asarray(pa)]))
-                self.qij.set_block(a, cp.matmul(t, Ls))
-                del t
-            self.ao_screened_build = nd_tot / max(1, natm)
+              del Jg
             groups = []
             # one sub-molecule per aux atom: their screening tables are not reused
             _QCOND.clear()
