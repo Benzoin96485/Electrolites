@@ -319,9 +319,11 @@ class PNOIntsGPU:
                     cc(q_vv[s, :na_, :nv, :nv])]
             vq = [cc(q_jo[s, :na_, :nl]), cc(q_jv[s, :na_, :nv])]
             if self.df_offload:
-                from electrolites.dlpno.devmem import to_pinned
-                vals = [to_pinned(x) for x in vals]
-                vq = [to_pinned(x) for x in vq]
+                # pageable host copies: freed pinned memory is not returned to
+                # the OS (CUDA keeps it for reuse), so the grouped copies the CC
+                # driver makes (pinned) would add to these instead of replacing them
+                vals = [cp.asnumpy(x) for x in vals]
+                vq = [cp.asnumpy(x) for x in vq]
             out['iQk'][p], out['iQa'][p], out['Qma'][p], out['Qab'][p] = vals
             if q != p:
                 out['iQk'][q], out['iQa'][q] = vq

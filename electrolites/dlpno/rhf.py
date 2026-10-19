@@ -239,11 +239,11 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
                 self.K_ivvv[q] = q_jv.T @ q_vv.reshape(na, -1)
             if self.strong[p]:
                 if self.df_offload:
-                    # the strong pairs' DF tensors wait in pinned host memory
-                    from electrolites.dlpno.devmem import to_pinned
-                    q_io, q_iv, q_ov, q_vv = (to_pinned(x) for x in (q_io, q_iv, q_ov, q_vv))
+                    # the strong pairs' DF tensors wait in host memory (pageable:
+                    # released to the OS when the CC driver has grouped them)
+                    q_io, q_iv, q_ov, q_vv = (cp.asnumpy(x) for x in (q_io, q_iv, q_ov, q_vv))
                     if q != p:
-                        q_jo, q_jv = to_pinned(q_jo), to_pinned(q_jv)
+                        q_jo, q_jv = cp.asnumpy(q_jo), cp.asnumpy(q_jv)
                 self.iQk[p], self.iQa[p] = q_io, q_iv
                 self.Qma[p], self.Qab[p] = q_ov, q_vv
                 if q != p:

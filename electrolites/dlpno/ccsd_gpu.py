@@ -67,6 +67,14 @@ def _converged(de, rn, opt):
     return abs(de) < opt['E_CONVERGENCE'] and ok
 
 
+def _malloc_trim():
+    try:
+        import ctypes
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 class _ChunkedPlan:
     """A chain (or dot) plan whose PNO-overlap operands (layout ``LS``) are
     generated on the device per chunk of terms (``ovgen``) instead of being
@@ -767,7 +775,15 @@ class CCSDGPU:
         load = np.zeros(len(self.devs))
         home = cp.cuda.Device().id
         off = getattr(ref, 'df_offload', False)
-        pin = cp.get_default_pinned_memory_pool()
+        dbg = os.environ.get('DLPNO_DEBUG_HOST') == '1'
+
+        def rss():
+            for l_ in open('/proc/self/status'):
+                if l_.startswith('VmRSS'):
+                    return int(l_.split()[1]) / 1e6
+        if dbg:
+            nb0 = sum(x.nbytes for nm in ('Qma', 'Qab', 'iQk', 'iQa') for x in getattr(ref, nm) if x is not None)
+            print(f'[debug] before DF grouping: RSS {rss():.2f} GB, per-pair lists {nb0 / 1e9:.2f} GB (with dups)', flush=True)
         for A, Lp, Vp, mem in chunks:
             g = len(mem)
             # several GPUs: the groups (and their DF tensors) are spread
@@ -776,10 +792,12 @@ class CCSDGPU:
             with cp.cuda.Device(self.devs[r]):
                 self._load_df_group(mem, A, Lp, Vp, g)
             if off:
-                # the released per-pair pinned copies back to the OS: the pinned
-                # pool would keep them (other sizes than the groups'), doubling
-                # the host footprint of the DF tensors
-                pin.free_all_blocks()
+                # the released per-pair host copies back to the OS (the C heap
+                # keeps freed blocks), so that they make room for the groups
+                _malloc_trim()
+        if dbg:
+            left = sum(1 for nm in ('Qma', 'Qab') for x in getattr(ref, nm) if x is not None)
+            print(f'[debug] after DF grouping: RSS {rss():.2f} GB, per-pair arrays left {left}', flush=True)
         if off and getattr(ref, 'verbose', 0) >= 2:
             nb = sum(sum(d[k].nbytes for k in ('Qma', 'Qab', 'Qk', 'Qa')) for d in self.df)
             print(f'[mem] CC DF groups in pinned host memory: {nb / 1e9:.1f} GB', flush=True)
