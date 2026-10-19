@@ -36,9 +36,7 @@ class PNOIntsGPU:
                 self._ext[p] = su.union(self.pao[p], *[self.dom.lmo_paos[k] for k in self.lmos[p]])
         npao = np.array([len(self.pao[p]) for p in canon])
         P = padded(npao)
-        # direct (Q|uv): every chunk evaluates the AO integrals of its aux atoms,
-        # so fewer, larger chunks
-        cap = self.MAX_INT_CHUNK_BYTES * (4 if getattr(self.dfi, 'qab_direct', False) else 1)
+        cap = self.MAX_INT_CHUNK_BYTES
         chunks = []
         for Pv in np.unique(P):
             sel = [p for p, pv in zip(canon, P) if pv == Pv]
