@@ -64,7 +64,7 @@ def _memo_qcond():
                hash(np.asarray(mol._bas).tobytes()), precision, tile, tril, cp.cuda.Device().id)
         r = _QCOND.get(key)
         if r is None:
-            if len(_QCOND) > 64:              # sub-molecules of the AO-screened regions
+            if len(_QCOND) > 16:              # sub-molecules of the AO-screened regions (used once)
                 _QCOND.pop(next(iter(_QCOND)))
             r = _QCOND[key] = orig(mol, rys_envs, precision, tile, tril)
         return r
@@ -785,26 +785,59 @@ class DFInts:
         tot = sum(8. * na[a] * len(u) ** 2 for a, u in needs.items())
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         on_dev = tot < 0.3 * free
-        aosub = None
-        if self._pao_sup is not None and needs:
-            allp = np.unique(np.concatenate([np.asarray(u, np.int64) for u in needs.values()]))
-            ao_used = self._pao_sup[:, allp].any(axis=1)
-            shells = np.unique(self._ao_shell[ao_used])
-            if len(shells) < self.mol.nbas:
-                aosub = sub_mol_shells(self.mol, shells)
+        atoms = [a for a in sorted(needs) if na[a] and len(needs[a])]
+        groups = [(atoms, None)]
+        if self._pao_sup is not None and atoms:
+            groups = self._region_groups(atoms, needs)
         reg = {}
-        for a in sorted(needs):
-            if na[a] == 0 or len(needs[a]) == 0:
-                continue
-            blk, pmap = self._direct_block(a, [needs[a]], cache=False, aosub=aosub)
-            reg[a] = (blk if on_dev else to_pinned(blk), pmap)
-            del blk
+        for g_atoms, aosub in groups:
+            for a in g_atoms:
+                blk, pmap = self._direct_block(a, [needs[a]], cache=False, aosub=aosub)
+                reg[a] = (blk if on_dev else to_pinned(blk), pmap)
+                del blk
         self._regions[dev] = reg
         if verbose >= 2:
-            nd = len(aosub[1]) if aosub is not None else self.mol.nao
+            nds = [len(s[1]) if s is not None else self.mol.nao for _, s in groups]
             print(f'[mem] (Q|uv) region on GPU {dev}: {len(reg)} atoms, {tot / 1e9:.1f} GB on the '
-                  f'{"device" if on_dev else "host"}, {nd} of {self.mol.nao} AOs, '
-                  f'built in {time.perf_counter() - t0:.1f} s', flush=True)
+                  f'{"device" if on_dev else "host"}, {len(groups)} AO domains of {min(nds)}..{max(nds)} '
+                  f'of {self.mol.nao} AOs, built in {time.perf_counter() - t0:.1f} s', flush=True)
+
+    def _region_groups(self, atoms, needs):
+        """the region's aux atoms in groups of neighbours (Morton order), each
+        with the AO shells supporting its atoms' PAOs: the AO integrals and
+        the transformation of an atom run over its group's AO domain instead
+        of the region's (DLPNO_REGION_SPLIT=0: one domain for the region).
+        -> [(atoms, (sub-molecule, AO indices) or None)]"""
+        nbas = self.mol.nbas
+        if getattr(self, '_pao_shsup', None) is None:
+            loc = self.mol.ao_loc_nr()
+            self._pao_shsup = np.ascontiguousarray(
+                np.logical_or.reduceat(self._pao_sup, loc[:-1], axis=0).T)      # (nbf, nbas)
+        sup = {a: self._pao_shsup[np.asarray(needs[a], np.int64)].any(axis=0) for a in atoms}
+        if os.environ.get('DLPNO_REGION_SPLIT', '1') == '0':
+            parts = [atoms]
+        else:
+            order = [atoms[k] for k in self.spatial_order([[a] for a in atoms])]
+            parts, cur, u = [], [], None
+            for a in order:
+                # join the group while its AO domain grows by at most 10%
+                if cur:
+                    v = u | sup[a]
+                    if v.sum() <= 1.1 * max(u.sum(), sup[a].sum()):
+                        cur.append(a)
+                        u = v
+                        continue
+                    parts.append(cur)
+                cur, u = [a], sup[a].copy()
+            parts.append(cur)
+        out = []
+        for g in parts:
+            m = np.zeros(nbas, bool)
+            for a in g:
+                m |= sup[a]
+            shells = np.flatnonzero(m)
+            out.append((sorted(g), sub_mol_shells(self.mol, shells) if len(shells) < nbas else None))
+        return out
 
     def region_end(self):
         dev = cp.cuda.Device().id
@@ -872,12 +905,25 @@ class DFInts:
         def rwork(ctx, region):
             idx, needs = region
             dv = getattr(ctx, 'dfi', None) or self        # this device's view
-            dv.region_begin(needs, verbose)
-            try:
-                for k in idx:
-                    work(ctx, items[k])
-            finally:
-                dv.region_end()
+            dev = cp.cuda.Device().id
+            dv._dev_clear(dev)
+            cp.get_default_memory_pool().free_all_blocks()
+            fr = cp.cuda.runtime.memGetInfo()[0]
+            tot = sum(8. * len(self.atom_ribfs[a]) * len(u) ** 2 for a, u in needs.items())
+            if tot >= 0.3 * fr and len(idx) > 1:
+                # this device has less room than planned: smaller regions kept
+                # on the device rather than one in pinned host memory
+                subs = [([idx[j] for j in si], nd) for si, nd in
+                        self.plan_regions([item_needs[k] for k in idx], 0.25 * fr)]
+            else:
+                subs = [region]
+            for sidx, sneeds in subs:
+                dv.region_begin(sneeds, verbose)
+                try:
+                    for k in sidx:
+                        work(ctx, items[k])
+                finally:
+                    dv.region_end()
         try:
             return mgpu.run_queue(regions, rwork, devs, setup=setup)
         finally:
