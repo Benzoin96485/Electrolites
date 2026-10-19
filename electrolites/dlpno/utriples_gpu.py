@@ -297,8 +297,9 @@ class UTriplesGPU:
         mpdevs = os.environ.get('DLPNO_MP_DEVS')       # testing: e.g. "0,0" on one GPU
         if mpdevs:
             devs = [int(x) for x in mpdevs.split(',')]
-        if getattr(getattr(self, 'dfi', None), 'qia', None) is not None and getattr(self.dfi.qia, 'host', False):
-            return None                 # host (Q|i u) is pinned in this process: threads
+        dfi_ = getattr(self, 'dfi', None)
+        if any(getattr(getattr(dfi_, x, None), 'host', False) for x in ('qia', 'qij')):
+            return None                 # host (Q|i u) / (Q|i j) pinned in this process: threads
         if getattr(getattr(self, 'dfi', None), 'qab_direct', False):
             return None                 # direct (Q|uv): regions of this process, threads
         if (len(devs) > 1 or os.environ.get('DLPNO_MP_FORCE')) and os.environ.get('DLPNO_MP', '1') == '1':

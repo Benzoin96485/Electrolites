@@ -155,10 +155,17 @@ for a compact protein.  Hence the direct (Q|uv) with regions and the host
 (Q|iu): the device then holds ~20 GB of integrals for Trp-cage.
 
 Several GPUs, direct mode: (Gly)20 (143 atoms) 346 s total on 2 GPUs (1555 s
-on one GPU with stored blocks), identical energies; Trp-cage on 2 GPUs:
-LMP2 159 s (the overlaps fit spread over two devices), PNO integrals 2254 s
-(372 regions; the AO integral evaluation dominates: 3467 GPU-s vs 22 s of
-transforms).
+on one GPU with stored blocks), identical energies.
+
+**Trp-cage on one node (4 x A100-80GB)**, DLPNO-CCSD(T0)/def2-SVP, Normal
+PNO, 304 atoms, 2906 basis functions, 36533 pairs (6977 strong), 36791
+triplets: 2301 s post-SCF (SCF 139 s on one GPU).  DF integrals 102 s,
+LMP2 138 s, PNO integrals 1093 s (394 regions, AO integrals dominate),
+LCCSD 497 s (the 83.5 GB of PNO overlaps stored over the four GPUs),
+(T0) 154 + 269 s.  Peak host memory ~200 GB ((Q|iu) 49 GB pinned, DF
+tensors of the strong pairs offloaded).  On one GPU the same run gets
+through the DF integrals and LMP2 but the overlaps (83.5 GB) must be
+regenerated every CC iteration.
 
 ## Known issue
 

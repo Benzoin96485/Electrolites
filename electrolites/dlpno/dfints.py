@@ -286,8 +286,23 @@ class DFInts:
             self.qij_sparse = sparse_ij and 8. * naux * n * n > 0.1 * free_
         else:
             self.qij_sparse = env == '1'
+        # exact alternative: the complete (Q|i j) in pinned host memory, read
+        # zero-copy by the gathers (DLPNO_QIJ_HOST=auto: when the dense tensor
+        # would take more than 10% of the free device memory)
+        envh = os.environ.get('DLPNO_QIJ_HOST', 'auto')
+        if envh == 'auto':
+            free_ = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+            qij_host = 8. * naux * n * n > 0.1 * free_
+        else:
+            qij_host = envh == '1'
+        self._qij_lmos = None
         if self.qij_sparse:
             self.qij = BlockQ(naux, n, n, ribf_atom, atom_ribfs, ext.lmos, ext.lmos)
+        elif qij_host:
+            allm = np.arange(n, dtype=np.int64)
+            self._qij_lmos = [allm] * mol.natm
+            self.qij = BlockQ(naux, n, n, ribf_atom, atom_ribfs, self._qij_lmos, self._qij_lmos, host=True)
+            self.qij_sparse = True          # filled block by block below
         else:
             self.qij = cp.empty((naux, n, n))
         self.qab = [None] * mol.natm
@@ -365,9 +380,10 @@ class DFInts:
                 self.qia[gi] = cp.matmul(t, P)
             if self.qij_sparse:
                 off = 0
+                lm_sets = self._qij_lmos if self._qij_lmos is not None else ext.lmos
                 for a in atoms:
                     na = len(atom_ribfs[a])
-                    la = ext.lmos[a]
+                    la = lm_sets[a]
                     if na and len(la):
                         gla = cp.asarray(la)
                         self.qij.set_block(a, cp.matmul(t[off:off + na][:, gla], L[:, gla]))
