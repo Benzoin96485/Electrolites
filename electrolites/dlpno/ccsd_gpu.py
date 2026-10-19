@@ -574,7 +574,11 @@ class CCSDGPU:
             store = None
             need = float(np.sum(8. * nv[cp_] * nv[cq_]))
             if len(devs) > 1 and mode != '1' and need < sum(per.values()):
-                store = _SStore(ref.orb.S_pao, ref.pao, ref.X, cp_, cq_, nv, devs)
+                # the home device keeps the PNO integrals and the plans: the
+                # store goes to the other devices when they can hold it
+                others = [d for d in devs if d != home]
+                sdevs = others if need < sum(per[d] for d in others) else devs
+                store = _SStore(ref.orb.S_pao, ref.pao, ref.X, cp_, cq_, nv, sdevs)
                 sbud = None
                 cp.cuda.Device(home).use()
             if getattr(ref, 'verbose', 0) >= 2:
