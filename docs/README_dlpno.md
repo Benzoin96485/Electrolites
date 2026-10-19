@@ -171,6 +171,28 @@ LCCSD 497 s (the 83.5 GB of PNO overlaps stored over the four GPUs),
 6.9 GB after the DF integrals ((Q|iu) 49 GB and (Q|ij) 13.7 GB in pinned
 host memory), peak 67.4 GB on the home GPU; host ~205 GB resident.
 
+### Linear alkanes (all-trans CnH2n+2, Normal PNO, (T0))
+
+Riplinger et al., JCP 144, 024109 (2016), Table II (ORCA, one 2012 Xeon
+core): C150H302/def2-TZVP 13.7 h DLPNO-CCSD(T) + 14.9 h RIJCOSX-HF.
+
+| system | basis fns | GPUs | SCF | post-SCF | notes |
+|---|---|---|---|---|---|
+| C50H102 / def2-SVP | 1210 | 1 | 10 s | 60 s | |
+| C100H202 / def2-SVP | 2410 | 1 | 18 s | 162 s | |
+| C150H302 / def2-SVP | 3610 | 2 | 21 s | 327 s | |
+| C150H302 / def2-TZVP | 6462 | 4 | 171 s | **1875 s** | E_corr -28.0121 Eh (paper -27.990) |
+
+What made the chains scale: the DOI grid built on the GPU (the CPU Becke
+partition was 90 s for 450 atoms) and screened per grid block; the DF build
+with AO screening (`DLPNO_DF_SCREEN`: consecutive aux atoms on the union of
+the AO supports of their extended LMOs / PAOs, `DLPNO_AO_CUT` relative
+coefficient cut, default 1e-8); the direct (Q|uv) regions on their AO support
+(chunked over aux shells when an atom's block is large); block-sparse
+(Q|ij).  All exact to the printed digits on C50 / C100 / C150.  In
+C150/def2-TZVP the (T0) dominates (614 + 516 s: the triplet regions still span
+~70% of the AOs at the 1e-8 cut).
+
 ## Known issue
 
 Open-shell (T0): per-triplet energies depend on which triplets are batched
