@@ -282,9 +282,10 @@ def _decide_qia_direct(nbytes, host):
 
 def _qia_placement(nbytes):
     """[(device or None = host, bytes)] holding ``nbytes`` of (Q|iu): the
-    other devices, then the home device, each up to DLPNO_QIA_DEV_FRAC (0.45)
-    of its free memory (DLPNO_QIA_DEV_GB: a fixed size, testing), then the
-    host up to 40% of its available memory; None if that is not enough."""
+    host up to 40% of its available memory, then the other devices and the
+    home device (half share), each up to DLPNO_QIA_DEV_FRAC (0.45) of its
+    free memory (DLPNO_QIA_DEV_GB: a fixed size, testing); None if that is
+    not enough."""
     from electrolites.dlpno import mgpu
     home = cp.cuda.Device().id
     devs = mgpu.devices()
@@ -295,10 +296,11 @@ def _qia_placement(nbytes):
         with cp.cuda.Device(d):
             fr = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         return float(fixed) * 1e9 if fixed else f * fr
-    # the home device keeps the (Q|ij), the DF build and the pair data: it
-    # comes last, with a smaller share
-    place = [(d, cap(d, frac)) for d in devs if d != home]
-    place.append((None, 0.4 * _host_available()))
+    # the host first (device memory sets the region sizes and the stored
+    # overlaps of the LMP2 / CC); the home device keeps the (Q|ij), the DF
+    # build and the pair data: it comes last, with a smaller share
+    place = [(None, 0.4 * _host_available())]
+    place += [(d, cap(d, frac)) for d in devs if d != home]
     place.append((home, cap(home, 0.5 * frac)))
     if sum(c for _, c in place) < 1.05 * nbytes:
         return None
