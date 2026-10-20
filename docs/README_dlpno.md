@@ -182,7 +182,7 @@ core): C150H302/def2-TZVP 13.7 h DLPNO-CCSD(T) + 14.9 h RIJCOSX-HF.
 | C100H202 / def2-SVP | 2410 | 1 | 18 s | 162 s | |
 | C150H302 / def2-SVP | 3610 | 2 | 21 s | 327 s | |
 | C150H302 / def2-TZVP | 6462 | 4 | 171 s | **1076 s** (1875 s before the per-group AO domains) | E_corr -28.0121 Eh (paper -27.990) |
-| C300H602 / def2-TZVP | 12912 | 4 | 291 s | through LCCSD (684 s) | node host memory (235 GB) was the limit, see below |
+| C300H602 / def2-TZVP | 12912 | 4 | 291 s | **2291 s** | E_corr -55.9981 Eh (paper -55.955); paper 31.9 h + 54.5 h HF |
 
 What made the chains scale: the DOI grid built on the GPU (the CPU Becke
 partition was 90 s for 450 atoms) and screened per grid block; the DF build
@@ -204,6 +204,16 @@ pageable (`malloc_trim` while the CC groups them) and the CC groups are
 stored packed in pinned memory (padded on the device per use; C150/TZVP
 40.4 GB instead of 53 GB, host peak 73 GB).  A region that no longer fits
 the device when it starts is split instead of going to pinned memory.
+GPU4PySCF installs its own pinned pool as CuPy's pinned allocator: freeing
+CuPy's default pool releases nothing (`devmem.free_pinned` frees both).
+C300/TZVP timings: DF 135 s, LMP2 88 s, PNO integrals 412 s, CC build 325 s +
+LCCSD 263 s, (T0) 427 + 519 s; host peak 194 GB; the (T0) PNO table is stored
+as back-to-back row blocks and the 8 GB fitting metric is read by peer access.
+
+Direct (Q|iu) (`DLPNO_QIA_DIRECT`): for compact proteins the block-sparse
+(Q|iu) exceeds the host (crambin/def2-SVP: 214 GB); each region then also
+builds its (Q|iu) from the same AO integrals as its (Q|uv) (LMP2 and the crude
+prescreening run through regions too).
 
 ## Known issue
 
