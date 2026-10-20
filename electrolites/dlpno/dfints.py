@@ -914,7 +914,8 @@ class DFInts:
             e0 = np.zeros(0, np.int64)
             bq = BlockQ(self.naux, self.n, self.nbf, self.ribf_atom, self.atom_ribfs,
                         [lneeds[a][0] if a in lneeds else e0 for a in range(natm)],
-                        [lneeds[a][1] if a in lneeds else e0 for a in range(natm)])
+                        [lneeds[a][1] if a in lneeds else e0 for a in range(natm)],
+                        host=not on_dev)
         reg = {}
         for g_atoms, aosub in groups:
             for a in g_atoms:
@@ -1068,7 +1069,7 @@ class DFInts:
             fr = cp.cuda.runtime.memGetInfo()[0]
             tot = sum(8. * len(self.atom_ribfs[a]) * len(u) ** 2 for a, u in needs.items())
             tot += sum(8. * len(self.atom_ribfs[a]) * len(l_) * len(u) for a, (l_, u) in lneeds.items())
-            if tot >= 0.3 * fr and len(idx) > 1:
+            if tot >= 0.3 * fr and len(idx) > 1 and not env:
                 # this device has less room than planned: smaller regions kept
                 # on the device rather than one in pinned host memory
                 subs = [([idx[j] for j in si], nd, ld) for si, nd, ld in
@@ -1142,7 +1143,17 @@ class DFInts:
                 nb -= old.nbytes
             self.cache_stats['miss'] += 1
             self.cache_stats['bytes'] += q.nbytes
-        d = cp.asarray(q)
+        try:
+            d = cp.asarray(q)
+        except cp.cuda.memory.OutOfMemoryError:
+            # the budget was taken while the other device threads still had
+            # their batch temporaries to allocate: drop this device's cache
+            with lock():
+                cache.clear()
+                self._cache_bytes[dev] = nb = 0
+            cp.get_default_memory_pool().free_all_blocks()
+            self.cache_stats['oom_evict'] = self.cache_stats.get('oom_evict', 0) + 1
+            d = cp.asarray(q)
         with lock():
             cache[a] = d
             self._cache_bytes[dev] = nb + d.nbytes
