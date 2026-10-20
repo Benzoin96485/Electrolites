@@ -341,6 +341,38 @@ class LMP2GPU:
         self._run_chunks(self._pair_chunks(self._canon_pairs()), work)
         self.de_pno_total = self.de_pno.sum()
 
+    def sc_pnos(self):
+        """ORCA-style (LMP2_MODE='semicanonical'): semicanonical amplitudes
+        in the full PAO domains, PNOs truncated at the CC thresholds right
+        away (no LMP2 iterations, no recomputed PNOs).  Returns the
+        semicanonical pair energies (full domains); the PNO truncation error
+        of each pair goes to de_pno."""
+        self._prep_dev()
+        opt, pl = self.opt, self.pl
+        npair = len(pl)
+        self.X = [None] * npair
+        self.e_pno = [None] * npair
+        self.K = [None] * npair
+        self.T = [None] * npair
+        self.de_pno = np.zeros(npair)
+        e_sc = np.zeros(npair)
+        self._lag = False
+        pno = (opt['T_CUT_PNO'], opt['T_CUT_TRACE'], opt['T_CUT_ENERGY'])
+
+        def work(w, ch):
+            e_h, res = w._sc_chunk(ch, pno)
+            e_sc[ch] = e_h
+            e_sc[pl.ji[ch]] = e_h
+            for p, X, ep, K, T, de in res:
+                self.de_pno[p] = de
+                self.de_pno[pl.ji[p]] = de
+                self._store_pair(p, X, ep, K, T)
+        self._run_chunks(self._pair_chunks(self._canon_pairs()), work)
+        self.de_pno_total = self.de_pno.sum()
+        self.e_lmp2 = float(e_sc.sum() - self.de_pno_total)
+        self.de_weak = 0.
+        return e_sc
+
     # ------------------------------------------------------------------
     def lmp2_iterations(self):
         opt, pl = self.opt, self.pl

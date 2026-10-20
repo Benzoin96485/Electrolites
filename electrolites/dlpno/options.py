@@ -45,6 +45,16 @@ DEFAULTS = dict(
     LOCAL_CONVERGENCE=1e-12,
     # DOI grid (radial, angular) -- Psi4 uses 25 radial x 50 Lebedev
     DOI_GRID=(25, 50),
+    # 'iterative' (Psi4: LMP2 iterations, PNOs recomputed from the LMP2
+    # amplitudes) or 'semicanonical' (ORCA: CC PNOs and pair classes from the
+    # semicanonical amplitudes)
+    LMP2_MODE='iterative',
+    # fitting-domain cut of the crude prescreening (None: 100 x T_CUT_MKN, Psi4)
+    T_CUT_MKN_PRE=None,
+    # ORCA-compatible truncation (ORCA 6.1 NormalPNO etc.): no PNO trace /
+    # energy completeness criteria, semicanonical PNOs, crude-prescreening
+    # fitting domains at 10 x T_CUT_MKN
+    ORCA_COMPAT=False,
 )
 
 PRESETS = {
@@ -77,7 +87,12 @@ def make_options(pno='normal', **overrides):
     if unknown:
         raise KeyError(f'unknown DLPNO option(s) {sorted(unknown)}')
     user_pre = 'T_CUT_PRE' in overrides
+    if overrides.get('ORCA_COMPAT'):
+        opt.update(T_CUT_TRACE=0., T_CUT_ENERGY=0., T_CUT_TRACE_MP2=0., T_CUT_ENERGY_MP2=0.,
+                   LMP2_MODE='semicanonical', T_CUT_MKN_PRE=10 * opt['T_CUT_MKN'])
     opt.update(overrides)
+    if opt['T_CUT_MKN_PRE'] is None:
+        opt['T_CUT_MKN_PRE'] = 100 * opt['T_CUT_MKN']
     if not user_pre:
         opt['T_CUT_PRE'] = min(DEFAULTS['T_CUT_PRE'], 0.01 * opt['T_CUT_PAIRS'])
     if opt['T_CUT_PAIRS_MP2'] is None:

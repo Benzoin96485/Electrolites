@@ -956,7 +956,7 @@ class RefDLPNO:
         self.de_dipole = float(np.sum(self.dip_e[~mask]))
         t = time.perf_counter()
         # crude prescreening
-        self.set_pairs(mask, self.domains(opt['T_CUT_MKN'] * 100, opt['T_CUT_DO'] * 2))
+        self.set_pairs(mask, self.domains(opt['T_CUT_MKN_PRE'], opt['T_CUT_DO'] * 2))
         e_crude = self.sc_mp2_pair_energies()
         keep = np.zeros((n, n), bool)
         self.de_lmp2_eliminated = 0.
@@ -968,15 +968,22 @@ class RefDLPNO:
         t = self._tick('crude_prescreen', t)
         # refined prescreening
         self.set_pairs(keep, self.domains(opt['T_CUT_MKN'], opt['T_CUT_DO']))
-        self.lmp2_pnos()
-        e_ij = self.lmp2_iterations()
+        semi = opt['LMP2_MODE'] == 'semicanonical'
+        if semi:
+            # ORCA: no LMP2 iterations; the CC PNOs come straight from the
+            # semicanonical amplitudes, pairs classified by those energies
+            e_ij = self.sc_pnos()
+        else:
+            self.lmp2_pnos()
+            e_ij = self.lmp2_iterations()
         pl = self.pl
         self.strong = np.array([abs(e_ij[p]) >= opt['T_CUT_PAIRS'] or i == j
                                 for p, (i, j) in enumerate(pl.pairs)])
         self.e['lmp2'] = (self.e_lmp2 + self.de_lmp2_eliminated + self.de_dipole
                           + self.de_pno_total)
         t = self._tick('lmp2', t)
-        self.recompute_pnos()
+        if not semi:
+            self.recompute_pnos()
         self.pno_integrals()
         t = self._tick('pno_ints', t)
         self.lccsd_iterations()

@@ -1171,7 +1171,10 @@ class DFInts:
         c = np.array([xyz[np.asarray(a, np.int64)].mean(axis=0) if len(a) else np.zeros(3)
                       for a in atom_sets])
         lo, hi = c.min(axis=0), c.max(axis=0)
-        q = ((c - lo) / np.maximum(hi - lo, 1e-9) * 1023).astype(np.int64)
+        # one scale for all axes: a dimension with a tiny extent (a planar
+        # zig-zag chain) would otherwise get the full bit range and its two
+        # levels would split the order into far-apart halves
+        q = ((c - lo) / max(float((hi - lo).max()), 1e-9) * 1023).astype(np.int64)
         code = np.zeros(len(c), np.int64)
         for bit in range(10):
             for d in range(3):
