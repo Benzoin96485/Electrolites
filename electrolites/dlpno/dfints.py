@@ -392,15 +392,26 @@ class QabDiskStore:
             g_atoms, aosub = job
             for a in g_atoms:
                 rows, cols = self.rows[a], self.cols[a]
-                blk, _, _, _ = dv._direct_rect(a, rows, None if cols is rows else cols, cache=False, aosub=aosub)
-                h = cp.asnumpy(cp.ascontiguousarray(blk.transpose(1, 0, 2)))     # (rows, aux, cols)
-                del blk
+                na_ = len(dfi.atom_ribfs[a])
+                # rows in pieces when the block (and its transposed copy) would
+                # not fit next to what the device already holds; each piece
+                # re-evaluates the atom's AO integrals
+                fr = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+                full = 8. * na_ * len(rows) * len(cols)
+                npc = max(1, int(np.ceil(2.5 * full / (0.5 * fr))), int(os.environ.get('DLPNO_DISK_ROWPIECES', 1)))
                 p = os.path.join(self.dir, f'a{a}.bin')
-                h.tofile(p)
-                self.shape[a] = h.shape
+                with open(p, 'wb') as fh:
+                    for rr in np.array_split(rows, npc):
+                        sq = cols is rows and npc == 1
+                        blk, _, _, _ = dv._direct_rect(a, rr, None if sq else cols, cache=False, aosub=aosub)
+                        h = cp.asnumpy(cp.ascontiguousarray(blk.transpose(1, 0, 2)))     # (rows, aux, cols)
+                        del blk
+                        cp.get_default_memory_pool().free_all_blocks()
+                        h.tofile(fh)
+                        nbytes[0] += h.nbytes
+                        del h
+                self.shape[a] = (len(rows), na_, len(cols))
                 self.path[a] = p
-                nbytes[0] += h.nbytes
-                del h
         try:
             mgpu.run_queue(jobs, bwork, devs, setup=setup)
         except BaseException:
