@@ -457,7 +457,7 @@ class DFInts:
             if os.environ.get('V', '0') >= '2' or os.environ.get('DLPNO_VERBOSE_MEM') == '1':
                 print(f'[mem] (Q|iu) block-sparse {nb_ia / 1e9:.1f} GB (dense {8e-9 * naux * n * nbf:.1f} GB), '
                       f'(Q|ij) block-sparse {8e-9 * float(np.sum(na_ * nl_ * nl_)):.1f} GB '
-                      f'(dense {8e-9 * naux * n * n:.1f} GB), naux {naux}, LMOs {n}, '
+                      f'(dense {8e-9 * naux * n * n:.1f} GB), (Q|uv) extended {8e-9 * float(np.sum(na_ * np_.astype(np.float64) ** 2)):.1f} GB, naux {naux}, LMOs {n}, '
                       f'host available {_host_available() / 1e9:.1f} GB', flush=True)
             host_ia = _decide_qia_host(nb_ia)
             # closed shell: too large for the host as well -> spread over the

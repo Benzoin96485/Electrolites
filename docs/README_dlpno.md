@@ -215,6 +215,20 @@ Direct (Q|iu) (`DLPNO_QIA_DIRECT`): for compact proteins the block-sparse
 builds its (Q|iu) from the same AO integrals as its (Q|uv) (LMP2 and the crude
 prescreening run through regions too).
 
+### Extended-domain integrals of compact proteins
+
+The (ik|ac), (ia|kc) integrals with a in the PNOs of ij and c in those of kj
+need (Q|uv) with v over the extended domain of ij.  For crambin/def2-SVP the
+stored extended blocks would be 2.16 TB, and the direct regions recompute the
+AO integrals of each aux atom ~50 times (1715 PNO-integral regions).  Tried
+(2026-10-20): evaluating them in the PNOs of ij and projecting c onto the
+PNOs of kj by the PNO overlap (no extended domain).  Exact in the complete-PNO
+limit (C4H10, identical to 1e-10), but with Normal PNOs the projection loses
+the parts of the kj PNOs outside the ij PNO space: C50H102/def2-TZVP CCSD
+-9.1520 vs -9.0114 Eh (140 mEh).  Not usable; patch kept in
+`_el_jobs/dlpno/proj_pno_experiment.patch`.  ORCA evaluates these integrals in
+the extended domains as well (its PNO-integral step streams them from disk).
+
 ## Known issue
 
 Open-shell (T0): per-triplet energies depend on which triplets are batched
