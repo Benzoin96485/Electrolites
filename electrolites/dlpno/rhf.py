@@ -269,4 +269,15 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
         self.cc = cc = None
         import gc
         gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
+        # the CC stores (PNO overlaps, DF groups) lived on every device
+        from electrolites.dlpno import mgpu
+        from electrolites.dlpno.devmem import free_pinned
+        free_pinned()                    # the packed DF groups (pinned)
+        used = {}
+        for d in mgpu.devices():
+            with cp.cuda.Device(d):
+                cp.get_default_memory_pool().free_all_blocks()
+                fr, tot = cp.cuda.runtime.memGetInfo()
+                used[d] = round((tot - fr) / 1e9, 1)
+        if self.verbose >= 2:
+            print('[mem] device GB in use after the CC:', used, flush=True)

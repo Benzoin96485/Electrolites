@@ -161,6 +161,9 @@ class TriplesGPU:
             T1[i, :len(self.T1[i])] = self.T1[i]
         self._pt = dict(VP=VP, PP=PP, X=cp.asarray(Xp), dom=cp.asarray(dom),
                         dmk=cp.asarray(dmk), T=Tp_d, D=Dp, T1=cp.asarray(T1))
+        if getattr(self, 'verbose', 0) >= 2:
+            print(f'[mem] (T) pair table: {npair} pairs padded to {PP} PAOs x {VP} PNOs, '
+                  f'{(Xp.nbytes + 2 * Tp.nbytes) / 1e9:.1f} GB on the home device', flush=True)
 
     def _project(self, Z, bidx, pidx):
         """S(a_t, a_p)^T = X_p^T S_pao[d_p, d_t] X_t for couples (b, p),
@@ -308,10 +311,20 @@ class TriplesGPU:
         return float(self.e_ijk.sum())
 
     def _dev_view(self):
-        """this object with its device tables on the current device."""
+        """this object with its device tables on the current device.  The
+        padded PNO table of all pairs (``_pt['X']``, the largest) is read from
+        the home device by the pointer-batched GEMMs (peer access) instead of
+        being copied to every device."""
         from electrolites.dlpno import mgpu
-        return mgpu.device_view(self, ('_pt', 'S_pao_d', 'F_pao_d'),
-                                sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'C_lmo_d', 'mask_uv_d')})
+        v = mgpu.device_view(self, ('S_pao_d', 'F_pao_d'),
+                             sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'C_lmo_d', 'mask_uv_d')})
+        pt = getattr(self, '_pt', None)
+        if pt is not None and isinstance(pt.get('X'), cp.ndarray) and pt['X'].device.id != cp.cuda.Device().id:
+            mgpu.enable_peer(mgpu.devices())
+            v._pt = {k: (x if k == 'X' else mgpu.replicate(x)) for k, x in pt.items()}
+        else:
+            v._pt = pt
+        return v
 
     def _t0_item(self, Pv, ch, save):
         nbf = self.orb.nbf

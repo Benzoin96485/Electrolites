@@ -255,7 +255,8 @@ def _mp_worker(dev, ctrl, tasks, results, warm):
             ctx = work = None
             gc.collect()
             pool.free_all_blocks()
-            cp_.get_default_pinned_memory_pool().free_all_blocks()
+            from electrolites.dlpno.devmem import free_pinned
+            free_pinned()
             results.put(('done', dev, None))
 
 

@@ -24,6 +24,18 @@ def pooled():
         pool.free_all_blocks()
 
 
+def free_pinned():
+    """return the cached free pinned blocks to the OS.  GPU4PySCF installs its
+    own pinned pool (``gpu4pyscf.lib.cupy_helper.pinned_memory_pool``) as the
+    allocator, so freeing CuPy's default pool alone releases nothing."""
+    cp.get_default_pinned_memory_pool().free_all_blocks()
+    try:
+        from gpu4pyscf.lib import cupy_helper
+        cupy_helper.pinned_memory_pool.free_all_blocks()
+    except (ImportError, AttributeError):
+        pass
+
+
 def pinned_empty(shape, dtype=np.float64):
     """numpy array in page-locked host memory (fast, asynchronous H2D)."""
     n = int(np.prod(shape))

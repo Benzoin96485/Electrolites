@@ -999,7 +999,8 @@ class DFInts:
         gc.collect()
         # pinned blocks back to the OS (the pinned pool would keep them, and the
         # next region's blocks have other sizes); this device's pool too
-        cp.get_default_pinned_memory_pool().free_all_blocks()
+        from electrolites.dlpno.devmem import free_pinned
+        free_pinned()
         cp.get_default_memory_pool().free_all_blocks()
 
     def _dev_clear(self, dev):
