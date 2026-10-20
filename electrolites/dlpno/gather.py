@@ -9,7 +9,7 @@ import numpy as np
 import cupy as cp
 
 _SRC = r'''
-extern "C" __global__ void gather_blocks(const double* __restrict__ qa, const long long N,
+extern "C" __global__ void gather_blocks(const double* __restrict__ qa, const long long N1, const long long N,
                                          const int* __restrict__ rpos, const int* __restrict__ cpos,
                                          const double* __restrict__ rmask, const double* __restrict__ cmask,
                                          double* __restrict__ out, const int nq, const int R, const int C,
@@ -28,7 +28,7 @@ extern "C" __global__ void gather_blocks(const double* __restrict__ qa, const lo
         for (int v = threadIdx.x; v < C; v += blockDim.x) o[v] = 0.;
         return;
     }
-    const double* src = qa + ((long long)q * N + rpos[(long long)b * R + u]) * N;
+    const double* src = qa + ((long long)q * N1 + rpos[(long long)b * R + u]) * N;
     const int* cp_ = cpos + (long long)b * C;
     const double* cm = cmask + (long long)b * C;
     for (int v = threadIdx.x; v < C; v += blockDim.x)
@@ -39,14 +39,14 @@ _k = None
 
 
 def blocks(qa, rpos, cpos, rmask, cmask, out=None, ru=False):
-    """qa (nq, N, N) device; rpos (b, R), cpos (b, C) int positions (any
+    """qa (nq, N1, N) device (rows, columns); rpos (b, R), cpos (b, C) int positions (any
     value where the mask is 0); masks float (b, R), (b, C).  ``ru``: output
     (b, R, nq, C) (row index ahead of the aux index)."""
     global _k
     if _k is None:
         _k = cp.RawKernel(_SRC, 'gather_blocks')
     qa = cp.ascontiguousarray(qa)
-    nq, N = qa.shape[0], qa.shape[1]
+    nq, N1, N = qa.shape
     b, R = rpos.shape
     C = cpos.shape[1]
     if out is None:
@@ -56,7 +56,7 @@ def blocks(qa, rpos, cpos, rmask, cmask, out=None, ru=False):
     rp = cp.ascontiguousarray(cp.where(rmask > 0, rpos, 0).astype(cp.int32))
     cq = cp.ascontiguousarray(cp.where(cmask > 0, cpos, 0).astype(cp.int32))
     nt = 128 if C <= 128 else 256
-    _k((b * nq * R,), (nt,), (qa, np.int64(N), rp, cq, cp.ascontiguousarray(rmask, dtype=cp.float64),
+    _k((b * nq * R,), (nt,), (qa, np.int64(N1), np.int64(N), rp, cq, cp.ascontiguousarray(rmask, dtype=cp.float64),
                              cp.ascontiguousarray(cmask, dtype=cp.float64), out,
                              np.int32(nq), np.int32(R), np.int32(C), np.int32(1 if ru else 0)))
     return out

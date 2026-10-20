@@ -95,17 +95,22 @@ class PNOIntsGPU:
             order = self.dfi.spatial_order([np.unique(np.concatenate([self.riatoms[p] for p in c[0]]))
                                             for c in chunks])
             chunks = [chunks[k] for k in order]
+            # (Q_a|uv) blocks: rows over the pair PAOs, columns over the pair
+            # PAOs and, strong pairs, their extended domains (rectangular:
+            # the extended x extended part is never read)
             needs, lneeds = [], []
             for ch, _ in chunks:
-                nd, ld = {}, {}
+                nr, nc, ld = {}, {}, {}
                 for p in ch:
                     u = self.pao[p] if not self.strong[p] else np.union1d(self.pao[p], self._ext[p])
                     lm = np.concatenate([np.asarray(self.pl.pairs[p], np.int64), self.lmos[p]])
                     for a in self.riatoms[p]:
-                        nd.setdefault(int(a), []).append(u)
+                        nr.setdefault(int(a), []).append(self.pao[p])
+                        nc.setdefault(int(a), []).append(u)
                         ld.setdefault(int(a), []).append(lm)
-                needs.append({a: np.concatenate(v) for a, v in nd.items()})
-                lneeds.append({a: (np.concatenate(ld[a]), needs[-1][a]) for a in nd})
+                needs.append({a: (np.unique(np.concatenate(nr[a])), np.unique(np.concatenate(nc[a])))
+                              for a in nr})
+                lneeds.append({a: (np.concatenate(ld[a]), needs[-1][a][1]) for a in nr})
             ctxs = self.dfi.run_regions(chunks, needs, work, setup, devs, getattr(self, 'verbose', 0),
                                         item_lneeds=lneeds)
         else:
@@ -235,11 +240,12 @@ class PNOIntsGPU:
             rows = np.array([r for r in range(B) if a in offs[r]], np.int64)
             off = np.array([offs[r][a] for r in rows], np.int64)
             need = [pidx[rows][pm[rows] > 0]]
+            cols = list(need)
             if ns:
                 sr_ = srank[rows[st[rows]]]
-                need.append(eidx[sr_][emk[sr_] > 0])
+                cols.append(eidx[sr_][emk[sr_] > 0])
             prof('qab_get')
-            qa, pmap = dfi.qab_block(a, need)
+            qa, pmap, cmap = dfi.qab_block_rect(a, need, cols)
             prof('vv')
             if qa is None:
                 continue
@@ -247,13 +253,15 @@ class PNOIntsGPU:
             pos = pmap[pidx[rows]]
             pos = np.where(pm[rows] > 0, pos, 0)
             assert (pos >= 0).all(), 'pair PAO outside the extended domain'
-            gr, gpos = cp.asarray(rows), cp.asarray(pos)
+            cpos = cmap[pidx[rows]]
+            cpos = np.where(pm[rows] > 0, cpos, 0)
+            gr, gpos, gcpos = cp.asarray(rows), cp.asarray(pos), cp.asarray(cpos)
             step = max(1, int((1 << 28) // (8 * na * P * P)))
             for r0 in range(0, len(rows), step):
                 sl = slice(r0, r0 + step)
                 g_ = gr[sl]
                 # (b, u, q, v) layout: both contractions are single large GEMMs
-                blk = gather_blocks(qa, gpos[sl], gpos[sl], gpm[g_], gpm[g_], ru=True)
+                blk = gather_blocks(qa, gpos[sl], gcpos[sl], gpm[g_], gpm[g_], ru=True)
                 b_ = blk.shape[0]
                 xr = X[g_]
                 Y = cp.matmul(_tr(xr), blk.reshape(b_, P, na * P))                  # (b, V, na*P)
@@ -270,7 +278,7 @@ class PNOIntsGPU:
             sr = srank[srows]
             ppos = pmap[pidx[srows]]
             ppos = np.where(pm[srows] > 0, ppos, 0)
-            epos = pmap[eidx[sr]]
+            epos = cmap[eidx[sr]]
             epos = np.where(emk[sr] > 0, epos, 0)
             assert (epos >= 0).all(), 'extended PAO outside the aux atom domain'
             gsr, gpp, gep, gsr2 = cp.asarray(srows), cp.asarray(ppos), cp.asarray(epos), cp.asarray(sr)

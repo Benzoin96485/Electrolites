@@ -288,15 +288,18 @@ def _qia_placement(nbytes):
     from electrolites.dlpno import mgpu
     home = cp.cuda.Device().id
     devs = mgpu.devices()
-    order = [d for d in devs if d != home] + [home]
     frac = float(os.environ.get('DLPNO_QIA_DEV_FRAC', '0.45'))
     fixed = os.environ.get('DLPNO_QIA_DEV_GB')
-    place = []
-    for d in order:
+
+    def cap(d, f):
         with cp.cuda.Device(d):
             fr = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        place.append((d, float(fixed) * 1e9 if fixed else frac * fr))
+        return float(fixed) * 1e9 if fixed else f * fr
+    # the home device keeps the (Q|ij), the DF build and the pair data: it
+    # comes last, with a smaller share
+    place = [(d, cap(d, frac)) for d in devs if d != home]
     place.append((None, 0.4 * _host_available()))
+    place.append((home, cap(home, 0.5 * frac)))
     if sum(c for _, c in place) < 1.05 * nbytes:
         return None
     if len(devs) > 1:
@@ -813,24 +816,57 @@ class DFInts:
         reg = getattr(self, '_regions', None)
         reg = reg.get(cp.cuda.Device().id) if reg else None
         if reg is not None and a in reg:
-            blk, pmap = reg[a]
-            return self._region_dev(a, blk), pmap
+            blk, rmap, cmap = reg[a]
+            assert rmap is cmap, 'rectangular region block read as square'
+            return self._region_dev(a, blk), rmap
         return self._direct_block(a, need)
+
+    def qab_block_rect(self, a, rows, cols):
+        """(Q_a|uv) for u in the PAOs ``rows``, v in ``cols`` (index arrays
+        or iterables of them): (block, row map, column map); stored blocks:
+        the extended-domain block with its map for both.  Direct mode: only
+        the rectangle is evaluated (columns may extend far beyond the rows,
+        e.g. the extended domains of the PNO integrals)."""
+        if not self.qab_direct:
+            m = self.ext.pao_pos[a]
+            return self.qab_get(a), m, m
+        reg = getattr(self, '_regions', None)
+        reg = reg.get(cp.cuda.Device().id) if reg else None
+        if reg is not None and a in reg:
+            blk, rmap, cmap = reg[a]
+            return self._region_dev(a, blk), rmap, cmap
+        out, rmap, cmap, _ = self._direct_rect(a, rows, cols)
+        return out, rmap, cmap
 
     def _direct_block(self, a, need, cache=True, aosub=None, iu=None):
         """(Q_a|uv) over the PAOs ``need`` and its PAO -> position map, from the
         AO integrals of aux atom ``a`` (over the AO domain ``aosub`` when
         given).  With ``iu`` = (LMOs, PAOs) also (Q_a|i u) over them, from the
         same AO integrals: returns (uv block, map, iu block) then."""
+        out, rmap, _, oiu = self._direct_rect(a, need, None, cache, aosub, iu)
+        return (out, rmap) if iu is None else (out, rmap, oiu)
+
+    @staticmethod
+    def _union(x):
+        if isinstance(x, np.ndarray):
+            x = [x]
+        x = [np.asarray(v, np.int64).ravel() for v in x]
+        return np.unique(np.concatenate(x)) if x else np.zeros(0, np.int64)
+
+    def _direct_rect(self, a, need, cols=None, cache=True, aosub=None, iu=None):
+        """(Q_a|uv), u in ``need``, v in ``cols`` (None: square over ``need``):
+        (block, row map, column map, (Q_a|iu) block or None)."""
         na = len(self.atom_ribfs[a])
-        need = [np.asarray(x, np.int64).ravel() for x in need]
-        need = np.unique(np.concatenate(need)) if need else np.zeros(0, np.int64)
-        m = len(need)
+        need = self._union(need)
+        square = cols is None
+        colv = need if square else self._union(cols)
+        m, mc = len(need), len(colv)
         if na == 0 or (m == 0 and iu is None):
-            return (None, None) if iu is None else (None, None, None)
+            return None, None, None, None
         import time
         t0 = time.perf_counter()
         gn = cp.asarray(need)
+        gc = gn if square else cp.asarray(colv)
         if aosub is not None:
             smol, ao = aosub
             gao = cp.asarray(ao)
@@ -839,6 +875,7 @@ class DFInts:
         else:
             smol, gao, Cp, nd = self.mol, None, self.C_pao_d, self.mol.nao
         Pn = Cp[:, gn] if m else None
+        Pc = Pn if square else (Cp[:, gc] if mc else None)
         nl = mi = 0
         if iu is not None:
             li, pi = (np.asarray(x, np.int64) for x in iu)
@@ -847,12 +884,13 @@ class DFInts:
             nl, mi = len(li), len(pi)
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         # J column + the transforms of one aux function
-        per_q = 8. * (nd * nd + m * nd + m * m + nl * nd + nl * mi)
+        per_q = 8. * (nd * nd + m * nd + m * mc + nl * nd + nl * mi)
         lim = min(1.5e9, 0.1 * free)
         if os.environ.get('DLPNO_AUXCHUNK_GB'):           # testing
             lim = float(os.environ['DLPNO_AUXCHUNK_GB']) * 1e9
-        if na * per_q > lim and aosub is not None:
-            # large AO domains (triple zeta): the atom's aux shells in chunks
+        if na * per_q > lim and not (aosub is None and cache):
+            # large AO domains (triple zeta, compact molecules): the atom's aux
+            # shells in chunks
             _memo_qcond()
             shl = np.flatnonzero(self.auxmol._bas[:, gto.ATOM_OF] == a)
             aloc = self.auxmol.ao_loc_nr()
@@ -868,7 +906,7 @@ class DFInts:
                 chunks.append(cur)
         else:
             chunks = [None]
-        out = cp.empty((na, m, m)) if m else None
+        out = cp.empty((na, m, mc)) if m else None
         oiu = cp.empty((na, nl, mi)) if iu is not None else None
         t_tr, q0 = 0., 0
         for ch in chunks:
@@ -883,7 +921,7 @@ class DFInts:
             t1 = time.perf_counter()
             if m:
                 uc = cp.matmul(Pn.T, Jc.reshape(nd, nd * nc)).reshape(m, nd, nc)
-                out[q0:q0 + nc] = cp.matmul(uc.transpose(2, 0, 1), Pn)
+                out[q0:q0 + nc] = cp.matmul(uc.transpose(2, 0, 1), Pc)
                 del uc
             if iu is not None and nl and mi:
                 tc = cp.matmul(Ls.T, Jc.reshape(nd, nd * nc)).reshape(nl, nd, nc)
@@ -895,11 +933,16 @@ class DFInts:
             q0 += nc
             t_tr += time.perf_counter() - t1
         assert q0 == na
-        pmap = None
+        pmap = cmap = None
         if m:
-            out *= self.mask_uv_d[gn[:, None], gn[None, :]][None]
+            out *= self.mask_uv_d[gn[:, None], gc[None, :]][None]
             pmap = -np.ones(self.nbf, np.int64)
             pmap[need] = np.arange(m)
+            if square:
+                cmap = pmap
+            else:
+                cmap = -np.ones(self.nbf, np.int64)
+                cmap[colv] = np.arange(mc)
         st = self.cache_stats
         st['direct'] = st.get('direct', 0) + 1
         st['direct_m'] = st.get('direct_m', 0) + m
@@ -908,16 +951,17 @@ class DFInts:
         tt = time.perf_counter() - t0
         st['t_ao'] = st.get('t_ao', 0.) + (tt - t_tr)
         st['t_tr'] = st.get('t_tr', 0.) + t_tr
-        return (out, pmap) if iu is None else (out, pmap, oiu)
+        return out, pmap, cmap, oiu
 
     # ---- regions: direct (Q|uv) evaluated once per atom for a group of batches
     def plan_regions(self, item_needs, budget, item_lneeds=None):
         """split items (in order) into regions: consecutive items whose
         (Q_a|uv) blocks over the union of their PAOs per atom (and, direct
         (Q|iu), (Q_a|i u) blocks over the union of their LMOs x PAOs) stay
-        within ``budget`` bytes.  item_needs[k]: {atom: PAO index array};
-        item_lneeds[k]: {atom: (LMO index array, PAO index array)}.  Returns
-        [(item indices, {atom: PAOs}, {atom: (LMOs, PAOs)})]."""
+        within ``budget`` bytes.  item_needs[k]: {atom: PAO index array, or
+        (row PAOs, column PAOs) for a rectangular block}; item_lneeds[k]:
+        {atom: (LMO index array, PAO index array)}.  Returns
+        [(item indices, {atom: PAOs or (rows, columns)}, {atom: (LMOs, PAOs)})]."""
         natm, nbf, n = len(self.atom_ribfs), self.nbf, self.n
         na = np.array([len(self.atom_ribfs[a]) for a in range(natm)], np.float64)
         if item_lneeds is None:
@@ -931,17 +975,22 @@ class DFInts:
             r = R()
             r.items, r.tot = [], 0.
             r.pm, r.pc = np.zeros((natm, nbf), bool), np.zeros(natm, np.int64)
+            r.cm, r.cc = np.zeros((natm, nbf), bool), np.zeros(natm, np.int64)
             r.lm, r.qm = np.zeros((natm, n), bool), np.zeros((natm, nbf), bool)
             r.lc, r.qc = np.zeros(natm, np.int64), np.zeros(natm, np.int64)
             return r
 
         def grow(r, nd, ld):
             """rows to add and the new total."""
-            addp, addl, addq = {}, {}, {}
+            addp, addc, addl, addq = {}, {}, {}, {}
             for a, u in nd.items():
+                ur, uc = u if isinstance(u, tuple) else (u, u)
                 m = addp[a] if a in addp else r.pm[a].copy()
-                m[np.asarray(u, np.int64)] = True
+                m[np.asarray(ur, np.int64)] = True
                 addp[a] = m
+                m = addc[a] if a in addc else r.cm[a].copy()
+                m[np.asarray(uc, np.int64)] = True
+                addc[a] = m
             for a, (l_, u) in ld.items():
                 m = addl[a] if a in addl else r.lm[a].copy()
                 m[np.asarray(l_, np.int64)] = True
@@ -949,25 +998,31 @@ class DFInts:
                 m = addq[a] if a in addq else r.qm[a].copy()
                 m[np.asarray(u, np.int64)] = True
                 addq[a] = m
-            new = r.tot + sum(8. * na[a] * (int(m.sum()) ** 2 - int(r.pc[a]) ** 2) for a, m in addp.items())
+            new = r.tot + sum(8. * na[a] * (int(m.sum()) * int(addc[a].sum()) - int(r.pc[a]) * int(r.cc[a]))
+                              for a, m in addp.items())
             for a in addl:
                 lc, qc = int(addl[a].sum()), int(addq[a].sum())
                 new += 8. * na[a] * (lc * qc - int(r.lc[a]) * int(r.qc[a]))
-            return addp, addl, addq, new
+            return addp, addc, addl, addq, new
 
         def close(r):
-            nd = {a: np.flatnonzero(r.pm[a]) for a in range(natm) if r.pc[a]}
+            nd = {}
+            for a in range(natm):
+                if r.pc[a]:
+                    rows = np.flatnonzero(r.pm[a])
+                    nd[a] = rows if np.array_equal(r.pm[a], r.cm[a]) else (rows, np.flatnonzero(r.cm[a]))
             ld = {a: (np.flatnonzero(r.lm[a]), np.flatnonzero(r.qm[a])) for a in range(natm) if r.lc[a]}
             regions.append((r.items, nd, ld))
         r = fresh()
         for k, (nd, ld) in enumerate(zip(item_needs, item_lneeds)):
-            addp, addl, addq, new = grow(r, nd, ld)
+            addp, addc, addl, addq, new = grow(r, nd, ld)
             if r.items and new > budget:
                 close(r)
                 r = fresh()
-                addp, addl, addq, new = grow(r, nd, ld)
+                addp, addc, addl, addq, new = grow(r, nd, ld)
             for a, m in addp.items():
                 r.pm[a], r.pc[a] = m, int(m.sum())
+                r.cm[a], r.cc[a] = addc[a], int(addc[a].sum())
             for a in addl:
                 r.lm[a], r.lc[a] = addl[a], int(addl[a].sum())
                 r.qm[a], r.qc[a] = addq[a], int(addq[a].sum())
@@ -976,6 +1031,13 @@ class DFInts:
         if r.items:
             close(r)
         return regions
+
+    @staticmethod
+    def _need_bytes(na, u):
+        """bytes of a region block over ``u`` (PAOs, or (rows, columns))."""
+        if isinstance(u, tuple):
+            return 8. * na * len(u[0]) * len(u[1])
+        return 8. * na * len(u) ** 2
 
     def region_begin(self, needs, verbose=0, lneeds=None):
         """(Q_a|uv) over needs[a] for every atom a, on the current device, each
@@ -991,11 +1053,11 @@ class DFInts:
         lneeds = lneeds or {}
         allat = set(needs) | set(lneeds)
         na = {a: len(self.atom_ribfs[a]) for a in allat}
-        tot = sum(8. * na[a] * len(u) ** 2 for a, u in needs.items())
+        tot = sum(self._need_bytes(na[a], u) for a, u in needs.items())
         tot_iu = sum(8. * na[a] * len(l_) * len(u) for a, (l_, u) in lneeds.items())
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         on_dev = tot + tot_iu < 0.3 * free and os.environ.get('DLPNO_REGION_HOST') != '1'   # testing
-        atoms = [a for a in sorted(allat) if na[a] and (len(needs.get(a, ())) or a in lneeds)]
+        atoms = [a for a in sorted(allat) if na[a] and (a in needs or a in lneeds)]
         groups = [(atoms, None)]
         if self._pao_sup is not None and atoms:
             groups = self._region_groups(atoms, needs, lneeds)
@@ -1010,15 +1072,15 @@ class DFInts:
         reg = {}
         for g_atoms, aosub in groups:
             for a in g_atoms:
-                nd = [needs[a]] if a in needs else []
-                if a in lneeds:
-                    blk, pmap, qiu = self._direct_block(a, nd, cache=False, aosub=aosub, iu=lneeds[a])
+                u = needs.get(a)
+                rows, cols = (u if isinstance(u, tuple) else (u, None)) if u is not None else ([], None)
+                blk, rmap, cmap, qiu = self._direct_rect(a, rows, cols, cache=False, aosub=aosub,
+                                                         iu=lneeds.get(a))
+                if qiu is not None:
                     bq.set_block(a, qiu)
                     del qiu
-                else:
-                    blk, pmap = self._direct_block(a, nd, cache=False, aosub=aosub)
                 if blk is not None:
-                    reg[a] = (blk if on_dev else to_pinned(blk), pmap)
+                    reg[a] = (blk if on_dev else to_pinned(blk), rmap, cmap)
                 del blk
         self._regions[dev] = reg
         self._region_qia[dev] = bq
@@ -1048,8 +1110,11 @@ class DFInts:
         sup = {}
         for a in atoms:
             m = np.zeros(nbas, bool)
-            if a in needs and len(needs[a]):
-                m |= self._pao_shsup[np.asarray(needs[a], np.int64)].any(axis=0)
+            if a in needs:
+                u = needs[a]
+                u = np.concatenate(u) if isinstance(u, tuple) else u
+                if len(u):
+                    m |= self._pao_shsup[np.asarray(u, np.int64)].any(axis=0)
             if a in lneeds:
                 l_, u = lneeds[a]
                 if len(u):
@@ -1158,7 +1223,7 @@ class DFInts:
             dv._dev_clear(dev)
             cp.get_default_memory_pool().free_all_blocks()
             fr = cp.cuda.runtime.memGetInfo()[0]
-            tot = sum(8. * len(self.atom_ribfs[a]) * len(u) ** 2 for a, u in needs.items())
+            tot = sum(self._need_bytes(len(self.atom_ribfs[a]), u) for a, u in needs.items())
             tot += sum(8. * len(self.atom_ribfs[a]) * len(l_) * len(u) for a, (l_, u) in lneeds.items())
             if tot >= 0.3 * fr and len(idx) > 1 and not env:
                 # this device has less room than planned: smaller regions kept
