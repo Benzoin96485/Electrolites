@@ -885,7 +885,9 @@ class DFInts:
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         # J column + the transforms of one aux function
         per_q = 8. * (nd * nd + m * nd + m * mc + nl * nd + nl * mi)
-        lim = min(1.5e9, 0.1 * free)
+        # few, large integral calls: each call over a big AO domain has a fixed
+        # screening cost (crambin: 300 MB per aux function over all 6177 AOs)
+        lim = min(6e9, 0.15 * free)
         if os.environ.get('DLPNO_AUXCHUNK_GB'):           # testing
             lim = float(os.environ['DLPNO_AUXCHUNK_GB']) * 1e9
         if na * per_q > lim and not (aosub is None and cache):
