@@ -143,6 +143,26 @@ class PNOIntsGPU:
                 for name in ('aQiv', 'aQjv', 'aQio', 'aQjo'):
                     setattr(self, name, [None] * npair)
                 ctxs = mgpu.run_queue(chunks, work, devs, setup=setup)
+                for c in ctxs:
+                    if getattr(c, '_prof', None) is not None:
+                        c._prof.report()
+                ctxs = []
+                if getattr(self, 'verbose', 0) >= 2:
+                    rss = next((int(l.split()[1]) / 1e6 for l in open('/proc/self/status')
+                                if l.startswith('VmRSS')), 0.)
+                    print(f'[mem] PNO integrals: pair-major pass done, host RSS {rss:.1f} GB', flush=True)
+                if getattr(self.dfi, 'qia_spread', False):
+                    # the atom pass reads no (Q|iu): its host / device memory
+                    # goes to the raw (Q|ab) rows and the accumulators
+                    from electrolites.dlpno.devmem import free_pinned
+                    import gc
+                    self.dfi.qia = None
+                    self.dfi.qia_spread, self.dfi.qia_direct = False, True
+                    gc.collect()
+                    free_pinned()
+                    for d in devs:
+                        with cp.cuda.Device(d):
+                            cp.get_default_memory_pool().free_all_blocks()
                 pno_atom_pass(self, devs, getattr(self, 'verbose', 0))
                 for name in ('aQiv', 'aQjv', 'aQio', 'aQjo'):
                     setattr(self, name, None)
