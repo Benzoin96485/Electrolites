@@ -289,15 +289,18 @@ class TriplesGPU:
             order = dfi.spatial_order([np.unique(np.concatenate([self.t_riatoms[t] for t in it[1]]))
                                        for it in items])
             items = [items[k] for k in order]
-            needs = []
+            needs, lneeds = [], []
             for _, ch in items:
-                nd = {}
+                nd, ld = {}, {}
                 for t in ch:
+                    lm = np.asarray(self.trip[t], np.int64)
                     for a in self.t_riatoms[t]:
                         nd.setdefault(int(a), []).append(self.t_paos[t])
+                        ld.setdefault(int(a), []).append(lm)
                 needs.append({a: np.concatenate(v) for a, v in nd.items()})
+                lneeds.append({a: (np.concatenate(ld[a]), needs[-1][a]) for a in nd})
             dfi.run_regions(items, needs, twork, lambda d: self._dev_view(), devs,
-                            getattr(self, 'verbose', 0))
+                            getattr(self, 'verbose', 0), item_lneeds=lneeds)
         else:
             # largest chunks first (load balance of the device queue)
             items.sort(key=lambda it: -len(it[1]) * it[0] ** 2)
@@ -308,7 +311,7 @@ class TriplesGPU:
         """this object with its device tables on the current device."""
         from electrolites.dlpno import mgpu
         return mgpu.device_view(self, ('_pt', 'S_pao_d', 'F_pao_d'),
-                                sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')})
+                                sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'C_lmo_d', 'mask_uv_d')})
 
     def _t0_item(self, Pv, ch, save):
         nbf = self.orb.nbf

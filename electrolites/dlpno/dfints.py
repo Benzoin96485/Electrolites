@@ -215,6 +215,17 @@ def _host_available():
     return 0.
 
 
+def _decide_qia_direct(nbytes, host):
+    """(Q|i u) evaluated with the direct (Q|uv) regions from the same AO
+    integrals (no stored tensor) when the block-sparse tensor goes to the host
+    and would take more than 40% of its available memory
+    (DLPNO_QIA_DIRECT=auto|0|1)."""
+    env = os.environ.get('DLPNO_QIA_DIRECT', 'auto')
+    if env != 'auto':
+        return env == '1'
+    return bool(host) and nbytes > 0.4 * _host_available()
+
+
 def _decide_qab_direct(nbytes, host):
     """evaluate (Q|uv) per use (no stored blocks) when the blocks go to the
     host and would take more than 40% of its available memory
@@ -281,6 +292,38 @@ def _decide_qia_sparse(nbytes):
     return nbytes > 0.25 * free
 
 
+def _qia_stats(natm, lmo_riatoms, lmo_paos, pairs, nbf, ext_lmos):
+    """diagnostic: (Q|iu) storage per aux atom (current), per (atom, LMO) over
+    the LMO's extended PAOs, and per (atom, LMO) over exactly what its pairs
+    through that atom need (in units of aux functions per atom = 1)."""
+    n = len(lmo_riatoms)
+    P = cp.zeros((n, nbf), cp.float32)
+    A = cp.zeros((n, natm), cp.float32)
+    for i in range(n):
+        P[i, cp.asarray(lmo_paos[i])] = 1
+        A[i, cp.asarray(lmo_riatoms[i])] = 1
+    G = cp.zeros((n, n), cp.float32)
+    pr = np.asarray(pairs)
+    G[cp.asarray(pr[:, 0]), cp.asarray(pr[:, 1])] = 1
+    G[cp.asarray(pr[:, 1]), cp.asarray(pr[:, 0])] = 1
+    G[cp.arange(n), cp.arange(n)] = 1
+    EP = (G @ P) > 0                                   # extended PAOs of each LMO
+    s0 = s1 = s2 = 0.
+    for a in range(natm):
+        L = cp.asarray(ext_lmos[a])
+        if len(L) == 0:
+            continue
+        s0 += float(len(L)) * float(cp.count_nonzero(P[L].sum(0)))
+        s1 += float(cp.count_nonzero(EP[L]))
+    for i in range(n):
+        # pairs (i, j): aux(ij) = aux(i) | aux(j), pao(ij) = P(i) | P(j)
+        Ai = G[i][:, None] * cp.maximum(A, A[i][None, :])      # (j, atom): j pairs with i and a in aux(ij)
+        U = (Ai.T @ cp.maximum(P, P[i][None, :])) > 0           # (atom, pao)
+        s2 += float(cp.count_nonzero(U))
+    print(f'[debug] (Q|iu) entries per aux function: per atom {s0:.3e}, per (atom, LMO) ext-PAO {s1:.3e}, '
+          f'per (atom, LMO) exact {s2:.3e}', flush=True)
+
+
 class ExtDomains:
     """Psi4's extended LMO / PAO domains of each auxiliary atom."""
 
@@ -294,6 +337,8 @@ class ExtDomains:
             for a in ext[i]:
                 self.lmos[a].append(i)
         self.lmos = [np.array(sorted(l), dtype=np.int64) for l in self.lmos]
+        if os.environ.get('DLPNO_DEBUG_QIA_STATS') == '1':
+            _qia_stats(natm, lmo_riatoms, lmo_paos, pairs, nbf, self.lmos)
         self.paos = []
         for a in range(natm):
             if len(self.lmos[a]):
@@ -320,12 +365,24 @@ class DFInts:
         L = cp.asarray(C_lmo)
         P = cp.asarray(C_pao)
         self.qia_sparse = _decide_qia_sparse(8. * naux * n * nbf)
+        self.qia_direct = False
         if self.qia_sparse:
             nl_ = np.array([len(ext.lmos[a]) for a in range(mol.natm)])
             np_ = np.array([len(ext.paos[a]) for a in range(mol.natm)])
             na_ = np.array([len(atom_ribfs[a]) for a in range(mol.natm)])
-            self.qia = BlockQ(naux, n, nbf, ribf_atom, atom_ribfs, ext.lmos, ext.paos,
-                              host=_decide_qia_host(8. * float(np.sum(na_ * nl_ * np_))))
+            nb_ia = 8. * float(np.sum(na_ * nl_ * np_))
+            if os.environ.get('V', '0') >= '2' or os.environ.get('DLPNO_VERBOSE_MEM') == '1':
+                print(f'[mem] (Q|iu) block-sparse {nb_ia / 1e9:.1f} GB (dense {8e-9 * naux * n * nbf:.1f} GB), '
+                      f'(Q|ij) block-sparse {8e-9 * float(np.sum(na_ * nl_ * nl_)):.1f} GB '
+                      f'(dense {8e-9 * naux * n * n:.1f} GB), naux {naux}, LMOs {n}, '
+                      f'host available {_host_available() / 1e9:.1f} GB', flush=True)
+            host_ia = _decide_qia_host(nb_ia)
+            # closed shell: too large for the host as well -> per region (direct)
+            self.qia_direct = sparse_ij and need_ab and _decide_qia_direct(nb_ia, host_ia)
+            if self.qia_direct:
+                self.qia = None
+            else:
+                self.qia = BlockQ(naux, n, nbf, ribf_atom, atom_ribfs, ext.lmos, ext.paos, host=host_ia)
         else:
             self.qia = cp.empty((naux, n, nbf))
         # (Q|i j) block-sparse over the aux atoms' extended LMO domains when the
@@ -363,6 +420,7 @@ class DFInts:
         mask_uv = cp.asarray(doi_uv > t_cut_do_uv) if need_ab else None
         # the PAO coefficients and the DOI mask: kept for the direct (Q|uv)
         self.C_pao_d, self.mask_uv_d = P, mask_uv
+        self.C_lmo_d = L if self.qia_direct else None
         # AO screening of the direct (Q|uv): AOs carrying |C_pao| above
         # DLPNO_AO_CUT x (largest |C| of that PAO); the region integrals are
         # evaluated only over the shells of the union of its PAOs' supports
@@ -371,6 +429,9 @@ class DFInts:
         if self.ao_cut > 0:
             Cp = np.abs(np.asarray(C_pao))
             self._pao_sup = Cp > self.ao_cut * Cp.max(axis=0)[None, :]      # (nao, nbf)
+            if self.qia_direct:
+                Lh_ = np.abs(np.asarray(C_lmo))
+                self._lmo_sup = Lh_ > self.ao_cut * Lh_.max(axis=0)[None, :]  # (nao, n)
             loc = mol.ao_loc_nr()
             self._ao_shell = np.repeat(np.arange(mol.nbas), np.diff(loc))
         natm = mol.natm
@@ -398,12 +459,13 @@ class DFInts:
                     self._shard = dict(devs=others, load=np.zeros(len(others)))
         # blocks that would not fit the host either: evaluated per use from the
         # AO three-index integrals of the aux atom (``qab_block``)
-        self.qab_direct = need_ab and _decide_qab_direct(nab, self.qab_host)
+        self.qab_direct = need_ab and (self.qia_direct or _decide_qab_direct(nab, self.qab_host))
         if self.qab_direct:
             self.qab_host = False
             self._shard = None
         self._ao_cache, self._ao_bytes = {}, {}
         self._regions = {}             # device -> region blocks (direct mode)
+        self._region_qia = {}          # device -> region (Q|iu) (direct (Q|iu))
         self._cache = {}               # device -> OrderedDict(atom -> block)
         self._cache_bytes = {}
         self.cache_stats = dict(hit=0, miss=0, bytes=0.)
@@ -436,7 +498,7 @@ class DFInts:
                 sup = lmo_sup[:, la].any(axis=1) if len(la) else np.zeros(nao, bool)
                 if len(ext.lmos[a]):
                     sup |= lmo_sup[:, ext.lmos[a]].any(axis=1)
-                if len(pa):
+                if len(pa) and not (self.qia_direct and self.qab_direct):
                     sup |= self._pao_sup[:, pa].any(axis=1)
                 sups.append(sup)
             # consecutive aux atoms grouped while the union of their supports
@@ -469,6 +531,7 @@ class DFInts:
             if not self.qia_sparse:
                 self.qia = None
                 self.qia = cp.zeros((naux, n, nbf))
+            do_ia = self.qia is not None
             if not self.qij_sparse:
                 self.qij = None
                 self.qij = cp.zeros((naux, n, n))
@@ -496,7 +559,7 @@ class DFInts:
                 if len(la):
                     Ls = Lr[:, gla]
                     t = cp.matmul(Ls.T, J.reshape(nd, nd * na)).reshape(len(la), nd, na).transpose(2, 0, 1)
-                    if len(pa):
+                    if len(pa) and do_ia:
                         q = cp.matmul(t, P[gao][:, cp.asarray(pa)])            # (na, nl, np)
                         if self.qia_sparse:
                             self.qia.set_block(a, q)
@@ -557,7 +620,9 @@ class DFInts:
             t = cp.matmul(L.T, j3c.reshape(nao, nao * nq)).reshape(n, nao, nq)
             t = t.transpose(2, 0, 1)                               # (nq, n, nao)
             gi = cp.asarray(idx)
-            if self.qia_sparse:
+            if self.qia is None:
+                pass
+            elif self.qia_sparse:
                 off = 0
                 for a in atoms:
                     na = len(atom_ribfs[a])
@@ -623,7 +688,7 @@ class DFInts:
                 del j3c, t
             self.qij = _CheckedQ(self.qij, dense)
         self.J2c = cp.asarray(auxmol.intor('int2c2e'))
-        self.nbytes = dict(ia=self.qia.nbytes, ij=self.qij.nbytes,
+        self.nbytes = dict(ia=self.qia.nbytes if self.qia is not None else 0., ij=self.qij.nbytes,
                            ab=sum(q.nbytes for q in self.qab if q is not None))
         self.ribf_atom = ribf_atom
         self.atom_ribfs = atom_ribfs
@@ -661,159 +726,245 @@ class DFInts:
             return self._region_dev(a, blk), pmap
         return self._direct_block(a, need)
 
-    def _direct_block(self, a, need, cache=True, aosub=None):
+    def _direct_block(self, a, need, cache=True, aosub=None, iu=None):
+        """(Q_a|uv) over the PAOs ``need`` and its PAO -> position map, from the
+        AO integrals of aux atom ``a`` (over the AO domain ``aosub`` when
+        given).  With ``iu`` = (LMOs, PAOs) also (Q_a|i u) over them, from the
+        same AO integrals: returns (uv block, map, iu block) then."""
         na = len(self.atom_ribfs[a])
         need = [np.asarray(x, np.int64).ravel() for x in need]
         need = np.unique(np.concatenate(need)) if need else np.zeros(0, np.int64)
-        if na == 0 or len(need) == 0:
-            return None, None
+        m = len(need)
+        if na == 0 or (m == 0 and iu is None):
+            return (None, None) if iu is None else (None, None, None)
         import time
         t0 = time.perf_counter()
         gn = cp.asarray(need)
         if aosub is not None:
-            # AO-screened: (mu nu|Q_a) over the region's AO support only
             smol, ao = aosub
-            Pn = self.C_pao_d[cp.asarray(ao)][:, gn]
-            nd, m = len(ao), len(need)
-            free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-            per_q = 8. * (nd * nd + m * nd + m * m)            # J column + both transforms
-            lim = min(1.5e9, 0.1 * free)
-            if os.environ.get('DLPNO_AUXCHUNK_GB'):           # testing
-                lim = float(os.environ['DLPNO_AUXCHUNK_GB']) * 1e9
-            if na * per_q > lim:
-                # large AO domains (triple zeta): the atom's aux shells in chunks
-                _memo_qcond()
-                shl = np.flatnonzero(self.auxmol._bas[:, gto.ATOM_OF] == a)
-                aloc = self.auxmol.ao_loc_nr()
-                out = cp.empty((na, m, m))
-                q0, cur = 0, []
-                chunks = []
-                cap = max(1, int(lim // per_q))
-                for sh in shl:
-                    w = aloc[sh + 1] - aloc[sh]
-                    if cur and sum(aloc[c + 1] - aloc[c] for c in cur) + w > cap:
-                        chunks.append(cur)
-                        cur = []
-                    cur.append(sh)
-                if cur:
-                    chunks.append(cur)
-                for ch in chunks:
-                    Jc = cp.ascontiguousarray(int3c2e_bdiv.aux_e2(smol, sub_auxmol(self.auxmol, None, ch)))
-                    nc = Jc.shape[2]
-                    t1 = time.perf_counter()
-                    uc = cp.matmul(Pn.T, Jc.reshape(nd, nd * nc)).reshape(m, nd, nc)
-                    del Jc
-                    out[q0:q0 + nc] = cp.matmul(uc.transpose(2, 0, 1), Pn)
-                    del uc
-                    q0 += nc
-                assert q0 == na
-                out *= self.mask_uv_d[gn[:, None], gn[None, :]][None]
-                pmap = -np.ones(self.nbf, np.int64)
-                pmap[need] = np.arange(len(need))
-                st = self.cache_stats
-                st['direct'] = st.get('direct', 0) + 1
-                st['t_ao'] = st.get('t_ao', 0.) + (time.perf_counter() - t0)
-                return out, pmap
-            J = cp.ascontiguousarray(aux_e2_atoms(smol, self.auxmol, [a]))
+            gao = cp.asarray(ao)
+            Cp = self.C_pao_d[gao]
+            nd = len(ao)
         else:
-            J = self._ao_j3c(a) if cache else cp.ascontiguousarray(aux_e2_atoms(self.mol, self.auxmol, [a]))
-            Pn = self.C_pao_d[:, gn]
-        nao = J.shape[0]
-        t1 = time.perf_counter()
-        u = cp.matmul(Pn.T, J.reshape(nao, nao * na)).reshape(len(need), nao, na)
-        u = cp.matmul(u.transpose(2, 0, 1), Pn)                     # (na, m, m)
-        u *= self.mask_uv_d[gn[:, None], gn[None, :]][None]
-        pmap = -np.ones(self.nbf, np.int64)
-        pmap[need] = np.arange(len(need))
+            smol, gao, Cp, nd = self.mol, None, self.C_pao_d, self.mol.nao
+        Pn = Cp[:, gn] if m else None
+        nl = mi = 0
+        if iu is not None:
+            li, pi = (np.asarray(x, np.int64) for x in iu)
+            Cl = self.C_lmo_d if gao is None else self.C_lmo_d[gao]
+            Ls, Pi = Cl[:, cp.asarray(li)], Cp[:, cp.asarray(pi)]
+            nl, mi = len(li), len(pi)
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        # J column + the transforms of one aux function
+        per_q = 8. * (nd * nd + m * nd + m * m + nl * nd + nl * mi)
+        lim = min(1.5e9, 0.1 * free)
+        if os.environ.get('DLPNO_AUXCHUNK_GB'):           # testing
+            lim = float(os.environ['DLPNO_AUXCHUNK_GB']) * 1e9
+        if na * per_q > lim and aosub is not None:
+            # large AO domains (triple zeta): the atom's aux shells in chunks
+            _memo_qcond()
+            shl = np.flatnonzero(self.auxmol._bas[:, gto.ATOM_OF] == a)
+            aloc = self.auxmol.ao_loc_nr()
+            chunks, cur = [], []
+            cap = max(1, int(lim // per_q))
+            for sh in shl:
+                w = aloc[sh + 1] - aloc[sh]
+                if cur and sum(aloc[c + 1] - aloc[c] for c in cur) + w > cap:
+                    chunks.append(cur)
+                    cur = []
+                cur.append(sh)
+            if cur:
+                chunks.append(cur)
+        else:
+            chunks = [None]
+        out = cp.empty((na, m, m)) if m else None
+        oiu = cp.empty((na, nl, mi)) if iu is not None else None
+        t_tr, q0 = 0., 0
+        for ch in chunks:
+            if ch is not None:
+                Jc = int3c2e_bdiv.aux_e2(smol, sub_auxmol(self.auxmol, None, ch))
+            elif aosub is None and cache:
+                Jc = self._ao_j3c(a)
+            else:
+                Jc = aux_e2_atoms(smol, self.auxmol, [a])
+            Jc = cp.ascontiguousarray(Jc)
+            nc = Jc.shape[2]
+            t1 = time.perf_counter()
+            if m:
+                uc = cp.matmul(Pn.T, Jc.reshape(nd, nd * nc)).reshape(m, nd, nc)
+                out[q0:q0 + nc] = cp.matmul(uc.transpose(2, 0, 1), Pn)
+                del uc
+            if iu is not None and nl and mi:
+                tc = cp.matmul(Ls.T, Jc.reshape(nd, nd * nc)).reshape(nl, nd, nc)
+                oiu[q0:q0 + nc] = cp.matmul(tc.transpose(2, 0, 1), Pi)
+                del tc
+            elif iu is not None:
+                oiu[q0:q0 + nc] = 0.
+            del Jc
+            q0 += nc
+            t_tr += time.perf_counter() - t1
+        assert q0 == na
+        pmap = None
+        if m:
+            out *= self.mask_uv_d[gn[:, None], gn[None, :]][None]
+            pmap = -np.ones(self.nbf, np.int64)
+            pmap[need] = np.arange(m)
         st = self.cache_stats
         st['direct'] = st.get('direct', 0) + 1
-        st['direct_m'] = st.get('direct_m', 0) + len(need)
+        st['direct_m'] = st.get('direct_m', 0) + m
         if os.environ.get('DLPNO_PROF') == '1':
             cp.cuda.Device().synchronize()
-        st['t_ao'] = st.get('t_ao', 0.) + (t1 - t0)
-        st['t_tr'] = st.get('t_tr', 0.) + (time.perf_counter() - t1)
-        return u, pmap
+        tt = time.perf_counter() - t0
+        st['t_ao'] = st.get('t_ao', 0.) + (tt - t_tr)
+        st['t_tr'] = st.get('t_tr', 0.) + t_tr
+        return (out, pmap) if iu is None else (out, pmap, oiu)
 
     # ---- regions: direct (Q|uv) evaluated once per atom for a group of batches
-    def plan_regions(self, item_needs, budget):
+    def plan_regions(self, item_needs, budget, item_lneeds=None):
         """split items (in order) into regions: consecutive items whose
-        (Q_a|uv) blocks over the union of their PAOs per atom stay within
-        ``budget`` bytes.  item_needs[k]: {atom: PAO index array}.  Returns
-        [(item indices, {atom: PAO indices})]."""
-        natm, nbf = len(self.atom_ribfs), self.nbf
+        (Q_a|uv) blocks over the union of their PAOs per atom (and, direct
+        (Q|iu), (Q_a|i u) blocks over the union of their LMOs x PAOs) stay
+        within ``budget`` bytes.  item_needs[k]: {atom: PAO index array};
+        item_lneeds[k]: {atom: (LMO index array, PAO index array)}.  Returns
+        [(item indices, {atom: PAOs}, {atom: (LMOs, PAOs)})]."""
+        natm, nbf, n = len(self.atom_ribfs), self.nbf, self.n
         na = np.array([len(self.atom_ribfs[a]) for a in range(natm)], np.float64)
+        if item_lneeds is None:
+            item_lneeds = [{}] * len(item_needs)
         regions = []
 
-        def fresh():
-            return [], np.zeros((natm, nbf), bool), np.zeros(natm, np.int64), 0.
+        class R:
+            pass
 
-        def grow(mask, nd):
-            add = {}
+        def fresh():
+            r = R()
+            r.items, r.tot = [], 0.
+            r.pm, r.pc = np.zeros((natm, nbf), bool), np.zeros(natm, np.int64)
+            r.lm, r.qm = np.zeros((natm, n), bool), np.zeros((natm, nbf), bool)
+            r.lc, r.qc = np.zeros(natm, np.int64), np.zeros(natm, np.int64)
+            return r
+
+        def grow(r, nd, ld):
+            """rows to add and the new total."""
+            addp, addl, addq = {}, {}, {}
             for a, u in nd.items():
-                m = add[a] if a in add else mask[a].copy()
+                m = addp[a] if a in addp else r.pm[a].copy()
                 m[np.asarray(u, np.int64)] = True
-                add[a] = m
-            return add
-        cur, mask, cnt, tot = fresh()
-        for k, nd in enumerate(item_needs):
-            add = grow(mask, nd)
-            new = tot + sum(8. * na[a] * (int(m.sum()) ** 2 - int(cnt[a]) ** 2) for a, m in add.items())
-            if cur and new > budget:
-                regions.append((cur, {a: np.flatnonzero(mask[a]) for a in range(natm) if cnt[a]}))
-                cur, mask, cnt, tot = fresh()
-                add = grow(mask, nd)
-                new = sum(8. * na[a] * int(m.sum()) ** 2 for a, m in add.items())
-            for a, m in add.items():
-                mask[a] = m
-                cnt[a] = int(m.sum())
-            tot = new
-            cur.append(k)
-        if cur:
-            regions.append((cur, {a: np.flatnonzero(mask[a]) for a in range(natm) if cnt[a]}))
+                addp[a] = m
+            for a, (l_, u) in ld.items():
+                m = addl[a] if a in addl else r.lm[a].copy()
+                m[np.asarray(l_, np.int64)] = True
+                addl[a] = m
+                m = addq[a] if a in addq else r.qm[a].copy()
+                m[np.asarray(u, np.int64)] = True
+                addq[a] = m
+            new = r.tot + sum(8. * na[a] * (int(m.sum()) ** 2 - int(r.pc[a]) ** 2) for a, m in addp.items())
+            for a in addl:
+                lc, qc = int(addl[a].sum()), int(addq[a].sum())
+                new += 8. * na[a] * (lc * qc - int(r.lc[a]) * int(r.qc[a]))
+            return addp, addl, addq, new
+
+        def close(r):
+            nd = {a: np.flatnonzero(r.pm[a]) for a in range(natm) if r.pc[a]}
+            ld = {a: (np.flatnonzero(r.lm[a]), np.flatnonzero(r.qm[a])) for a in range(natm) if r.lc[a]}
+            regions.append((r.items, nd, ld))
+        r = fresh()
+        for k, (nd, ld) in enumerate(zip(item_needs, item_lneeds)):
+            addp, addl, addq, new = grow(r, nd, ld)
+            if r.items and new > budget:
+                close(r)
+                r = fresh()
+                addp, addl, addq, new = grow(r, nd, ld)
+            for a, m in addp.items():
+                r.pm[a], r.pc[a] = m, int(m.sum())
+            for a in addl:
+                r.lm[a], r.lc[a] = addl[a], int(addl[a].sum())
+                r.qm[a], r.qc[a] = addq[a], int(addq[a].sum())
+            r.tot = new
+            r.items.append(k)
+        if r.items:
+            close(r)
         return regions
 
-    def region_begin(self, needs, verbose=0):
+    def region_begin(self, needs, verbose=0, lneeds=None):
         """(Q_a|uv) over needs[a] for every atom a, on the current device, each
         from one evaluation of its AO integrals; kept on the device when they
         fit (30% of its free memory), else in pinned host memory behind the
-        device LRU cache."""
+        device LRU cache.  Direct (Q|iu): with ``lneeds`` {a: (LMOs, PAOs)}
+        also the region's (Q|iu) (a device BlockQ over these domains) from the
+        same AO integrals."""
         import time
         t0 = time.perf_counter()
         dev = cp.cuda.Device().id
         self._dev_clear(dev)
-        na = {a: len(self.atom_ribfs[a]) for a in needs}
+        lneeds = lneeds or {}
+        allat = set(needs) | set(lneeds)
+        na = {a: len(self.atom_ribfs[a]) for a in allat}
         tot = sum(8. * na[a] * len(u) ** 2 for a, u in needs.items())
+        tot_iu = sum(8. * na[a] * len(l_) * len(u) for a, (l_, u) in lneeds.items())
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        on_dev = tot < 0.3 * free
-        atoms = [a for a in sorted(needs) if na[a] and len(needs[a])]
+        on_dev = tot + tot_iu < 0.3 * free
+        atoms = [a for a in sorted(allat) if na[a] and (len(needs.get(a, ())) or a in lneeds)]
         groups = [(atoms, None)]
         if self._pao_sup is not None and atoms:
-            groups = self._region_groups(atoms, needs)
+            groups = self._region_groups(atoms, needs, lneeds)
+        bq = None
+        if lneeds:
+            natm = len(self.atom_ribfs)
+            e0 = np.zeros(0, np.int64)
+            bq = BlockQ(self.naux, self.n, self.nbf, self.ribf_atom, self.atom_ribfs,
+                        [lneeds[a][0] if a in lneeds else e0 for a in range(natm)],
+                        [lneeds[a][1] if a in lneeds else e0 for a in range(natm)])
         reg = {}
         for g_atoms, aosub in groups:
             for a in g_atoms:
-                blk, pmap = self._direct_block(a, [needs[a]], cache=False, aosub=aosub)
-                reg[a] = (blk if on_dev else to_pinned(blk), pmap)
+                nd = [needs[a]] if a in needs else []
+                if a in lneeds:
+                    blk, pmap, qiu = self._direct_block(a, nd, cache=False, aosub=aosub, iu=lneeds[a])
+                    bq.set_block(a, qiu)
+                    del qiu
+                else:
+                    blk, pmap = self._direct_block(a, nd, cache=False, aosub=aosub)
+                if blk is not None:
+                    reg[a] = (blk if on_dev else to_pinned(blk), pmap)
                 del blk
         self._regions[dev] = reg
+        self._region_qia[dev] = bq
         if verbose >= 2:
             nds = [len(s[1]) if s is not None else self.mol.nao for _, s in groups]
-            print(f'[mem] (Q|uv) region on GPU {dev}: {len(reg)} atoms, {tot / 1e9:.1f} GB on the '
+            iu_s = f' + (Q|iu) {tot_iu / 1e9:.1f} GB' if lneeds else ''
+            print(f'[mem] (Q|uv) region on GPU {dev}: {len(atoms)} atoms, {tot / 1e9:.1f} GB{iu_s} on the '
                   f'{"device" if on_dev else "host"}, {len(groups)} AO domains of {min(nds)}..{max(nds)} '
                   f'of {self.mol.nao} AOs, built in {time.perf_counter() - t0:.1f} s', flush=True)
 
-    def _region_groups(self, atoms, needs):
+    def _region_groups(self, atoms, needs, lneeds=None):
         """the region's aux atoms in groups of neighbours (Morton order), each
-        with the AO shells supporting its atoms' PAOs: the AO integrals and
-        the transformation of an atom run over its group's AO domain instead
-        of the region's (DLPNO_REGION_SPLIT=0: one domain for the region).
+        with the AO shells supporting its atoms' PAOs (and LMOs, direct
+        (Q|iu)): the AO integrals and the transformation of an atom run over
+        its group's AO domain instead of the region's (DLPNO_REGION_SPLIT=0:
+        one domain for the region).
         -> [(atoms, (sub-molecule, AO indices) or None)]"""
         nbas = self.mol.nbas
+        loc = self.mol.ao_loc_nr()
         if getattr(self, '_pao_shsup', None) is None:
-            loc = self.mol.ao_loc_nr()
             self._pao_shsup = np.ascontiguousarray(
                 np.logical_or.reduceat(self._pao_sup, loc[:-1], axis=0).T)      # (nbf, nbas)
-        sup = {a: self._pao_shsup[np.asarray(needs[a], np.int64)].any(axis=0) for a in atoms}
+        lneeds = lneeds or {}
+        if lneeds and getattr(self, '_lmo_shsup', None) is None:
+            self._lmo_shsup = np.ascontiguousarray(
+                np.logical_or.reduceat(self._lmo_sup, loc[:-1], axis=0).T)      # (n, nbas)
+        sup = {}
+        for a in atoms:
+            m = np.zeros(nbas, bool)
+            if a in needs and len(needs[a]):
+                m |= self._pao_shsup[np.asarray(needs[a], np.int64)].any(axis=0)
+            if a in lneeds:
+                l_, u = lneeds[a]
+                if len(u):
+                    m |= self._pao_shsup[np.asarray(u, np.int64)].any(axis=0)
+                if len(l_):
+                    m |= self._lmo_shsup[np.asarray(l_, np.int64)].any(axis=0)
+            sup[a] = m
         if os.environ.get('DLPNO_REGION_SPLIT', '1') == '0':
             parts = [atoms]
         else:
@@ -842,6 +993,7 @@ class DFInts:
     def region_end(self):
         dev = cp.cuda.Device().id
         self._regions.pop(dev, None)
+        self._region_qia.pop(dev, None)
         self._dev_clear(dev)
         import gc
         gc.collect()
@@ -882,9 +1034,10 @@ class DFInts:
             self._cache_bytes[dev] = nb + d.nbytes
         return d
 
-    def run_regions(self, items, item_needs, work, setup, devs, verbose=0):
+    def run_regions(self, items, item_needs, work, setup, devs, verbose=0, item_lneeds=None):
         """work(ctx, item) for every item, the items grouped into regions
-        (direct (Q|uv)); the regions go to the devices through a work queue
+        (direct (Q|uv); direct (Q|iu) with ``item_lneeds``: ctx.dfi.qia is the
+        region's); the regions go to the devices through a work queue
         (``setup(dev)`` -> ctx), each device building its region's blocks and
         running its items.  Region budget: a quarter of the smallest free
         device memory (DLPNO_REGION_GB overrides)."""
@@ -896,38 +1049,48 @@ class DFInts:
                 free.append(cp.cuda.runtime.memGetInfo()[0])
         env = os.environ.get('DLPNO_REGION_GB')
         budget = float(env) * 1e9 if env else 0.25 * min(free)
-        regions = self.plan_regions(item_needs, budget)
+        if item_lneeds is not None and not self.qia_direct:
+            item_lneeds = None
+        regions = self.plan_regions(item_needs, budget, item_lneeds)
         if verbose >= 2:
             print(f'[mem] (Q|uv) regions: {len(regions)} for {len(items)} batches '
                   f'(budget {budget / 1e9:.1f} GB per region)', flush=True)
         self._regions = {}
+        self._region_qia = {}
 
         def rwork(ctx, region):
-            idx, needs = region
+            idx, needs, lneeds = region
             dv = getattr(ctx, 'dfi', None) or self        # this device's view
             dev = cp.cuda.Device().id
             dv._dev_clear(dev)
             cp.get_default_memory_pool().free_all_blocks()
             fr = cp.cuda.runtime.memGetInfo()[0]
             tot = sum(8. * len(self.atom_ribfs[a]) * len(u) ** 2 for a, u in needs.items())
+            tot += sum(8. * len(self.atom_ribfs[a]) * len(l_) * len(u) for a, (l_, u) in lneeds.items())
             if tot >= 0.3 * fr and len(idx) > 1:
                 # this device has less room than planned: smaller regions kept
                 # on the device rather than one in pinned host memory
-                subs = [([idx[j] for j in si], nd) for si, nd in
-                        self.plan_regions([item_needs[k] for k in idx], 0.25 * fr)]
+                subs = [([idx[j] for j in si], nd, ld) for si, nd, ld in
+                        self.plan_regions([item_needs[k] for k in idx], 0.25 * fr,
+                                          None if item_lneeds is None else [item_lneeds[k] for k in idx])]
             else:
                 subs = [region]
-            for sidx, sneeds in subs:
-                dv.region_begin(sneeds, verbose)
+            for sidx, sneeds, slneeds in subs:
+                dv.region_begin(sneeds, verbose, slneeds)
+                if slneeds:
+                    dv.qia = dv._region_qia.get(dev)
                 try:
                     for k in sidx:
                         work(ctx, items[k])
                 finally:
+                    if slneeds:
+                        dv.qia = None
                     dv.region_end()
         try:
             return mgpu.run_queue(regions, rwork, devs, setup=setup)
         finally:
             self._regions = {}
+            self._region_qia = {}
 
     def _ao_j3c(self, a):
         """AO (mu nu|Q_a) of aux atom ``a`` (nao, nao, na), from a per-device

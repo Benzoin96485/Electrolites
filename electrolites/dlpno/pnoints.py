@@ -87,7 +87,7 @@ class PNOIntsGPU:
                 for p, v in d.items():
                     lst[p] = v
         setup = lambda d: mgpu.device_view(
-            self, ('S_pao_d',), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')})
+            self, ('S_pao_d',), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'C_lmo_d', 'mask_uv_d')})
         ctxs = []
         if getattr(self.dfi, 'qab_direct', False):
             # direct (Q|uv): chunks in spatial order, grouped into regions whose
@@ -95,15 +95,19 @@ class PNOIntsGPU:
             order = self.dfi.spatial_order([np.unique(np.concatenate([self.riatoms[p] for p in c[0]]))
                                             for c in chunks])
             chunks = [chunks[k] for k in order]
-            needs = []
+            needs, lneeds = [], []
             for ch, _ in chunks:
-                nd = {}
+                nd, ld = {}, {}
                 for p in ch:
                     u = self.pao[p] if not self.strong[p] else np.union1d(self.pao[p], self._ext[p])
+                    lm = np.concatenate([np.asarray(self.pl.pairs[p], np.int64), self.lmos[p]])
                     for a in self.riatoms[p]:
                         nd.setdefault(int(a), []).append(u)
+                        ld.setdefault(int(a), []).append(lm)
                 needs.append({a: np.concatenate(v) for a, v in nd.items()})
-            ctxs = self.dfi.run_regions(chunks, needs, work, setup, devs, getattr(self, 'verbose', 0))
+                lneeds.append({a: (np.concatenate(ld[a]), needs[-1][a]) for a in nd})
+            ctxs = self.dfi.run_regions(chunks, needs, work, setup, devs, getattr(self, 'verbose', 0),
+                                        item_lneeds=lneeds)
         else:
             chunks.sort(key=lambda c: -len(c[0]))
             ctxs = mgpu.run_queue(chunks, work, devs, setup=setup)

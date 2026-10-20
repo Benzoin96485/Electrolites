@@ -294,9 +294,29 @@ class LMP2GPU:
     def _run_chunks(self, chunks, work):
         """work(view, chunk) for every pair chunk, over the visible GPUs."""
         from electrolites.dlpno import mgpu
+        setup = lambda d: mgpu.device_view(
+            self, ('S_pao_d', 'F_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'C_lmo_d', 'mask_uv_d')})
+        dfi = self.dfi
+        if getattr(dfi, 'qia_direct', False):
+            # (Q|iu) evaluated per region of neighbouring chunks
+            pl = self.pl
+            order = dfi.spatial_order([np.unique(np.concatenate([self.riatoms[p] for p in c])) for c in chunks])
+            chunks = [chunks[k] for k in order]
+            lneeds = []
+            for c in chunks:
+                nd = {}
+                for p in c:
+                    lm = np.asarray(pl.pairs[p], np.int64)
+                    for a in self.riatoms[p]:
+                        x = nd.setdefault(int(a), ([], []))
+                        x[0].append(lm)
+                        x[1].append(self.pao[p])
+                lneeds.append({a: (np.concatenate(l_), np.concatenate(u)) for a, (l_, u) in nd.items()})
+            dfi.run_regions(chunks, [{}] * len(chunks), work, setup, mgpu.devices(),
+                            getattr(self, 'verbose', 0), item_lneeds=lneeds)
+            return
         chunks = sorted(chunks, key=lambda c: -len(c))
-        mgpu.run_queue(chunks, work, setup=lambda d: mgpu.device_view(
-            self, ('S_pao_d', 'F_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')}))
+        mgpu.run_queue(chunks, work, setup=setup)
 
     def _prep_dev(self):
         if getattr(self, 'F_pao_d', None) is None:
