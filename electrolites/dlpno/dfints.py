@@ -96,7 +96,7 @@ def _bq_kernel():
     global _BQ_GATHER
     if _BQ_GATHER is None:
         _BQ_GATHER = cp.ElementwiseKernel(
-            'int64 qq, int64 ii, int64 uu, uint64 bufp, raw int32 atom_of, raw int64 aoff, '
+            'int64 qq, int64 ii, int64 uu, raw uint64 abase, raw int32 atom_of, '
             'raw int32 a0, raw int32 nl, raw int32 npo, raw int32 lpos, raw int32 ppos, int32 n, int32 nbf',
             'float64 y',
             '''
@@ -104,7 +104,7 @@ def _bq_kernel():
             const int li = lpos[(long long) a * n + ii];
             const int pu = ppos[(long long) a * nbf + uu];
             y = (li < 0 || pu < 0) ? 0.0
-                : ((const double*) bufp)[aoff[a] + ((long long) (qq - a0[a]) * nl[a] + li) * npo[a] + pu];
+                : ((const double*) abase[a])[((long long) (qq - a0[a]) * nl[a] + li) * npo[a] + pu];
             ''', 'dlpno_bq_gather')
     return _BQ_GATHER
 
@@ -114,9 +114,15 @@ class BlockQ:
     domains (the domains every pair / triplet using A lies in) instead of
     densely over all (Q, i, u): linear in the system size.  ``bq[Q, i, u]``
     with broadcastable integer index arrays gathers in one kernel (entries
-    outside the domains are 0)."""
+    outside the domains are 0).
 
-    def __init__(self, naux, n, nbf, ribf_atom, atom_ribfs, ext_lmos, ext_paos, buf=None, host=False):
+    Storage: one device or pinned-host buffer, or (``placement`` =
+    [(device id or None for host, bytes), ...]) the atoms' blocks spread over
+    several devices' memory and the host, read by the gathers through
+    per-atom pointers (peer access / zero copy)."""
+
+    def __init__(self, naux, n, nbf, ribf_atom, atom_ribfs, ext_lmos, ext_paos, buf=None, host=False,
+                 placement=None):
         natm = len(atom_ribfs)
         self.shape = (naux, n, nbf)
         self.ndim = 3
@@ -135,8 +141,36 @@ class BlockQ:
         for a in range(natm):
             lpos[a, ext_lmos[a]] = np.arange(len(ext_lmos[a]))
             ppos[a, ext_paos[a]] = np.arange(len(ext_paos[a]))
-        self._host = dict(atom_of=np.asarray(ribf_atom, np.int32), aoff=self.aoff, a0=self.a0,
+        self._host = dict(atom_of=np.asarray(ribf_atom, np.int32), a0=self.a0,
                           nl=self.nl, npo=self.npo, lpos=lpos.ravel(), ppos=ppos.ravel())
+        self.bufs = None
+        if placement is not None and buf is None:
+            # the atoms in order into the listed stores, each up to its capacity
+            from electrolites.dlpno.devmem import pinned_empty
+            self.abuf = np.zeros(natm, np.int64)
+            self.aoff = np.zeros(natm, np.int64)
+            sizes, k, used = [], 0, 0
+            for a in range(natm):
+                while k < len(placement) - 1 and 8 * (used + sz[a]) > placement[k][1]:
+                    sizes.append(used)
+                    k, used = k + 1, 0
+                self.abuf[a], self.aoff[a] = k, used
+                used += int(sz[a])
+            sizes.append(used)
+            sizes += [0] * (len(placement) - len(sizes))
+            self.bufs = []
+            for (d, _), m in zip(placement, sizes):
+                if d is None:
+                    b = pinned_empty((max(m, 1),))
+                    b[...] = 0.
+                else:
+                    with cp.cuda.Device(d):
+                        b = cp.zeros(max(m, 1))
+                self.bufs.append(b)
+            self.buf = self.bufs[0]
+            self.placed = [(d, 8. * m) for (d, _), m in zip(placement, sizes)]
+            self._tabs = None
+            return
         if buf is None:
             if host:
                 # pinned host memory, read by the gather kernel directly (zero copy)
@@ -148,41 +182,59 @@ class BlockQ:
         self.buf = buf
         self._tabs = None
 
+    def _buf_of(self, a):
+        return self.bufs[int(self.abuf[a])] if self.bufs is not None else self.buf
+
     def block(self, a):
         """the stored (na, nl, np) block of aux atom ``a`` (a view)."""
         o, s = int(self.aoff[a]), int(self.na[a] * self.nl[a] * self.npo[a])
-        return self.buf[o:o + s].reshape(int(self.na[a]), int(self.nl[a]), int(self.npo[a]))
+        return self._buf_of(a)[o:o + s].reshape(int(self.na[a]), int(self.nl[a]), int(self.npo[a]))
 
     @property
     def host(self):
+        """all storage in host memory"""
+        if self.bufs is not None:
+            return all(isinstance(b, np.ndarray) for b in self.bufs)
         return isinstance(self.buf, np.ndarray)
+
+    @property
+    def split(self):
+        return self.bufs is not None
 
     def set_block(self, a, x):
         """store the (na, nl, np) device block of aux atom ``a``."""
-        if self.host:
-            self.block(a)[...] = cp.asnumpy(x)
+        dst = self.block(a)
+        if isinstance(dst, np.ndarray):
+            dst[...] = cp.asnumpy(x)
+        elif dst.device.id == cp.cuda.Device().id:
+            dst[...] = x
         else:
-            self.block(a)[...] = x
+            x = cp.ascontiguousarray(x)
+            cp.cuda.Device().synchronize()
+            cp.cuda.runtime.memcpy(dst.data.ptr, x.data.ptr, x.nbytes, 4)     # UVA, peer
 
-    def _bufp(self):
-        if not self.host:
-            return np.uint64(self.buf.data.ptr)
-        p = getattr(self, '_hostp', None)
-        if p is None or p[0] != self.buf.ctypes.data:
-            at = cp.cuda.runtime.pointerGetAttributes(self.buf.ctypes.data)
-            p = self._hostp = (self.buf.ctypes.data, np.uint64(at.devicePointer))
-        return p[1]
+    @staticmethod
+    def _devptr(b):
+        if isinstance(b, cp.ndarray):
+            return int(b.data.ptr)
+        return int(cp.cuda.runtime.pointerGetAttributes(b.ctypes.data).devicePointer)
 
     def _dev_tabs(self):
         dev = cp.cuda.Device().id
         if self._tabs is None or self._tabs[0] != dev:
-            self._tabs = (dev, {k: cp.asarray(v) for k, v in self._host.items()})
+            t = {k: cp.asarray(v) for k, v in self._host.items()}
+            if self.bufs is not None:
+                base = np.array([self._devptr(b) for b in self.bufs], np.uint64)[self.abuf]
+            else:
+                base = np.full(len(self.aoff), self._devptr(self.buf), np.uint64)
+            t['abase'] = cp.asarray(base + self.aoff.astype(np.uint64) * np.uint64(8))
+            self._tabs = (dev, t)
         return self._tabs[1]
 
     def __getitem__(self, key):
         Q, i, u = (cp.asarray(k, dtype=cp.int64) for k in key)
         t = self._dev_tabs()
-        return _bq_kernel()(Q, i, u, self._bufp(), t['atom_of'], t['aoff'], t['a0'], t['nl'], t['npo'],
+        return _bq_kernel()(Q, i, u, t['abase'], t['atom_of'], t['a0'], t['nl'], t['npo'],
                             t['lpos'], t['ppos'], np.int32(self.n), np.int32(self.nbf))
 
     def _with(self, buf):
@@ -193,15 +245,17 @@ class BlockQ:
 
     def replicate(self):
         """a view whose storage is on the current device (host storage: shared)."""
-        if self.host or self.buf.device.id == cp.cuda.Device().id:
+        if self.split or self.host or self.buf.device.id == cp.cuda.Device().id:
             return self
         return self._with(cp.asarray(self.buf))
 
     def to_host(self):
+        if self.split:
+            return self
         return self._with(cp.asnumpy(self.buf) if isinstance(self.buf, cp.ndarray) else self.buf)
 
     def to_device(self):
-        return self if self.host else self._with(cp.asarray(self.buf))
+        return self if (self.host or self.split) else self._with(cp.asarray(self.buf))
 
 
 def _host_available():
@@ -224,6 +278,30 @@ def _decide_qia_direct(nbytes, host):
     if env != 'auto':
         return env == '1'
     return bool(host) and nbytes > 0.4 * _host_available()
+
+
+def _qia_placement(nbytes):
+    """[(device or None = host, bytes)] holding ``nbytes`` of (Q|iu): the
+    other devices, then the home device, each up to DLPNO_QIA_DEV_FRAC (0.45)
+    of its free memory (DLPNO_QIA_DEV_GB: a fixed size, testing), then the
+    host up to 40% of its available memory; None if that is not enough."""
+    from electrolites.dlpno import mgpu
+    home = cp.cuda.Device().id
+    devs = mgpu.devices()
+    order = [d for d in devs if d != home] + [home]
+    frac = float(os.environ.get('DLPNO_QIA_DEV_FRAC', '0.45'))
+    fixed = os.environ.get('DLPNO_QIA_DEV_GB')
+    place = []
+    for d in order:
+        with cp.cuda.Device(d):
+            fr = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        place.append((d, float(fixed) * 1e9 if fixed else frac * fr))
+    place.append((None, 0.4 * _host_available()))
+    if sum(c for _, c in place) < 1.05 * nbytes:
+        return None
+    if len(devs) > 1:
+        mgpu.enable_peer(devs)
+    return place
 
 
 def _decide_qab_direct(nbytes, host):
@@ -365,7 +443,7 @@ class DFInts:
         L = cp.asarray(C_lmo)
         P = cp.asarray(C_pao)
         self.qia_sparse = _decide_qia_sparse(8. * naux * n * nbf)
-        self.qia_direct = False
+        self.qia_direct = self.qia_spread = False
         if self.qia_sparse:
             nl_ = np.array([len(ext.lmos[a]) for a in range(mol.natm)])
             np_ = np.array([len(ext.paos[a]) for a in range(mol.natm)])
@@ -377,9 +455,21 @@ class DFInts:
                       f'(dense {8e-9 * naux * n * n:.1f} GB), naux {naux}, LMOs {n}, '
                       f'host available {_host_available() / 1e9:.1f} GB', flush=True)
             host_ia = _decide_qia_host(nb_ia)
-            # closed shell: too large for the host as well -> per region (direct)
+            # closed shell: too large for the host as well -> spread over the
+            # devices' memory and the host while that fits (kept for the LMP2
+            # and the PNO integrals, then dropped: the triples evaluate theirs
+            # per region), else per region throughout (direct)
             self.qia_direct = sparse_ij and need_ab and _decide_qia_direct(nb_ia, host_ia)
-            if self.qia_direct:
+            place = _qia_placement(nb_ia) if (self.qia_direct or os.environ.get('DLPNO_QIA_SPREAD') == '1') \
+                and os.environ.get('DLPNO_QIA_SPREAD') != '0' and os.environ.get('DLPNO_QIA_DIRECT') != '1' else None
+            self.qia_spread = place is not None
+            if self.qia_spread:
+                self.qia_direct = False
+                self.qia = BlockQ(naux, n, nbf, ribf_atom, atom_ribfs, ext.lmos, ext.paos, placement=place)
+                if os.environ.get('V', '0') >= '2':
+                    print('[mem] (Q|iu) spread over', [(('host' if d is None else f'GPU {d}'), round(b / 1e9, 1))
+                                                      for d, b in self.qia.placed], 'GB', flush=True)
+            elif self.qia_direct:
                 self.qia = None
             else:
                 self.qia = BlockQ(naux, n, nbf, ribf_atom, atom_ribfs, ext.lmos, ext.paos, host=host_ia)
@@ -420,7 +510,7 @@ class DFInts:
         mask_uv = cp.asarray(doi_uv > t_cut_do_uv) if need_ab else None
         # the PAO coefficients and the DOI mask: kept for the direct (Q|uv)
         self.C_pao_d, self.mask_uv_d = P, mask_uv
-        self.C_lmo_d = L if self.qia_direct else None
+        self.C_lmo_d = L if (self.qia_direct or self.qia_spread) else None
         # AO screening of the direct (Q|uv): AOs carrying |C_pao| above
         # DLPNO_AO_CUT x (largest |C| of that PAO); the region integrals are
         # evaluated only over the shells of the union of its PAOs' supports
@@ -429,7 +519,7 @@ class DFInts:
         if self.ao_cut > 0:
             Cp = np.abs(np.asarray(C_pao))
             self._pao_sup = Cp > self.ao_cut * Cp.max(axis=0)[None, :]      # (nao, nbf)
-            if self.qia_direct:
+            if self.qia_direct or self.qia_spread:
                 Lh_ = np.abs(np.asarray(C_lmo))
                 self._lmo_sup = Lh_ > self.ao_cut * Lh_.max(axis=0)[None, :]  # (nao, n)
             loc = mol.ao_loc_nr()
@@ -459,7 +549,8 @@ class DFInts:
                     self._shard = dict(devs=others, load=np.zeros(len(others)))
         # blocks that would not fit the host either: evaluated per use from the
         # AO three-index integrals of the aux atom (``qab_block``)
-        self.qab_direct = need_ab and (self.qia_direct or _decide_qab_direct(nab, self.qab_host))
+        self.qab_direct = need_ab and (self.qia_direct or self.qia_spread
+                                       or _decide_qab_direct(nab, self.qab_host))
         if self.qab_direct:
             self.qab_host = False
             self._shard = None

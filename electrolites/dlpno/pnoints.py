@@ -123,6 +123,16 @@ class PNOIntsGPU:
         # the CC build does not read (Q|uv): the device cache (up to a quarter
         # of the device) is refilled by the triples
         self.dfi.cache_clear()
+        if getattr(self.dfi, 'qia_spread', False):
+            # (Q|iu) spread over the devices and the host: its memory goes to
+            # the CC; the triples evaluate theirs per region
+            from electrolites.dlpno.devmem import free_pinned
+            ctxs = None                    # the device views hold it too
+            self.dfi.qia = None
+            self.dfi.qia_spread, self.dfi.qia_direct = False, True
+            import gc
+            gc.collect()
+            free_pinned()
         for d in devs:
             with cp.cuda.Device(d):
                 cp.get_default_memory_pool().free_all_blocks()
