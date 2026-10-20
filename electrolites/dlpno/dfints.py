@@ -903,7 +903,7 @@ class DFInts:
         tot = sum(8. * na[a] * len(u) ** 2 for a, u in needs.items())
         tot_iu = sum(8. * na[a] * len(l_) * len(u) for a, (l_, u) in lneeds.items())
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        on_dev = tot + tot_iu < 0.3 * free
+        on_dev = tot + tot_iu < 0.3 * free and os.environ.get('DLPNO_REGION_HOST') != '1'   # testing
         atoms = [a for a in sorted(allat) if na[a] and (len(needs.get(a, ())) or a in lneeds)]
         groups = [(atoms, None)]
         if self._pao_sup is not None and atoms:
