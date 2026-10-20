@@ -142,12 +142,16 @@ class TriplesGPU:
         nv = np.array([x.shape[1] for x in self.X])
         npo = np.array([len(p) for p in self.pao])
         VP, PP = int(padded(nv.max())), int(padded(npo.max()))
-        Xp = np.zeros((npair, PP, VP))
+        # PNO coefficients: row blocks (npao_p, VP) back to back (pointer
+        # offsets) instead of padded to the largest PAO domain; a zero tail
+        # of PP rows keeps the padded reads of the last block in bounds
+        xoff = np.concatenate([[0], np.cumsum(npo * VP)]).astype(np.uint64)
+        Xp = np.zeros(int(xoff[-1]) + PP * VP)
         dom = np.zeros((npair, PP), np.int64)
         dmk = np.zeros((npair, PP))
         Tp = np.zeros((npair, VP, VP))
         for p in range(npair):
-            Xp[p, :npo[p], :nv[p]] = self.X[p]
+            Xp[int(xoff[p]):int(xoff[p + 1])].reshape(npo[p], VP)[:, :nv[p]] = self.X[p]
             dom[p, :npo[p]] = self.pao[p]
             dmk[p, :npo[p]] = 1.
             Tp[p, :nv[p], :nv[p]] = self.T[p]
@@ -159,7 +163,7 @@ class TriplesGPU:
         T1 = np.zeros((self.n, VP))
         for i in range(self.n):
             T1[i, :len(self.T1[i])] = self.T1[i]
-        self._pt = dict(VP=VP, PP=PP, X=cp.asarray(Xp), dom=cp.asarray(dom),
+        self._pt = dict(VP=VP, PP=PP, X=cp.asarray(Xp), xoff=cp.asarray(xoff[:-1]), dom=cp.asarray(dom),
                         dmk=cp.asarray(dmk), T=Tp_d, D=Dp, T1=cp.asarray(T1))
         if getattr(self, 'verbose', 0) >= 2:
             print(f'[mem] (T) pair table: {npair} pairs padded to {PP} PAOs x {VP} PNOs, '
@@ -180,7 +184,7 @@ class TriplesGPU:
         for c0 in range(0, n, step):
             b_, p_ = bidx[c0:c0 + step], pidx[c0:c0 + step]
             Zg = gather_rows(Z, b_, pt['dom'][p_], pt['dmk'][p_])
-            out[c0:c0 + step] = xT_z_by_pointer(pt['X'], p_, Zg)
+            out[c0:c0 + step] = xT_z_by_pointer(pt['X'], p_, Zg, offs=pt['xoff'], VP=VP)
         return out
 
     # ---- TNOs ------------------------------------------------------------
@@ -316,8 +320,14 @@ class TriplesGPU:
         the home device by the pointer-batched GEMMs (peer access) instead of
         being copied to every device."""
         from electrolites.dlpno import mgpu
+        # a large fitting metric (8 GB at 32k aux functions) is gathered from
+        # the home device rather than copied
+        big_j = getattr(self.dfi, 'J2c', None) is not None and self.dfi.J2c.nbytes > 2e9
         v = mgpu.device_view(self, ('S_pao_d', 'F_pao_d'),
-                             sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'C_lmo_d', 'mask_uv_d')})
+                             sub={'dfi': ('qia', 'qij', 'C_pao_d', 'C_lmo_d', 'mask_uv_d')
+                                  + (() if big_j else ('J2c',))})
+        if big_j:
+            mgpu.enable_peer(mgpu.devices())
         pt = getattr(self, '_pt', None)
         if pt is not None and isinstance(pt.get('X'), cp.ndarray) and pt['X'].device.id != cp.cuda.Device().id:
             mgpu.enable_peer(mgpu.devices())

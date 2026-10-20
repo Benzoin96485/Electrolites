@@ -186,12 +186,16 @@ def gather_rows(Z, bidx, rows, mask):
     return out
 
 
-def xT_z_by_pointer(tab, pidx, Zg):
+def xT_z_by_pointer(tab, pidx, Zg, offs=None, VP=None):
     """out[i] = tab[pidx[i]]^T Zg[i] with tab (np, P, VP) and Zg (n, P, V),
-    as one pointer-batched GEMM (no gathered copy of the table rows)."""
+    as one pointer-batched GEMM (no gathered copy of the table rows).  With
+    ``offs``: ``tab`` is a flat buffer of row blocks (rows, VP) starting at
+    element offsets offs[p] (rows beyond a block's own are read from the next
+    one / the zero tail and must meet zero rows of Zg)."""
     from cupy_backends.cuda.libs import cublas
     n, P, V = Zg.shape
-    VP = tab.shape[2]
+    if VP is None:
+        VP = tab.shape[2]
     out = cp.empty((n, VP, V))
     if n == 0:
         return out
@@ -199,7 +203,10 @@ def xT_z_by_pointer(tab, pidx, Zg):
     Zg = cp.ascontiguousarray(Zg)
     pidx = cp.asarray(pidx, dtype=cp.uint64)
     Ap = Zg.data.ptr + cp.arange(n, dtype=cp.uint64) * np.uint64(P * V * 8)
-    Bp = tab.data.ptr + pidx * np.uint64(tab.shape[1] * VP * 8)
+    if offs is None:
+        Bp = tab.data.ptr + pidx * np.uint64(tab.shape[1] * VP * 8)
+    else:
+        Bp = tab.data.ptr + offs[pidx] * np.uint64(8)
     Cp = out.data.ptr + cp.arange(n, dtype=cp.uint64) * np.uint64(VP * V * 8)
     one = np.array(1., np.float64)
     zero = np.array(0., np.float64)
