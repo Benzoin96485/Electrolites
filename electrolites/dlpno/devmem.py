@@ -36,6 +36,17 @@ def free_pinned():
         pass
 
 
+def trim_host():
+    """cached host memory back to the OS: the free pinned blocks and the C
+    heap's freed blocks (numpy temporaries)."""
+    free_pinned()
+    try:
+        import ctypes
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def pinned_empty(shape, dtype=np.float64):
     """numpy array in page-locked host memory (fast, asynchronous H2D)."""
     n = int(np.prod(shape))

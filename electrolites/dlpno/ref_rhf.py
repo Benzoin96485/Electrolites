@@ -124,6 +124,11 @@ class RefDLPNO:
     # ------------------------------------------------------------------
     def _tick(self, key, t0):
         self.timings[key] = self.timings.get(key, 0.) + time.perf_counter() - t0
+        try:
+            from electrolites.dlpno.devmem import trim_host
+            trim_host()                    # phase temporaries back to the OS
+        except ImportError:
+            pass
         if getattr(self, 'verbose', 0) >= 2:
             _phase_log(key, self.timings[key])
         return time.perf_counter()

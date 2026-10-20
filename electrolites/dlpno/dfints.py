@@ -205,7 +205,7 @@ class BlockQ:
         """store the (na, nl, np) device block of aux atom ``a``."""
         dst = self.block(a)
         if isinstance(dst, np.ndarray):
-            dst[...] = cp.asnumpy(x)
+            cp.ascontiguousarray(x).get(out=dst)          # no pageable temporary
         elif dst.device.id == cp.cuda.Device().id:
             dst[...] = x
         else:
