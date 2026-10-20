@@ -248,6 +248,18 @@ convergence ORCA's (`R_NORM='max'`, max. residuum 1e-5).
 | taxol (RHF) | cc-pVDZ | -- | 359 (Psi4 criterion) | 640 | -- |
 | Ni dithiolene (ROHF, doublet) | def2-SVP | 345 | 296 | 607 | 691 |
 | Cu macrocycle (ROHF, doublet) | def2-SVP | -- | 843 (3 GPUs: 947) | 986 | 1158 |
+| Trp-cage 1L2Y (RHF, +1, 304 atoms) | def2-SVP | -- | 1939 | ~2290 (64 x 7000 MB) | out of memory (128 x 3500 MB) |
+| C50H102, standardized geometry (RHF) | def2-TZVP | -- | 198 (stored (Q\|uv)) | -- | ~850 (908 incl. SCF) |
+
+Closed shell, same geometry and SCF (C100H202/def2-SVP: SCF energies 1e-9 Eh
+apart): ORCA 6.1 and this code (Psi4 truncation) differ by about 0.1% of the
+correlation energy: CCSD -11.2 mEh, (T) +3.2 mEh (C100/SVP); -5.7 / -2.5 mEh
+(C50/TZVP, standardized geometry); Trp-cage -10.9 / +13.2 mEh.  The thresholds
+are the same; ORCA builds its CC PNOs and pair lists from semi-local MP2
+(SL-MP2) amplitudes without LMP2 iterations or PNO completeness criteria.
+`ORCA_COMPAT=True` (no completeness criteria, semicanonical PNOs, no LMP2
+iterations) is ~30% faster but does not reproduce ORCA's SL-MP2 (C50/TZVP:
++8.4 / +5.2 mEh), so it is not the default.
 
 The two open-shell SCF solutions are not the same state as ORCA's (Ni:
 ours 9 mEh lower; Cu: ORCA's 49 mEh lower), so only the timings compare.
