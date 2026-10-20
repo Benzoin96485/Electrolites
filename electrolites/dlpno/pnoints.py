@@ -62,6 +62,28 @@ class PNOIntsGPU:
                 chunks.append((ch, int(Pv)))
         return chunks
 
+    def _decide_atom_mode(self, needs, devs):
+        """atom-major (Q|uv) contributions when the regions would evaluate each
+        aux atom's AO integrals many times (DLPNO_PNOINT_ATOM=auto|0|1; auto:
+        more than 4 times on average); needs a stored (Q|iu)."""
+        import os
+        env = os.environ.get('DLPNO_PNOINT_ATOM', 'auto')
+        if env == '0' or getattr(self.dfi, 'qia_direct', False):
+            return False
+        if env == '1':
+            return True
+        free = []
+        for d in devs:
+            with cp.cuda.Device(d):
+                free.append(cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes())
+        regions = self.dfi.plan_regions(needs, 0.25 * min(free))
+        evals = sum(len(nd) for _, nd, _ in regions)
+        atoms = len({a for nd in needs for a in nd})
+        if getattr(self, 'verbose', 0) >= 2:
+            print(f'[mem] PNO integrals: {len(regions)} regions, {evals} atom blocks for {atoms} atoms',
+                  flush=True)
+        return evals > 4 * atoms
+
     def pno_integrals_batched(self):
         from electrolites.dlpno import mgpu
         self.df_offload = self._decide_df_offload()
@@ -73,8 +95,10 @@ class PNOIntsGPU:
         devs = mgpu.devices()
         home = cp.cuda.Device().id
 
+        atom_mode = [False]
+
         def work(w, it):
-            out = w._pno_chunk(*it)
+            out = w._pno_chunk(*it, atom_mode=atom_mode[0])
             if cp.cuda.Device().id != home:
                 # the CC driver reads the pair integrals on the home device; the
                 # strong pairs' DF tensors stay here (their DF groups are spread
@@ -111,8 +135,20 @@ class PNOIntsGPU:
                 needs.append({a: (np.unique(np.concatenate(nr[a])), np.unique(np.concatenate(nc[a])))
                               for a in nr})
                 lneeds.append({a: (np.concatenate(ld[a]), needs[-1][a][1]) for a in nr})
-            ctxs = self.dfi.run_regions(chunks, needs, work, setup, devs, getattr(self, 'verbose', 0),
-                                        item_lneeds=lneeds)
+            if self._decide_atom_mode(needs, devs):
+                # atom-major: the pair-major pass without (Q|uv), then one
+                # (Q_a|uv) block per aux atom and device (``pnoatom``)
+                from electrolites.dlpno.pnoatom import pno_atom_pass
+                atom_mode[0] = True
+                for name in ('aQiv', 'aQjv', 'aQio', 'aQjo'):
+                    setattr(self, name, [None] * npair)
+                ctxs = mgpu.run_queue(chunks, work, devs, setup=setup)
+                pno_atom_pass(self, devs, getattr(self, 'verbose', 0))
+                for name in ('aQiv', 'aQjv', 'aQio', 'aQjo'):
+                    setattr(self, name, None)
+            else:
+                ctxs = self.dfi.run_regions(chunks, needs, work, setup, devs, getattr(self, 'verbose', 0),
+                                            item_lneeds=lneeds)
         else:
             chunks.sort(key=lambda c: -len(c[0]))
             ctxs = mgpu.run_queue(chunks, work, devs, setup=setup)
@@ -159,9 +195,11 @@ class PNOIntsGPU:
                 if q != p:
                     self.L_iajb[q] = self.L_iajb[p].T
 
-    def _pno_chunk(self, ch, P):
+    def _pno_chunk(self, ch, P, atom_mode=False):
         """PNO-basis integrals of the canonical pairs ``ch`` (padded PAO
-        domain P).  Returns {list name: {pair: array}}."""
+        domain P).  Returns {list name: {pair: array}}.  ``atom_mode``: only
+        what needs no (Q|uv) block, plus the fitted (Q|ia), (Q|ik) factors the
+        atom-major pass (``_pno_atom_pass``) contracts its (Q|uv) blocks with."""
         pl, dfi, ext = self.pl, self.dfi, self.dfi.ext
         B = len(ch)
         from electrolites.dlpno.devmem import Prof
@@ -232,10 +270,12 @@ class PNOIntsGPU:
                 e_ = self._ext[ch[s]]
                 eidx[r, :len(e_)], emk[r, :len(e_)] = e_, 1.
             gem = cp.asarray(emk)
-            Kio = cp.zeros((ns, L, V, E))
-            Kjo = cp.zeros((ns, L, V, E))
-        q_vv = cp.zeros((B, A, V, V))
-        atoms = sorted({a for o_ in offs for a in o_})
+            Kio = Kjo = None
+            if not atom_mode:
+                Kio = cp.zeros((ns, L, V, E))
+                Kjo = cp.zeros((ns, L, V, E))
+        q_vv = cp.zeros((B, A, V, V)) if not atom_mode else None
+        atoms = sorted({a for o_ in offs for a in o_}) if not atom_mode else []
         for a in atoms:
             rows = np.array([r for r in range(B) if a in offs[r]], np.int64)
             off = np.array([offs[r][a] for r in rows], np.int64)
@@ -296,6 +336,22 @@ class PNOIntsGPU:
                 Kjo[s_] += cp.matmul(_tr(q_jo_c[g_[:, None], oo]), ve).reshape(b_, L, V, E)
                 del ve
         prof('rest')
+        extra = {}
+        if atom_mode:
+            # fitted factors for the atom pass: (Q|ia), (Q|ja) of every pair,
+            # (Q|ik), (Q|jk) of the strong ones (host)
+            q_ivc_all, q_jvc_all = C(q_iv), C(q_jv)
+            extra = {'aQiv': {}, 'aQjv': {}, 'aQio': {}, 'aQjo': {}}
+            for s_, p in enumerate(ch):
+                na_, nl_, nv_ = len(auxs[s_]), nla[s_], nva[s_]
+                extra['aQiv'][p] = cp.asnumpy(q_ivc_all[s_, :na_, :nv_])
+                if pl.ji[p] != p:
+                    extra['aQjv'][p] = cp.asnumpy(q_jvc_all[s_, :na_, :nv_])
+                if ns and st[s_]:
+                    extra['aQio'][p] = cp.asnumpy(q_io_c[s_, :na_, :nl_])
+                    if pl.ji[p] != p:
+                        extra['aQjo'][p] = cp.asnumpy(q_jo_c[s_, :na_, :nl_])
+            del q_ivc_all, q_jvc_all
         if ns:
             del q_io_c, q_jo_c
             # (k a'| i a) with a' over the extended domain
@@ -310,16 +366,20 @@ class PNOIntsGPU:
             Kovjv = cp.matmul(_tr(q_ovx), q_jv_c).reshape(ns, L, E, V)
             del q_ovx, q_iv_c, q_jv_c
         q_pair = H(q_pair[:, :, None])[:, :, 0]
-        q_io, q_jo, q_iv, q_jv, q_ov, q_vv = (H(x) for x in (q_io, q_jo, q_iv, q_jv, q_ov, q_vv))
+        q_io, q_jo, q_iv, q_jv, q_ov = (H(x) for x in (q_io, q_jo, q_iv, q_jv, q_ov))
+        if not atom_mode:
+            q_vv = H(q_vv)
         K_mibj = cp.matmul(_tr(q_io), q_jv)                         # (B, L, V)
         K_mjbi = cp.matmul(_tr(q_jo), q_iv)
         J_ijmb = cp.einsum('bA,bAlv->blv', q_pair, q_ov)
-        K_ivvv = cp.matmul(_tr(q_iv), q_vv.reshape(B, A, V * V)).reshape(B, V, V, V)
-        K_jvvv = cp.matmul(_tr(q_jv), q_vv.reshape(B, A, V * V)).reshape(B, V, V, V)
+        if not atom_mode:
+            K_ivvv = cp.matmul(_tr(q_iv), q_vv.reshape(B, A, V * V)).reshape(B, V, V, V)
+            K_jvvv = cp.matmul(_tr(q_jv), q_vv.reshape(B, A, V * V)).reshape(B, V, V, V)
         prof('out')
         proj = self._proj_chunk(ch, st, srank, nla, nva, Kio, Koviv, Kjo, Kovjv) if ns else {}
         names = ('K_mibj', 'J_ijmb', 'K_ivvv', 'J_ikac', 'K_iakc', 'iQk', 'iQa', 'Qma', 'Qab')
         out = {k: {} for k in names}
+        out.update(extra)
         cc = cp.ascontiguousarray
         for s, p in enumerate(ch):
             i, j = pl.pairs[p]
@@ -327,24 +387,26 @@ class PNOIntsGPU:
             na_, nl, nv = len(auxs[s]), nla[s], nva[s]
             out['K_mibj'][p] = cc(K_mibj[s, :nl, :nv])
             out['J_ijmb'][p] = cc(J_ijmb[s, :nl, :nv])
-            out['K_ivvv'][p] = cc(K_ivvv[s, :nv, :nv, :nv]).reshape(nv, nv * nv)
+            if not atom_mode:
+                out['K_ivvv'][p] = cc(K_ivvv[s, :nv, :nv, :nv]).reshape(nv, nv * nv)
             if q != p:
                 out['K_mibj'][q] = cc(K_mjbi[s, :nl, :nv])
                 out['J_ijmb'][q] = out['J_ijmb'][p]
-                out['K_ivvv'][q] = cc(K_jvvv[s, :nv, :nv, :nv]).reshape(nv, nv * nv)
+                if not atom_mode:
+                    out['K_ivvv'][q] = cc(K_jvvv[s, :nv, :nv, :nv]).reshape(nv, nv * nv)
             if not st[s]:
                 continue
             out['J_ikac'][p], out['K_iakc'][p] = proj[(p, 0)]
             if q != p:
                 out['J_ikac'][q], out['K_iakc'][q] = proj[(p, 1)]
             vals = [cc(q_io[s, :na_, :nl]), cc(q_iv[s, :na_, :nv]), cc(q_ov[s, :na_, :nl, :nv]),
-                    cc(q_vv[s, :na_, :nv, :nv])]
+                    cc(q_vv[s, :na_, :nv, :nv]) if not atom_mode else None]
             vq = [cc(q_jo[s, :na_, :nl]), cc(q_jv[s, :na_, :nv])]
             if self.df_offload:
                 # pageable host copies: freed pinned memory is not returned to
                 # the OS (CUDA keeps it for reuse), so the grouped copies the CC
                 # driver makes (pinned) would add to these instead of replacing them
-                vals = [cp.asnumpy(x) for x in vals]
+                vals = [None if x is None else cp.asnumpy(x) for x in vals]
                 vq = [cp.asnumpy(x) for x in vq]
             out['iQk'][p], out['iQa'][p], out['Qma'][p], out['Qab'][p] = vals
             if q != p:
@@ -406,8 +468,8 @@ class PNOIntsGPU:
             return out
         n_t = np.array([len(self.pao[it[4]]) for it in items])
         v_t = np.array([self.X[it[4]].shape[1] for it in items])
-        E = Kio.shape[3]
-        V = Kio.shape[2]
+        E = Koviv.shape[2]
+        V = Koviv.shape[3]
         Pq, Vq = int(n_t.max()), int(v_t.max())
         step = max(1, int((1 << 29) // (8 * (V * E + 2 * Pq * (V + Vq) + E * V))))
         res = [None] * len(items)
@@ -428,14 +490,17 @@ class PNOIntsGPU:
             kk = cp.asarray(np.array([it[3] for it in its], np.int64))
             sd = np.array([it[1] for it in its])
             s1 = cp.asarray(sd == 1)
-            Ka = cp.where(s1[:, None, None], Kjo[rr, kk], Kio[rr, kk])                   # (m, V, E)
             Kb = cp.where(s1[:, None, None], Kovjv[rr, kk], Koviv[rr, kk])               # (m, E, V)
-            A = cp.take_along_axis(Ka, gc[:, None, :], axis=2) * gm[:, None, :]         # (m, V, Pq)
-            J = cp.matmul(A, X)                                                          # (m, V, Vq)
+            J = None
+            if Kio is not None:
+                Ka = cp.where(s1[:, None, None], Kjo[rr, kk], Kio[rr, kk])               # (m, V, E)
+                A = cp.take_along_axis(Ka, gc[:, None, :], axis=2) * gm[:, None, :]     # (m, V, Pq)
+                J = cp.matmul(A, X)                                                      # (m, V, Vq)
             B = cp.take_along_axis(Kb, gc[:, :, None], axis=1) * gm[:, :, None]         # (m, Pq, V)
             K = cp.matmul(X.transpose(0, 2, 1), B).transpose(0, 2, 1)                    # (m, V, Vq)
             for r_, it in enumerate(its):
-                res[c0 + r_] = (J[r_, :it[6], :v_t[c0 + r_]], K[r_, :it[6], :v_t[c0 + r_]])
+                res[c0 + r_] = (None if J is None else J[r_, :it[6], :v_t[c0 + r_]],
+                                K[r_, :it[6], :v_t[c0 + r_]])
         for it, (Jm, Km) in zip(items, res):
             key = (it[0], it[1])
             if key not in out:
