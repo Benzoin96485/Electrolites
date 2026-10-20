@@ -319,6 +319,148 @@ def _decide_qab_direct(nbytes, host):
     return bool(host) and nbytes > 0.4 * _host_available()
 
 
+def scratch_dir(tag):
+    """a fresh directory for bulk run data on the scratch file system
+    (DLPNO_SCRATCH, else $PSCRATCH/dlpno_scratch, else $SCRATCH); never in
+    the home directory."""
+    import tempfile
+    base = os.environ.get('DLPNO_SCRATCH')
+    if not base:
+        for v in ('PSCRATCH', 'SCRATCH'):
+            if os.environ.get(v):
+                base = os.path.join(os.environ[v], 'dlpno_scratch')
+                break
+    if not base:
+        raise RuntimeError('no scratch file system: set DLPNO_SCRATCH (bulk integral data '
+                           'is not written to the home directory)')
+    home = os.path.realpath(os.path.expanduser('~'))
+    if os.path.realpath(base).startswith(home):
+        raise RuntimeError(f'DLPNO_SCRATCH={base} is inside the home directory')
+    os.makedirs(base, exist_ok=True)
+    return tempfile.mkdtemp(prefix=f'{tag}_{os.getpid()}_', dir=base)
+
+
+class QabDiskStore:
+    """(Q_a|uv) blocks of every aux atom over the union of what a phase's
+    batches need (rows x columns), evaluated once and kept on the scratch file
+    system; the regions read their sub-blocks back instead of recomputing the
+    AO integrals.  File per atom, layout (rows, aux, columns): a row subset
+    is a set of contiguous reads.  ``close()`` deletes the files."""
+
+    def __init__(self, dfi, item_needs, devs, setup, verbose=0):
+        import time
+        from electrolites.dlpno import mgpu
+        t0 = time.perf_counter()
+        natm, nbf = len(dfi.atom_ribfs), dfi.nbf
+        rm, cm = np.zeros((natm, nbf), bool), np.zeros((natm, nbf), bool)
+        square = np.ones(natm, bool)
+        for nd in item_needs:
+            for a, u in nd.items():
+                if isinstance(u, tuple):
+                    rm[a, np.asarray(u[0], np.int64)] = True
+                    cm[a, np.asarray(u[1], np.int64)] = True
+                    square[a] = False
+                else:
+                    rm[a, np.asarray(u, np.int64)] = True
+                    cm[a, np.asarray(u, np.int64)] = True
+        atoms = [a for a in range(natm) if rm[a].any() and len(dfi.atom_ribfs[a])]
+        self.rows = {a: np.flatnonzero(rm[a]) for a in atoms}
+        self.cols = {a: (self.rows[a] if square[a] else np.flatnonzero(cm[a])) for a in atoms}
+        self.rpos, self.cpos, self.shape, self.path = {}, {}, {}, {}
+        for a in atoms:
+            r = -np.ones(nbf, np.int64)
+            r[self.rows[a]] = np.arange(len(self.rows[a]))
+            self.rpos[a] = r
+            if self.cols[a] is self.rows[a]:
+                self.cpos[a] = r
+            else:
+                c = -np.ones(nbf, np.int64)
+                c[self.cols[a]] = np.arange(len(self.cols[a]))
+                self.cpos[a] = c
+        self.dir = scratch_dir('qab')
+        needs = {a: (self.rows[a] if self.cols[a] is self.rows[a] else (self.rows[a], self.cols[a]))
+                 for a in atoms}
+        groups = [(atoms, None)]
+        if dfi._pao_sup is not None and atoms:
+            groups = dfi._region_groups(atoms, needs)
+        # one integral evaluation per atom, the groups spread over the devices
+        jobs = [(g_atoms[k:k + 8], aosub) for g_atoms, aosub in groups for k in range(0, len(g_atoms), 8)]
+        nbytes = [0.]
+
+        def bwork(ctx, job):
+            dv = getattr(ctx, 'dfi', None) or dfi
+            g_atoms, aosub = job
+            for a in g_atoms:
+                rows, cols = self.rows[a], self.cols[a]
+                blk, _, _, _ = dv._direct_rect(a, rows, None if cols is rows else cols, cache=False, aosub=aosub)
+                h = cp.asnumpy(cp.ascontiguousarray(blk.transpose(1, 0, 2)))     # (rows, aux, cols)
+                del blk
+                p = os.path.join(self.dir, f'a{a}.bin')
+                h.tofile(p)
+                self.shape[a] = h.shape
+                self.path[a] = p
+                nbytes[0] += h.nbytes
+                del h
+        try:
+            mgpu.run_queue(jobs, bwork, devs, setup=setup)
+        except BaseException:
+            self.close()
+            raise
+        self.nbytes = nbytes[0]
+        if verbose >= 2:
+            print(f'[mem] (Q|uv) disk store: {len(atoms)} atoms, {self.nbytes / 1e9:.1f} GB in {self.dir}, '
+                  f'built in {time.perf_counter() - t0:.1f} s', flush=True)
+
+    def __contains__(self, a):
+        return a in self.path
+
+    def read(self, a, u):
+        """device block of atom ``a`` over ``u`` (PAOs, or (rows, columns)),
+        with its row and column maps (the same object for a square need)."""
+        rows, cols = u if isinstance(u, tuple) else (u, None)
+        rows = np.asarray(rows, np.int64)
+        ir = self.rpos[a][rows]
+        ic = ir if cols is None else self.cpos[a][np.asarray(cols, np.int64)]
+        assert (ir >= 0).all() and (ic >= 0).all(), 'block outside the stored domain'
+        mm = np.memmap(self.path[a], dtype=np.float64, mode='r', shape=self.shape[a])
+        sub = np.asarray(mm[ir])                                    # contiguous row reads
+        if cols is None and len(ir) == self.shape[a][2] and np.array_equal(ic, np.arange(len(ic))):
+            pass
+        else:
+            sub = sub[:, :, ic]
+        del mm
+        blk = cp.ascontiguousarray(cp.asarray(sub).transpose(1, 0, 2))      # (aux, rows, cols)
+        nbf = len(self.rpos[a])
+        rmap = -np.ones(nbf, np.int64)
+        rmap[rows] = np.arange(len(rows))
+        if cols is None:
+            cmap = rmap
+        else:
+            cmap = -np.ones(nbf, np.int64)
+            cmap[np.asarray(cols, np.int64)] = np.arange(len(cols))
+        return blk, rmap, cmap
+
+    def close(self):
+        import shutil
+        if getattr(self, 'dir', None) and os.path.isdir(self.dir):
+            shutil.rmtree(self.dir, ignore_errors=True)
+        self.dir = None
+
+
+def _decide_qab_disk(dfi, regions, item_lneeds):
+    """the on-disk store when the regions would evaluate each atom's AO
+    integrals many times (DLPNO_QAB_DISK=auto|0|1; auto: more than 4 times on
+    average, and no region (Q|iu), which needs the AO integrals anyway)."""
+    env = os.environ.get('DLPNO_QAB_DISK', 'auto')
+    if env != 'auto':
+        return env == '1' and item_lneeds is None
+    if item_lneeds is not None:
+        return False
+    evals = sum(len(nd) for _, nd, _ in regions)
+    atoms = len({a for _, nd, _ in regions for a in nd})
+    return atoms > 0 and evals > 4 * atoms
+
+
 class _CheckedQ:
     """debug: a BlockQ whose gathers are compared with the dense tensor."""
 
@@ -1062,6 +1204,20 @@ class DFInts:
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         on_dev = tot + tot_iu < 0.3 * free and os.environ.get('DLPNO_REGION_HOST') != '1'   # testing
         atoms = [a for a in sorted(allat) if na[a] and (a in needs or a in lneeds)]
+        disk = getattr(self, '_disk', None)
+        if disk is not None and not lneeds:
+            # blocks read back from the scratch store (no AO integrals)
+            reg = {}
+            for a in atoms:
+                blk, rmap, cmap = disk.read(a, needs[a])
+                reg[a] = (blk if on_dev else to_pinned(blk), rmap, cmap)
+                del blk
+            self._regions[dev] = reg
+            self._region_qia[dev] = None
+            if verbose >= 3:
+                print(f'[mem] (Q|uv) region on GPU {dev}: {len(atoms)} atoms, {tot / 1e9:.1f} GB read '
+                      f'from disk in {time.perf_counter() - t0:.1f} s', flush=True)
+            return
         groups = [(atoms, None)]
         if self._pao_sup is not None and atoms:
             groups = self._region_groups(atoms, needs, lneeds)
@@ -1215,10 +1371,14 @@ class DFInts:
             item_lneeds = None
         regions = self.plan_regions(item_needs, budget, item_lneeds)
         if verbose >= 2:
+            evals = sum(len(nd) for _, nd, _ in regions)
             print(f'[mem] (Q|uv) regions: {len(regions)} for {len(items)} batches '
-                  f'(budget {budget / 1e9:.1f} GB per region)', flush=True)
+                  f'(budget {budget / 1e9:.1f} GB per region, {evals} atom blocks)', flush=True)
         self._regions = {}
         self._region_qia = {}
+        self._disk = None
+        if _decide_qab_disk(self, regions, item_lneeds):
+            self._disk = QabDiskStore(self, item_needs, devs, setup, verbose)
 
         def rwork(ctx, region):
             idx, needs, lneeds = region
@@ -1253,6 +1413,9 @@ class DFInts:
         finally:
             self._regions = {}
             self._region_qia = {}
+            if self._disk is not None:
+                self._disk.close()
+            self._disk = None
 
     def _ao_j3c(self, a):
         """AO (mu nu|Q_a) of aux atom ``a`` (nao, nao, na), from a per-device
