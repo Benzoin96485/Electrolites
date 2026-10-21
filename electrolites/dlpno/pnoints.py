@@ -124,6 +124,9 @@ class PNOIntsGPU:
         def work(w, it):
             out = w._pno_chunk(*it, atom_mode=atom_mode[0])
             if cp.cuda.Device().id != home:
+                # outputs complete before the home device copies them (the copy
+                # runs on the home device's stream)
+                cp.cuda.Device().synchronize()
                 # the CC driver reads the pair integrals on the home device; the
                 # strong pairs' DF tensors stay here (their DF groups are spread
                 # over the devices anyway)
