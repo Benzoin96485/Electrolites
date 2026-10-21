@@ -91,13 +91,13 @@ class _Packed:
     shape (members, [sub,] A, R, C) on the current device."""
 
     def __init__(self, blocks, shape, sub=1):
-        from electrolites.dlpno.devmem import pinned_empty
+        from electrolites.dlpno.devmem import pinned_empty, as_host
         dims = np.array([(b.shape + (1,) * (3 - b.ndim)) for b in blocks], np.int32).reshape(-1, 3)
         sz = dims.astype(np.int64).prod(axis=1)
         self.off = np.concatenate([[0], np.cumsum(sz)[:-1]]).astype(np.int64)
         self.buf = pinned_empty(int(sz.sum()))
         for b, o, n in zip(blocks, self.off, sz):
-            self.buf[o:o + n] = (b if isinstance(b, np.ndarray) else cp.asnumpy(b)).ravel()
+            self.buf[o:o + n] = as_host(b).ravel()
         self.dims = dims
         self.shape = (len(blocks) // sub,) + ((sub,) if sub > 1 else ()) + tuple(shape)
         self.inner = (tuple(shape) + (1,))[:3]
@@ -791,6 +791,9 @@ class CCSDGPU:
         self._load_df()
         for name in ('Qma', 'Qab', 'iQk', 'iQa'):
             setattr(ref, name, [None] * len(getattr(ref, name)))
+        if getattr(ref, '_df_spill', None) is not None:
+            ref._df_spill.close()          # grouped: the scratch files go
+            ref._df_spill = None
         cp.get_default_memory_pool().free_all_blocks()
 
     def _load_df(self):

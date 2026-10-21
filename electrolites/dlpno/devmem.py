@@ -47,6 +47,74 @@ def trim_host():
         pass
 
 
+class SpillRef:
+    """a host array kept in a file on the scratch file system (``SpillStore``):
+    ``shape``, ``nbytes`` and ``load()``."""
+    __slots__ = ('path', 'offset', 'shape', 'dtype')
+
+    def __init__(self, path, offset, shape, dtype):
+        self.path, self.offset, self.shape, self.dtype = path, offset, tuple(shape), np.dtype(dtype)
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    @property
+    def nbytes(self):
+        return int(np.prod(self.shape)) * self.dtype.itemsize
+
+    def load(self):
+        n = int(np.prod(self.shape))
+        return np.fromfile(self.path, dtype=self.dtype, count=n, offset=self.offset).reshape(self.shape)
+
+
+def as_host(x):
+    """numpy array of a (device / host / spilled) array."""
+    if isinstance(x, SpillRef):
+        return x.load()
+    return x if isinstance(x, np.ndarray) else cp.asnumpy(x)
+
+
+class SpillStore:
+    """append-only files (one per writing thread) under a scratch directory
+    holding host arrays until they are read back; ``close()`` deletes them."""
+
+    def __init__(self, tag):
+        import threading
+        from electrolites.dlpno.dfints import scratch_dir
+        self.dir = scratch_dir(tag)
+        self._f = {}
+        self._lock = threading.Lock()
+        self.nbytes = 0
+
+    def put(self, x):
+        import os
+        import threading
+        x = np.ascontiguousarray(as_host(x))
+        tid = threading.get_ident()
+        with self._lock:
+            fh = self._f.get(tid)
+            if fh is None:
+                fh = self._f[tid] = open(os.path.join(self.dir, f'spill_{len(self._f)}.bin'), 'ab')
+            self.nbytes += x.nbytes
+        off = fh.tell()
+        x.tofile(fh)
+        return SpillRef(fh.name, off, x.shape, x.dtype)
+
+    def flush(self):
+        for fh in self._f.values():
+            fh.flush()
+
+    def close(self):
+        import shutil
+        for fh in self._f.values():
+            fh.close()
+        self._f = {}
+        if self.dir:
+            shutil.rmtree(self.dir, ignore_errors=True)
+        self.dir = None
+
+
 def pinned_empty(shape, dtype=np.float64):
     """numpy array in page-locked host memory (fast, asynchronous H2D)."""
     n = int(np.prod(shape))

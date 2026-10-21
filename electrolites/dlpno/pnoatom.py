@@ -385,7 +385,8 @@ def _half_fit(obj, Qab_raw, off):
         for s, p in enumerate(grp):
             nax, v = Qab_raw[p].shape[0], obj.X[p].shape[1]
             x = cp.ascontiguousarray(H[s, :nax, :v, :v])
-            val = cp.asnumpy(x) if off else x
+            sp = getattr(obj, '_df_spill', None)
+            val = (sp.put(x) if sp is not None else cp.asnumpy(x)) if off else x
             obj.Qab[p] = val
             q = pl.ji[p]
             if q != p:

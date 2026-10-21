@@ -62,6 +62,29 @@ class PNOIntsGPU:
                 chunks.append((ch, int(Pv)))
         return chunks
 
+    def _decide_df_spill(self):
+        """the strong pairs' DF tensors (host-offloaded) to the scratch file
+        system until the CC groups them, when they would take more than 30% of
+        the available host memory (DLPNO_DF_SPILL=auto|0|1)."""
+        import os
+        env = os.environ.get('DLPNO_DF_SPILL', 'auto')
+        if env == '0':
+            return None
+        nb = 0.
+        for p, (i, j) in enumerate(self.pl.pairs):
+            if i <= j and self.strong[p]:
+                A = sum(len(self.dfi.atom_ribfs[a]) for a in self.riatoms[p])
+                nv, nl = self.X[p].shape[1], len(self.lmos[p])
+                nb += 8. * A * (nl * nv + nl + nv) * (1 if self.pl.ji[p] == p else 2)
+        from electrolites.dlpno.dfints import _host_available
+        if env == 'auto' and nb < 0.3 * _host_available():
+            return None
+        from electrolites.dlpno.devmem import SpillStore
+        st = SpillStore('dfspill')
+        if getattr(self, 'verbose', 0) >= 2:
+            print(f'[mem] pair DF tensors (~{nb / 1e9:.0f} GB) spilled to {st.dir}', flush=True)
+        return st
+
     def _decide_atom_mode(self, needs, devs):
         """atom-major (Q|uv) contributions when the regions would evaluate each
         aux atom's AO integrals many times (DLPNO_PNOINT_ATOM=auto|0|1; auto:
@@ -87,6 +110,7 @@ class PNOIntsGPU:
     def pno_integrals_batched(self):
         from electrolites.dlpno import mgpu
         self.df_offload = self._decide_df_offload()
+        self._df_spill = self._decide_df_spill() if self.df_offload else None
         npair = len(self.pl)
         for name in ('K_mibj', 'J_ijmb', 'K_ivvv', 'L_iajb', 'J_ikac', 'K_iakc',
                      'iQk', 'iQa', 'Qma', 'Qab'):
@@ -176,6 +200,8 @@ class PNOIntsGPU:
             if getattr(c, '_prof', None) is not None:
                 c._prof.report()
         self._ext = None
+        if getattr(self, '_df_spill', None) is not None:
+            self._df_spill.flush()
         if getattr(self, 'verbose', 0) >= 2:
             if (getattr(self.dfi, 'qab_host', False) or getattr(self.dfi, '_shard', None)
                     or getattr(self.dfi, 'qab_direct', False)):
@@ -425,9 +451,13 @@ class PNOIntsGPU:
             if self.df_offload:
                 # pageable host copies: freed pinned memory is not returned to
                 # the OS (CUDA keeps it for reuse), so the grouped copies the CC
-                # driver makes (pinned) would add to these instead of replacing them
-                vals = [None if x is None else cp.asnumpy(x) for x in vals]
-                vq = [cp.asnumpy(x) for x in vq]
+                # driver makes (pinned) would add to these instead of replacing them;
+                # with a spill store: files on the scratch file system until the
+                # CC groups them
+                sp = getattr(self, '_df_spill', None)
+                put = sp.put if sp is not None else cp.asnumpy
+                vals = [None if x is None else put(x) for x in vals]
+                vq = [put(x) for x in vq]
             out['iQk'][p], out['iQa'][p], out['Qma'][p], out['Qab'][p] = vals
             if q != p:
                 out['iQk'][q], out['iQa'][q] = vq

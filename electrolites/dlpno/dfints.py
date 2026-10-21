@@ -305,7 +305,7 @@ def _qia_placement(nbytes):
     # the host first (device memory sets the region sizes and the stored
     # overlaps of the LMP2 / CC); the home device keeps the (Q|ij), the DF
     # build and the pair data: it comes last, with a smaller share
-    place = [(None, 0.4 * _host_available())]
+    place = [(None, float(os.environ.get('DLPNO_QIA_HOST_FRAC', '0.4')) * _host_available())]
     place += [(d, cap(d, frac)) for d in devs if d != home]
     place.append((home, cap(home, 0.5 * frac)))
     if sum(c for _, c in place) < 1.05 * nbytes:
