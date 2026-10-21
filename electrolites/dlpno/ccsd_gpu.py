@@ -220,7 +220,14 @@ class _ChunkedPlan:
             return S
         if self.store is not None:
             return self.store.gather(ch['LS'], ch['preps'])
-        keep = self.budget is not None and self.budget.take(ch['dev'], ch['LS'].nbytes())
+        nb = ch['LS'].nbytes()
+        keep = False
+        if self.budget is not None:
+            # kept only while a quarter of the device stays free: the budget was
+            # set at the build, before the replicas and the DF groups' temporaries
+            fr, tot = cp.cuda.runtime.memGetInfo()
+            fr += cp.get_default_memory_pool().free_bytes()
+            keep = fr - nb > 0.25 * tot and self.budget.take(ch['dev'], nb)
         if keep:
             S = Ragged(ch['LS'])
         else:
