@@ -258,7 +258,10 @@ class BlockQ:
     def to_host(self):
         if self.split:
             return self
-        return self._with(cp.asnumpy(self.buf) if isinstance(self.buf, cp.ndarray) else self.buf)
+        if isinstance(self.buf, cp.ndarray):
+            # pinned: read by the gathers directly (zero copy)
+            return self._with(to_pinned(self.buf))
+        return self
 
     def to_device(self):
         return self if (self.host or self.split) else self._with(cp.asarray(self.buf))

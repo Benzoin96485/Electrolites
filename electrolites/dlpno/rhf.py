@@ -14,6 +14,7 @@ metric (cached per domain) where Psi4 uses its inverse square root; every
 quantity contracts two fitted factors over the auxiliary index, so the two
 are the same up to rounding.
 """
+import os
 import time
 
 import numpy as np
@@ -259,6 +260,14 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
         t0 = time.perf_counter()
         # the (Q|uv) device cache is not needed again before the triples
         self.dfi.cache_clear()
+        # a large device (Q|ij) (block-sparse, read by the triples only) waits
+        # in pinned host memory: the CC needs the home device
+        from electrolites.dlpno.dfints import BlockQ
+        qij = self.dfi.qij
+        if (isinstance(qij, BlockQ) and not qij.host and not qij.split
+                and qij.nbytes > float(os.environ.get('DLPNO_QIJ_CC_HOST_GB', '4')) * 1e9):
+            self.dfi.qij = qij.to_host()
+            del qij
         cp.get_default_memory_pool().free_all_blocks()
         self.cc = cc = CCSDGPU(self, None)
         self.timings['cc_build'] = time.perf_counter() - t0
