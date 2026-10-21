@@ -244,9 +244,15 @@ class BlockQ:
         return c
 
     def replicate(self):
-        """a view whose storage is on the current device (host storage: shared)."""
+        """a view whose storage is on the current device (host storage: shared;
+        a large device buffer is shared too and read by peer access: a copy
+        per device would not fit next to the rest, e.g. crambin's 21 GB (Q|ij))."""
         if self.split or self.host or self.buf.device.id == cp.cuda.Device().id:
             return self
+        if self.buf.nbytes > float(os.environ.get('DLPNO_BQ_REPLICATE_GB', '4')) * 1e9:
+            from electrolites.dlpno import mgpu
+            mgpu.enable_peer(mgpu.devices())
+            return self._with(self.buf)
         return self._with(cp.asarray(self.buf))
 
     def to_host(self):
