@@ -90,18 +90,24 @@ class _Packed:
     back in pinned memory; ``device()`` uploads them and pads to the group's
     shape (members, [sub,] A, R, C) on the current device."""
 
-    def __init__(self, blocks, shape, sub=1):
+    def __init__(self, blocks, shape, sub=1, store=None):
         from electrolites.dlpno.devmem import pinned_empty, as_host
         dims = np.array([(b.shape + (1,) * (3 - b.ndim)) for b in blocks], np.int32).reshape(-1, 3)
         sz = dims.astype(np.int64).prod(axis=1)
         self.off = np.concatenate([[0], np.cumsum(sz)[:-1]]).astype(np.int64)
-        self.buf = pinned_empty(int(sz.sum()))
+        # store: the packed buffer in a file on the scratch file system, read
+        # back at every use (host memory too small for the CC's DF tensors)
+        buf = np.empty(int(sz.sum())) if store is not None else pinned_empty(int(sz.sum()))
         for b, o, n in zip(blocks, self.off, sz):
-            self.buf[o:o + n] = as_host(b).ravel()
+            buf[o:o + n] = as_host(b).ravel()
+        self.ref = store.put(buf) if store is not None else None
+        self.buf = buf if store is None else None
+        nbytes = buf.nbytes
+        del buf
         self.dims = dims
         self.shape = (len(blocks) // sub,) + ((sub,) if sub > 1 else ()) + tuple(shape)
         self.inner = (tuple(shape) + (1,))[:3]
-        self.nbytes = self.buf.nbytes
+        self.nbytes = nbytes
 
     def device(self):
         X, Y, Z = self.inner
@@ -109,7 +115,7 @@ class _Packed:
         out = cp.zeros(self.shape)
         nmax = int(self.dims.astype(np.int64).prod(axis=1).max()) if m else 0
         if nmax:
-            src = cp.asarray(self.buf)
+            src = cp.asarray(self.buf if self.ref is None else self.ref.load())
             _PAD((min(1024, -(-nmax // 256)), m), (256,),
                  (src, cp.asarray(self.off), cp.asarray(self.dims.ravel()), out,
                   np.int32(X), np.int32(Y), np.int32(Z)))
@@ -811,6 +817,15 @@ class CCSDGPU:
         ref = self.ref
         sel = np.where(self.strong & self.canon)[0]
         naux = np.array([ref.Qma[p].shape[0] for p in sel], np.int64)
+        # spilled pair DF tensors: the packed groups stay on the scratch file
+        # system too and are read at every iteration (DLPNO_CC_DF_DISK=auto|0|1)
+        import os
+        env = os.environ.get('DLPNO_CC_DF_DISK', 'auto')
+        self._df_store = None
+        if getattr(ref, 'df_offload', False) and (env == '1' or (
+                env == 'auto' and getattr(ref, '_df_spill', None) is not None)):
+            from electrolites.dlpno.devmem import SpillStore
+            self._df_store = SpillStore('ccdf')
         bk = lambda n, q: np.maximum(q, -(-np.asarray(n) // q) * q)
         Ab, Lb, Vb = bk(naux, 128), bk(self.nl[sel], 16), bk(self.nv[sel], 32)
         key = np.stack([Ab, Lb, Vb], 1)
@@ -853,9 +868,12 @@ class CCSDGPU:
         if dbg:
             left = sum(1 for nm in ('Qma', 'Qab') for x in getattr(ref, nm) if x is not None)
             print(f'[debug] after DF grouping: RSS {rss():.2f} GB, per-pair arrays left {left}', flush=True)
+        if self._df_store is not None:
+            self._df_store.flush()
         if off and getattr(ref, 'verbose', 0) >= 2:
             nb = sum(sum(d[k].nbytes for k in ('Qma', 'Qab', 'Qk', 'Qa')) for d in self.df)
-            print(f'[mem] CC DF groups in pinned host memory: {nb / 1e9:.1f} GB', flush=True)
+            where = f'on scratch ({self._df_store.dir})' if self._df_store is not None else 'in pinned host memory'
+            print(f'[mem] CC DF groups {where}: {nb / 1e9:.1f} GB', flush=True)
         self.df_dev = sorted({d['dev'] for d in self.df})
         cp.cuda.Device(home).use()
 
@@ -892,10 +910,11 @@ class CCSDGPU:
         if off:
             # host memory: the members' blocks back to back (no padding), padded
             # on the device when the group is used
-            Qma = _Packed([ref.Qma[p] for p in mem], (A, Lp, Vp))
-            Qab = _Packed([ref.Qab[p] for p in mem], (A, Vp, Vp))
-            Qk = _Packed([x for p, r in zip(mem, q) for x in (ref.iQk[p], ref.iQk[r])], (A, Lp), 2)
-            Qa = _Packed([x for p, r in zip(mem, q) for x in (ref.iQa[p], ref.iQa[r])], (A, Vp), 2)
+            st = getattr(self, '_df_store', None)
+            Qma = _Packed([ref.Qma[p] for p in mem], (A, Lp, Vp), store=st)
+            Qab = _Packed([ref.Qab[p] for p in mem], (A, Vp, Vp), store=st)
+            Qk = _Packed([x for p, r in zip(mem, q) for x in (ref.iQk[p], ref.iQk[r])], (A, Lp), 2, store=st)
+            Qa = _Packed([x for p, r in zip(mem, q) for x in (ref.iQa[p], ref.iQa[r])], (A, Vp), 2, store=st)
             for p, r in zip(mem, q):
                 ref.Qma[p] = ref.Qab[p] = ref.iQk[p] = ref.iQa[p] = None
                 ref.Qma[r] = ref.Qab[r] = ref.iQk[r] = ref.iQa[r] = None

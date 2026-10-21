@@ -271,7 +271,11 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
         cp.get_default_memory_pool().free_all_blocks()
         self.cc = cc = CCSDGPU(self, None)
         self.timings['cc_build'] = time.perf_counter() - t0
-        self.e_lccsd, self.de_weak = cc.kernel(verbose=self.verbose >= 4)
+        try:
+            self.e_lccsd, self.de_weak = cc.kernel(verbose=self.verbose >= 4)
+        finally:
+            if getattr(cc, '_df_store', None) is not None:
+                cc._df_store.close()       # the CC's DF groups on scratch
         self.T = cc.T.to_list()
         self.T1 = [t.ravel() for t in cc.T1.to_list()]
         # the CC stores are not needed by (T)
