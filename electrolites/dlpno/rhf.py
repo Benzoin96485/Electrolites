@@ -52,6 +52,11 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
         with pooled():
             return super().kernel()
 
+    def resume_cc(self):
+        from electrolites.dlpno.devmem import pooled
+        with pooled():
+            return super().resume_cc()
+
     def setup(self):
         t = time.perf_counter()
         mf, mol, opt = self.mf, self.mol, self.opt

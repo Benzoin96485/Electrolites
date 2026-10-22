@@ -991,6 +991,23 @@ class RefDLPNO:
             self.recompute_pnos()
         self.pno_integrals()
         t = self._tick('pno_ints', t)
+        import os
+        ck = os.environ.get('DLPNO_CKPT_PNO')
+        if ck:
+            # state after the PNO integrals (restart of the CC: resume_cc)
+            from electrolites.dlpno import checkpoint
+            checkpoint.save(self, ck)
+            self.log(f'  checkpoint written to {ck}')
+            t = self._tick('checkpoint', t)
+        return self._after_pno_ints(t)
+
+    def resume_cc(self):
+        """continue a run restored from a checkpoint written after the PNO
+        integrals (``checkpoint.load``)."""
+        return self._after_pno_ints(time.perf_counter())
+
+    def _after_pno_ints(self, t):
+        opt = self.opt
         self.lccsd_iterations()
         t = self._tick('lccsd', t)
         e_corr = (self.e_lccsd + self.de_weak + self.de_lmp2_eliminated

@@ -105,12 +105,23 @@ class SpillStore:
         for fh in self._f.values():
             fh.flush()
 
+    def __getstate__(self):
+        self.flush()
+        return dict(dir=self.dir, nbytes=self.nbytes)
+
+    def __setstate__(self, st):
+        import threading
+        self.__dict__.update(st)
+        self._f = {}
+        self._lock = threading.Lock()
+        self.keep = True               # restored from a checkpoint: its files stay
+
     def close(self):
         import shutil
         for fh in self._f.values():
             fh.close()
         self._f = {}
-        if self.dir:
+        if self.dir and not getattr(self, 'keep', False):
             shutil.rmtree(self.dir, ignore_errors=True)
         self.dir = None
 
