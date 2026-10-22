@@ -130,6 +130,9 @@ def _malloc_trim():
         pass
 
 
+_SWS = {}      # device -> overlap workspace of the chunked plans (shared)
+
+
 class _ChunkedPlan:
     """A chain (or dot) plan whose PNO-overlap operands (layout ``LS``) are
     generated on the device per chunk of terms (``ovgen``) instead of being
@@ -237,12 +240,16 @@ class _ChunkedPlan:
         if keep:
             S = Ragged(ch['LS'])
         else:
-            # regenerated every use: one zeroed workspace per device, no
+            # regenerated every use: one zeroed workspace per device, shared by
+            # all the plans (they run one after another on a device), no
             # allocation per chunk and iteration
-            ws_ = self.__dict__.setdefault('_sws', {})
+            ws_ = _SWS
             n = ch['LS'].nbytes() // 8
             w = ws_.get(ch['dev'])
             if w is None or w.size < n:
+                ws_.pop(ch['dev'], None)
+                w = None
+                cp.get_default_memory_pool().free_all_blocks()
                 w = ws_[ch['dev']] = cp.empty(max(n, 1))
             w[:n].fill(0.)
             data, off = [], 0

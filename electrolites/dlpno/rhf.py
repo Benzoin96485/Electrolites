@@ -281,6 +281,8 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
         finally:
             if getattr(cc, '_df_store', None) is not None:
                 cc._df_store.close()       # the CC's DF groups on scratch
+            from electrolites.dlpno import ccsd_gpu as _cg
+            _cg._SWS.clear()
         self.T = cc.T.to_list()
         self.T1 = [t.ravel() for t in cc.T1.to_list()]
         # the CC stores are not needed by (T)
