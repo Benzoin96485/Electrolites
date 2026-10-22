@@ -236,7 +236,8 @@ class _ChunkedPlan:
             # set at the build, before the replicas and the DF groups' temporaries
             fr, tot = cp.cuda.runtime.memGetInfo()
             fr += cp.get_default_memory_pool().free_bytes()
-            keep = fr - nb > 0.25 * tot and self.budget.take(ch['dev'], nb)
+            keep = fr - nb > float(os.environ.get('DLPNO_S_KEEP_FREE', '0.4')) * tot \
+                and self.budget.take(ch['dev'], nb)
         if keep:
             S = Ragged(ch['LS'])
         else:
@@ -1254,6 +1255,15 @@ class CCSDGPU:
         diis = _DeviceDIIS(opt['DIIS_MAX_VECS'])
         e_prev = 0.
         weak = cp.asarray(~self.strong)
+        if getattr(self.ref, 'verbose', 0) >= 2:
+            from electrolites.dlpno import mgpu
+            used = {}
+            for d in mgpu.devices():
+                with cp.cuda.Device(d):
+                    fr, tot = cp.cuda.runtime.memGetInfo()
+                    used[d] = (round((tot - fr) / 1e9, 1),
+                               round(cp.get_default_memory_pool().free_bytes() / 1e9, 1))
+            print('[mem] device GB (used, pool free) before the CC iterations:', used, flush=True)
         for it in range(1, opt['MAXITER'] + 1):
             t0 = time.perf_counter()
             R1, R2 = self.residuals()
