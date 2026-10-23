@@ -1289,6 +1289,15 @@ class CCSDGPU:
     def kernel(self, verbose=True):
         opt = self.ref.opt
         self.init_state()
+        # DLPNO_CC_AMP=<file on scratch>: the amplitudes are saved after every
+        # iteration and, when the file exists, read as the starting point
+        # (CC restarts across allocations; the DIIS history starts afresh)
+        amp = os.environ.get('DLPNO_CC_AMP')
+        if amp and os.path.exists(amp):
+            z = np.load(amp)
+            self.T1.set_flat(cp.asarray(z['t1']))
+            self.T.set_flat(cp.asarray(z['t2']))
+            print(f'  CC amplitudes read from {amp} (iteration {int(z["it"])})', flush=True)
         diis = _DeviceDIIS(opt['DIIS_MAX_VECS'])
         e_prev = 0.
         weak = cp.asarray(~self.strong)
@@ -1313,6 +1322,10 @@ class CCSDGPU:
             self.T1.set_flat(x[:n1])
             self.T.set_flat(x[n1:])
             e = self.energy()
+            if amp:
+                tmp = amp + '.tmp.npz'
+                np.savez(tmp, t1=cp.asnumpy(self.T1.flat()), t2=cp.asnumpy(self.T.flat()), it=it)
+                os.replace(tmp, amp)
             if it % 10 == 0 or (it <= 2 and os.environ.get('DLPNO_PROF') == '1'):
                 self._prof.report()
             e_cur = float(e.sum())
