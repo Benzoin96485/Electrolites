@@ -131,6 +131,20 @@ def _malloc_trim():
 
 
 _SWS = {}      # device -> overlap workspace of the chunked plans (shared)
+_KEPT = {}     # device -> [(chunk, budget, bytes)] of kept regenerated overlaps
+_NOKEEP = set()  # devices that stopped keeping after an eviction
+
+
+def _evict(dev):
+    """drop the kept overlaps of a device (regenerated from now on)."""
+    for ch, bud, nb in _KEPT.pop(dev, []):
+        ch.pop('S', None)
+        if bud is not None:
+            with bud.lock:
+                bud.left[dev] = bud.left.get(dev, 0) + nb
+    _NOKEEP.add(dev)
+    _SWS.pop(dev, None)
+    cp.get_default_memory_pool().free_all_blocks()
 
 
 class _ChunkedPlan:
@@ -236,7 +250,8 @@ class _ChunkedPlan:
             # set at the build, before the replicas and the DF groups' temporaries
             fr, tot = cp.cuda.runtime.memGetInfo()
             fr += cp.get_default_memory_pool().free_bytes()
-            keep = fr - nb > float(os.environ.get('DLPNO_S_KEEP_FREE', '0.4')) * tot \
+            keep = ch['dev'] not in _NOKEEP and \
+                fr - nb > float(os.environ.get('DLPNO_S_KEEP_FREE', '0.4')) * tot \
                 and self.budget.take(ch['dev'], nb)
         if keep:
             S = Ragged(ch['LS'])
@@ -263,12 +278,26 @@ class _ChunkedPlan:
             ch['gen'].run(P, S)
         if keep:
             ch['S'] = S                   # kept: this chunk's overlaps are not regenerated
+            _KEPT.setdefault(ch['dev'], []).append((ch, self.budget, nb))
         return S
 
     def _run_chunks(self, chunks, out, rags, w, alpha, dot):
         res = []
         for ch in chunks:
-            S = self._S(ch)
+            # the kept overlaps must not crowd out the temporaries (they grew
+            # after the build): when the plan's largest temporary set would
+            # not fit, this device drops them and regenerates from now on
+            need = 8. * max((sum(c[3]) for c in getattr(ch['plan'], 'chunks', [])), default=0)
+            fr = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+            if _KEPT.get(ch['dev']) and fr < 1.5 * need + 2e9:
+                _evict(ch['dev'])
+            try:
+                S = self._S(ch)
+            except cp.cuda.memory.OutOfMemoryError:
+                if not _KEPT.get(ch['dev']):
+                    raise
+                _evict(ch['dev'])          # nothing written yet: retry
+                S = self._S(ch)
             r = [S if i in self.s_ops else x for i, x in enumerate(rags)]
             if dot:
                 res.append((ch, ch['plan'].run(out, r)))
@@ -659,11 +688,20 @@ class CCSDGPU:
                 sdevs = others if need < sum(per[d] for d in others) else devs
                 store = _SStore(ref.orb.S_pao, ref.pao, ref.X, cp_, cq_, nv, sdevs)
                 sbud = None
-                if sdevs == others and os.environ.get('DLPNO_CC_HOME_CHUNKS', '0') != '1':
+                if sdevs == others and os.environ.get('DLPNO_CC_HOME_CHUNKS', 'auto') != '1':
                     # the home device is the fullest (integrals, amplitudes):
                     # the chunks (gathered overlaps, plan tables) run on the others
                     cdevs = others
                 cp.cuda.Device(home).use()
+            hc = os.environ.get('DLPNO_CC_HOME_CHUNKS', 'auto')
+            if store is None and len(devs) > 2 and hc != '1':
+                # overlaps regenerated per chunk: the chunks leave the home
+                # device too when it holds more than half of its memory
+                with cp.cuda.Device(home):
+                    fr_, tot_ = cp.cuda.runtime.memGetInfo()
+                    fr_ += cp.get_default_memory_pool().free_bytes()
+                if hc == '0' or fr_ < 0.5 * tot_:
+                    cdevs = [d for d in devs if d != home]
             if getattr(ref, 'verbose', 0) >= 2:
                 print(f'[mem] PNO overlaps {need / 1e9:.1f} GB:',
                       'stored over the GPUs' if store is not None else 'regenerated per chunk', flush=True)
