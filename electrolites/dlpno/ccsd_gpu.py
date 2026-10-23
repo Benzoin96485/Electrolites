@@ -248,8 +248,9 @@ class _ChunkedPlan:
         if self.budget is not None:
             # kept only while a quarter of the device stays free: the budget was
             # set at the build, before the replicas and the DF groups' temporaries
+            # (memory not yet taken by the pool: cached pool blocks are
+            # fragmented and may not serve the temporaries)
             fr, tot = cp.cuda.runtime.memGetInfo()
-            fr += cp.get_default_memory_pool().free_bytes()
             keep = ch['dev'] not in _NOKEEP and \
                 fr - nb > float(os.environ.get('DLPNO_S_KEEP_FREE', '0.4')) * tot \
                 and self.budget.take(ch['dev'], nb)
@@ -288,7 +289,7 @@ class _ChunkedPlan:
             # after the build): when the plan's largest temporary set would
             # not fit, this device drops them and regenerates from now on
             need = 8. * max((sum(c[3]) for c in getattr(ch['plan'], 'chunks', [])), default=0)
-            fr = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+            fr = cp.cuda.runtime.memGetInfo()[0]
             if _KEPT.get(ch['dev']) and fr < 1.5 * need + 2e9:
                 _evict(ch['dev'])
             try:
