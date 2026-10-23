@@ -696,12 +696,10 @@ class CCSDGPU:
             hc = os.environ.get('DLPNO_CC_HOME_CHUNKS', 'auto')
             if store is None and len(devs) > 2 and hc != '1':
                 # overlaps regenerated per chunk: the chunks leave the home
-                # device too when it holds more than half of its memory
-                with cp.cuda.Device(home):
-                    fr_, tot_ = cp.cuda.runtime.memGetInfo()
-                    fr_ += cp.get_default_memory_pool().free_bytes()
-                if hc == '0' or fr_ < 0.5 * tot_:
-                    cdevs = [d for d in devs if d != home]
+                # device too
+                # (decided before the CC's own home-device data arrive: always,
+                # crambin's home device went from half to full in the iterations)
+                cdevs = [d for d in devs if d != home]
             if getattr(ref, 'verbose', 0) >= 2:
                 print(f'[mem] PNO overlaps {need / 1e9:.1f} GB:',
                       'stored over the GPUs' if store is not None else 'regenerated per chunk', flush=True)
