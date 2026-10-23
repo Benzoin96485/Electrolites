@@ -1276,7 +1276,7 @@ class CCSDGPU:
             self.T1.set_flat(x[:n1])
             self.T.set_flat(x[n1:])
             e = self.energy()
-            if it % 10 == 0:
+            if it % 10 == 0 or (it <= 2 and os.environ.get('DLPNO_PROF') == '1'):
                 self._prof.report()
             e_cur = float(e.sum())
             e_weak = float(e[weak].sum())
@@ -1295,7 +1295,7 @@ class _DeviceDIIS:
     """DIIS on device vectors.  The Gram matrix of the error vectors is kept
     on the host and extended by one row per update; the extrapolation is
     accumulated vector by vector (no stacked copies of the history).  When
-    the history would take more than a quarter of the free device memory it
+    the history would take more than 10% of the free device memory (5% of the device) it
     is kept in pinned host memory."""
 
     def __init__(self, nvec=6):
@@ -1306,8 +1306,11 @@ class _DeviceDIIS:
 
     def _keep(self, v):
         if self.host is None:
-            free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-            self.host = 2 * self.nvec * v.nbytes > 0.25 * free
+            free, tot = cp.cuda.runtime.memGetInfo()
+            free += cp.get_default_memory_pool().free_bytes()
+            # the history grows over the first iterations, after the plans
+            # have taken their share: on the device only when it is small
+            self.host = 2 * self.nvec * v.nbytes > min(0.1 * free, 0.05 * tot)
         if self.host:
             from electrolites.dlpno.devmem import to_pinned
             return to_pinned(v)
