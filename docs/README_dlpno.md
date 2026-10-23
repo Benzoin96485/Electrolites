@@ -229,6 +229,28 @@ the parts of the kj PNOs outside the ij PNO space: C50H102/def2-TZVP CCSD
 `_el_jobs/dlpno/proj_pno_experiment.patch`.  ORCA evaluates these integrals in
 the extended domains as well (its PNO-integral step streams them from disk).
 
+### Crambin on one node (4 x A100-80GB, 256 GB host)
+
+Crambin (642 atoms, 6177 basis functions), DLPNO-CCSD(T0)/def2-SVP, Normal
+PNO: 90741 pairs (15331 strong), 84999 triplets.  E_SCF -17992.337838,
+E_corr(CCSD) -51.408539 (LCCSD -50.336749, weak -0.948076, PNO/dipole
+corrections), (T0) -1.639964, **E_corr -53.048503 Eh** (Riplinger 2016:
+-52.915 Eh, 93.6 h).  Timings: DF integrals 212 s, crude prescreening 28 s,
+LMP2 1749 s, PNO integrals 1028 s, CC build 1817 s, LCCSD 19 iterations x
+~1280 s, (T0) 610 + 1275 s: ~8.6 h if run in one piece.  It ran in 4 h
+interactive allocations, restarted from the checkpoint after the PNO
+integrals (`DLPNO_CKPT_PNO`, 133 GB on scratch) and from the CC amplitudes
+(`DLPNO_CC_AMP`; the DIIS history restarts).
+
+What it took: the atom-major PNO-integral pass (`pnoatom.py`, one (Q_A|uv)
+block per aux atom instead of 1715 regions; the on-disk (Q|uv) store would
+have re-read ~10 TB), (Q|iu) spread over pinned host and the other GPUs,
+peer-shared (Q|ij) and fitting metric, pair DF tensors spilled to scratch,
+(Q|ij) in pinned host and the CC DF groups on scratch during the CC, one
+shared workspace for the regenerated PNO overlaps with a keep guard on the
+memory the pool has not taken, DIIS history on the host.  The CC iteration is
+dominated by regenerating the overlaps (gamma/delta ~550 s, r2 B/F ~350 s).
+
 ## Known issue
 
 Open-shell (T0): per-triplet energies depend on which triplets are batched
