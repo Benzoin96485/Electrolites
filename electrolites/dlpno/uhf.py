@@ -988,8 +988,16 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         Boo = cp.matmul(Linv, qoo.reshape(B, A, -1)).reshape(B, A, Lm, Lm)
         del qoo
         qvv = [cp.zeros((B, A, Va, Va)), cp.zeros((B, A, Vb, Vb))]
-        atoms = sorted({a for o_ in offs for a in o_})
+        raw = getattr(self, '_qvv_raw', None)
+        atoms = [] if raw is not None else sorted({a for o_ in offs for a in o_})
         tr = lambda Y: Y.swapaxes(-1, -2)
+        if raw is not None:
+            # precomputed atom-major (uatom.qvv_atom_pass)
+            from electrolites.dlpno.devmem import as_host
+            for s_, c in enumerate(ch):
+                na_ = len(auxs[s_])
+                for s, nv_ in ((0, self.nva(c)), (1, self.nvb(c))):
+                    qvv[s][s_, :na_, :nv_, :nv_] = cp.asarray(as_host(raw[c][s]))
         for a in atoms:
             rows = np.array([r for r in range(B) if a in offs[r]], np.int64)
             off = np.array([offs[r][a] for r in rows], np.int64)
@@ -1067,6 +1075,27 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             out.extend(res)
         setup = lambda d: mgpu.device_view(
             self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d'), sub={'dfi': ('qia', 'qij', 'J2c', 'C_pao_d', 'mask_uv_d')})
+        if getattr(self.dfi, 'qab_direct', False) and os.environ.get('DLPNO_OPEN_ATOM', '1') == '1':
+            # direct (Q|uv): the (Q|AB) blocks atom-major, once per aux atom
+            # (uatom), then the chunks without regions
+            from electrolites.dlpno.uatom import qvv_atom_pass
+            from electrolites.dlpno.dfints import _host_available
+            nb = sum(8. * len(self.ribfs[c]) * (self.nva(c) ** 2 + self.nvb(c) ** 2) for c in clist)
+            store = own = None
+            if nb > 0.2 * _host_available():
+                store = getattr(self, '_pair_spill', None)
+                if store is None:
+                    from electrolites.dlpno.devmem import SpillStore
+                    store = own = SpillStore('uqvv')
+            self._qvv_raw = qvv_atom_pass(self, clist, mgpu.devices(), store, getattr(self, 'verbose', 0))
+            try:
+                chunks.sort(key=lambda c: -len(c))
+                mgpu.run_queue(chunks, work, setup=setup)
+            finally:
+                self._qvv_raw = None
+                if own is not None:
+                    own.close()
+            return out
         if getattr(self.dfi, 'qab_direct', False):
             # direct (Q|uv): spatial order, regions evaluated once per atom
             order = self.dfi.spatial_order([np.unique(self.ribf_atom[np.concatenate([self.ribfs[c] for c in ch])])

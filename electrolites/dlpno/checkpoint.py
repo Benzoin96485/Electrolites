@@ -15,8 +15,17 @@ import numpy as np
 import cupy as cp
 
 
+def _cp_restore(x, dev=None):
+    """a device array back on the device it was saved from (when present):
+    a (Q|iu) spread over the GPUs would not fit one of them."""
+    if dev is not None and dev < cp.cuda.runtime.getDeviceCount():
+        with cp.cuda.Device(dev):
+            return cp.asarray(x)
+    return cp.asarray(x)
+
+
 def _cp_reduce(a):
-    return cp.asarray, (cp.asnumpy(a),)
+    return _cp_restore, (cp.asnumpy(a), int(a.device.id))
 
 
 def save(obj, path):
@@ -38,11 +47,24 @@ def save(obj, path):
     return path
 
 
+def _legacy_asarray(x):
+    """device arrays of checkpoints written before _cp_restore: large ones
+    stay on the host until their owner places them (the spread (Q|iu))."""
+    return x if x.nbytes > (16 << 30) else cp.asarray(x)
+
+
+class _Unpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module.startswith('cupy') and name == 'asarray':
+            return _legacy_asarray
+        return super().find_class(module, name)
+
+
 def load(path):
     from electrolites.dlpno.dfints import BlockQ
     from electrolites.dlpno.devmem import SpillRef, to_pinned
     with open(os.path.join(path, 'state.pkl'), 'rb') as f:
-        obj = pickle.load(f)
+        obj = _Unpickler(f).load()
     spill = os.path.join(path, 'spill')
 
     def fix(x, seen):
@@ -56,7 +78,18 @@ def load(path):
             if isinstance(x.buf, np.ndarray):
                 x.buf = to_pinned(x.buf)           # zero-copy gathers need pinned memory
             if getattr(x, 'bufs', None):
-                x.bufs = [to_pinned(b) if isinstance(b, np.ndarray) else b for b in x.bufs]
+                # spread storage: each store back where it was placed
+                devs = [d for d, _ in getattr(x, 'placed', [])] or [None] * len(x.bufs)
+                out = []
+                for b, d in zip(x.bufs, devs):
+                    if isinstance(b, np.ndarray):
+                        if d is None:
+                            b = to_pinned(b)
+                        else:
+                            with cp.cuda.Device(d):
+                                b = cp.asarray(b)
+                    out.append(b)
+                x.bufs = out
                 x.buf = x.bufs[0]
         elif isinstance(x, (list, tuple)):
             for y in x:
