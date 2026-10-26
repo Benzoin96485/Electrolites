@@ -308,8 +308,11 @@ def _qia_placement(nbytes, home_share=0.5):
     # the host first (device memory sets the region sizes and the stored
     # overlaps of the LMP2 / CC); the home device keeps the (Q|ij), the DF
     # build and the pair data: it comes last, with a smaller share
-    place = [(None, float(os.environ.get('DLPNO_QIA_HOST_FRAC', '0.4')) * _host_available())]
-    place += [(d, cap(d, frac)) for d in devs if d != home]
+    hostp = [(None, float(os.environ.get('DLPNO_QIA_HOST_FRAC', '0.4')) * _host_available())]
+    devp = [(d, cap(d, frac)) for d in devs if d != home]
+    # home_share 0 (open shell): the host keeps the LMP2 / CC history and
+    # the pinned pair data, so the other devices come first
+    place = hostp + devp if home_share > 0 else devp + hostp
     if home_share > 0 or sum(c for _, c in place) < 1.05 * nbytes:
         place.append((home, cap(home, (home_share or 0.5) * frac)))
     if sum(c for _, c in place) < 1.05 * nbytes:
