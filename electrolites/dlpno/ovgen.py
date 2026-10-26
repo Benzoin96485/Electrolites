@@ -51,7 +51,12 @@ class OverlapGen:
     """pao: PAO index arrays per pair; X: per pair (npao_p + ne, nv_p)
     coefficients (PAO rows, then ne extra identity-metric rows)."""
 
-    def __init__(self, S_pao_d, pao, X, ne=0, max_bytes=1 << 29):
+    def __init__(self, S_pao_d, pao, X, ne=0, max_bytes=None):
+        if max_bytes is None:
+            # per-chunk workspace (DLPNO_OVGEN_MB): fewer, larger chunks keep the
+            # per-chunk setup (plans, small uploads) off the critical path
+            import os
+            max_bytes = int(float(os.environ.get('DLPNO_OVGEN_MB', '1024')) * 2 ** 20)
         self.S = S_pao_d
         self.nbf = S_pao_d.shape[0]
         self.pao = pao
@@ -84,8 +89,9 @@ class OverlapGen:
     def chunks(self, pp, qq):
         """split couple indices into chunks (sorted by q); returns
         [(couple ids, U, involved pairs)].  Vectorised greedy split: a chunk
-        grows while 16 x (pairs) x (union PAO bound + ne) x max(nv) stays
-        within max_bytes."""
+        grows while its embedded coefficients and W = S_UU X_U, 16 x (union
+        PAO bound + ne) x (sum of the involved pairs' nv), and its overlaps,
+        8 x sum nv_p nv_q, stay within max_bytes."""
         pp, qq = np.asarray(pp, np.int64), np.asarray(qq, np.int64)
         N = len(pp)
         if N == 0:
@@ -103,9 +109,10 @@ class OverlapGen:
             _, first = np.unique(ids, return_index=True)
             isnew = np.zeros(2 * W, np.int64)
             isnew[first] = 1
-            npc = np.cumsum(isnew.reshape(W, 2).sum(axis=1))
+            nvc = np.cumsum((self.nv[ids] * isnew).reshape(W, 2).sum(axis=1))
             nuc = np.minimum(np.cumsum((self.npao[ids] * isnew).reshape(W, 2).sum(axis=1)), nbf)
-            est = 16. * npc * (nuc + ne) * Vm
+            nout = np.cumsum(self.nv[P_[start:start + W]] * self.nv[Q_[start:start + W]])
+            est = np.maximum(16. * nvc * (nuc + ne), 8. * nout)
             over = np.flatnonzero(est > self.max_bytes)
             L = int(over[0]) if len(over) else W
             L = max(1, L)
