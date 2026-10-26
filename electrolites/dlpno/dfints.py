@@ -572,7 +572,7 @@ def _qia_stats(natm, lmo_riatoms, lmo_paos, pairs, nbf, ext_lmos):
 class ExtDomains:
     """Psi4's extended LMO / PAO domains of each auxiliary atom."""
 
-    def __init__(self, natm, lmo_riatoms, lmo_paos, pairs, nbf):
+    def __init__(self, natm, lmo_riatoms, lmo_paos, pairs, nbf, extra_lmos=None):
         n = len(lmo_riatoms)
         ext = [set() for _ in range(n)]
         for (i, j) in pairs:
@@ -590,6 +590,11 @@ class ExtDomains:
                 self.paos.append(np.unique(np.concatenate([lmo_paos[i] for i in self.lmos[a]])))
             else:
                 self.paos.append(np.zeros(0, np.int64))
+        if extra_lmos is not None and len(extra_lmos):
+            # open shell: the SOMO rows are read for every aux atom of a pair
+            # (over that atom's PAOs only: the PAO domains stay as they are)
+            ex = np.asarray(extra_lmos, np.int64)
+            self.lmos = [np.union1d(l, ex) if len(l) else l for l in self.lmos]
         # dense position lookups, -1 when absent
         self.pao_pos = -np.ones((natm, nbf), dtype=np.int64)
         for a in range(natm):
@@ -600,7 +605,8 @@ class DFInts:
     """Device three-index integrals for one set of LMOs/PAOs."""
 
     def __init__(self, mol, auxmol, C_lmo, C_pao, ext, doi_uv, t_cut_do_uv,
-                 ribf_atom, atom_ribfs, group_mem=2 << 30, need_ab=True, sparse_ij=True):
+                 ribf_atom, atom_ribfs, group_mem=2 << 30, need_ab=True, sparse_ij=True,
+                 direct_ok=True):
         self.mol, self.auxmol = mol, auxmol
         nao = mol.nao
         naux = auxmol.nao
@@ -626,9 +632,11 @@ class DFInts:
             # devices' memory and the host while that fits (kept for the LMP2
             # and the PNO integrals, then dropped: the triples evaluate theirs
             # per region), else per region throughout (direct)
-            self.qia_direct = sparse_ij and need_ab and _decide_qia_direct(nb_ia, host_ia)
-            place = _qia_placement(nb_ia) if (self.qia_direct or os.environ.get('DLPNO_QIA_SPREAD') == '1') \
-                and os.environ.get('DLPNO_QIA_SPREAD') != '0' and os.environ.get('DLPNO_QIA_DIRECT') != '1' else None
+            # (open shell: no direct (Q|iu); spread when it would not fit the host)
+            big = need_ab and _decide_qia_direct(nb_ia, host_ia)
+            self.qia_direct = sparse_ij and direct_ok and big
+            place = _qia_placement(nb_ia) if (big or os.environ.get('DLPNO_QIA_SPREAD') == '1') \
+                and os.environ.get('DLPNO_QIA_SPREAD') != '0' and not (self.qia_direct and os.environ.get('DLPNO_QIA_DIRECT') == '1') else None
             self.qia_spread = place is not None
             if self.qia_spread:
                 self.qia_direct = False

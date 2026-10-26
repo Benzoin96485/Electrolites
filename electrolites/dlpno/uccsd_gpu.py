@@ -17,6 +17,7 @@ Integrals: every pair keeps its exchange blocks (x V^s|y V^t), 1-external
 keep their DF tensors per spin and the non-projected ring integrals, and
 their T1-dressed DF quantities are rebuilt per spin every iteration.
 """
+import os
 import time
 
 import numpy as np
@@ -317,6 +318,14 @@ class UCCSDGPU:
         nd = len(mgpu.devices())
         self.offload_bytes = nk3 + ndf
         self._df_bytes, self._ndev, self._k3_bytes = ndf, nd, nk3
+        if getattr(u, 'verbose', 0) >= 2:
+            cs = np.asarray(self.canon_sp, np.int64)
+            st = np.array([bool(self.strong_sp[c]) for c in cs])
+            nv = self.nvs[cs]
+            A = np.array([len(u.ribfs[c]) for c in cs[st]])
+            print(f'[mem] open CC: {len(cs)} pairs ({int(st.sum())} strong), PNOs a/b mean {nv[:, 0].mean():.0f}/'
+                  f'{nv[:, 1].mean():.0f} max {nv.max()}, aux mean {A.mean() if len(A) else 0:.0f}; '
+                  f'3-external {nk3 / 1e9:.1f} GB, DF {ndf / 1e9:.1f} GB, free {free / 1e9:.1f} GB', flush=True)
         # the DF groups are spread over the GPUs, the 3-external tensors stay home
         return nk3 + ndf / nd > free / 3.
 
@@ -564,6 +573,13 @@ class UCCSDGPU:
         self.fix = [None] * self.npair
         if hasattr(u, 'gpu_pair_ints'):
             self.offload = self._decide_offload()
+            # the per-pair blocks themselves on scratch when the host could
+            # not hold them next to the assembled groups (DLPNO_CC_DF_DISK)
+            env = os.environ.get('DLPNO_CC_DF_DISK', 'auto')
+            from electrolites.dlpno.dfints import _host_available
+            if self.offload and (env == '1' or (env == 'auto' and self.offload_bytes > 0.35 * _host_available())):
+                from electrolites.dlpno.devmem import SpillStore
+                u._pair_spill = SpillStore('upair')
             rows_of = {c: self.rows[c] for c in self.canon_sp}
             strong_of = {c: bool(self.strong_sp[c]) for c in self.canon_sp}
             if hasattr(u, 'gpu_pair_ints_many'):
@@ -1052,6 +1068,16 @@ class UCCSDGPU:
                     for n, k in enumerate(self.sop)]
         _set_items(T, range(len(self.sop)), init)
         T1 = Ragged(self.LT1)
+        # DLPNO_CC_AMP=<file on scratch>: amplitudes saved after every
+        # iteration and read back when present (restarts across allocations;
+        # the DIIS history starts afresh)
+        import os
+        amp = os.environ.get('DLPNO_CC_AMP')
+        if amp and os.path.exists(amp):
+            z = np.load(amp)
+            T1.set_flat(cp.asarray(z['t1']))
+            T.set_flat(cp.asarray(z['t2']))
+            print(f'  CC amplitudes read from {amp} (iteration {int(z["it"])})', flush=True)
         diis = _DeviceDIIS(opt['DIIS_MAX_VECS'])
         e_prev = 0.
         ci = np.array([self.sidx[k] for k in self.canon], np.int64)
@@ -1059,7 +1085,6 @@ class UCCSDGPU:
             t0 = time.perf_counter()
             R1, R = self.residuals(T, T1)
             rn = _rnorm(R1, R)
-            import os
             if os.environ.get('DLPNO_DEBUG_R1'):
                 rr = R1.rms_per_item().get()
                 top = np.argsort(rr)[::-1][:4]
@@ -1073,6 +1098,10 @@ class UCCSDGPU:
             T1.set_flat(x[:n1])
             T.set_flat(x[n1:])
             e, ew = self.energy(T, T1)
+            if amp:
+                tmp = amp + '.tmp.npz'
+                np.savez(tmp, t1=cp.asnumpy(T1.flat()), t2=cp.asnumpy(T.flat()), it=it)
+                os.replace(tmp, amp)
             if getattr(self, '_prof', None) is not None and it % 10 == 0:
                 self._prof.report()
             if verbose:

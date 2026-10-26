@@ -143,6 +143,8 @@ def to_pinned(x):
 
 
 def to_dev(x):
+    if isinstance(x, SpillRef):
+        return cp.asarray(x.load())
     return x if isinstance(x, cp.ndarray) else cp.asarray(x)
 
 

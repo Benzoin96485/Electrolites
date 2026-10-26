@@ -24,7 +24,9 @@ import cupyx
 
 from electrolites.dlpno.ragged import Layout, Ragged, padded, op
 from electrolites.dlpno.vbatch import VChainPlan, VDotPlan
-from electrolites.dlpno.ccsd_gpu import _mv, _dot2, _wsum
+from electrolites.dlpno.ccsd_gpu import _mv, _dot2, _wsum, _Packed
+from electrolites.dlpno.dfints import _host_available
+from electrolites.dlpno.devmem import as_host
 from electrolites.dlpno.uccsd_gpu import UCCSDGPU, _SpinPlan, _Terms, _Reg, _set_items, _get
 
 
@@ -94,12 +96,14 @@ class _K3:
            kind 'a'  : out[a]    += w sum_dc Y[a,d,c] M[c,d]  (M: matrix item)"""
         self.ops.setdefault((kind, src, dst), []).append((self.reg(k3key), src_item, dst_item, w))
 
-    def build(self, fetch, host=False):
-        from electrolites.dlpno.devmem import to_pinned
-        xp = np if host else cp
+    def build(self, fetch, host=False, shape=None, release=None, store=None):
+        """fetch(key) -> Y; shape(key) -> Y.shape without fetching; release(key)
+        drops the source once its group is assembled; store: the padded
+        groups go to a file on scratch (read back at every use)."""
+        from electrolites.dlpno.devmem import as_host
         keys = self.reg.keys
-        Ys = [fetch(k) for k in keys]
-        shp = np.array([Y.shape for Y in Ys], np.int64).reshape(-1, 3)
+        shp = np.array([shape(k) if shape is not None else fetch(k).shape for k in keys],
+                       np.int64).reshape(-1, 3)
         pads = np.stack([padded(shp[:, 0]), padded(shp[:, 1]), padded(shp[:, 2])], 1)
         uk, inv = np.unique(pads, axis=0, return_inverse=True)
         inv = inv.reshape(-1)
@@ -109,18 +113,27 @@ class _K3:
         for g in range(len(uk)):
             mem = np.where(inv == g)[0]
             self.slot[mem] = np.arange(len(mem))
-            shape = (len(mem),) + tuple(int(x) for x in uk[g])
-            if host:
+            gshape = (len(mem),) + tuple(int(x) for x in uk[g])
+            if store is not None:
+                buf = np.zeros(gshape)
+            elif host:
                 from electrolites.dlpno.devmem import pinned_empty
-                buf = pinned_empty(shape)
+                buf = pinned_empty(gshape)
                 buf[...] = 0.
             else:
-                buf = cp.zeros(shape)
+                buf = cp.zeros(gshape)
             for s, k in enumerate(mem):
-                Y = Ys[k]
+                Y = fetch(keys[k])
+                Y = as_host(Y) if isinstance(buf, np.ndarray) else cp.asarray(Y)
                 buf[s, :Y.shape[0], :Y.shape[1], :Y.shape[2]] = Y
+                del Y
+            if store is not None:
+                buf = store.put(buf)
             self.data.append(buf)
-        del Ys
+            del buf
+            if release is not None:
+                for k in mem:
+                    release(keys[k])
         self.plans = {}
         for key, lst in self.ops.items():
             ids = np.array([l[0] for l in lst], np.int64)
@@ -357,6 +370,9 @@ class UCCSDGPUv(UCCSDGPU):
         for c in self.canon_sp:
             for key in ('Qov', 'Qvv', 'Qmz', 'Qaz', 'K3'):
                 self.fix[c].pop(key, None)
+        if getattr(self.u, '_pair_spill', None) is not None:
+            self.u._pair_spill.close()           # the per-pair blocks are assembled
+            self.u._pair_spill = None
         cp.get_default_memory_pool().free_all_blocks()
         # term lists are only needed through their plans now
         lists = [self.fp, self.rg, self.zq, self.fkc, self.r1c, self.r1a2, self.uq, self.r1b, self.a1,
@@ -390,7 +406,7 @@ class UCCSDGPUv(UCCSDGPU):
         rep['Kx'] = rag(self.Kx) / 1e9
         rep['T'] = rag(Ragged(self.LT)) / 1e9 if False else self.LT.nbytes() / 1e9
         rep['K3'] = sum(d.nbytes for d in self.k3.data if isinstance(d, cp.ndarray)) / 1e9
-        rep['dfg'] = sum(v.nbytes for d in self.dfg for v in d.values() if isinstance(v, cp.ndarray)) / 1e9
+        rep['dfg'] = sum(v.nbytes for d in self.dfg for v in d.values() if isinstance(v, (cp.ndarray, _Packed))) / 1e9
         rep['offload'] = float(self.offload)
         rep['pool_used'] = cp.get_default_memory_pool().used_bytes() / 1e9
         return {k: round(v, 3) for k, v in rep.items()}
@@ -891,6 +907,15 @@ class UCCSDGPUv(UCCSDGPU):
         inv = inv.reshape(-1)
         self.dfg = []
         bmap = {}
+        # offload: the packed DF groups and the 3-external groups in files on
+        # scratch when together they would take more than 35% of the host's
+        # available memory (DLPNO_CC_DF_DISK=auto|0|1)
+        self._df_store = None
+        env = os.environ.get('DLPNO_CC_DF_DISK', 'auto')
+        nbh = getattr(self, '_df_bytes', 0.) + getattr(self, '_k3_bytes', 0.)
+        if self.offload and (env == '1' or (env == 'auto' and nbh > 0.35 * _host_available())):
+            from electrolites.dlpno.devmem import SpillStore
+            self._df_store = SpillStore('uccdf')
         # several GPUs: the groups (and their DF tensors) are spread over them
         from electrolites.dlpno import mgpu
         devs = mgpu.devices()
@@ -916,6 +941,12 @@ class UCCSDGPUv(UCCSDGPU):
                 d['dev'] = devs[r]
                 self.dfg.append(d)
         cp.cuda.Device(home).use()
+        if self.offload and getattr(u, 'verbose', 0) >= 2:
+            nb = sum(v.nbytes for d in self.dfg for v in d.values() if isinstance(v, _Packed))
+            where = f'on scratch ({self._df_store.dir})' if self._df_store is not None else 'in pinned host memory'
+            print(f'[mem] open CC DF groups {where}: {nb / 1e9:.1f} GB', flush=True)
+        if self._df_store is not None:
+            self._df_store.flush()
         # beta entries -> (group, combo, which matrix, member, rK, rL)
         self.beta_src = bmap
         # registries may have grown in _vec_terms: rebuild the dependent stores
@@ -1003,10 +1034,25 @@ class UCCSDGPUv(UCCSDGPU):
 
         def fetch(key):
             c, z, s, t = key
-            return self.fix[c]['K3'][(z, s, t)].transpose(1, 0, 2)
-        self.k3.build(fetch, host=self.offload)
+            Y = self.fix[c]['K3'][(z, s, t)]
+            Y = as_host(Y) if not isinstance(Y, (np.ndarray, cp.ndarray)) else Y
+            return Y.transpose(1, 0, 2)
+
+        def shape(key):
+            c, z, s, t = key
+            a_, b_, c_ = self.fix[c]['K3'][(z, s, t)].shape
+            return (b_, a_, c_)
+
+        def release(key):
+            c, z, s, t = key
+            self.fix[c]['K3'].pop((z, s, t), None)
+        self.k3.build(fetch, host=self.offload, shape=shape, release=release,
+                      store=getattr(self, '_df_store', None))
         for c in self.canon_sp:
             self.fix[c].pop('K3', None)
+        if self.offload:
+            from electrolites.dlpno.devmem import trim_host
+            trim_host()
 
     #: generate the PNO overlaps of every term on the fly (no stored S)
     import os as _os
@@ -1104,25 +1150,26 @@ class UCCSDGPUv(UCCSDGPU):
         lmo, sp, si = self.lmo, self.spin, u.so_index
         g = len(mem)
         d = dict(mem=mem, A=A, R=R, V=V)
-        xp = np if self.offload else cp
-        from electrolites.dlpno.devmem import pinned_empty
-
-        def zeros(shape):
-            if not self.offload:
-                return cp.zeros(shape)
-            a = pinned_empty(shape)
-            a[...] = 0.
-            return a
+        # offload: the members' blocks packed back to back (no padding) in
+        # pinned host memory or, with a DF store, in a file on scratch; padded
+        # on the device at every use (ccsd_gpu._Packed)
+        from electrolites.dlpno.devmem import as_host
+        packed = bool(self.offload)
+        store = getattr(self, '_df_store', None)
+        e2 = np.zeros((0, 0))
         for s in (0, 1):
-            Qov = zeros((g, A, R[s], V[s]))
-            Qvv = zeros((g, A, V[s], V[s]))
+            if packed:
+                Qov, Qvv, Qmz, Qaz = [], [], [], []
+            else:
+                Qov = cp.zeros((g, A, R[s], V[s]))
+                Qvv = cp.zeros((g, A, V[s], V[s]))
+                Qmz = cp.zeros((g, 2, A, R[s]))
+                Qaz = cp.zeros((g, 2, A, V[s]))
             fov = cp.zeros((g, R[s], V[s]))
             ev = cp.zeros((g, V[s]))
-            Qmz = zeros((g, 2, A, R[s]))
-            Qaz = zeros((g, 2, A, V[s]))
             zrow = np.zeros((g, 2), np.int64)
             zm = np.zeros((g, 2))
-            on_dev = not self.offload and all(isinstance(fx[c]['Qov'][s], cp.ndarray) for c in mem)
+            on_dev = not packed and all(isinstance(fx[c]['Qov'][s], cp.ndarray) for c in mem)
             # device sources: one batched padded copy per tensor (the per-pair
             # blocks may live on a peer device)
             bat = dict(ov=[], vv=[], fov=[], ev=[], mz=[], mzc=[], az=[]) if on_dev else None
@@ -1136,11 +1183,16 @@ class UCCSDGPUv(UCCSDGPU):
                     bat['vv'].append((m, f['Qvv'][s]))
                     bat['fov'].append((m, cp.asarray(f['fov'][s])))
                     bat['ev'].append((m, cp.asarray(f['ev'][s])))
+                elif packed:
+                    Qov.append(as_host(f['Qov'][s]))
+                    Qvv.append(as_host(f['Qvv'][s]))
+                    fov[m, :nr, :nv] = cp.asarray(f['fov'][s])
+                    ev[m, :nv] = cp.asarray(f['ev'][s])
                 else:
-                    Qov[m, :na, :nr, :nv] = f['Qov'][s]
-                    Qvv[m, :na, :nv, :nv] = f['Qvv'][s]
-                    fov[m, :nr, :nv] = f['fov'][s]
-                    ev[m, :nv] = f['ev'][s]
+                    Qov[m, :na, :nr, :nv] = cp.asarray(f['Qov'][s])
+                    Qvv[m, :na, :nv, :nv] = cp.asarray(f['Qvv'][s])
+                    fov[m, :nr, :nv] = cp.asarray(f['fov'][s])
+                    ev[m, :nv] = cp.asarray(f['ev'][s])
                 rp = None
                 for side, z in enumerate((x, y)):
                     if nr:
@@ -1150,16 +1202,29 @@ class UCCSDGPUv(UCCSDGPU):
                                     rp = cp.asarray(np.asarray(f['rowsp'][s], np.int64))
                             bat['mz'].append((2 * m + side, f['Qmz'][z]))
                             bat['mzc'].append(rp)
+                        elif packed:
+                            Qmz.append(as_host(f['Qmz'][z])[:, np.asarray(f['rowsp'][s], np.int64)])
                         else:
-                            rp = xp.asarray(np.asarray(f['rowsp'][s], np.int64))
-                            Qmz[m, side, :na, :nr] = f['Qmz'][z][:, rp]
+                            rp = cp.asarray(np.asarray(f['rowsp'][s], np.int64))
+                            Qmz[m, side, :na, :nr] = cp.asarray(f['Qmz'][z])[:, rp]
+                    elif packed:
+                        Qmz.append(e2)
                     if (z, s) in si:
                         if on_dev:
                             bat['az'].append((2 * m + side, f['Qaz'][(z, s)]))
+                        elif packed:
+                            Qaz.append(as_host(f['Qaz'][(z, s)]))
                         else:
-                            Qaz[m, side, :na, :nv] = f['Qaz'][(z, s)]
+                            Qaz[m, side, :na, :nv] = cp.asarray(f['Qaz'][(z, s)])
                         zrow[m, side] = self.rows[c][s].index(si[(z, s)])
                         zm[m, side] = 1.
+                    elif packed:
+                        Qaz.append(e2)
+            if packed:
+                Qov = _Packed(Qov, (A, R[s], V[s]), store=store)
+                Qvv = _Packed(Qvv, (A, V[s], V[s]), store=store)
+                Qmz = _Packed(Qmz, (A, R[s]), 2, store=store)
+                Qaz = _Packed(Qaz, (A, V[s]), 2, store=store)
             if on_dev:
                 from electrolites.dlpno.gather import pad_copy
                 for key, dst in (('ov', Qov), ('vv', Qvv), ('fov', fov), ('ev', ev)):
@@ -1177,6 +1242,9 @@ class UCCSDGPUv(UCCSDGPU):
                 for c in mem:                 # assembled: drop the per-pair copies
                     for key in ('Qov', 'Qvv', 'Qmz', 'Qaz'):
                         fx[c].pop(key, None)
+                if packed:
+                    from electrolites.dlpno.devmem import trim_host
+                    trim_host()
             # members by source / target layout group
             its = np.array([self.cpos[c] for c in mem], np.int64)
             lay = self.LTn[s]
@@ -1479,7 +1547,8 @@ class UCCSDGPUv(UCCSDGPU):
             d = dict(d)
             for s in (0, 1):
                 for key in ('Qov', 'Qvv', 'Qmz', 'Qaz'):
-                    d[(key, s)] = to_dev(d[(key, s)])
+                    x = d[(key, s)]
+                    d[(key, s)] = x.device() if isinstance(x, _Packed) else to_dev(x)
         mm = cp.matmul
         tr = lambda X: X.swapaxes(-1, -2)
         Tc, Qov, Qvv, Fbo, Fbv, Qvt, Bk, Ba = {}, {}, {}, {}, {}, {}, {}, {}

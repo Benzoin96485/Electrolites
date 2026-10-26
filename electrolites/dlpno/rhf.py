@@ -277,7 +277,7 @@ class DLPNO(PNOIntsGPU, LMP2GPU, TriplesGPU, RefDLPNO):
         self.cc = cc = CCSDGPU(self, None)
         self.timings['cc_build'] = time.perf_counter() - t0
         try:
-            self.e_lccsd, self.de_weak = cc.kernel(verbose=self.verbose >= 4)
+            self.e_lccsd, self.de_weak = cc.kernel(verbose=self.verbose >= 2)
         finally:
             if getattr(cc, '_df_store', None) is not None:
                 cc._df_store.close()       # the CC's DF groups on scratch

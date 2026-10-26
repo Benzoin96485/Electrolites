@@ -20,6 +20,7 @@ this class moves the expensive steps to the device:
 Amplitudes are kept by spin block: ``T2b[(I, J)]`` is the (spin I, spin J)
 block of the spin-orbital pair amplitude (``T2b[(J, I)] = T2b[(I, J)].T``).
 """
+import os
 import time
 
 import numpy as np
@@ -88,13 +89,22 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         self.nd_all, self.ns = nd, ns
         Da = C[:, :nd + ns] @ C[:, :nd + ns].T
         Db = C[:, :nd] @ C[:, :nd].T
-        mfu = scf.UHF(mol)
+        try:
+            # the UHF Fock matrices of the reference on the GPU (the CPU direct
+            # J/K takes hours for a few thousand basis functions)
+            from gpu4pyscf import scf as gscf
+            mfu = gscf.UHF(mol)
+            dms = cp.asarray(np.array([Da, Db]))
+        except ImportError:
+            mfu = scf.UHF(mol)
+            dms = np.array([Da, Db])
         if getattr(mf, 'with_df', None) is not None:
             mfu = mfu.density_fit(auxbasis=mf.with_df.auxbasis)
         h = su.asnumpy(mf.get_hcore())
-        vhf = mfu.get_veff(mol, np.array([Da, Db]))
+        vhf = mfu.get_veff(mol, dms)
         Fa, Fb = h + su.asnumpy(vhf[0]), h + su.asnumpy(vhf[1])
-        self.e_ref = float(mfu.energy_tot(dm=np.array([Da, Db]), vhf=vhf))
+        self.e_ref = float(mfu.energy_tot(dm=dms, vhf=vhf))
+        del vhf, dms
         self.Fa_ao, self.Fb_ao = Fa, Fb
         nfc = su.count_frozen_core(mol) if self.frozen_core else 0
         self.ncore = nfc
@@ -132,9 +142,14 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         dom = self.domains(min(opt['T_CUT_MKN'], opt['T_CUT_MKN_TRIPLES']),
                            min(opt['T_CUT_DO'], opt['T_CUT_DO_TRIPLES']))
         pairs = [(i, j) for i in range(n) for j in range(n) if mask[i, j]]
-        self.ext = ExtDomains(mol.natm, dom.lmo_riatoms, dom.lmo_paos, pairs, orb.nbf)
+        self.ext = ExtDomains(mol.natm, dom.lmo_riatoms, dom.lmo_paos, pairs, orb.nbf,
+                              extra_lmos=np.arange(self.nda, n))
+        # block-sparse (Q|iu) / (Q|ij) (the SOMO rows kept for every aux atom),
+        # (Q|iu) spread over the host and the devices when large; no direct
+        # (Q|iu) (DLPNO_OPEN_SPARSE_IJ=0: the complete (Q|ij), as before)
         self.dfi = DFInts(mol, auxmol, L, P, self.ext, self.doi_uv, opt['T_CUT_DO_UV'],
-                          self.ribf_atom, self.atom_ribfs, sparse_ij=False)
+                          self.ribf_atom, self.atom_ribfs,
+                          sparse_ij=os.environ.get('DLPNO_OPEN_SPARSE_IJ', '1') == '1', direct_ok=False)
         if self.verbose >= 2:
             print('[mem] DF ints GB:', {k: round(v / 1e9, 2) for k, v in self.dfi.nbytes.items()}, flush=True)
         self.J2c = self.dfi.J2c
@@ -1069,14 +1084,17 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             ent['Qmz'] = {z: Boo[:, :, lpos[z]] for z in {x, y}}
             ent['Qaz'] = {(z, s): Bm[s][:, lpos[z]] for z in {x, y} for s in (0, 1) if (z, s) in si}
         if host:
-            # the large DF / 3-external blocks wait in pinned host memory
+            # the large DF / 3-external blocks wait in pinned host memory, or
+            # in files on scratch (``_pair_spill``) when they would not fit
             from electrolites.dlpno.devmem import to_pinned
+            sp_ = getattr(self, '_pair_spill', None)
+            put = sp_.put if sp_ is not None else to_pinned
             for key in ('Qov', 'Qvv'):
                 if key in ent:
-                    ent[key] = [to_pinned(v) for v in ent[key]]
+                    ent[key] = [put(v) for v in ent[key]]
             for key in ('Qmz', 'Qaz', 'K3'):
                 if key in ent:
-                    ent[key] = {k: to_pinned(v) for k, v in ent[key].items()}
+                    ent[key] = {k: put(v) for k, v in ent[key].items()}
         return ent
 
     def _f_ov_rows(self, p, lm, s):
@@ -1259,7 +1277,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             raise SystemExit(0)
         self.log('  CC stores (GB):', getattr(g, 'mem_report', None))
         self.mem_cc = getattr(g, 'mem_report', None)
-        self.e_lccsd, self.de_weak = g.kernel(verbose=self.verbose >= 4)
+        self.e_lccsd, self.de_weak = g.kernel(verbose=self.verbose >= 2)
         # amplitudes back for the triples (blocks and dense host copies)
         Th = g.T.to_list()
         self.T2b = {k: Th[n] for n, k in enumerate(g.sop)}
@@ -1275,6 +1293,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             p = self._sp(k)
             self.T2[k] = self._dense(p, self.so[k[0]][1], self.so[k[1]][1], blk)
         # the CC stores (overlaps, ring integrals, DF groups) are not needed by (T)
+        if getattr(g, '_df_store', None) is not None:
+            g._df_store.close()
         self.ucc = g = None
         import gc
         gc.collect()
