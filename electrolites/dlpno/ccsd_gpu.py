@@ -1372,7 +1372,8 @@ class _DeviceDIIS:
             free += cp.get_default_memory_pool().free_bytes()
             # the history grows over the first iterations, after the plans
             # have taken their share: on the device only when it is small
-            self.host = 2 * self.nvec * v.nbytes > min(0.1 * free, 0.05 * tot)
+            self.host = (2 * self.nvec * v.nbytes > min(0.1 * free, 0.05 * tot)
+                         or os.environ.get('DLPNO_DIIS_HOST') == '1')       # testing
         if self.host:
             from electrolites.dlpno.devmem import to_pinned
             return to_pinned(v)
@@ -1382,8 +1383,16 @@ class _DeviceDIIS:
     def _dev(v):
         return v if isinstance(v, cp.ndarray) else cp.asarray(v)
 
+    SEG = 1 << 26        # elements per host -> device slice (512 MB)
+
+    def _dot(self, e, v):
+        if isinstance(v, cp.ndarray):
+            return float(cp.dot(e, v))
+        S = self.SEG
+        return sum(float(cp.dot(e[i:i + S], cp.asarray(v[i:i + S]))) for i in range(0, v.size, S))
+
     def update(self, x, e):
-        g = np.array([float(cp.dot(e, self._dev(v))) for v in self.e] + [float(cp.dot(e, e))])
+        g = np.array([self._dot(e, v) for v in self.e] + [float(cp.dot(e, e))])
         n0 = len(self.e)
         G = np.zeros((n0 + 1, n0 + 1))
         G[:n0, :n0] = self.G
@@ -1407,7 +1416,17 @@ class _DeviceDIIS:
             c = np.linalg.solve(B, rhs)[:n]
         except np.linalg.LinAlgError:
             return x
-        out = self._dev(self.x[0]) * c[0]
-        for ci, v in zip(c[1:], self.x[1:]):
-            out += ci * self._dev(v)
-        return out
+        if not self.host:
+            out = self.x[0] * c[0]
+            for ci, v in zip(c[1:], self.x[1:]):
+                out += ci * v
+            return out
+        # host history: the extrapolation slice by slice (no full-size device
+        # temporaries per vector), written over x
+        S = self.SEG
+        for i in range(0, x.size, S):
+            seg = x[i:i + S]
+            seg[...] = cp.asarray(self.x[0][i:i + S]) * c[0]
+            for ci, v in zip(c[1:], self.x[1:]):
+                seg += ci * cp.asarray(v[i:i + S])
+        return x
