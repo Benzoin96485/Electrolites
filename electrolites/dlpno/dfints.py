@@ -221,15 +221,22 @@ class BlockQ:
 
     def _dev_tabs(self):
         dev = cp.cuda.Device().id
-        if self._tabs is None or self._tabs[0] != dev:
+        # one table set per device: a split / host BlockQ is shared by the
+        # worker threads of several devices (a single cached entry could be
+        # replaced by another thread between the check and the kernel launch)
+        tabs = self._tabs if isinstance(self._tabs, dict) else {}
+        t = tabs.get(dev)
+        if t is None:
             t = {k: cp.asarray(v) for k, v in self._host.items()}
             if self.bufs is not None:
                 base = np.array([self._devptr(b) for b in self.bufs], np.uint64)[self.abuf]
             else:
                 base = np.full(len(self.aoff), self._devptr(self.buf), np.uint64)
             t['abase'] = cp.asarray(base + self.aoff.astype(np.uint64) * np.uint64(8))
-            self._tabs = (dev, t)
-        return self._tabs[1]
+            tabs = dict(tabs)
+            tabs[dev] = t
+            self._tabs = tabs
+        return t
 
     def __getitem__(self, key):
         Q, i, u = (cp.asarray(k, dtype=cp.int64) for k in key)
