@@ -1314,11 +1314,17 @@ class CCSDGPU:
             t0 = time.perf_counter()
             R1, R2 = self.residuals()
             rn = _rnorm(R1, R2)
-            self.T1 = self.T1 - R1 / self.D1
-            self.T = self.T - R2 / self.D2
+            s1, s2 = R1 / self.D1, R2 / self.D2
+            self.T1 = self.T1 - s1
+            self.T = self.T - s2
             n1 = self.T1.flat().size
-            x = diis.update(cp.concatenate([self.T1.flat(), self.T.flat()]),
-                            cp.concatenate([R1.flat(), R2.flat()]))
+            # DIIS error: the residual, or the (preconditioned) amplitude step,
+            # which weighs small-denominator components fairly
+            err = (cp.concatenate([s1.flat(), s2.flat()]) if _diis_step(opt)
+                   else cp.concatenate([R1.flat(), R2.flat()]))
+            del s1, s2
+            x = diis.update(cp.concatenate([self.T1.flat(), self.T.flat()]), err)
+            del err
             self.T1.set_flat(x[:n1])
             self.T.set_flat(x[n1:])
             e = self.energy()
@@ -1339,6 +1345,12 @@ class CCSDGPU:
         else:
             raise RuntimeError('LCCSD did not converge')
         return e_cur - e_weak, e_weak
+
+
+def _diis_step(opt):
+    """DIIS error vector of the CC iterations: 'step' (amplitude update R/D)
+    or 'residual' (DIIS_ERR option, env DLPNO_DIIS_ERR)."""
+    return os.environ.get('DLPNO_DIIS_ERR', opt.get('DIIS_ERR', 'residual')) == 'step'
 
 
 class _DeviceDIIS:

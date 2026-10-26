@@ -20,6 +20,7 @@ this class moves the expensive steps to the device:
 Amplitudes are kept by spin block: ``T2b[(I, J)]`` is the (spin I, spin J)
 block of the spin-orbital pair amplitude (``T2b[(J, I)] = T2b[(I, J)].T``).
 """
+import functools
 import os
 import time
 
@@ -65,6 +66,15 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         try:
             with pooled():
                 return super().kernel()
+        finally:
+            mgpu.close_pools()
+
+    def resume_cc(self):
+        from electrolites.dlpno.devmem import pooled
+        from electrolites.dlpno import mgpu
+        try:
+            with pooled():
+                return super().resume_cc()
         finally:
             mgpu.close_pools()
 
@@ -382,21 +392,26 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             o = occ_h[s, :nval[s]]
             nfin[s] = self._truncate(o, ecum_h[s], e_h[s], scale * cut, trace, energy, lag)
         Xp = cp.matmul(Xa, V)
-        Xa_h, Xb_h, V_h, Vb_h, Xp_h = Xa.get(), Xb.get(), V.get(), Vb.get(), Xp.get()
-        amps_h = [a.get() for a in (taa, tbb, tab, tba)]
+        # the semicanonical amplitudes in the PNO basis (rows / columns: alpha
+        # PNOs V, or their beta images Vb = U^T V); only the leading nf PNOs
+        # are kept per pair (the full PAO-domain blocks would take ~10 MB a
+        # pair on the host)
+        nmax = int(nfin.max()) if B else 0
+        V_, Vb_ = V[:, :, :nmax], Vb[:, :, :nmax]
+        amps_p = [cp.matmul(tr(l), cp.matmul(t, r)).get()
+                  for l, t, r in ((V_, taa, V_), (Vb_, tbb, Vb_), (V_, tab, Vb_), (Vb_, tba, V_))]
+        Xp_h = Xp[:, :, :nmax].get()
         res = []
         for s, p in enumerate(ch):
             n_, nf = npao[s], nfin[s]
-            nv = nval[s]
-            am_ = dict(aa=amps_h[0][s, :nv, :nv])
+            am_ = dict(aa=amps_p[0][s, :nf, :nf])
             if not self.is_somo[xx[s]] and not self.is_somo[yy[s]]:
-                am_['bb'] = amps_h[1][s, :nv, :nv]
+                am_['bb'] = amps_p[1][s, :nf, :nf]
             if not self.is_somo[yy[s]]:
-                am_['ab'] = amps_h[2][s, :nv, :nv]
+                am_['ab'] = amps_p[2][s, :nf, :nf]
             if not self.is_somo[xx[s]]:
-                am_['ba'] = amps_h[3][s, :nv, :nv]
-            res.append((p, Xp_h[s, :n_, :nf], e_h[s] - ecum_h[s, nf], am_,
-                        Xa_h[s, :n_, :nv], Xb_h[s, :n_, :nv]))
+                am_['ba'] = amps_p[3][s, :nf, :nf]
+            res.append((p, Xp_h[s, :n_, :nf], e_h[s] - ecum_h[s, nf], am_))
         return e_h, res
 
     def sc_mp2_pair_energies(self):
@@ -495,9 +510,9 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         plist, Xps = [], []
         def work(w, ch):
             _, res = w._sc_chunk(ch, pno)
-            for p, Xp, de, amps, Xa_sc, Xb_sc in res:
+            for p, Xp, de, amps in res:
                 self.de_pno[p] = self.de_pno[pl.ji[p]] = de
-                sc[p] = (amps, Xa_sc, Xb_sc)
+                sc[p] = amps
                 plist.append(p)
                 Xps.append(Xp)
         self._run_chunks(self._pair_chunks(self._canon_pairs()), work)
@@ -513,13 +528,14 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             p = pl.ij[x, y]
             flip = x > y
             c = pl.ji[p] if flip else p
-            amps, Xa_sc, Xb_sc = sc[c]
+            amps = sc[c]
             T = tcache.get(c)
-            if T is None:          # semicanonical -> PNO-space maps, once per spatial pair
+            if T is None:          # PNO -> canonical pair-space maps, once per spatial pair
                 paos = self.pao[c]
                 Sd = self.orb.S_pao[np.ix_(paos, paos)]
                 npo = len(paos)
-                T = tcache[c] = {0: Xa_sc.T @ Sd @ self.Xa[c], 1: Xb_sc.T @ Sd @ self.Xb[c][:npo]}
+                Xp = self.Xpno[c]
+                T = tcache[c] = {0: Xp.T @ Sd @ self.Xa[c], 1: Xp.T @ Sd @ self.Xb[c][:npo]}
             s1, s2 = (t, s) if flip else (s, t)
             key = letter[s1] + letter[s2]
             blk = T[s1].T @ amps[key] @ T[s2]
@@ -657,12 +673,10 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                 ga_, gb_ = gens_on(d)
                 Pa = ga_.prepare(pp, qq, parts=[parts[ci]])[0]
                 Pb = gb_.prepare(pp, qq, parts=[parts[ci]])[0]
-                t_ = _Terms()
-                t_._keys = ('o', 's', 't', 'a', 'b', 'w')
                 Rs = R_[rsel]
-                t_._rows = list(zip(Rs[:, 0].astype(np.int64).tolist(), local[Rs[:, 1].astype(np.int64)].tolist(),
-                                    Rs[:, 2].astype(np.int64).tolist(), Rs[:, 3].astype(np.int64).tolist(),
-                                    Rs[:, 4].astype(np.int64).tolist(), Rs[:, 5].tolist()))
+                t_ = _Terms.from_columns(o=Rs[:, 0].astype(np.int64), s=local[Rs[:, 1].astype(np.int64)],
+                                         t=Rs[:, 2].astype(np.int64), a=Rs[:, 3].astype(np.int64),
+                                         b=Rs[:, 4].astype(np.int64), w=Rs[:, 5].copy())
                 lays = dict(S=[Pa['LS'], Pb['LS']], T=LT)
                 pl_ = _SpinPlan(lays, LT, t_, 'o', [('S', 's', 'a', False), ('T', 't', None, False),
                                                    ('S', 's', 'b', True)])
@@ -741,7 +755,10 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         R = Ragged(LT)
         fm = [z.astype(cp.float64)[:, None, None] for z in gm]
         tix = _transpose_index(LT, src, dst)
-        self.log(f'  ULMP2 setup {time.perf_counter() - t_l0:.1f} s')
+        if self.verbose >= 2:
+            print(f'[lmp2] {len(sop)} spin-orbital pairs, {len(R_)} coupling terms over {len(pp)} PNO overlaps '
+                  f'in {len(lmp2_chunks)} chunks, overlaps kept on {[d for d in cdevs if not onfly[d]]}; '
+                  f'setup {time.perf_counter() - t_l0:.1f} s', flush=True)
         for it in range(1, opt['MAXITER'] + 1):
             t_it = time.perf_counter()
             for g in range(len(R.data)):
@@ -757,7 +774,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             T.set_flat(diis.update(T.flat(), R.flat()))
             e_so = Gr.vdot_items(T) * cp.asarray(.25 * mult)
             e_cur = float(e_so.sum())
-            self.log(f'  GPU ULMP2 iter {it:3d} {e_cur:.12f} {e_cur - e_prev:.3e} {rms:.3e} '
+            (functools.partial(print, flush=True) if self.verbose >= 2 else self.log)(f'  GPU ULMP2 iter {it:3d} {e_cur:.12f} {e_cur - e_prev:.3e} {rms:.3e} '
                      f'{time.perf_counter() - t_it:.2f}s')
             if abs(e_cur - e_prev) < ec and rms < rc:
                 break

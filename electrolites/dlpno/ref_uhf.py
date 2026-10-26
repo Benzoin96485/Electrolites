@@ -35,6 +35,7 @@ Spin-orbital storage: every spin-orbital pair (I, J) keeps a dense
 zero.  That is wasteful but makes every term the canonical spin-orbital
 formula; the GPU code stores the blocks.
 """
+import os
 import time
 
 import numpy as np
@@ -1384,6 +1385,21 @@ class RefUDLPNO:
         self.e['lmp2'] = self.e_lmp2 + self.de_lmp2_eliminated + self.de_dipole + self.de_pno_total
         self.recompute_pnos()
         t = self._tick('recompute_pnos', t)
+        ck = os.environ.get('DLPNO_CKPT_PNO')
+        if ck:
+            # state after the CC PNOs (restart of the CC: resume_cc)
+            from electrolites.dlpno import checkpoint
+            checkpoint.save(self, ck)
+            t = self._tick('checkpoint', t)
+        return self._after_pnos(t)
+
+    def resume_cc(self):
+        """continue a run restored from a checkpoint written after the CC
+        PNOs (``checkpoint.load``)."""
+        return self._after_pnos(time.perf_counter())
+
+    def _after_pnos(self, t):
+        opt = self.opt
         self.lccsd_iterations()
         t = self._tick('lccsd', t)
         e_corr = (self.e_lccsd + self.de_weak + self.de_lmp2_eliminated

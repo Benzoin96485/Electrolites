@@ -26,7 +26,7 @@ import cupyx
 
 from electrolites.dlpno.ragged import Layout, Ragged, op
 from electrolites.dlpno.vbatch import VChainPlan, VDotPlan
-from electrolites.dlpno.ccsd_gpu import _DeviceDIIS, _rnorm, _converged
+from electrolites.dlpno.ccsd_gpu import _DeviceDIIS, _rnorm, _converged, _diis_step
 
 
 class _Reg:
@@ -1090,11 +1090,16 @@ class UCCSDGPU:
                 top = np.argsort(rr)[::-1][:4]
                 print('   r1 top:', [(int(I), self.so[I], bool(self.u.is_somo[self.so[I][0]]), f'{rr[I]:.2e}',
                                      f'D1min {float(cp.min(cp.abs(_get(self.D1, I)))):.3f}') for I in top], flush=True)
-            T1 = T1 - R1 / self.D1
-            T = T - R / self.D2
+            s1, s2 = R1 / self.D1, R / self.D2
+            T1 = T1 - s1
+            T = T - s2
             T = self._symmetrize(T)
             n1 = T1.flat().size
-            x = diis.update(cp.concatenate([T1.flat(), T.flat()]), cp.concatenate([R1.flat(), R.flat()]))
+            err = (cp.concatenate([s1.flat(), s2.flat()]) if _diis_step(opt)
+                   else cp.concatenate([R1.flat(), R.flat()]))
+            del s1, s2
+            x = diis.update(cp.concatenate([T1.flat(), T.flat()]), err)
+            del err
             T1.set_flat(x[:n1])
             T.set_flat(x[n1:])
             e, ew = self.energy(T, T1)
