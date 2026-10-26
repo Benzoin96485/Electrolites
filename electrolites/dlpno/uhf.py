@@ -45,6 +45,15 @@ from electrolites.dlpno.uccsd_gpu import _SpinPlan, _Terms, _Reg, _set_items, _g
 from electrolites.dlpno.uccsd_vec import UCCSDGPUv as UCCSDGPU
 
 
+def _fix_sign(U):
+    """batched eigenvectors (B, n, m) with the largest-magnitude component of
+    each column positive: the PNO / pair-space bases (and amplitudes stored
+    in them) are then the same from run to run (LMP2 restarts)."""
+    k = cp.argmax(cp.abs(U), axis=1)
+    s = cp.sign(cp.take_along_axis(U, k[:, None, :], axis=1))
+    return U * cp.where(s == 0, 1., s)
+
+
 def _half(L, x):
     s = x.shape
     return cpla.solve_triangular(L, x.reshape(L.shape[0], -1), lower=True).reshape(s)
@@ -375,6 +384,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         D[cp.asarray(xx == yy)] *= .5
         D -= cp.eye(P)[None] * (~valid)[:, :, None]
         occ, V = eigh_batched(D)
+        V = _fix_sign(V)
         occ, V = occ[:, ::-1], V[:, :, ::-1]
         Vb = cp.matmul(Ut, V)
 
@@ -466,6 +476,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             fa = cp.matmul(tr(X), cp.matmul(Fa, X))
             fa += 1e6 * cp.eye(V)[None] * (1 - gvm)[:, :, None]
             ea, Ua = eigh_batched(fa)
+            Ua = _fix_sign(Ua)
             Xa = cp.matmul(X, Ua)
             # beta: [PNO | SOMO] block matrix; PNO count v sits in the first V slots
             W = V + ns
@@ -480,6 +491,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             mb = cp.concatenate([gvm, cp.ones((B, ns))], axis=1)
             fb += 1e6 * cp.eye(W)[None] * (1 - mb)[:, :, None]
             eb, Ub = eigh_batched(fb)
+            Ub = _fix_sign(Ub)
             Xbp = cp.matmul(X, Ub[:, :V])
             Xa_h, ea_h, Xbp_h, Ub_h, eb_h = Xa.get(), ea.get(), Xbp.get(), Ub.get(), eb.get()
             for r, s in enumerate(sel):
