@@ -289,7 +289,7 @@ def _decide_qia_direct(nbytes, host):
     return bool(host) and nbytes > 0.4 * _host_available()
 
 
-def _qia_placement(nbytes):
+def _qia_placement(nbytes, home_share=0.5):
     """[(device or None = host, bytes)] holding ``nbytes`` of (Q|iu): the
     host up to 40% of its available memory, then the other devices and the
     home device (half share), each up to DLPNO_QIA_DEV_FRAC (0.45) of its
@@ -310,7 +310,8 @@ def _qia_placement(nbytes):
     # build and the pair data: it comes last, with a smaller share
     place = [(None, float(os.environ.get('DLPNO_QIA_HOST_FRAC', '0.4')) * _host_available())]
     place += [(d, cap(d, frac)) for d in devs if d != home]
-    place.append((home, cap(home, 0.5 * frac)))
+    if home_share > 0 or sum(c for _, c in place) < 1.05 * nbytes:
+        place.append((home, cap(home, (home_share or 0.5) * frac)))
     if sum(c for _, c in place) < 1.05 * nbytes:
         return None
     if len(devs) > 1:
@@ -606,7 +607,7 @@ class DFInts:
 
     def __init__(self, mol, auxmol, C_lmo, C_pao, ext, doi_uv, t_cut_do_uv,
                  ribf_atom, atom_ribfs, group_mem=2 << 30, need_ab=True, sparse_ij=True,
-                 direct_ok=True):
+                 direct_ok=True, qia_home_share=0.5):
         self.mol, self.auxmol = mol, auxmol
         nao = mol.nao
         naux = auxmol.nao
@@ -635,7 +636,7 @@ class DFInts:
             # (open shell: no direct (Q|iu); spread when it would not fit the host)
             big = need_ab and _decide_qia_direct(nb_ia, host_ia)
             self.qia_direct = sparse_ij and direct_ok and big
-            place = _qia_placement(nb_ia) if (big or os.environ.get('DLPNO_QIA_SPREAD') == '1') \
+            place = _qia_placement(nb_ia, qia_home_share) if (big or os.environ.get('DLPNO_QIA_SPREAD') == '1') \
                 and os.environ.get('DLPNO_QIA_SPREAD') != '0' and not (self.qia_direct and os.environ.get('DLPNO_QIA_DIRECT') == '1') else None
             self.qia_spread = place is not None
             if self.qia_spread:

@@ -36,7 +36,7 @@ from pyscf import df, scf
 from electrolites.dlpno import setup as su
 from electrolites.dlpno.ref_uhf import qro
 from electrolites.dlpno.ref_uhf2 import RefUDLPNO2
-from electrolites.dlpno.dfints import DFInts, ExtDomains
+from electrolites.dlpno.dfints import BlockQ, DFInts, ExtDomains
 from electrolites.dlpno.ragged import Layout, Ragged, padded, op
 from electrolites.dlpno.linalg import eigh_batched, orthonormal_domain
 from electrolites.dlpno.ccsd_gpu import _DeviceDIIS
@@ -159,7 +159,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         # (Q|iu) (DLPNO_OPEN_SPARSE_IJ=0: the complete (Q|ij), as before)
         self.dfi = DFInts(mol, auxmol, L, P, self.ext, self.doi_uv, opt['T_CUT_DO_UV'],
                           self.ribf_atom, self.atom_ribfs,
-                          sparse_ij=os.environ.get('DLPNO_OPEN_SPARSE_IJ', '1') == '1', direct_ok=False)
+                          sparse_ij=os.environ.get('DLPNO_OPEN_SPARSE_IJ', '1') == '1', direct_ok=False,
+                          qia_home_share=0.)   # the home device keeps the LMP2 / CC stores
         if self.verbose >= 2:
             print('[mem] DF ints GB:', {k: round(v / 1e9, 2) for k, v in self.dfi.nbytes.items()}, flush=True)
         self.J2c = self.dfi.J2c
@@ -587,6 +588,14 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         t_l0 = time.perf_counter()
         opt, pl = self.opt, self.pl
         G = self._exchange_blocks()
+        # a large device (Q|ij) waits in pinned host memory (read zero copy
+        # by the later pair integrals): the iterations' stores need the room
+        qij = self.dfi.qij
+        if (isinstance(qij, BlockQ) and not qij.host and not qij.split
+                and qij.nbytes > float(os.environ.get('DLPNO_QIJ_CC_HOST_GB', '4')) * 1e9):
+            self.dfi.qij = qij.to_host()
+            del qij
+            cp.get_default_memory_pool().free_all_blocks()
         sop = self.sop
         sidx = {k: n for n, k in enumerate(sop)}
         sp_of, nvs, LT = self._so_layout()
@@ -706,11 +715,19 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         src = np.array([sidx[k] for k in canon], np.int64)
         dst = np.array([sidx[(k[1], k[0])] for k in canon], np.int64)
         diis = _DeviceDIIS(opt['DIIS_MAX_VECS'])
+        # DLPNO_LMP2_AMP=<file on scratch>: amplitudes saved after every
+        # iteration and read back when present (LMP2 restarts across
+        # allocations; the DIIS history starts afresh)
+        lamp = os.environ.get('DLPNO_LMP2_AMP')
+        if lamp and os.path.exists(lamp):
+            z = np.load(lamp)
+            if z['t'].size == T.flat().size:
+                T.set_flat(cp.asarray(z['t']))
+                print(f'  LMP2 amplitudes read from {lamp} (iteration {int(z["it"])})', flush=True)
         ec, rc = 0.01 * opt['E_CONVERGENCE'], 0.01 * opt['R_CONVERGENCE']
         e_prev = 0.
         gm = [cp.asarray(cmask[m]) for m in LT.members]
         # keep the overlaps when they fit comfortably, else regenerate them per iteration
-        import os
         mode = os.environ.get('DLPNO_ONFLY_S', 'auto')
         cdevs = sorted({c[4] for c in lmp2_chunks})
         onfly = {}
@@ -772,6 +789,9 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                 T.data[g] -= R.data[g] / D.data[g]
             _transpose_inplace(T, tix)
             T.set_flat(diis.update(T.flat(), R.flat()))
+            if lamp:
+                np.savez(lamp + '.tmp.npz', t=cp.asnumpy(T.flat()), it=it)
+                os.replace(lamp + '.tmp.npz', lamp)
             e_so = Gr.vdot_items(T) * cp.asarray(.25 * mult)
             e_cur = float(e_so.sum())
             (functools.partial(print, flush=True) if self.verbose >= 2 else self.log)(f'  GPU ULMP2 iter {it:3d} {e_cur:.12f} {e_cur - e_prev:.3e} {rms:.3e} '
@@ -1288,7 +1308,6 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         self.timings['cc_build'] = time.perf_counter() - t0
         if self.verbose >= 2:
             print('[phase] cc_build steps (s):', {k: round(v, 1) for k, v in g.t_build.items()}, flush=True)
-        import os
         if os.environ.get('DLPNO_DEBUG_CC_SUMS'):
             _cc_checksums(g)
             raise SystemExit(0)
@@ -1316,7 +1335,6 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         import gc
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
-        import os
         if os.environ.get('DLPNO_DEBUG_MEM'):
             alln = [o for o in gc.get_objects() if isinstance(o, cp.ndarray)]
             pool = cp.get_default_memory_pool()
