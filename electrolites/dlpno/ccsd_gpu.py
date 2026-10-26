@@ -1358,13 +1358,16 @@ class _DeviceDIIS:
     on the host and extended by one row per update; the extrapolation is
     accumulated vector by vector (no stacked copies of the history).  When
     the history would take more than 10% of the free device memory (5% of the device) it
-    is kept in pinned host memory."""
+    is kept in pinned host memory, and when it would take more than 25% of
+    the host's available memory, in files on scratch (memory-mapped, read
+    slice by slice; DLPNO_DIIS_DISK=auto|0|1)."""
 
     def __init__(self, nvec=6):
         self.nvec = nvec
         self.x, self.e = [], []
         self.G = np.zeros((0, 0))
         self.host = None
+        self.disk = None
 
     def _keep(self, v):
         if self.host is None:
@@ -1374,10 +1377,48 @@ class _DeviceDIIS:
             # have taken their share: on the device only when it is small
             self.host = (2 * self.nvec * v.nbytes > min(0.1 * free, 0.05 * tot)
                          or os.environ.get('DLPNO_DIIS_HOST') == '1')       # testing
+            from electrolites.dlpno.dfints import _host_available, scratch_dir
+            env = os.environ.get('DLPNO_DIIS_DISK', 'auto')
+            if self.host and (env == '1' or (env == 'auto' and 2 * self.nvec * v.nbytes
+                                             > 0.25 * _host_available())):
+                self.disk = scratch_dir('diis')
+                self._nfile = 0
+        if self.disk is not None:
+            fn = os.path.join(self.disk, f'v{self._nfile}.npy')
+            self._nfile += 1
+            m = np.lib.format.open_memmap(fn, mode='w+', dtype=v.dtype, shape=v.shape)
+            S = self.SEG
+            for i in range(0, v.size, S):
+                m[i:i + S] = cp.asnumpy(v[i:i + S])
+            m.flush()
+            del m
+            return np.load(fn, mmap_mode='r')
         if self.host:
             from electrolites.dlpno.devmem import to_pinned
             return to_pinned(v)
         return v.copy()
+
+    def _drop(self, v):
+        if self.disk is not None and isinstance(v, np.memmap):
+            fn = v.filename
+            del v
+            try:
+                os.remove(fn)
+            except OSError:
+                pass
+
+    def close(self):
+        if self.disk is not None:
+            import shutil
+            self.x, self.e = [], []
+            shutil.rmtree(self.disk, ignore_errors=True)
+            self.disk = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _dev(v):
@@ -1402,7 +1443,10 @@ class _DeviceDIIS:
         self.e.append(self._keep(e))
         if len(self.x) > self.nvec:
             k = int(np.argmax(np.diag(self.G)))
-            del self.x[k], self.e[k]
+            xk, ek = self.x.pop(k), self.e.pop(k)
+            self._drop(xk)
+            self._drop(ek)
+            del xk, ek
             self.G = np.delete(np.delete(self.G, k, 0), k, 1)
         n = len(self.x)
         if n < 2:
