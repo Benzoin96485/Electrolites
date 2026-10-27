@@ -1210,6 +1210,18 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                     res = mgpu.replicate(res)
             for n, v in zip(idx, res):
                 out[n] = v
+        if getattr(self.dfi, 'qab_direct', False) and os.environ.get('DLPNO_OPEN_ATOM', '1') == '1':
+            # direct (Q|uv): its part of every key atom-major (uring), the rest
+            # per pair without regions
+            from electrolites.dlpno.uring import ring_qab_pass
+            items = list(by_p.items())
+            self._ring_qab = ring_qab_pass(self, items, keys, mgpu.devices(), getattr(self, 'verbose', 0))
+            try:
+                items.sort(key=lambda kv: -len(kv[1]))
+                mgpu.run_queue(items, work, setup=setup)
+            finally:
+                self._ring_qab = None
+            return out
         if getattr(self.dfi, 'qab_direct', False):
             items = list(by_p.items())
             order = self.dfi.spatial_order([np.unique(self.ribf_atom[self.ribfs[p]]) for p, _ in items])
@@ -1256,7 +1268,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             for s in (0, 1):
                 Xs = Xa if s == 0 else Xbp
                 v = cp.zeros((len(aux), Xs.shape[1], ne + ns))
-                v[:, :, :ne] = self.dfi.q_vv(atoms, self.pao[p], Xs, ext, E)
+                if getattr(self, '_ring_qab', None) is None:
+                    v[:, :, :ne] = self.dfi.q_vv(atoms, self.pao[p], Xs, ext, E)
                 if ns:
                     so_ = cp.asarray(self.somo_idx)
                     qsu = self.dfi.qia[ga[:, None, None], so_[None, :, None], cp.asarray(ext)[None, None, :]]
@@ -1328,8 +1341,11 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                                        cp.asarray(g.off[qq[rr]]), g.pao_flat, posU,
                                        np.int32(ne), np.int32(ns if c_ == 1 else 0)))
                 res = cp.matmul(Z, Xs)
+                rq = getattr(self, '_ring_qab', None)
                 for r_, n in enumerate(lst):
                     out[n] = res[r_, :, :int(ws[r_])]
+                    if rq is not None and n in rq:        # the (Q|uv) part (uring)
+                        out[n] = out[n] + cp.asarray(rq[n])
         return [out[n] for n in idx]
 
     # ------------------------------------------------------------------
