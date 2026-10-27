@@ -998,9 +998,10 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             # precomputed atom-major (uatom.qvv_atom_pass)
             from electrolites.dlpno.devmem import as_host
             for s_, c in enumerate(ch):
-                na_ = len(auxs[s_])
-                for s, nv_ in ((0, self.nva(c)), (1, self.nvb(c))):
-                    qvv[s][s_, :na_, :nv_, :nv_] = cp.asarray(as_host(raw[c][s]))
+                for o, pa, pb in raw[c]:
+                    for s, x in ((0, pa), (1, pb)):
+                        x = cp.asarray(as_host(x))
+                        qvv[s][s_, o:o + x.shape[0], :x.shape[1], :x.shape[2]] = x
         for a in atoms:
             rows = np.array([r for r in range(B) if a in offs[r]], np.int64)
             off = np.array([offs[r][a] for r in rows], np.int64)
@@ -1256,34 +1257,11 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             epos = -np.ones(nbf, np.int64)
             epos[ext] = np.arange(len(ext))
             ne = len(ext)
-            # (Q| k u) over ext PAOs + SOMOs, half fitted
-            Qk = cp.zeros((len(aux), len(lm), ne + ns))
-            Qk[:, :, :ne] = self.dfi.qia[ga[:, None, None], gl[None, :, None], cp.asarray(ext)[None, None, :]]
-            if ns:
-                Qk[:, :, ne:] = self.dfi.qij[ga[:, None, None], gl[None, :, None],
-                                             cp.asarray(self.somo_idx)[None, None, :]]
-            Qk = _half(L, Qk)
-            # (Q| B_p u) over ext PAOs (+ SOMOs for beta), half fitted, per spin of B
             Xa, Xbp, Xbs = self._vir_coef_d(p)
             atoms = np.unique(self.ribf_atom[aux])
-            E = cp.eye(ne)
-            Vx = []
-            for s in (0, 1):
-                Xs = Xa if s == 0 else Xbp
-                v = cp.zeros((len(aux), Xs.shape[1], ne + ns))
-                if getattr(self, '_ring_qab', None) is None:
-                    v[:, :, :ne] = self.dfi.q_vv(atoms, self.pao[p], Xs, ext, E)
-                if ns:
-                    so_ = cp.asarray(self.somo_idx)
-                    qsu = self.dfi.qia[ga[:, None, None], so_[None, :, None], cp.asarray(ext)[None, None, :]]
-                    qss = self.dfi.qij[ga[:, None, None], so_[None, :, None], so_[None, None, :]]
-                    # (Q| B u) gets the SOMO part of B (beta only); (Q| B t) for SOMO t
-                    qup = self.dfi.qia[ga[:, None, None], so_[None, :, None], cp.asarray(self.pao[p])[None, None, :]]
-                    v[:, :, ne:] = cp.matmul(Xs.T[None], qup.transpose(0, 2, 1))
-                    if s == 1:
-                        v[:, :, :ne] += cp.matmul(Xbs.T[None], qsu)
-                        v[:, :, ne:] += cp.matmul(Xbs.T[None], qss)
-                Vx.append(_half(L, v))
+            A, nl = len(aux), len(lm)
+            gext = cp.asarray(ext)
+            so_ = cp.asarray(self.somo_idx) if ns else None
             # compact virtual coefficients of every pair on this device (one
             # overlap generator per spin); a group's target coefficients are
             # scattered into the extended domain by one kernel
@@ -1301,6 +1279,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             for n in idx:
                 (_, K, Q, bp, c_, q) = keys[n]
                 grp.setdefault((so[Q][0], bp), []).append(n)
+            G = []
             for (qo, bp), lst in grp.items():
                 c1 = np.zeros(len(lst))
                 c2 = np.zeros(len(lst))
@@ -1319,14 +1298,6 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                     for r_, n in enumerate(lst):
                         out[n] = cp.zeros((nvp, int(ws[r_])))
                     continue
-                glk = cp.asarray(lk)
-                Z = 0.
-                if c1.any():        # (k u|B q) for the domain LMOs k
-                    t1 = cp.einsum('Qb,Qku->kbu', Bm[bp][:, lpos[qo]], Qk)
-                    Z = Z + t1[glk] * cp.asarray(c1)[:, None, None]
-                if c2.any():        # (k q|B u)
-                    t2 = cp.einsum('Qk,Qbu->kbu', Boo[:, :, lpos[qo]], Vx[bp])
-                    Z = Z - t2[glk] * cp.asarray(c2)[:, None, None]
                 Wm = int(ws.max())
                 Xs = cp.zeros((len(lst), ne + ns, Wm))
                 for c_ in (0, 1):
@@ -1343,10 +1314,55 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                                        cp.asarray(g.nv[qq[rr]].astype(np.int32)),
                                        cp.asarray(g.off[qq[rr]]), g.pao_flat, posU,
                                        np.int32(ne), np.int32(ns if c_ == 1 else 0)))
-                res = cp.matmul(Z, Xs)
-                rq = getattr(self, '_ring_qab', None)
-                for r_, n in enumerate(lst):
-                    out[n] = res[r_, :, :int(ws[r_])]
+                G.append(dict(qo=qo, bp=bp, lst=lst, glk=cp.asarray(lk), c1=c1, c2=c2, ws=ws, Xs=Xs,
+                              res=cp.zeros((len(lst), nvp, Wm))))
+            # the extended columns in slices (plus the SOMO columns): the
+            # (A x nl x ne) / (A x V x ne) intermediates of a compact protein's
+            # pairs would take several GB each
+            V2 = max(Xa.shape[1], Xbp.shape[1])
+            ucap = max(1, int((1 << 28) // (8 * A * max(nl, V2))))
+            cuts = [(u0, min(ne, u0 + ucap)) for u0 in range(0, ne, ucap)] + ([(ne, ne + ns)] if ns else [])
+            for u0, u1 in cuts:
+                som = u0 >= ne
+                uc = u1 - u0
+                # (Q| k u) over this slice of ext PAOs (or the SOMOs), half fitted
+                if not som:
+                    Qk = self.dfi.qia[ga[:, None, None], gl[None, :, None], gext[u0:u1][None, None, :]]
+                else:
+                    Qk = self.dfi.qij[ga[:, None, None], gl[None, :, None], so_[None, None, :]]
+                Qk = _half(L, Qk)
+                # (Q| B_p u) over the slice (+ SOMOs for beta), half fitted, per spin of B
+                Vx = []
+                for s in (0, 1):
+                    Xs_ = Xa if s == 0 else Xbp
+                    if not som:
+                        v = cp.zeros((A, Xs_.shape[1], uc))
+                        if getattr(self, '_ring_qab', None) is None:
+                            v[...] = self.dfi.q_vv(atoms, self.pao[p], Xs_, ext[u0:u1], cp.eye(uc))
+                        if ns and s == 1:
+                            qsu = self.dfi.qia[ga[:, None, None], so_[None, :, None], gext[u0:u1][None, None, :]]
+                            v += cp.matmul(Xbs.T[None], qsu)
+                    else:
+                        qup = self.dfi.qia[ga[:, None, None], so_[None, :, None], cp.asarray(self.pao[p])[None, None, :]]
+                        v = cp.matmul(Xs_.T[None], qup.transpose(0, 2, 1))
+                        if s == 1:
+                            qss = self.dfi.qij[ga[:, None, None], so_[None, :, None], so_[None, None, :]]
+                            v += cp.matmul(Xbs.T[None], qss)
+                    Vx.append(_half(L, v))
+                for D in G:
+                    Z = 0.
+                    if D['c1'].any():        # (k u|B q) for the domain LMOs k
+                        t1 = cp.einsum('Qb,Qku->kbu', Bm[D['bp']][:, lpos[D['qo']]], Qk)
+                        Z = Z + t1[D['glk']] * cp.asarray(D['c1'])[:, None, None]
+                    if D['c2'].any():        # (k q|B u)
+                        t2 = cp.einsum('Qk,Qbu->kbu', Boo[:, :, lpos[D['qo']]], Vx[D['bp']])
+                        Z = Z - t2[D['glk']] * cp.asarray(D['c2'])[:, None, None]
+                    D['res'] += cp.matmul(Z, D['Xs'][:, u0:u1])
+                del Qk, Vx
+            rq = getattr(self, '_ring_qab', None)
+            for D in G:
+                for r_, n in enumerate(D['lst']):
+                    out[n] = D['res'][r_, :, :int(D['ws'][r_])]
                     if rq is not None and n in rq:        # the (Q|uv) part (uring)
                         out[n] = out[n] + cp.asarray(rq[n])
         return [out[n] for n in idx]

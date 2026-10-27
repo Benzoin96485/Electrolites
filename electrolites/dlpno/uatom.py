@@ -68,7 +68,7 @@ def _device_pass(u, pairs, store, verbose=0):
     import time
     dfi = u.dfi
     t0 = time.perf_counter()
-    offs, left = {}, {}
+    offs = {}
     users = {}
     for c in pairs:
         o, at = 0, {}
@@ -77,8 +77,6 @@ def _device_pass(u, pairs, store, verbose=0):
             o += len(dfi.atom_ribfs[a])
             users.setdefault(int(a), []).append(c)
         offs[c] = (at, o)
-        left[c] = len(at)
-    acc = {}
     out = {}
     atoms = sorted(users)
     atoms = [atoms[k] for k in dfi.spatial_order([[a] for a in atoms])]
@@ -119,19 +117,16 @@ def _device_pass(u, pairs, store, verbose=0):
                     qb = xtbx(bk, cp.asarray(Xb), cp.asarray(Xb)).get()
                     del bk
                     for s_, c in enumerate(bp):
-                        at, A = offs[c]
-                        if c not in acc:
-                            acc[c] = (np.zeros((A, u.nva(c), u.nva(c))), np.zeros((A, u.nvb(c), u.nvb(c))))
-                        o = at[a]
-                        acc[c][0][o:o + na] = qa[s_, :, :u.nva(c), :u.nva(c)]
-                        acc[c][1][o:o + na] = qb[s_, :, :u.nvb(c), :u.nvb(c)]
+                        # this atom's rows of the pair, at once to the store (a
+                        # pair is complete only when its last atom is done:
+                        # whole-pair accumulators held ~all of them at once)
+                        pa = np.ascontiguousarray(qa[s_, :, :u.nva(c), :u.nva(c)])
+                        pb = np.ascontiguousarray(qb[s_, :, :u.nvb(c), :u.nvb(c)])
+                        if store is not None:
+                            pa, pb = store.put(pa), store.put(pb)
+                        out.setdefault(c, []).append((offs[c][0][a], pa, pb))
             del blk
             st['t_pair'] += time.perf_counter() - t1
-        for c in users[a]:
-            left[c] -= 1
-            if left[c] == 0:                # all rows of this pair: to the store
-                qa_, qb_ = acc.pop(c)
-                out[c] = (store.put(qa_), store.put(qb_)) if store is not None else (qa_, qb_)
     cp.cuda.Device().synchronize()
     if verbose >= 2:
         print(f'[mem] atom-major open-shell (Q|AB) on GPU {cp.cuda.Device().id}: {len(pairs)} pairs, '
@@ -141,8 +136,9 @@ def _device_pass(u, pairs, store, verbose=0):
 
 
 def qvv_atom_pass(u, clist, devs, store=None, verbose=0):
-    """{c: (raw alpha, raw beta) (Q|AB) blocks} of the canonical pairs
-    ``clist`` (host arrays or SpillRefs into ``store``)."""
+    """{c: [(row offset, raw alpha rows, raw beta rows)]}: the (Q|AB) rows of
+    the canonical pairs ``clist`` per aux atom (host arrays or SpillRefs into
+    ``store``)."""
     from electrolites.dlpno import mgpu
     owners = _owners(u, list(clist), devs)
     res = {}
