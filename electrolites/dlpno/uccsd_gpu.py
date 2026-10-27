@@ -52,9 +52,15 @@ class _Terms:
     """Column store of a term list.  ``add`` appends a row (all calls use the
     same keyword order); columns are materialised on first read."""
 
+    #: row tuples are converted to a float64 block every BLOCK rows (Python
+    #: tuples take ~10x the memory: hundreds of GB for a 500-atom open shell)
+    BLOCK = 1 << 20
+
     def __init__(self):
         self._keys = None
         self._rows = []
+        self._blocks = []
+        self._first = None
         self._cols = None
         self._np = {}
 
@@ -69,19 +75,28 @@ class _Terms:
                 c.append(v)
             self._np = {}
         else:
-            self._rows.append(tuple(kw.values()))
+            r = tuple(kw.values())
+            if self._first is None:
+                self._first = r
+            self._rows.append(r)
+            if len(self._rows) >= self.BLOCK:
+                self._blocks.append(np.array(self._rows, dtype=np.float64))
+                self._rows = []
 
     def _mat(self):
         if self._cols is None:
             if self._keys is None:
                 self._cols = {}
-            elif not self._rows:
+            elif not self._rows and not self._blocks:
                 self._cols = {k: [] for k in self._keys}
             else:
-                # one C-level conversion of the row tuples, then numpy columns
+                # C-level conversion of the row tuples, then numpy columns
                 # (integer columns exact: indices < 2**53)
-                first = self._rows[0]
-                M = np.array(self._rows, dtype=np.float64)
+                first = self._first
+                if self._rows:
+                    self._blocks.append(np.array(self._rows, dtype=np.float64))
+                M = self._blocks[0] if len(self._blocks) == 1 else np.concatenate(self._blocks)
+                self._blocks = []
                 self._cols = {}
                 for j, k in enumerate(self._keys):
                     v = first[j]
@@ -139,7 +154,7 @@ class _Terms:
         if getattr(self, '_n', None) is not None:
             return self._n
         if self._cols is None:
-            return len(self._rows)
+            return len(self._rows) + sum(len(b) for b in self._blocks)
         return len(next(iter(self._cols.values()))) if self._cols else 0
 
     def compact(self, keep=('w',)):
@@ -256,6 +271,20 @@ class _SpinPlan:
         return out
 
 
+def _build_report(g, name):
+    """build step done: its time and the process's resident host memory."""
+    if getattr(g.u, 'verbose', 0) < 2:
+        return
+    rss = 0.
+    try:
+        for l in open('/proc/self/status'):
+            if l.startswith('VmRSS'):
+                rss = int(l.split()[1]) / 1e6
+    except OSError:
+        pass
+    print(f'[build] {name}: {g.t_build.get(name, 0.):.0f} s, host RSS {rss:.1f} GB', flush=True)
+
+
 class UCCSDGPU:
 
     #: generate the F'_vv and oooo-ladder term lists with numpy (subclasses)
@@ -347,6 +376,7 @@ class UCCSDGPU:
             t0 = time.perf_counter()
             fn()
             self.t_build[name] = time.perf_counter() - t0
+            _build_report(self, name)
 
     def _terms(self):
         u, pl = self.u, self.pl

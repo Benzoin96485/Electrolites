@@ -27,7 +27,7 @@ from electrolites.dlpno.vbatch import VChainPlan, VDotPlan
 from electrolites.dlpno.ccsd_gpu import _mv, _dot2, _wsum, _Packed
 from electrolites.dlpno.dfints import _host_available
 from electrolites.dlpno.devmem import as_host
-from electrolites.dlpno.uccsd_gpu import UCCSDGPU, _SpinPlan, _Terms, _Reg, _set_items, _get
+from electrolites.dlpno.uccsd_gpu import UCCSDGPU, _SpinPlan, _Terms, _Reg, _set_items, _get, _build_report
 
 
 def gather_like(src, items, layout):
@@ -365,6 +365,7 @@ class UCCSDGPUv(UCCSDGPU):
             t0 = time.perf_counter()
             fn()
             self.t_build[name] = time.perf_counter() - t0
+            _build_report(self, name)
         # the DF tensors now live (padded) in the DF groups, the 3-external
         # tensors in the K3 store: drop the per-pair copies
         for c in self.canon_sp:
