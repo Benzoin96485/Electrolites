@@ -38,12 +38,16 @@ def _pair_setup(u, p, keys, idx):
     tg = sorted({(keys[n][5], keys[n][4]) for n in act})
     tpos = {t: r for r, t in enumerate(tg)}
     aux = u.ribfs[p]
+    # qo (the LMO of Q) is one of the pair's two LMOs: F over those columns only
+    qcols = sorted({lpos[so[keys[n][2]][0]] for n in act})
+    qmap = {c: r for r, c in enumerate(qcols)}
     ga, gl = cp.asarray(aux), cp.asarray(np.asarray(lm, np.int64))
-    qoo = dfi.qij[ga[:, None, None], gl[None, :, None], gl[None, None, :]]
+    gq = cp.asarray(np.asarray([lm[c] for c in qcols], np.int64))
+    qoo = dfi.qij[ga[:, None, None], gl[None, :, None], gq[None, None, :]]
     Lc = cp.linalg.cholesky(dfi.J2c[ga[:, None], ga[None, :]])
-    A, nl = len(aux), len(lm)
-    F = cpla.solve_triangular(Lc, qoo.reshape(A, nl * nl), lower=True)
-    F = cpla.solve_triangular(Lc.T, F, lower=False).reshape(A, nl, nl)
+    A, nl, nq = len(aux), len(lm), len(qcols)
+    F = cpla.solve_triangular(Lc, qoo.reshape(A, nl * nq), lower=True)
+    F = cpla.solve_triangular(Lc.T, F, lower=False).reshape(A, nl, nq)
     del qoo, Lc
     offs, o = {}, 0
     for a in np.unique(u.ribf_atom[aux]):
@@ -69,7 +73,7 @@ def _pair_setup(u, p, keys, idx):
             continue
         # distinct (target, k, qo) combinations: the keys of one combination
         # (spin cases of K, Q) share the contraction
-        trip = np.array([(tpos[(keys[n][5], keys[n][4])], lpos[so[keys[n][1]][0]], lpos[so[keys[n][2]][0]])
+        trip = np.array([(tpos[(keys[n][5], keys[n][4])], lpos[so[keys[n][1]][0]], qmap[lpos[so[keys[n][2]][0]]])
                          for n in ns_], np.int64).reshape(-1, 3)
         cmb, kmap = np.unique(trip, axis=0, return_inverse=True)
         V = u.nva(p) if bp == 0 else u.nvb(p)
@@ -102,8 +106,11 @@ def _ring_device_pass(u, items, keys, verbose=0):
             if p not in live:
                 live[p] = _pair_setup(u, p, keys, idx_of[p])
         us = [p for p in users[a] if live[p] is not None]
-        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        lim = 0.2 * free
+        cp.get_default_memory_pool().free_all_blocks()
+        free = cp.cuda.runtime.memGetInfo()[0]
+        # the block, next to the AO integral chunk of _direct_rect (up to 15% of
+        # the free memory) and its transforms
+        lim = 0.12 * free
         groups, cur = [], []
         rm, cm = np.zeros(dfi.nbf, bool), np.zeros(dfi.nbf, bool)
         for p in us:
@@ -202,7 +209,7 @@ def ring_qab_pass(u, items, keys, devs, verbose=0):
         for p in owners[d]:
             nl = len(u.lmos[p])
             V = max(u.nva(p), u.nvb(p))
-            m = 8. * (len(u.ribfs[p]) * nl * nl + 4 * nl * V * V)
+            m = 8. * (len(u.ribfs[p]) * nl * 2 + 4 * nl * V * V)
             if cur and mem + m > lim:
                 batches.append(cur)
                 cur, mem = [], 0.

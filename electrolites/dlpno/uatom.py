@@ -42,8 +42,11 @@ def _owners(u, clist, devs):
 def _split_users(u, us, na):
     """an atom's pairs in groups whose square block over the union of their
     PAOs fits a fifth of the free device memory."""
-    free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-    lim = 0.2 * free
+    cp.get_default_memory_pool().free_all_blocks()
+    free = cp.cuda.runtime.memGetInfo()[0]
+    # the block, next to the AO integral chunk of _direct_rect (up to 15% of
+    # the free memory) and its transforms
+    lim = 0.12 * free
     out, cur = [], []
     m = np.zeros(u.dfi.nbf, bool)
     for c in us:
