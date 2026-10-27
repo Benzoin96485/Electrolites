@@ -200,7 +200,26 @@ def ring_qab_pass(u, items, keys, devs, verbose=0):
 
     def dwork(d):
         wv = mgpu.device_view(u, ('S_pao_d',), sub={'dfi': ('qij', 'J2c', 'C_pao_d', 'mask_uv_d')})
-        res[d] = _ring_device_pass(wv, [(p, idx[p]) for p in owners[d]], keys, verbose)
+        # the pairs in batches whose live data (F, accumulators) fit a quarter
+        # of the free device memory; each batch loops over its own atoms
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        lim = 0.25 * free
+        batches, cur, mem = [], [], 0.
+        for p in owners[d]:
+            nl = len(u.lmos[p])
+            V = max(u.nva(p), u.nvb(p))
+            m = 8. * (len(u.ribfs[p]) * nl * nl + len(idx[p]) * V * V * 2)
+            if cur and mem + m > lim:
+                batches.append(cur)
+                cur, mem = [], 0.
+            cur.append(p)
+            mem += m
+        if cur:
+            batches.append(cur)
+        res[d] = {}
+        for b in batches:
+            res[d].update(_ring_device_pass(wv, [(p, idx[p]) for p in b], keys, verbose))
+            cp.get_default_memory_pool().free_all_blocks()
     mgpu.run_per_device(dwork, list(owners))
     out = {}
     for r in res.values():
