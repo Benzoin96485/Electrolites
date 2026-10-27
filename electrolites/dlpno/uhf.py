@@ -1377,8 +1377,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             for D in G:
                 for r_, n in enumerate(D['lst']):
                     out[n] = D['res'][r_, :, :int(D['ws'][r_])]
-                    if rq is not None and n in rq:        # the (Q|uv) part (uring)
-                        out[n] = out[n] + cp.asarray(rq[n])
+                    if rq is not None and n in rq:        # the (Q|uv) part (uring),
+                        out[n] = out[n] + cp.asarray(rq.pop(n))   # freed once used
         return [out[n] for n in idx]
 
     # ------------------------------------------------------------------

@@ -698,8 +698,10 @@ class UCCSDGPU:
             from electrolites.dlpno.devmem import mapped_zeros
             lay = self.LNP
             data, host = zip(*[mapped_zeros((len(m), r, c)) for m, (r, c) in zip(lay.members, lay.shapes)])
-            for it, M in enumerate(mats):
+            for it in range(len(mats)):
+                M, mats[it] = mats[it], None        # the host copies freed as they go
                 host[lay.group[it]][lay.slot[it], :lay.rows[it], :lay.cols[it]] = M.reshape(lay.rows[it], lay.cols[it])
+                del M
             self.NP = Ragged(lay, list(data))
         else:
             self.NP = Ragged(self.LNP)
