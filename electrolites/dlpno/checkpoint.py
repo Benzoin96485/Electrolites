@@ -24,7 +24,48 @@ def _cp_restore(x, dev=None):
     return cp.asarray(x)
 
 
+_SAVE = {}      # save in progress: dir, counter
+_LOAD = {}      # load in progress: dir
+_FILE_MIN = 64 << 20
+_SEG = 1 << 27   # elements per host <-> device slice
+
+
+def _cp_load_file(name, dev, shape, dtype):
+    """a large device array saved to its own file (memory-mapped and copied
+    slice by slice: the unpickler's memo would otherwise keep a host copy of
+    every device array alive until the end of the load)."""
+    fn = os.path.join(_LOAD['dir'], 'arrays', name)
+    m = np.load(fn, mmap_mode='r').reshape(-1)
+    devc = dev if dev is not None and dev < cp.cuda.runtime.getDeviceCount() else cp.cuda.Device().id
+    with cp.cuda.Device(devc):
+        out = cp.empty(shape, dtype=np.dtype(dtype))
+        flat = out.reshape(-1)
+        for i in range(0, m.size, _SEG):
+            flat[i:i + _SEG] = cp.asarray(np.ascontiguousarray(m[i:i + _SEG]))
+        cp.cuda.Device(devc).synchronize()
+    del m
+    try:
+        fd = os.open(fn, os.O_RDONLY)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os.close(fd)
+    except (AttributeError, OSError):
+        pass
+    return out
+
+
 def _cp_reduce(a):
+    if _SAVE and a.nbytes >= _FILE_MIN:
+        name = f'dev{_SAVE["n"]}.npy'
+        _SAVE['n'] += 1
+        m = np.lib.format.open_memmap(os.path.join(_SAVE['dir'], 'arrays', name), mode='w+',
+                                      dtype=a.dtype, shape=(a.size,))
+        with cp.cuda.Device(a.device.id):
+            flat = cp.ascontiguousarray(a).reshape(-1)
+            for i in range(0, a.size, _SEG):
+                m[i:i + _SEG] = cp.asnumpy(flat[i:i + _SEG])
+        m.flush()
+        del m
+        return _cp_load_file, (name, int(a.device.id), tuple(a.shape), a.dtype.str)
     return _cp_restore, (cp.asnumpy(a), int(a.device.id))
 
 
@@ -40,10 +81,15 @@ def save(obj, path):
         shutil.copytree(sp.dir, os.path.join(path, 'spill'), dirs_exist_ok=True)
     disp = copyreg.dispatch_table.copy()
     disp[cp.ndarray] = _cp_reduce
-    with open(os.path.join(path, 'state.pkl'), 'wb') as f:
-        p = pickle.Pickler(f, protocol=pickle.HIGHEST_PROTOCOL)
-        p.dispatch_table = disp
-        p.dump(obj)
+    os.makedirs(os.path.join(path, 'arrays'), exist_ok=True)
+    _SAVE.update(dir=path, n=0)
+    try:
+        with open(os.path.join(path, 'state.pkl'), 'wb') as f:
+            p = pickle.Pickler(f, protocol=pickle.HIGHEST_PROTOCOL)
+            p.dispatch_table = disp
+            p.dump(obj)
+    finally:
+        _SAVE.clear()
     return path
 
 
@@ -112,8 +158,12 @@ class _Unpickler(pickle.Unpickler):
 def load(path):
     from electrolites.dlpno.dfints import BlockQ
     from electrolites.dlpno.devmem import SpillRef, to_pinned
-    with open(os.path.join(path, 'state.pkl'), 'rb') as f:
-        obj = _Unpickler(_DropCache(f)).load()
+    _LOAD['dir'] = path
+    try:
+        with open(os.path.join(path, 'state.pkl'), 'rb') as f:
+            obj = _Unpickler(_DropCache(f)).load()
+    finally:
+        _LOAD.clear()
     spill = os.path.join(path, 'spill')
 
     def fix(x, seen):
