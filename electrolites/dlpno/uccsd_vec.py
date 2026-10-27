@@ -975,6 +975,12 @@ class UCCSDGPUv(UCCSDGPU):
                           np.array([m.shape[1] for m in mats], np.int64))
         self.Kx = Ragged(self.LKx)
         _set_items(self.Kx, range(len(mats)), mats)
+        # the integral caches (pair metric factors, (Q|uv) blocks: tens of GB
+        # on a compact protein) give the device to the plans
+        getattr(u, '_chol', {}).clear()
+        if hasattr(getattr(u, 'dfi', None), 'cache_clear'):
+            u.dfi.cache_clear()
+        cp.get_default_memory_pool().free_all_blocks()
         self._plans()
         lays = dict(S=self.LS, T=self.LT, Pt=self.LPt, Kx=self.LKx, Tn=self.LTn, J1R=self.LTn,
                     Fv=self.LF, V1=self.LV1)

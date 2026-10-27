@@ -168,11 +168,18 @@ class _Op:
         self.n = rows if self.trans else cols
         self.ngroups = lay.ngroups
         if host:
-            self.off, self.group = _pinned(off), _pinned(self.group)
+            self.off, self.group = _pinned(off), _pinned(self.group.astype(np.int32))
             self.goff = self.gg = None
         else:
             self.goff = cp.asarray(off)
             self.gg = cp.asarray(self.group)
+
+    def trim(self):
+        """drop what only a plan's construction needs (host memory of
+        10^8-term plans): the shapes, and the host tables of a device plan"""
+        self.m = self.n = self.ld = None
+        if self.gg is not None:
+            self.group = self.off = None
 
     def ptrs(self, rag, sl):
         """element pointers of terms sl of a host-resident operand"""
@@ -232,7 +239,7 @@ class VChainPlan:
         off = lay.slot[out_idx] * pr * pc
         if out_row is not None:
             off = off + np.asarray(out_row, np.int64) * pc
-        self.out = (_pinned(g), _pinned(off), pc) if self.host else (cp.asarray(g), cp.asarray(off), pc)
+        self.out = (_pinned(g.astype(np.int32)), _pinned(off), pc) if self.host else (cp.asarray(g), cp.asarray(off), pc)
         self.out_row = out_row is not None
         m_out, n_out = self.ops[0].m, self.ops[-1].n
         if self.out_row:
@@ -310,6 +317,9 @@ class VChainPlan:
                 d = self.dims[-1].get()
                 d[:, 5] = 1
                 self.dims[-1] = cp.asarray(d)
+        self.steps = [(st[0], None, None, None) for st in self.steps]
+        for o in self.ops:
+            o.trim()
 
     def run(self, out, rags, w=None, alpha=1.):
         if self.nterms == 0:
