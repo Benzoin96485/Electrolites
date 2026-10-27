@@ -136,8 +136,7 @@ def _host_plan(nbytes):
     env = os.environ.get('DLPNO_PLAN_HOST', 'auto')
     if env in ('0', '1'):                               # testing
         return env == '1'
-    if nbytes < (16 << 20):
-        return False
+    # whatever its size: the open-shell CC builds 10^5 small chunk plans
     free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
     return free - nbytes < HOST_HEADROOM * cp.cuda.Device().mem_info[1]
 
