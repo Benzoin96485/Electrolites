@@ -102,7 +102,7 @@ def _pair_bytes(u, p, keys, idx):
     return 8. * (len(u.ribfs[p]) * nl * 2 + len(cmb) * V * Vq + len(tg) * Pq * (Vq + 2))
 
 
-def _ring_device_pass(u, items, keys, verbose=0):
+def _ring_device_pass(u, items, keys, verbose=0, sink=None):
     import time
     dfi = u.dfi
     t0 = time.perf_counter()
@@ -199,7 +199,10 @@ def _ring_device_pass(u, items, keys, verbose=0):
                     for r, n in enumerate(D['n']):
                         q, c_ = keys[n][5], keys[n][4]
                         w = u.nva(q) if c_ == 0 else u.nvb(q)
-                        out[n] = -acc[D['comb'][r], :, :w]
+                        if sink is not None:
+                            sink(n, -acc[D['comb'][r], :, :w])
+                        else:
+                            out[n] = -acc[D['comb'][r], :, :w]
                     del acc
     cp.cuda.Device().synchronize()
     if verbose >= 2:
@@ -209,9 +212,10 @@ def _ring_device_pass(u, items, keys, verbose=0):
     return out
 
 
-def ring_qab_pass(u, items, keys, devs, verbose=0):
+def ring_qab_pass(u, items, keys, devs, verbose=0, sink=None):
     """{key index: (Q|uv) part of the non-projected ring integral} for
-    items [(p, key indices)], on the devices that computed them."""
+    items [(p, key indices)] (host arrays), or each part handed to
+    sink(key index, part) as it is finished."""
     from electrolites.dlpno import mgpu
     ps = [p for p, _ in items]
     owners = _owners(u, ps, devs)
@@ -236,7 +240,7 @@ def ring_qab_pass(u, items, keys, devs, verbose=0):
             batches.append(cur)
         res[d] = {}
         for b in batches:
-            res[d].update(_ring_device_pass(wv, [(p, idx[p]) for p in b], keys, verbose))
+            res[d].update(_ring_device_pass(wv, [(p, idx[p]) for p in b], keys, verbose, sink))
             cp.get_default_memory_pool().free_all_blocks()
     mgpu.run_per_device(dwork, list(owners))
     out = {}

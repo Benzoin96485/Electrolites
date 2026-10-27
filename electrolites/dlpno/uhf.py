@@ -1189,9 +1189,11 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             v = v + self.Fb_lmo[np.ix_(lm, self.somo_idx)] @ self.Xb[p][npo:]
         return v
 
-    def gpu_ring_np(self, keys):
+    def gpu_ring_np(self, keys, sink=None):
         """non-projected ring integrals <K B_p || C_q Q> spin blocks for
-        UCCSDGPU's registry keys (p, K, Q, bp, c, q)."""
+        UCCSDGPU's registry keys (p, K, Q, bp, c, q); with sink, each is added
+        to its store by sink(key index, block) instead (stores too large for
+        one device, no list of the blocks)."""
         pl, so = self.pl, self.so
         by_p = {}
         for n, key in enumerate(keys):
@@ -1206,24 +1208,14 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             w._chol = {}
             return w
 
-        # large stores (compact proteins): the items go to the host and the
-        # CC reads them from mapped pinned memory
-        nb = 0.
-        for key in keys:
-            p, c_, q, bp = key[0], key[4], key[5], key[3]
-            nb += 8. * (self.nva(p) if bp == 0 else self.nvb(p)) * (self.nva(q) if c_ == 0 else self.nvb(q))
-        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        self._np_host = nb > 0.15 * free or os.environ.get('DLPNO_NP_HOST') == '1'
-        if getattr(self, 'verbose', 0) >= 2:
-            print(f'[mem] non-projected ring integrals {nb / 1e9:.1f} GB'
-                  + (' (host, mapped)' if self._np_host else ''), flush=True)
-
         def work(w, it):
             p, idx = it
             res = w._ring_np_pair(p, idx, keys)
-            if self._np_host:
-                res = [cp.asnumpy(v) for v in res]
-            elif cp.cuda.Device().id != home:
+            if sink is not None:
+                for n, v in zip(idx, res):
+                    sink(n, v)
+                return
+            if cp.cuda.Device().id != home:
                 with cp.cuda.Device(home):
                     res = mgpu.replicate(res)
             for n, v in zip(idx, res):
@@ -1233,7 +1225,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             # per pair without regions
             from electrolites.dlpno.uring import ring_qab_pass
             items = list(by_p.items())
-            self._ring_qab = ring_qab_pass(self, items, keys, mgpu.devices(), getattr(self, 'verbose', 0))
+            self._ring_qab = ring_qab_pass(self, items, keys, mgpu.devices(), getattr(self, 'verbose', 0), sink)
             try:
                 items.sort(key=lambda kv: -len(kv[1]))
                 mgpu.run_queue(items, work, setup=setup)

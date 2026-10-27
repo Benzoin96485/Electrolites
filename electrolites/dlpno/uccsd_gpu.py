@@ -597,6 +597,34 @@ class UCCSDGPU:
             self.Sd.append(S)
 
     # ------------------------------------------------------------------
+    def _np_mapped(self, u):
+        """the non-projected ring integrals of a large system (compact
+        proteins: tens of GB) in mapped pinned host memory, each block added
+        in as it is computed (no list of the blocks on the host or the home
+        device); False when the store fits the device."""
+        keys = self.np_reg.keys
+        nr = np.array([u.nva(k[0]) if k[3] == 0 else u.nvb(k[0]) for k in keys], np.int64)
+        nc = np.array([u.nva(k[5]) if k[4] == 0 else u.nvb(k[5]) for k in keys], np.int64)
+        nb = 8. * float(np.dot(nr, nc))
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        mapped = nb > 0.15 * free or os.environ.get('DLPNO_NP_HOST') == '1'          # testing
+        if getattr(u, 'verbose', 0) >= 2:
+            print(f'[mem] non-projected ring integrals {nb / 1e9:.1f} GB'
+                  + (' (host, mapped)' if mapped else ''), flush=True)
+        if not mapped:
+            return False
+        from electrolites.dlpno.devmem import mapped_zeros
+        self.LNP = lay = Layout(nr, nc)
+        data, host = zip(*[mapped_zeros((len(m), r, c)) for m, (r, c) in zip(lay.members, lay.shapes)])
+
+        def sink(n, v):
+            v = cp.asnumpy(v)
+            assert v.shape == (nr[n], nc[n])
+            host[lay.group[n]][lay.slot[n], :nr[n], :nc[n]] += v
+        u.gpu_ring_np(keys, sink=sink)
+        self.NP = Ragged(lay, list(data))
+        return True
+
     def _load_ints(self):
         u, pl = self.u, self.pl
         si = u.so_index
@@ -685,25 +713,19 @@ class UCCSDGPU:
                 M = M - self.fix[p]['Kx'][(y, x, a, a)]
             mats.append(M)
         _set_items(self.G, range(len(self.sop)), mats)
-        mats = u.gpu_ring_np(self.np_reg.keys) if hasattr(u, 'gpu_ring_np') else []
+        self.NP = None
+        if hasattr(u, 'gpu_ring_np') and self._np_mapped(u):
+            mats = []
+        else:
+            mats = u.gpu_ring_np(self.np_reg.keys) if hasattr(u, 'gpu_ring_np') else []
         for (p, K, Q, bp, c_, pk) in ([] if hasattr(u, 'gpu_ring_np') else self.np_reg.keys):
             Nd = cp.asarray(u._ring_np(p, K, Q, pk))
             ra = slice(0, u.nva(p)) if bp == 0 else slice(u.nva(p), u.nv(p))
             ca = slice(0, u.nva(pk)) if c_ == 0 else slice(u.nva(pk), u.nv(pk))
             mats.append(Nd[ra, ca])
-        self.LNP = Layout(np.array([m.shape[0] for m in mats], np.int64),
-                          np.array([m.shape[1] for m in mats], np.int64))
-        if mats and isinstance(mats[0], np.ndarray):
-            # host items (large systems): the store in mapped pinned memory
-            from electrolites.dlpno.devmem import mapped_zeros
-            lay = self.LNP
-            data, host = zip(*[mapped_zeros((len(m), r, c)) for m, (r, c) in zip(lay.members, lay.shapes)])
-            for it in range(len(mats)):
-                M, mats[it] = mats[it], None        # the host copies freed as they go
-                host[lay.group[it]][lay.slot[it], :lay.rows[it], :lay.cols[it]] = M.reshape(lay.rows[it], lay.cols[it])
-                del M
-            self.NP = Ragged(lay, list(data))
-        else:
+        if getattr(self, 'NP', None) is None:
+            self.LNP = Layout(np.array([m.shape[0] for m in mats], np.int64),
+                              np.array([m.shape[1] for m in mats], np.int64))
             self.NP = Ragged(self.LNP)
             _set_items(self.NP, range(len(mats)), mats)
         mats = None
