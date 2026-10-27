@@ -12,8 +12,11 @@ The association order of a chain (left-to-right or right-to-left) is chosen
 once per plan from the mean term shapes, which matters for chains that end
 in a vector (S T S^T t).
 """
+import os
+
 import numpy as np
 import cupy as cp
+import cupyx
 
 from electrolites.dlpno.ragged import padded
 
@@ -123,10 +126,32 @@ def _shapes(lay):
     return sh
 
 
+#: a plan's index tables stay on the host (uploaded chunk by chunk when it
+#: runs) once building it on the device would leave less than this fraction
+#: of the device free (compact proteins: 10^8 open-shell CC terms)
+HOST_HEADROOM = 0.35
+
+
+def _host_plan(nbytes):
+    env = os.environ.get('DLPNO_PLAN_HOST', 'auto')
+    if env in ('0', '1'):                               # testing
+        return env == '1'
+    if nbytes < (16 << 20):
+        return False
+    free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+    return free - nbytes < HOST_HEADROOM * cp.cuda.Device().mem_info[1]
+
+
+def _pinned(a):
+    out = cupyx.empty_pinned(a.shape, a.dtype)
+    out[...] = a
+    return out
+
+
 class _Op:
     """Static description of one chain operand over the term list."""
 
-    def __init__(self, o):
+    def __init__(self, o, host=False):
         lay = o.layout
         idx = o.idx
         self.trans = bool(o.trans)
@@ -143,8 +168,16 @@ class _Op:
         self.m = cols if self.trans else rows   # effective shape
         self.n = rows if self.trans else cols
         self.ngroups = lay.ngroups
-        self.goff = cp.asarray(off)
-        self.gg = cp.asarray(self.group)
+        if host:
+            self.off, self.group = _pinned(off), _pinned(self.group)
+            self.goff = self.gg = None
+        else:
+            self.goff = cp.asarray(off)
+            self.gg = cp.asarray(self.group)
+
+    def ptrs(self, rag, sl):
+        """element pointers of terms sl of a host-resident operand"""
+        return _base(rag)[cp.asarray(self.group[sl])] + cp.asarray(self.off[sl]) * 8
 
 
 _BASE = {}
@@ -179,11 +212,15 @@ class VChainPlan:
     #: largest total of chain intermediates per launch (doubles)
     MAX_TMP = 1 << 27
 
-    def __init__(self, out_layout, out_idx, operands, out_row=None, order=None):
+    def __init__(self, out_layout, out_idx, operands, out_row=None, order=None, host=None):
         self.out_layout = out_layout
         out_idx = np.asarray(out_idx, np.int64)
         self.nterms = nt = len(out_idx)
-        self.ops = [_Op(o) for o in operands]
+        k = len(operands)
+        if host is None:
+            host = _host_plan(nt * (16. * k + 16 + 32 * max(k - 1, 0)))
+        self.host = bool(host) and nt > 0
+        self.ops = [_Op(o, self.host) for o in operands]
         if nt == 0:
             return
         for a, b in zip(self.ops[:-1], self.ops[1:]):
@@ -196,7 +233,7 @@ class VChainPlan:
         off = lay.slot[out_idx] * pr * pc
         if out_row is not None:
             off = off + np.asarray(out_row, np.int64) * pc
-        self.out = (cp.asarray(g), cp.asarray(off), pc)
+        self.out = (_pinned(g), _pinned(off), pc) if self.host else (cp.asarray(g), cp.asarray(off), pc)
         self.out_row = out_row is not None
         m_out, n_out = self.ops[0].m, self.ops[-1].n
         if self.out_row:
@@ -232,16 +269,19 @@ class VChainPlan:
         per = np.sum(sizes, axis=0) if sizes else np.zeros(nt, np.int64)
         bounds = [0]
         acc = 0
+        cap = (1 << 22) if self.host else nt + 1     # host tables: bounded uploads
         for t_, v in enumerate(per):
-            if acc + v > self.MAX_TMP and t_ > bounds[-1]:
+            if (acc + v > self.MAX_TMP and t_ > bounds[-1]) or t_ - bounds[-1] >= cap:
                 bounds.append(t_)
                 acc = 0
             acc += int(v)
         bounds.append(nt)
         self.chunks = []
         for t0, t1 in zip(bounds[:-1], bounds[1:]):
-            offs = [cp.asarray(np.concatenate([[0], np.cumsum(sz[t0:t1])[:-1]]).astype(np.int64) * 8)
+            offs = [np.concatenate([[0], np.cumsum(sz[t0:t1])[:-1]]).astype(np.int64) * 8
                     for sz in sizes]
+            if not self.host:
+                offs = [cp.asarray(o_) for o_ in offs]
             self.chunks.append((t0, t1, offs, [int(sz[t0:t1].sum()) for sz in sizes]))
         self.dims = []
         self.tiles = []
@@ -258,19 +298,25 @@ class VChainPlan:
                 ldc = np.ones_like(nn) if np.all(nn == 1) else pc
             d = np.stack([nm, nn, kk, np.broadcast_to(lda, nm.shape),
                           np.broadcast_to(ldb, nm.shape), np.broadcast_to(ldc, nm.shape)], 1)
-            self.dims.append(cp.asarray(d.astype(np.int32)))
+            d = d.astype(np.int32)
+            self.dims.append(_pinned(d) if self.host else cp.asarray(d))
             tn = int(((nn + 31) // 32).max())
             tm = int(((nm + 31) // 32).max())
             self.tiles.append((tm, tn))
         if self.out_row and np.all(self.steps[-1][2] == 1):
             # product is a column (m x 1); write it as a row: stride 1 along m
-            d = self.dims[-1].get()
-            d[:, 5] = 1
-            self.dims[-1] = cp.asarray(d)
+            if self.host:
+                self.dims[-1][:, 5] = 1
+            else:
+                d = self.dims[-1].get()
+                d[:, 5] = 1
+                self.dims[-1] = cp.asarray(d)
 
     def run(self, out, rags, w=None, alpha=1.):
         if self.nterms == 0:
             return out
+        if self.host:
+            return self._run_host(out, rags, w, alpha)
         kern = _kern('vgemm')
         nt = self.nterms
         ptrs = [_ptrs(r, o) for r, o in zip(rags, self.ops)]
@@ -304,6 +350,40 @@ class VChainPlan:
                 tm, tn = self.tiles[q]
                 kern((t1 - t0, tm * tn), (16, 16),
                      (A, B, C, self.dims[q][sl], (al if q == last else ones)[sl], np.int32(tn),
+                      np.int32(ta), np.int32(tb), np.int32(1 if q == last else 0)))
+        return out
+
+
+    def _run_host(self, out, rags, w, alpha):
+        """run() with the index tables on the host: each chunk's slice
+        uploaded (and its pointers formed) right before its launches."""
+        kern = _kern('vgemm')
+        og, ooff, _ = self.out
+        bo = _base(out)
+        k = len(self.ops)
+        last = len(self.steps) - 1
+        for t0, t1, offs, tots in self.chunks:
+            sl = slice(t0, t1)
+            n_ = t1 - t0
+            ptrs = [o.ptrs(r, sl) for r, o in zip(rags, self.ops)]
+            optr = bo[cp.asarray(og[sl])] + cp.asarray(ooff[sl]) * 8
+            al = cp.full(n_, float(alpha)) if w is None else (w[sl] * alpha).astype(cp.float64)
+            ones = cp.ones(n_)
+            tmps = [cp.empty(max(t, 1)) for t in tots]
+            tptr = [tmps[q].data.ptr + cp.asarray(offs[q]) for q in range(len(tmps))]
+            for q, (s, nm, nn, kk) in enumerate(self.steps):
+                if self.order == 'l2r':
+                    A = ptrs[0] if q == 0 else tptr[q - 1]
+                    ta = self.ops[0].trans if q == 0 else False
+                    B, tb = ptrs[s], self.ops[s].trans
+                else:
+                    A, ta = ptrs[s], self.ops[s].trans
+                    B = ptrs[k - 1] if q == 0 else tptr[q - 1]
+                    tb = self.ops[k - 1].trans if q == 0 else False
+                C = optr if q == last else tptr[q]
+                tm, tn = self.tiles[q]
+                kern((n_, tm * tn), (16, 16),
+                     (A, B, C, cp.asarray(self.dims[q][sl]), (al if q == last else ones), np.int32(tn),
                       np.int32(ta), np.int32(tb), np.int32(1 if q == last else 0)))
         return out
 

@@ -617,11 +617,53 @@ class UCCSDGPU:
         self.LNP = lay = Layout(nr, nc)
         data, host = zip(*[mapped_zeros((len(m), r, c)) for m, (r, c) in zip(lay.members, lay.shapes)])
 
-        def sink(n, v):
-            v = cp.asnumpy(v)
-            assert v.shape == (nr[n], nc[n])
-            host[lay.group[n]][lay.slot[n], :nr[n], :nc[n]] += v
-        u.gpu_ring_np(keys, sink=sink)
+        # DLPNO_NP_FILE: a directory caching the store between restarts of the
+        # same checkpoint (its build is an hour on mimochrome); used only when
+        # the layout and a fingerprint of the PNOs match (the PNOs of a fresh
+        # run are not those of the cache: signs, degenerate rotations)
+        cache = os.environ.get('DLPNO_NP_FILE')
+
+        def _fp(X):
+            X = np.asarray(X.get() if hasattr(X, 'get') else X)
+            return float(X.sum(0) @ (1. + np.arange(X.shape[1]))) if X.size else 0.
+        tag = np.concatenate([nr, nc, [_fp(u.Xa[q]) for q in range(len(u.Xa))],
+                              [_fp(u.Xb[q]) for q in range(len(u.Xb))]]).astype(np.float64)
+
+        def compute(sub, put):
+            u.gpu_ring_np([keys[n] for n in sub], sink=lambda i, v: put(sub[i], cp.asnumpy(v)))
+
+        hit = False
+        if cache and os.path.exists(os.path.join(cache, 'tag.npy')):
+            old = np.load(os.path.join(cache, 'tag.npy'))
+            hit = old.shape == tag.shape and np.array_equal(old, tag)
+            if getattr(u, 'verbose', 0) >= 2:
+                print(f'[mem] non-projected ring integrals cache {cache}: '
+                      + ('read' if hit else 'other PNOs, recomputed'), flush=True)
+            if hit:
+                for g, h in enumerate(host):
+                    fn = os.path.join(cache, f'np{g}.npy')
+                    m = np.load(fn, mmap_mode='r')
+                    for i in range(0, len(h), 64):
+                        h[i:i + 64] = m[i:i + 64]
+                    del m
+                    try:        # not through the page cache (cgroup limit)
+                        fd = os.open(fn, os.O_RDONLY)
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                        os.close(fd)
+                    except (AttributeError, OSError):
+                        pass
+        if not hit:
+            def put(n, v):
+                assert v.shape == (nr[n], nc[n])
+                host[lay.group[n]][lay.slot[n], :nr[n], :nc[n]] += v
+            compute(list(range(len(keys))), put)
+            if cache:
+                os.makedirs(cache, exist_ok=True)
+                if os.path.exists(os.path.join(cache, 'tag.npy')):
+                    os.remove(os.path.join(cache, 'tag.npy'))
+                for g, h in enumerate(host):
+                    np.save(os.path.join(cache, f'np{g}.npy'), h)
+                np.save(os.path.join(cache, 'tag.npy'), tag)           # last: complete
         self.NP = Ragged(lay, list(data))
         return True
 
