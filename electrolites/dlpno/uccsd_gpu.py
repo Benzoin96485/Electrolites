@@ -693,8 +693,18 @@ class UCCSDGPU:
             mats.append(Nd[ra, ca])
         self.LNP = Layout(np.array([m.shape[0] for m in mats], np.int64),
                           np.array([m.shape[1] for m in mats], np.int64))
-        self.NP = Ragged(self.LNP)
-        _set_items(self.NP, range(len(mats)), mats)
+        if mats and isinstance(mats[0], np.ndarray):
+            # host items (large systems): the store in mapped pinned memory
+            from electrolites.dlpno.devmem import mapped_zeros
+            lay = self.LNP
+            data, host = zip(*[mapped_zeros((len(m), r, c)) for m, (r, c) in zip(lay.members, lay.shapes)])
+            for it, M in enumerate(mats):
+                host[lay.group[it]][lay.slot[it], :lay.rows[it], :lay.cols[it]] = M.reshape(lay.rows[it], lay.cols[it])
+            self.NP = Ragged(lay, list(data))
+        else:
+            self.NP = Ragged(self.LNP)
+            _set_items(self.NP, range(len(mats)), mats)
+        mats = None
         ij = self.pl.ij
         zq = [ij[self.lmo[J_], self.lmo[K]] for (J_, K, b, c) in self.z_reg.keys]
         self.LZ = Layout(np.array([self.nvs[q, k[2]] for q, k in zip(zq, self.z_reg.keys)], np.int64),

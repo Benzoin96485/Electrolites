@@ -1206,10 +1206,24 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             w._chol = {}
             return w
 
+        # large stores (compact proteins): the items go to the host and the
+        # CC reads them from mapped pinned memory
+        nb = 0.
+        for key in keys:
+            p, c_, q, bp = key[0], key[4], key[5], key[3]
+            nb += 8. * (self.nva(p) if bp == 0 else self.nvb(p)) * (self.nva(q) if c_ == 0 else self.nvb(q))
+        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        self._np_host = nb > 0.15 * free or os.environ.get('DLPNO_NP_HOST') == '1'
+        if getattr(self, 'verbose', 0) >= 2:
+            print(f'[mem] non-projected ring integrals {nb / 1e9:.1f} GB'
+                  + (' (host, mapped)' if self._np_host else ''), flush=True)
+
         def work(w, it):
             p, idx = it
             res = w._ring_np_pair(p, idx, keys)
-            if cp.cuda.Device().id != home:
+            if self._np_host:
+                res = [cp.asnumpy(v) for v in res]
+            elif cp.cuda.Device().id != home:
                 with cp.cuda.Device(home):
                     res = mgpu.replicate(res)
             for n, v in zip(idx, res):

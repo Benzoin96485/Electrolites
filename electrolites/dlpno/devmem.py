@@ -142,6 +142,19 @@ def to_pinned(x):
     return out
 
 
+def mapped_zeros(shape, dtype=np.float64):
+    """a device array backed by pinned host memory (zero copy: kernels read
+    and write it over the bus) for stores too large for the device; the
+    host buffer is kept alive by the array).  Returns the device view and
+    the host array."""
+    h = pinned_empty(shape, dtype)
+    h[...] = 0
+    ptr = int(cp.cuda.runtime.pointerGetAttributes(h.ctypes.data).devicePointer)
+    mem = cp.cuda.UnownedMemory(ptr, h.nbytes, h)
+    a = cp.ndarray(shape, dtype=dtype, memptr=cp.cuda.MemoryPointer(mem, 0))
+    return a, h
+
+
 def to_dev(x):
     if isinstance(x, SpillRef):
         return cp.asarray(x.load())
