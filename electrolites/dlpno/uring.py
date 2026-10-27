@@ -67,15 +67,14 @@ def _pair_setup(u, p, keys, idx):
         ns_ = [n for n in act if keys[n][3] == bp]
         if not ns_:
             continue
-        tt = np.array([tpos[(keys[n][5], keys[n][4])] for n in ns_], np.int64)
-        srt = np.argsort(tt, kind='stable')
-        ns_ = [ns_[i] for i in srt]
-        tt = tt[srt]
-        kk = np.array([lpos[so[keys[n][1]][0]] for n in ns_], np.int64)
-        qq = np.array([lpos[so[keys[n][2]][0]] for n in ns_], np.int64)
+        # distinct (target, k, qo) combinations: the keys of one combination
+        # (spin cases of K, Q) share the contraction
+        trip = np.array([(tpos[(keys[n][5], keys[n][4])], lpos[so[keys[n][1]][0]], lpos[so[keys[n][2]][0]])
+                         for n in ns_], np.int64).reshape(-1, 3)
+        cmb, kmap = np.unique(trip, axis=0, return_inverse=True)
         V = u.nva(p) if bp == 0 else u.nvb(p)
-        per_bp[bp] = dict(n=ns_, k=cp.asarray(kk), qo=cp.asarray(qq), t=cp.asarray(tt), t_h=tt,
-                          acc=cp.zeros((len(ns_), V, Vq)))
+        per_bp[bp] = dict(n=ns_, comb=kmap.reshape(-1), t=cp.asarray(cmb[:, 0]), k=cp.asarray(cmb[:, 1]),
+                          qo=cp.asarray(cmb[:, 2]), acc=cp.zeros((len(cmb), V, Vq)))
     return dict(F=F, offs=offs, cols=cols, Xt=cp.asarray(Xt), tcol=cp.asarray(tcol), tmsk=cp.asarray(tmsk),
                 per_bp=per_bp, Vq=Vq)
 
@@ -144,26 +143,21 @@ def _ring_device_pass(u, items, keys, verbose=0):
                 for bp, D in L_['per_bp'].items():
                     Xp = Xa if bp == 0 else Xbp
                     V = Xp.shape[1]
-                    Y = cp.matmul(Xp.T[None], b_)                            # (na, V, E)
-                    G = L_['F'][o:o + na][:, D['k'], D['qo']]               # (na, nk), keys sorted by target
-                    # targets in slices (bounded temporaries), their keys at once
-                    tstep = max(1, int((1 << 28) // (8 * na * V * max(Pq, Vq))))
-                    for t0_ in range(0, nt, tstep):
-                        t1_ = min(nt, t0_ + tstep)
-                        k0, k1 = (int(x) for x in np.searchsorted(D['t_h'], [t0_, t1_]))
-                        if k0 == k1:
-                            continue
-                        tc = L_['tcol'][t0_:t1_]
-                        Yt = Y[:, :, tc] * L_['tmsk'][t0_:t1_][None, None]   # (na, V, nts, Pq)
-                        Yt = cp.ascontiguousarray(Yt.transpose(2, 0, 1, 3)).reshape(t1_ - t0_, na * V, Pq)
-                        Pt = cp.matmul(Yt, L_['Xt'][t0_:t1_]).reshape(t1_ - t0_, na, V * Vq)
-                        del Yt
-                        kstep = max(1, int((1 << 28) // (8 * na * V * Vq)))
-                        for ka in range(k0, k1, kstep):
-                            sl = slice(ka, min(k1, ka + kstep))
-                            D['acc'][sl] += cp.matmul(G[:, sl].T[:, None, :],
-                                                      Pt[D['t'][sl] - t0_]).reshape(-1, V, Vq)
-                        del Pt
+                    E = b_.shape[2]
+                    Y = cp.matmul(Xp.T[None], b_).reshape(na, V * E)         # (na, V*E)
+                    G = L_['F'][o:o + na][:, D['k'], D['qo']]               # (na, nc)
+                    nc = G.shape[1]
+                    cstep = max(1, int((1 << 28) // (8 * V * E)))
+                    for c0 in range(0, nc, cstep):
+                        sl = slice(c0, min(nc, c0 + cstep))
+                        # sum_Q F[Q, k, qo] X_p^T (Q|P_p, cols), then the
+                        # combination's target columns times its coefficients
+                        H = cp.matmul(G[:, sl].T, Y).reshape(-1, V, E)        # (ncs, V, E)
+                        tt = D['t'][sl]
+                        Hs = cp.take_along_axis(H, L_['tcol'][tt][:, None, :], axis=2) \
+                            * L_['tmsk'][tt][:, None, :]                         # (ncs, V, Pq)
+                        D['acc'][sl] += cp.matmul(Hs, L_['Xt'][tt])
+                        del H, Hs
                     del Y, G
                 del b_
             del blk
@@ -179,7 +173,7 @@ def _ring_device_pass(u, items, keys, verbose=0):
                     for r, n in enumerate(D['n']):
                         q, c_ = keys[n][5], keys[n][4]
                         w = u.nva(q) if c_ == 0 else u.nvb(q)
-                        out[n] = -acc[r, :, :w]
+                        out[n] = -acc[D['comb'][r], :, :w]
                     del acc
     cp.cuda.Device().synchronize()
     if verbose >= 2:
@@ -208,7 +202,7 @@ def ring_qab_pass(u, items, keys, devs, verbose=0):
         for p in owners[d]:
             nl = len(u.lmos[p])
             V = max(u.nva(p), u.nvb(p))
-            m = 8. * (len(u.ribfs[p]) * nl * nl + len(idx[p]) * V * V * 2)
+            m = 8. * (len(u.ribfs[p]) * nl * nl + 4 * nl * V * V)
             if cur and mem + m > lim:
                 batches.append(cur)
                 cur, mem = [], 0.
