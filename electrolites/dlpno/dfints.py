@@ -145,31 +145,7 @@ class BlockQ:
                           nl=self.nl, npo=self.npo, lpos=lpos.ravel(), ppos=ppos.ravel())
         self.bufs = None
         if placement is not None and buf is None:
-            # the atoms in order into the listed stores, each up to its capacity
-            from electrolites.dlpno.devmem import pinned_empty
-            self.abuf = np.zeros(natm, np.int64)
-            self.aoff = np.zeros(natm, np.int64)
-            sizes, k, used = [], 0, 0
-            for a in range(natm):
-                while k < len(placement) - 1 and 8 * (used + sz[a]) > placement[k][1]:
-                    sizes.append(used)
-                    k, used = k + 1, 0
-                self.abuf[a], self.aoff[a] = k, used
-                used += int(sz[a])
-            sizes.append(used)
-            sizes += [0] * (len(placement) - len(sizes))
-            self.bufs = []
-            for (d, _), m in zip(placement, sizes):
-                if d is None:
-                    b = pinned_empty((max(m, 1),))
-                    b[...] = 0.
-                else:
-                    with cp.cuda.Device(d):
-                        b = cp.zeros(max(m, 1))
-                self.bufs.append(b)
-            self.buf = self.bufs[0]
-            self.placed = [(d, 8. * m) for (d, _), m in zip(placement, sizes)]
-            self._tabs = None
+            self._alloc_placement(placement)
             return
         if buf is None:
             if host:
@@ -181,6 +157,54 @@ class BlockQ:
                 buf = cp.zeros(max(self.size, 1))
         self.buf = buf
         self._tabs = None
+
+    def _alloc_placement(self, placement):
+        """the atoms in order into the listed stores, each up to its capacity."""
+        from electrolites.dlpno.devmem import pinned_empty
+        natm = len(self.na)
+        sz = self.na * self.nl * self.npo
+        self.abuf = np.zeros(natm, np.int64)
+        self.aoff = np.zeros(natm, np.int64)
+        sizes, k, used = [], 0, 0
+        for a in range(natm):
+            while k < len(placement) - 1 and 8 * (used + sz[a]) > placement[k][1]:
+                sizes.append(used)
+                k, used = k + 1, 0
+            self.abuf[a], self.aoff[a] = k, used
+            used += int(sz[a])
+        sizes.append(used)
+        sizes += [0] * (len(placement) - len(sizes))
+        self.bufs = []
+        for (d, _), m in zip(placement, sizes):
+            if d is None:
+                b = pinned_empty((max(m, 1),))
+                b[...] = 0.
+            else:
+                with cp.cuda.Device(d):
+                    b = cp.zeros(max(m, 1))
+            self.bufs.append(b)
+        self.buf = self.bufs[0]
+        self.placed = [(d, 8. * m) for (d, _), m in zip(placement, sizes)]
+        self._tabs = None
+
+    def respread(self, placement):
+        """move the blocks of a single (host / memory-mapped) buffer into the
+        stores of ``placement`` (a node with less host memory than the one
+        that wrote a checkpoint)."""
+        src, soff = self.buf, self.aoff.copy()
+        self._alloc_placement(placement)
+        for a in range(len(self.na)):
+            n_ = int(self.na[a] * self.nl[a] * self.npo[a])
+            if n_ == 0:
+                continue
+            blk = np.ascontiguousarray(src[soff[a]:soff[a] + n_])
+            dst = self._buf_of(a)[int(self.aoff[a]):int(self.aoff[a]) + n_]
+            if isinstance(dst, np.ndarray):
+                dst[...] = blk
+            else:
+                with cp.cuda.Device(dst.device.id):
+                    dst[...] = cp.asarray(blk)
+        del src
 
     def _buf_of(self, a):
         return self.bufs[int(self.abuf[a])] if self.bufs is not None else self.buf

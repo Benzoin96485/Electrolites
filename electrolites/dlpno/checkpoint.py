@@ -69,6 +69,26 @@ def _cp_reduce(a):
     return _cp_restore, (cp.asnumpy(a), int(a.device.id))
 
 
+_NP_FILE_MIN = 1 << 30
+
+
+def _np_load_file(name):
+    """a large host array saved to its own file: memory-mapped copy-on-write
+    (its owner decides where it goes: a (Q|iu) written on a 512 GB node is
+    re-spread over the devices of a smaller one)."""
+    return np.load(os.path.join(_LOAD['dir'], 'arrays', name), mmap_mode='c')
+
+
+def _np_reduce(a):
+    lim = int(os.environ.get('DLPNO_CKPT_NP_MIN', _NP_FILE_MIN))          # testing
+    if _SAVE and a.nbytes >= lim and not isinstance(a, np.memmap):
+        name = f'host{_SAVE["n"]}.npy'
+        _SAVE['n'] += 1
+        np.save(os.path.join(_SAVE['dir'], 'arrays', name), a)
+        return _np_load_file, (name,)
+    return a.__reduce_ex__(pickle.HIGHEST_PROTOCOL)
+
+
 def save(obj, path):
     from electrolites.dlpno.dfints import BlockQ
     os.makedirs(path, exist_ok=True)
@@ -81,6 +101,7 @@ def save(obj, path):
         shutil.copytree(sp.dir, os.path.join(path, 'spill'), dirs_exist_ok=True)
     disp = copyreg.dispatch_table.copy()
     disp[cp.ndarray] = _cp_reduce
+    disp[np.ndarray] = _np_reduce
     os.makedirs(os.path.join(path, 'arrays'), exist_ok=True)
     _SAVE.update(dir=path, n=0)
     try:
@@ -174,7 +195,16 @@ def load(path):
             x.path = os.path.join(spill, os.path.basename(x.path))
         elif isinstance(x, BlockQ):
             x._tabs = None
-            if isinstance(x.buf, np.ndarray):
+            if isinstance(x.buf, np.memmap) and not getattr(x, 'bufs', None):
+                from electrolites.dlpno.dfints import _host_available, _qia_placement
+                if (x.buf.nbytes > 0.4 * _host_available()
+                        or os.environ.get('DLPNO_CKPT_RESPREAD') == '1'):          # testing
+                    # larger than this node's host share: spread over the
+                    # other devices first (open-shell placement), then the host
+                    place = _qia_placement(x.buf.nbytes, 0.)
+                    if place is not None:
+                        x.respread(place)
+            if isinstance(x.buf, np.ndarray) and not getattr(x, 'bufs', None):
                 x.buf = to_pinned(x.buf)           # zero-copy gathers need pinned memory
             if getattr(x, 'bufs', None):
                 # spread storage: each store back where it was placed

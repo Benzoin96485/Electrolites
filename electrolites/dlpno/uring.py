@@ -83,6 +83,25 @@ def _pair_setup(u, p, keys, idx):
                 per_bp=per_bp, Vq=Vq)
 
 
+def _pair_bytes(u, p, keys, idx):
+    """device bytes a live pair holds in the pass: F (A x nl x 2), the target
+    coefficients and one accumulator per distinct (target, k, qo) and spin."""
+    so = u.so
+    nl = len(u.lmos[p])
+    cmb, tg = set(), set()
+    for n in idx:
+        (_, K, Q, bp, c_, q) = keys[n]
+        if so[K][1] == so[Q][1] and bp == c_:
+            cmb.add((q, c_, so[K][0], so[Q][0], bp))
+            tg.add((q, c_))
+    if not cmb:
+        return 0.
+    Vq = max((u.nva(q) if c_ == 0 else u.nvb(q)) for q, c_ in tg)
+    Pq = max(len(u.pao[q]) for q, _ in tg)
+    V = max(u.nva(p), u.nvb(p))
+    return 8. * (len(u.ribfs[p]) * nl * 2 + len(cmb) * V * Vq + len(tg) * Pq * (Vq + 2))
+
+
 def _ring_device_pass(u, items, keys, verbose=0):
     import time
     dfi = u.dfi
@@ -207,9 +226,7 @@ def ring_qab_pass(u, items, keys, devs, verbose=0):
         lim = 0.25 * free
         batches, cur, mem = [], [], 0.
         for p in owners[d]:
-            nl = len(u.lmos[p])
-            V = max(u.nva(p), u.nvb(p))
-            m = 8. * (len(u.ribfs[p]) * nl * 2 + 4 * nl * V * V)
+            m = _pair_bytes(u, p, keys, idx[p])
             if cur and mem + m > lim:
                 batches.append(cur)
                 cur, mem = [], 0.
