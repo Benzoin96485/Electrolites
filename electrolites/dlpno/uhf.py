@@ -736,7 +736,10 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             if z['t'].size == T.flat().size:
                 T.set_flat(cp.asarray(z['t']))
                 print(f'  LMP2 amplitudes read from {lamp} (iteration {int(z["it"])})', flush=True)
-        ec, rc = 0.01 * opt['E_CONVERGENCE'], 0.01 * opt['R_CONVERGENCE']
+        # LMP2 criteria: 1/100 of the CC ones (Psi4); DLPNO_LMP2_CONV_SCALE relaxes them for
+        # very large systems, where the energy drifts by ~1e-8 Eh per iteration
+        sc_ = float(os.environ.get('DLPNO_LMP2_CONV_SCALE', '0.01'))
+        ec, rc = sc_ * opt['E_CONVERGENCE'], sc_ * opt['R_CONVERGENCE']
         e_prev = 0.
         gm = [cp.asarray(cmask[m]) for m in LT.members]
         # keep the overlaps when they fit comfortably, else regenerate them per iteration
