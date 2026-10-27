@@ -48,9 +48,58 @@ def save(obj, path):
 
 
 def _legacy_asarray(x):
-    """device arrays of checkpoints written before _cp_restore: large ones
-    stay on the host until their owner places them (the spread (Q|iu))."""
-    return x if x.nbytes > (16 << 30) else cp.asarray(x)
+    """device arrays of checkpoints written before _cp_restore (their device
+    was not recorded): very large ones (the spread (Q|iu) stores) go to the
+    device with the most free memory and are moved by their owner (the host
+    could not hold them all at once), the rest to the current device."""
+    if x.nbytes <= (16 << 30):
+        return cp.asarray(x)
+    best, bf = None, -1
+    for d in range(cp.cuda.runtime.getDeviceCount()):
+        with cp.cuda.Device(d):
+            f_ = cp.cuda.runtime.memGetInfo()[0]
+        if f_ > bf:
+            best, bf = d, f_
+    with cp.cuda.Device(best):
+        return cp.asarray(x)
+
+
+class _DropCache:
+    """file wrapper for the unpickler that drops the pages already read from
+    the page cache every few GB (a 160 GB checkpoint read through the cache
+    pushed a 256 GB node into the OOM killer)."""
+
+    STEP = 4 << 30
+
+    def __init__(self, f):
+        self.f, self.n, self.last = f, 0, 0
+
+    def _tick(self, k):
+        self.n += k
+        if self.n - self.last > self.STEP:
+            try:
+                os.posix_fadvise(self.f.fileno(), 0, self.n, os.POSIX_FADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
+            self.last = self.n
+
+    def read(self, k=-1):
+        b = self.f.read(k)
+        self._tick(len(b))
+        return b
+
+    def readinto(self, buf):
+        k = self.f.readinto(buf)
+        self._tick(k or 0)
+        return k
+
+    def readline(self, k=-1):
+        b = self.f.readline(k)
+        self._tick(len(b))
+        return b
+
+    def peek(self, k=0):
+        return self.f.peek(k)
 
 
 class _Unpickler(pickle.Unpickler):
@@ -64,7 +113,7 @@ def load(path):
     from electrolites.dlpno.dfints import BlockQ
     from electrolites.dlpno.devmem import SpillRef, to_pinned
     with open(os.path.join(path, 'state.pkl'), 'rb') as f:
-        obj = _Unpickler(f).load()
+        obj = _Unpickler(_DropCache(f)).load()
     spill = os.path.join(path, 'spill')
 
     def fix(x, seen):
@@ -88,6 +137,14 @@ def load(path):
                         else:
                             with cp.cuda.Device(d):
                                 b = cp.asarray(b)
+                    elif d is not None and b.device.id != d:
+                        with cp.cuda.Device(d):
+                            b2 = cp.empty_like(b)
+                            b2.data.copy_from_device(b.data, b.nbytes)
+                        cp.cuda.Device(d).synchronize()
+                        b = b2
+                    elif d is None:
+                        b = to_pinned(b)
                     out.append(b)
                 x.bufs = out
                 x.buf = x.bufs[0]
