@@ -329,7 +329,12 @@ class ChunkedSpinPlan:
                 self.gens[s].run(P, R)
             S.append(R)
         bud = getattr(self, 'budget', None)
-        if bud is not None and bud.take(cp.cuda.Device().id, sum(L.nbytes() for L in ch['LS'])):
+        nb = sum(L.nbytes() for L in ch['LS'])
+        # kept only while DLPNO_S_KEEP_FREE of the device stays free (as the
+        # closed-shell plans): the budget was set before the plans and stores
+        fr, tot = cp.cuda.runtime.memGetInfo()
+        if bud is not None and fr - nb > float(os.environ.get('DLPNO_S_KEEP_FREE', '0.4')) * tot \
+                and bud.take(cp.cuda.Device().id, nb):
             ch['S'] = S                   # kept: not regenerated in later iterations
         return S
 
