@@ -1257,14 +1257,46 @@ class UCCSDGPU:
               + ', '.join(f'{k} {d / 1e9:.1f}' + (f' (+{m / 1e9:.1f} mapped)' if m else '')
                           for d, m, k in rows[:12]), flush=True)
 
+    def _ovgen_report(self):
+        """per iteration work of the overlaps generated on the fly, from the
+        prepared chunks of every plan: chunks, union rows, W = S_UU X_U flops,
+        overlap bytes (each plan regenerates its own)."""
+        rows = []
+        for k, v in vars(self).items():
+            plans = v if isinstance(v, (list, tuple)) else [v]
+            n = nU2 = fl = by = 0
+            uniq = set()
+            for pl in plans:
+                chs = getattr(pl, 'chunks', None)
+                for ch in chs if isinstance(chs, list) else []:
+                    if not isinstance(ch, dict) or 'preps' not in ch:
+                        continue
+                    by += sum(L.nbytes() for L in ch['LS'])
+                    for P in [P for ps in ch['preps'] for P in ps]:
+                        nv = sum(len(m) * c for m, (r, c) in zip(P['LXu'].members, P['LXu'].shapes))
+                        n += 1
+                        nU2 += P['nU']
+                        fl += 2. * P['LXu'].shapes[0][0] ** 2 * nv
+            if n:
+                rows.append((fl, k, n, nU2 / n, by))
+        rows.sort(reverse=True)
+        tot = sum(r[0] for r in rows)
+        print(f'[ovgen] per iteration: W GEMM {tot / 1e12:.0f} TF, overlaps '
+              f'{sum(r[4] for r in rows) / 1e9:.0f} GB; ' + ', '.join(
+                  f'{k} {fl / 1e12:.0f} TF ({n} chunks, union {u_:.0f}, {by / 1e9:.0f} GB)'
+                  for fl, k, n, u_, by in rows[:10]), flush=True)
+
     def kernel(self, verbose=True):
         u = self.u
         opt = u.opt
         if getattr(u, 'verbose', 0) >= 2:
             try:
                 self._dev_report()
+                self._ovgen_report()
             except Exception as e:          # a report only
                 print('[mem] CC device report failed:', e, flush=True)
+            if __import__('os').environ.get('DLPNO_STOP_BEFORE_CC') == '1':          # profiling aid
+                raise SystemExit(0)
         T = Ragged(self.LT)
         if hasattr(u, 'T2b'):
             init = [cp.asarray(u.T2b[k]) for k in self.sop]

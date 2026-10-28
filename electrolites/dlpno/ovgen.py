@@ -42,6 +42,35 @@ extern "C" __global__ void scatter_rows(const long long* __restrict__ srcp, cons
 '''
 _sk = None
 
+_GATHER_W = r'''
+// dst[r][i, c] = W_r[U[i], c] (i < nU);  dst[r][nU + e, c] = W_r[nbf + e, c] (e < ne)
+extern "C" __global__ void gather_w(const long long* __restrict__ srcp, const long long* __restrict__ dstp,
+                                    const int* __restrict__ lds, const int* __restrict__ ldd,
+                                    const int* __restrict__ ncol, const int* __restrict__ U,
+                                    const int nU, const int nbf, const int ne)
+{
+    const int r = blockIdx.x;
+    const double* src = (const double*)srcp[r];
+    double* dst = (double*)dstp[r];
+    const int nc = ncol[r], ls = lds[r], ld = ldd[r];
+    const long long tot = (long long)(nU + ne) * nc;
+    for (long long e = (long long)blockIdx.y * blockDim.x + threadIdx.x; e < tot;
+         e += (long long)gridDim.y * blockDim.x) {
+        const int i = (int)(e / nc), c = (int)(e % nc);
+        const int srow = (i < nU) ? U[i] : nbf + (i - nU);
+        dst[(long long)i * ld + c] = src[(long long)srow * ls + c];
+    }
+}
+'''
+_gwk = None
+
+
+def _gather_w_kernel():
+    global _gwk
+    if _gwk is None:
+        _gwk = cp.RawKernel(_GATHER_W, 'gather_w')
+    return _gwk
+
 #: chunk statistics with DLPNO_PROF=1 (synchronises): chunks, embedded
 #: pairs, union rows, W GEMM flops and seconds, couples, total seconds
 STATS = {}
@@ -99,6 +128,69 @@ class OverlapGen:
         shp = np.array(self.LXc.shapes, np.int64).reshape(-1, 2)
         self.c_ld = shp[self.LXc.group, 1]
         self.c_off = self.LXc.slot * shp[self.LXc.group, 0] * shp[self.LXc.group, 1]
+
+    def _w_tables(self):
+        """W_q = S_pao[:, d_q] X_q over all PAO rows (+ the extra rows of
+        X_q) for every pair, once: a chunk then gathers its union rows of W
+        instead of forming S_UU X_U (nU^2 flops per coefficient; the overlap
+        generation was ~70% of a compact protein's CC iteration).  Placed on
+        the devices with room (read by pointer, peer access); None when they
+        do not fit (DLPNO_OVGEN_W=auto|0|1)."""
+        st = getattr(self, '_w', 'unset')
+        if st != 'unset':
+            return st
+        self._w = None
+        env = os.environ.get('DLPNO_OVGEN_W', 'auto')
+        if env == '0':
+            return None
+        from electrolites.dlpno import mgpu
+        nr = self.nbf + self.ne
+        LW = Layout(np.full(len(self.nv), nr), self.nv)
+        home = cp.cuda.Device().id
+        devs = mgpu.devices() if home in mgpu.devices() else [home]
+        free = {}
+        for d in devs:
+            with cp.cuda.Device(d):
+                free[d] = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+        frac = 1.0 if env == '1' else 0.4
+        left = {d: frac * free[d] for d in devs}
+        place = []
+        for g, (m, (r, c)) in enumerate(zip(LW.members, LW.shapes)):
+            nb = 8. * len(m) * r * c
+            d = max(devs, key=lambda x: (left[x] if x != home else left[x] + 1.))
+            if left[d] < nb:
+                return None
+            left[d] -= nb
+            place.append(d)
+        if len(set(place)) > 1 or place[0] != home:
+            mgpu.enable_peer(devs)
+        data = []
+        for g, (m, (r, c)) in enumerate(zip(LW.members, LW.shapes)):
+            with cp.cuda.Device(place[g]):
+                data.append(cp.zeros((len(m), r, c)))
+        S = self.S
+        for g, m in enumerate(LW.members):
+            for s, q in enumerate(m):
+                q = int(q)
+                npo, nv = int(self.npao[q]), int(self.nv[q])
+                xq = self.Xc.data[self.LXc.group[q]][self.LXc.slot[q]]
+                w = cp.matmul(S[:, cp.asarray(self.pao[q])], xq[:npo, :nv])
+                if self.ne:
+                    w = cp.concatenate([w, xq[npo:npo + self.ne, :nv]])
+                if place[g] == home:
+                    data[g][s, :nr, :nv] = w
+                else:
+                    with cp.cuda.Device(place[g]):
+                        data[g][s, :nr, :nv] = cp.asarray(w)
+        cp.cuda.Device().synchronize()
+        self._w = (LW, Ragged(LW, data))
+        shp = np.array(LW.shapes, np.int64).reshape(-1, 2)
+        base = np.array([d.data.ptr for d in data], np.int64)
+        self._w_ptr = base[LW.group] + LW.slot * shp[LW.group, 0] * shp[LW.group, 1] * 8
+        self._w_ld = shp[LW.group, 1].astype(np.int32)
+        if os.environ.get('V', '0') >= '2':
+            print(f'[mem] overlap W tables {LW.nbytes() / 1e9:.1f} GB on GPUs {sorted(set(place))}', flush=True)
+        return self._w
 
     def _pao_rows(self, pairs):
         """the PAO indices of all the given pairs, concatenated (with repeats)"""
@@ -219,9 +311,13 @@ class OverlapGen:
             XU, o = self._views(LXu, ws)
             base = np.array([d.data.ptr for d in XU.data], np.int64)
             P['_dst'] = cp.asarray(base[LXu.group] + P['d_off'] * 8)
+            WU, _ = self._views(LXu, ws, o)
+            base = np.array([d.data.ptr for d in WU.data], np.int64)
+            P['_wdst'] = cp.asarray(base[LXu.group] + P['d_off'] * 8)
             P['_ws'] = ws.data.ptr
         XU, o = self._views(LXu, ws)
         WU, _ = self._views(LXu, ws, o)
+        wt = self._w_tables()
         ws[:need].fill(0.)
         dst = P['_dst']
         posU = cp.full(self.nbf, -1, dtype=cp.int32)
@@ -230,17 +326,28 @@ class OverlapGen:
                           (P['src'], dst, P['lds'], P['ldd'], P['npao'], P['ncol'], P['off'],
                            self.pao_flat, posU, np.int32(P['nU']), np.int32(self.ne)))
         pr = LXu.shapes[0][0]
-        M = cp.zeros((pr, pr))
         U = P['U']
         nU = P['nU']
-        M[:nU, :nU] = self.S[U[:, None], U[None, :]]
-        if self.ne:
-            M[nU:nU + self.ne, nU:nU + self.ne] = cp.eye(self.ne)
         if _PROF:
             cp.cuda.Device().synchronize()
             t1 = time.perf_counter()
-        for d, wd in zip(XU.data, WU.data):
-            cp.matmul(M, d, out=wd)
+        if wt is not None:
+            # W rows of the union gathered from the tables
+            if '_wsrc' not in P:
+                P['_wsrc'] = cp.asarray(self._w_ptr[P['inv']])
+                P['_wld'] = cp.asarray(self._w_ld[P['inv']])
+                P['_U32'] = U.astype(cp.int32)
+            ny = int(min(64, max(1, (nU + self.ne) * int(self.nv[P['inv']].max()) // 4096)))
+            _gather_w_kernel()((len(P['inv']), ny), (256,),
+                               (P['_wsrc'], P['_wdst'], P['_wld'], P['ldd'], P['ncol'], P['_U32'],
+                                np.int32(nU), np.int32(self.nbf), np.int32(self.ne)))
+        else:
+            M = cp.zeros((pr, pr))
+            M[:nU, :nU] = self.S[U[:, None], U[None, :]]
+            if self.ne:
+                M[nU:nU + self.ne, nU:nU + self.ne] = cp.eye(self.ne)
+            for d, wd in zip(XU.data, WU.data):
+                cp.matmul(M, d, out=wd)
         if _PROF:
             cp.cuda.Device().synchronize()
             t2 = time.perf_counter()
