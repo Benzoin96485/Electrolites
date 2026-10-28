@@ -291,6 +291,46 @@ def _trim_heap():
         pass
 
 
+def _host_report(g):
+    """host bytes held by the attributes of the CC object and of its owner
+    (numpy arrays incl. pinned, mapped device views; memory maps apart)."""
+    def walk(x, seen, acc):
+        if id(x) in seen:
+            return
+        seen.add(id(x))
+        if isinstance(x, np.ndarray):
+            b = x
+            while isinstance(b.base, np.ndarray):
+                b = b.base
+            if id(b) in seen and b is not x:
+                return
+            seen.add(id(b))
+            acc[1 if isinstance(b, np.memmap) else 0] += b.nbytes
+        elif isinstance(x, cp.ndarray):
+            if isinstance(x.data.mem, cp.cuda.memory.UnownedMemory):
+                acc[0] += x.nbytes
+        elif isinstance(x, (list, tuple, set)):
+            for y in x:
+                walk(y, seen, acc)
+        elif isinstance(x, dict):
+            for y in list(x.values()):
+                walk(y, seen, acc)
+        elif hasattr(x, '__dict__') and not isinstance(x, type) and \
+                (type(x).__module__ or '').startswith('electrolites'):
+            for y in list(vars(x).values()):
+                walk(y, seen, acc)
+    rows, seen = [], {id(g), id(g.u)}
+    for name, obj in (('g', g), ('u', g.u)):
+        for k, v in list(vars(obj).items()):
+            acc = [0, 0]
+            walk(v, seen, acc)
+            if acc[0] > (1 << 28) or acc[1] > (1 << 28):
+                rows.append((acc[0], acc[1], f'{name}.{k}'))
+    rows.sort(reverse=True)
+    print('[mem] host: ' + ', '.join(f'{k} {h / 1e9:.1f}' + (f' (+{m / 1e9:.1f} mmap)' if m else '')
+                                     for h, m, k in rows[:16]), flush=True)
+
+
 def _build_report(g, name):
     """build step done: its time and the process's resident host memory."""
     rss = _rss()
@@ -299,6 +339,11 @@ def _build_report(g, name):
         return
     print(f'[build] {name}: {g.t_build.get(name, 0.):.0f} s, host RSS {rss:.1f} GB '
           f'({_rss():.1f} GB after trim)', flush=True)
+    if os.environ.get('DLPNO_MEM_REPORT') == '1':
+        try:
+            _host_report(g)
+        except Exception as e:          # a report only
+            print('[mem] host report failed:', e, flush=True)
 
 
 class UCCSDGPU:
