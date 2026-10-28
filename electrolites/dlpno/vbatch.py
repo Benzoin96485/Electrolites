@@ -129,7 +129,7 @@ def _shapes(lay):
 #: a plan's index tables stay on the host (uploaded chunk by chunk when it
 #: runs) once building it on the device would leave less than this fraction
 #: of the device free (compact proteins: 10^8 open-shell CC terms)
-HOST_HEADROOM = 0.35
+HOST_HEADROOM = float(os.environ.get('DLPNO_PLAN_HEADROOM', '0.5'))
 
 
 def _host_plan(nbytes):
@@ -273,14 +273,19 @@ class VChainPlan:
         sizes = [st[1] * st[2] for st in self.steps[:-1]]
         # terms run in chunks whose intermediates fit MAX_TMP doubles
         per = np.sum(sizes, axis=0) if sizes else np.zeros(nt, np.int64)
-        bounds = [0]
-        acc = 0
+        # (greedy: a chunk ends before the term that takes its total over
+        # MAX_TMP; searchsorted on the running total, not a loop over 10^8 terms)
         cap = (1 << 22) if self.host else nt + 1     # host tables: bounded uploads
-        for t_, v in enumerate(per):
-            if (acc + v > self.MAX_TMP and t_ > bounds[-1]) or t_ - bounds[-1] >= cap:
-                bounds.append(t_)
-                acc = 0
-            acc += int(v)
+        csum = np.cumsum(np.asarray(per, np.int64))
+        bounds = [0]
+        while True:
+            t0_ = bounds[-1]
+            base = int(csum[t0_ - 1]) if t0_ else 0
+            t_ = int(np.searchsorted(csum, base + self.MAX_TMP, side='right'))
+            t_ = min(max(t_, t0_ + 1), t0_ + cap)
+            if t_ >= nt:
+                break
+            bounds.append(t_)
         bounds.append(nt)
         self.chunks = []
         for t0, t1 in zip(bounds[:-1], bounds[1:]):

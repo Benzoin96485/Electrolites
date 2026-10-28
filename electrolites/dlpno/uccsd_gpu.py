@@ -1162,9 +1162,48 @@ class UCCSDGPU:
                 Ew += e
         return E + ef, Ew
 
+    def _dev_report(self):
+        """the device stores held by the CC object at the first iteration
+        (largest first; mapped host stores apart)."""
+        def walk(x, seen, acc):
+            if id(x) in seen:
+                return
+            seen.add(id(x))
+            if isinstance(x, cp.ndarray):
+                mapped = isinstance(x.data.mem, cp.cuda.memory.UnownedMemory)
+                acc[1 if mapped else 0] += x.nbytes
+            elif isinstance(x, (list, tuple)):
+                for y in x:
+                    walk(y, seen, acc)
+            elif isinstance(x, dict):
+                for y in x.values():
+                    walk(y, seen, acc)
+            elif hasattr(x, '__dict__') and not isinstance(x, type) and \
+                    (type(x).__module__ or '').startswith('electrolites'):
+                for y in vars(x).values():
+                    walk(y, seen, acc)
+        rows, seen = [], {id(self), id(self.u)}
+        for k, v in vars(self).items():
+            acc = [0, 0]
+            walk(v, seen, acc)
+            if acc[0] or acc[1]:
+                rows.append((acc[0], acc[1], k))
+        rows.sort(reverse=True)
+        fr, tot = cp.cuda.runtime.memGetInfo()
+        pool = cp.get_default_memory_pool()
+        print(f'[mem] CC device: free {fr / 1e9:.1f} of {tot / 1e9:.1f} GB, pool used {pool.used_bytes() / 1e9:.1f} '
+              f'held {pool.total_bytes() / 1e9:.1f} GB; largest: '
+              + ', '.join(f'{k} {d / 1e9:.1f}' + (f' (+{m / 1e9:.1f} mapped)' if m else '')
+                          for d, m, k in rows[:12]), flush=True)
+
     def kernel(self, verbose=True):
         u = self.u
         opt = u.opt
+        if getattr(u, 'verbose', 0) >= 2:
+            try:
+                self._dev_report()
+            except Exception as e:          # a report only
+                print('[mem] CC device report failed:', e, flush=True)
         T = Ragged(self.LT)
         if hasattr(u, 'T2b'):
             init = [cp.asarray(u.T2b[k]) for k in self.sop]

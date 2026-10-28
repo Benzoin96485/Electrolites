@@ -842,7 +842,13 @@ class UCCSDGPUv(UCCSDGPU):
         # device (one variable-size GEMM per spin; much cheaper than the
         # union-domain generator for these many small couples)
         from electrolites.dlpno import mgpu
-        if len(mgpu.devices()) > 1 or getattr(self, '_ovgens', None) is None:
+        # full-PAO tables (X and SX per spin over all PAO rows) only when they
+        # fit next to the rest: on a compact protein they are ~100 GB a device
+        u = self.u
+        tab = 16. * sum((u.orb.nbf + (u.ns if s_ else 0)) * float(self.nvs[:, s_].sum()) for s_ in (0, 1))
+        env = os.environ.get('DLPNO_KL_TABLES', 'auto')
+        fits = tab < 0.3 * free if env == 'auto' else env == '1'
+        if fits and (len(mgpu.devices()) > 1 or getattr(self, '_ovgens', None) is None):
             gens, ktab = None, self._kl_tables_dev(dev)
         else:                   # one GPU, overlaps on the fly: no full-PAO tables
             gens, ktab = self._gens_on(dev), None
