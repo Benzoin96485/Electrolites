@@ -10,6 +10,9 @@ pairs into the union of their PAO domains (a scatter kernel), forms
 W = S_pao[U, U] X_U and evaluates every couple of the chunk with one
 variable-size batched GEMM.  Callers run their chunk's terms right after.
 """
+import os
+import time
+
 import numpy as np
 import cupy as cp
 
@@ -38,6 +41,21 @@ extern "C" __global__ void scatter_rows(const long long* __restrict__ srcp, cons
 }
 '''
 _sk = None
+
+#: chunk statistics with DLPNO_PROF=1 (synchronises): chunks, embedded
+#: pairs, union rows, W GEMM flops and seconds, couples, total seconds
+STATS = {}
+_PROF = os.environ.get('DLPNO_PROF') == '1'
+
+
+def stats_report(reset=True):
+    if STATS:
+        s = STATS
+        print(f"[ovgen] {s['runs']} chunks, {s['pairs']} pair embeddings, mean union {s['rows'] / s['runs']:.0f} rows, "
+              f"W GEMM {s['flops'] / 1e12:.1f} TF in {s['t_w']:.1f} s, {s['couples']} couples, "
+              f"{s['t']:.1f} s total", flush=True)
+        if reset:
+            STATS.clear()
 
 
 def _scatter_kernel():
@@ -82,6 +100,14 @@ class OverlapGen:
         self.c_ld = shp[self.LXc.group, 1]
         self.c_off = self.LXc.slot * shp[self.LXc.group, 0] * shp[self.LXc.group, 1]
 
+    def _pao_rows(self, pairs):
+        """the PAO indices of all the given pairs, concatenated (with repeats)"""
+        if not hasattr(self, '_pao_np'):
+            self._pao_np = np.concatenate([np.asarray(p, np.int64) for p in self.pao])
+        n = self.npao[pairs]
+        st = np.repeat(self.off[pairs] - np.concatenate([[0], np.cumsum(n)[:-1]]), n)
+        return self._pao_np[st + np.arange(int(n.sum()))]
+
     def _src_ptrs(self, pairs):
         base = np.array([d.data.ptr for d in self.Xc.data], np.int64)
         return base[self.LXc.group[pairs]] + self.c_off[pairs] * 8
@@ -121,8 +147,7 @@ class OverlapGen:
             sel = order[start:start + L]
             inv = np.unique(np.concatenate([P_[start:start + L], Q_[start:start + L]]))
             mask = np.zeros(nbf, bool)
-            for r in inv:
-                mask[self.pao[r]] = True
+            mask[self._pao_rows(inv)] = True
             out.append((sel, np.flatnonzero(mask), inv))
             start += L
         return out
@@ -179,6 +204,9 @@ class OverlapGen:
     def run(self, P, out=None):
         """evaluate one prepared chunk into ``out`` (accumulates: zero it first),
         by default a new Ragged(P['LS']), which is returned."""
+        if _PROF:
+            cp.cuda.Device().synchronize()
+            t0 = time.perf_counter()
         if out is None:
             out = Ragged(P['LS'])
         LXu = P['LXu']
@@ -208,7 +236,19 @@ class OverlapGen:
         M[:nU, :nU] = self.S[U[:, None], U[None, :]]
         if self.ne:
             M[nU:nU + self.ne, nU:nU + self.ne] = cp.eye(self.ne)
+        if _PROF:
+            cp.cuda.Device().synchronize()
+            t1 = time.perf_counter()
         for d, wd in zip(XU.data, WU.data):
             cp.matmul(M, d, out=wd)
+        if _PROF:
+            cp.cuda.Device().synchronize()
+            t2 = time.perf_counter()
         P['plan'].run(out, [XU, WU])
+        if _PROF:
+            cp.cuda.Device().synchronize()
+            nv = sum(len(m) * c for m, (r, c) in zip(LXu.members, LXu.shapes))
+            for k, v in (('runs', 1), ('pairs', len(P['inv'])), ('rows', pr), ('flops', 2. * pr * pr * nv),
+                         ('t_w', t2 - t1), ('couples', P['plan'].nterms), ('t', time.perf_counter() - t0)):
+                STATS[k] = STATS.get(k, 0) + v
         return out

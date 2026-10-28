@@ -206,6 +206,62 @@ class BlockQ:
                     dst[...] = cp.asarray(blk)
         del src
 
+    def park(self, store):
+        """move the storage to files of ``store`` (a SpillStore) and release
+        the device / pinned memory (the CC iterations do not read (Q|iu); a
+        compact protein's takes tens of GB of the devices and the host);
+        ``unpark`` restores it where it was."""
+        if getattr(self, '_parked', None) is not None:
+            return
+        split = self.bufs is not None
+        bufs = self.bufs if split else [self.buf]
+        seg = 1 << 27
+        parked = []
+        for b in bufs:
+            dev = b.device.id if isinstance(b, cp.ndarray) else None
+            refs = []
+            for i in range(0, b.size, seg):
+                if dev is None:
+                    refs.append(store.put(np.asarray(b[i:i + seg])))
+                else:
+                    with cp.cuda.Device(dev):
+                        refs.append(store.put(cp.asnumpy(b[i:i + seg])))
+            parked.append((refs, dev, b.size))
+        store.flush()
+        self._parked = (parked, split)
+        self.buf = self.bufs = None
+        self._tabs = None
+
+    def unpark(self):
+        if getattr(self, '_parked', None) is None:
+            return
+        from electrolites.dlpno.devmem import pinned_empty
+        parked, split = self._parked
+        out = []
+        for refs, dev, n in parked:
+            if dev is None:
+                b = pinned_empty((max(n, 1),))
+            else:
+                with cp.cuda.Device(dev):
+                    b = cp.empty(max(n, 1))
+            i = 0
+            for r in refs:
+                x = np.memmap(r.path, dtype=r.dtype, mode='r', offset=r.offset, shape=r.shape)
+                if dev is None:
+                    b[i:i + x.size] = x
+                else:
+                    with cp.cuda.Device(dev):
+                        b[i:i + x.size] = cp.asarray(np.ascontiguousarray(x))
+                i += x.size
+                del x
+            if dev is not None:
+                cp.cuda.Device(dev).synchronize()
+            out.append(b)
+        self.bufs = out if split else None
+        self.buf = out[0]
+        self._parked = None
+        self._tabs = None
+
     def _buf_of(self, a):
         return self.bufs[int(self.abuf[a])] if self.bufs is not None else self.buf
 

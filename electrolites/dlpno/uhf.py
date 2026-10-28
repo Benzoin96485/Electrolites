@@ -1374,6 +1374,45 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         return [out[n] for n in idx]
 
     # ------------------------------------------------------------------
+    def park_ints(self):
+        """the block-sparse (Q|iu) / (Q|ij) stores to scratch files for the
+        CC iterations (after the CC integrals; DLPNO_PARK_INTS=0 keeps them):
+        their device and pinned memory go to the plans and the DF groups."""
+        from electrolites.dlpno.dfints import BlockQ
+        if os.environ.get('DLPNO_PARK_INTS', '1') != '1':
+            return
+        objs = [getattr(self.dfi, k, None) for k in ('qia', 'qij')]
+        objs = [o for o in objs if isinstance(o, BlockQ) and getattr(o, '_parked', None) is None]
+        if not objs:
+            return
+        from electrolites.dlpno.devmem import SpillStore, free_pinned
+        t0 = time.perf_counter()
+        self._park_store = st = SpillStore('dfpark')
+        nb = 0
+        for o in objs:
+            nb += o.nbytes
+            o.park(st)
+        cp.get_default_memory_pool().free_all_blocks()
+        free_pinned()
+        if self.verbose >= 2:
+            print(f'[mem] (Q|iu), (Q|ij) parked on scratch ({nb / 1e9:.1f} GB) in {time.perf_counter() - t0:.0f} s',
+                  flush=True)
+
+    def unpark_ints(self):
+        from electrolites.dlpno.dfints import BlockQ
+        st = getattr(self, '_park_store', None)
+        if st is None:
+            return
+        t0 = time.perf_counter()
+        for k in ('qia', 'qij'):
+            o = getattr(self.dfi, k, None)
+            if isinstance(o, BlockQ):
+                o.unpark()
+        st.close()
+        self._park_store = None
+        if self.verbose >= 2:
+            print(f'[mem] (Q|iu), (Q|ij) restored in {time.perf_counter() - t0:.0f} s', flush=True)
+
     def lccsd_iterations(self):
         if self.triples:
             self.t0_pool_start()
@@ -1417,6 +1456,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         import gc
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
+        self.unpark_ints()
         if os.environ.get('DLPNO_DEBUG_MEM'):
             alln = [o for o in gc.get_objects() if isinstance(o, cp.ndarray)]
             pool = cp.get_default_memory_pool()

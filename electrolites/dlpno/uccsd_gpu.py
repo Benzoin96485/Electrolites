@@ -1313,8 +1313,10 @@ class UCCSDGPU:
                 tmp = amp + '.tmp.npz'
                 np.savez(tmp, t1=cp.asnumpy(T1.flat()), t2=cp.asnumpy(T.flat()), it=it)
                 os.replace(tmp, amp)
-            if getattr(self, '_prof', None) is not None and it % 10 == 0:
+            if getattr(self, '_prof', None) is not None and (it <= 2 or it % 10 == 0):
                 self._prof.report()
+                from electrolites.dlpno import ovgen
+                ovgen.stats_report()
             if verbose:
                 print(f'  GPU ULCCSD iter {it:3d} {e:.12f} {e - e_prev:.3e} {rn[0]:.3e} {rn[1]:.3e} '
                       f'{time.perf_counter() - t0:.2f}s', flush=True)

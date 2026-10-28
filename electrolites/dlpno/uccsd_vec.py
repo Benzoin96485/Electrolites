@@ -366,6 +366,8 @@ class UCCSDGPUv(UCCSDGPU):
         self._plans_base, self._plans = self._plans, self._layouts
         super().build()
         self._plans = self._plans_base
+        if hasattr(self.u, 'park_ints'):
+            self.u.park_ints()
         for name, fn in (('vec_terms', self._vec_terms), ('df_groups', self._df_groups)):
             t0 = time.perf_counter()
             fn()
