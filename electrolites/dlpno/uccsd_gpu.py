@@ -271,18 +271,34 @@ class _SpinPlan:
         return out
 
 
-def _build_report(g, name):
-    """build step done: its time and the process's resident host memory."""
-    if getattr(g.u, 'verbose', 0) < 2:
-        return
-    rss = 0.
+def _rss():
     try:
         for l in open('/proc/self/status'):
             if l.startswith('VmRSS'):
-                rss = int(l.split()[1]) / 1e6
+                return int(l.split()[1]) / 1e6
     except OSError:
         pass
-    print(f'[build] {name}: {g.t_build.get(name, 0.):.0f} s, host RSS {rss:.1f} GB', flush=True)
+    return 0.
+
+
+def _trim_heap():
+    """hand the heap memory freed by a build step back to the system (the
+    10^8-row numpy temporaries of the term lists otherwise stay resident)."""
+    try:
+        import ctypes
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _build_report(g, name):
+    """build step done: its time and the process's resident host memory."""
+    rss = _rss()
+    _trim_heap()
+    if getattr(g.u, 'verbose', 0) < 2:
+        return
+    print(f'[build] {name}: {g.t_build.get(name, 0.):.0f} s, host RSS {rss:.1f} GB '
+          f'({_rss():.1f} GB after trim)', flush=True)
 
 
 class UCCSDGPU:
