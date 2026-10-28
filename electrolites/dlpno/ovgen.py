@@ -64,6 +64,16 @@ extern "C" __global__ void gather_w(const long long* __restrict__ srcp, const lo
 '''
 _gwk = None
 
+class _WTables:
+    __slots__ = ('w', 'ptr', 'ld', '__weakref__')
+
+
+#: W tables shared by the live generators of the same pairs and coefficients
+#: (one per spin: the per-device generators of the kl terms reuse them);
+#: freed with the last generator holding them
+import weakref
+_WCACHE = weakref.WeakValueDictionary()
+
 
 def _gather_w_kernel():
     global _gwk
@@ -139,6 +149,14 @@ class OverlapGen:
         st = getattr(self, '_w', 'unset')
         if st != 'unset':
             return st
+        if not hasattr(self, '_wkey'):
+            self._wkey = (len(self.nv), self.ne, self.nbf, int(self.npao.sum()), int(self.nv.sum()),
+                          tuple(float(d.sum()) for d in self.Xc.data if d is not None))
+        hit = _WCACHE.get(self._wkey)
+        if hit is not None:
+            self._wt = hit
+            self._w, self._w_ptr, self._w_ld = hit.w, hit.ptr, hit.ld
+            return self._w
         self._w = None
         env = os.environ.get('DLPNO_OVGEN_W', 'auto')
         if env == '0':
@@ -153,11 +171,13 @@ class OverlapGen:
             with cp.cuda.Device(d):
                 free[d] = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
         frac = 1.0 if env == '1' else 0.4
-        left = {d: frac * free[d] for d in devs}
+        # the home device runs the chunks (workspaces, plans, DF / 3-external
+        # groups): it takes a smaller share
+        left = {d: frac * free[d] * (0.5 if d == home and len(devs) > 1 else 1.) for d in devs}
         place = []
         for g, (m, (r, c)) in enumerate(zip(LW.members, LW.shapes)):
             nb = 8. * len(m) * r * c
-            d = max(devs, key=lambda x: (left[x] if x != home else left[x] + 1.))
+            d = max(devs, key=lambda x: left[x])
             if left[d] < nb:
                 return None
             left[d] -= nb
@@ -188,6 +208,9 @@ class OverlapGen:
         base = np.array([d.data.ptr for d in data], np.int64)
         self._w_ptr = base[LW.group] + LW.slot * shp[LW.group, 0] * shp[LW.group, 1] * 8
         self._w_ld = shp[LW.group, 1].astype(np.int32)
+        self._wt = h = _WTables()
+        h.w, h.ptr, h.ld = self._w, self._w_ptr, self._w_ld
+        _WCACHE[self._wkey] = h
         if os.environ.get('V', '0') >= '2':
             print(f'[mem] overlap W tables {LW.nbytes() / 1e9:.1f} GB on GPUs {sorted(set(place))}', flush=True)
         return self._w

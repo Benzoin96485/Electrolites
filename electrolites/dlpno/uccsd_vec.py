@@ -157,16 +157,33 @@ class _K3:
     def run_all(self, jobs):
         """jobs: (kind, src_name, dst_name, src, dst); every tensor group is
         brought to the device once (it may wait in pinned host memory)."""
-        from electrolites.dlpno.devmem import to_dev
-        for g in range(len(self.data)):
-            Y = None
+        from electrolites.dlpno.devmem import to_dev, SpillRef, as_host
+        need = [g for g in range(len(self.data))
+                if any(P['g'] == g for (kind, sn, dn, src, dst) in jobs for P in self.plans.get((kind, sn, dn), []))]
+        # groups on scratch: the next one read by a helper thread while the
+        # current one is applied
+        ex = fut = None
+        if any(isinstance(self.data[g], SpillRef) for g in need):
+            from concurrent.futures import ThreadPoolExecutor
+            ex = ThreadPoolExecutor(1)
+        for n_, g in enumerate(need):
+            if ex is not None:
+                h = fut.result() if fut is not None else as_host(self.data[g]) \
+                    if isinstance(self.data[g], SpillRef) else self.data[g]
+                fut = None
+                if n_ + 1 < len(need) and isinstance(self.data[need[n_ + 1]], SpillRef):
+                    fut = ex.submit(self.data[need[n_ + 1]].load)
+                Y = to_dev(h)
+                del h
+            else:
+                Y = to_dev(self.data[g])
             for (kind, sn, dn, src, dst) in jobs:
                 for P in self.plans.get((kind, sn, dn), []):
-                    if P['g'] != g:
-                        continue
-                    if Y is None:
-                        Y = to_dev(self.data[g])
-                    self._apply(kind, P, Y, src, dst)
+                    if P['g'] == g:
+                        self._apply(kind, P, Y, src, dst)
+            del Y
+        if ex is not None:
+            ex.shutdown()
 
     def run(self, kind, src_name, dst_name, src, dst):
         self.run_all([(kind, src_name, dst_name, src, dst)])
