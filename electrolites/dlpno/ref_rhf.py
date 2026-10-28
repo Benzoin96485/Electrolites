@@ -986,6 +986,9 @@ class RefDLPNO:
                                 for p, (i, j) in enumerate(pl.pairs)])
         self.e['lmp2'] = (self.e_lmp2 + self.de_lmp2_eliminated + self.de_dipole
                           + self.de_pno_total)
+        if self.verbose >= 2:
+            print(f'[lmp2] E = {self.e["lmp2"]:.10f} (iterative {self.e_lmp2:.10f}, eliminated pairs '
+                  f'{self.de_lmp2_eliminated:.10f}, dipole {self.de_dipole:.10f}, PNO {self.de_pno_total:.10f})', flush=True)
         t = self._tick('lmp2', t)
         if not semi:
             self.recompute_pnos()

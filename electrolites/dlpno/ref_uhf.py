@@ -1383,6 +1383,9 @@ class RefUDLPNO:
         self.strong = np.array([abs(e_ij[p]) >= opt['T_CUT_PAIRS'] or i == j
                                 for p, (i, j) in enumerate(pl.pairs)])
         self.e['lmp2'] = self.e_lmp2 + self.de_lmp2_eliminated + self.de_dipole + self.de_pno_total
+        if self.verbose >= 2:
+            print(f'[lmp2] E = {self.e["lmp2"]:.10f} (iterative {self.e_lmp2:.10f}, eliminated pairs '
+                  f'{self.de_lmp2_eliminated:.10f}, dipole {self.de_dipole:.10f}, PNO {self.de_pno_total:.10f})', flush=True)
         self.recompute_pnos()
         t = self._tick('recompute_pnos', t)
         ck = os.environ.get('DLPNO_CKPT_PNO')
