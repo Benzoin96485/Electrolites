@@ -64,6 +64,78 @@ extern "C" __global__ void gather_w(const long long* __restrict__ srcp, const lo
 '''
 _gwk = None
 
+# S(p, q) = X_p^T W_q[rows of p]: X_p compact (its PAO rows, then the extra
+# rows), W_q the per-pair table over all PAO rows (+ extra rows).  One block
+# per (couple, 32 x 32 output tile), 16 x 16 threads with 2 x 2 outputs each.
+_COUPLE = r'''
+#define TS 32
+extern "C" __global__ void couple_ov(const long long* __restrict__ Xp, const int* __restrict__ ldx,
+                                     const int* __restrict__ kp, const int* __restrict__ mp,
+                                     const long long* __restrict__ Wq, const int* __restrict__ ldw,
+                                     const int* __restrict__ nq, const long long* __restrict__ poff,
+                                     const int* __restrict__ npao, const int* __restrict__ pao,
+                                     const int nbf, const long long* __restrict__ Op,
+                                     const int* __restrict__ ldo, const int ntn)
+{
+    const int t = blockIdx.x;
+    const int m = mp[t], n = nq[t], k = kp[t], np_ = npao[t];
+    const int tm = blockIdx.y / ntn, tn = blockIdx.y % ntn;
+    const int r0 = tm * TS, c0 = tn * TS;
+    if (r0 >= m || c0 >= n) return;
+    const double* __restrict__ X = (const double*)Xp[t];
+    const double* __restrict__ W = (const double*)Wq[t];
+    const int* __restrict__ rows = pao + poff[t];
+    const int lx = ldx[t], lw = ldw[t];
+    __shared__ double As[TS][TS + 1];      // As[kk][a] = X[k0 + kk, r0 + a]
+    __shared__ double Bs[TS][TS + 1];      // Bs[kk][b] = W[row(k0 + kk), c0 + b]
+    const int tx = threadIdx.x, ty = threadIdx.y, lid = ty * 16 + tx;
+    double acc00 = 0., acc01 = 0., acc10 = 0., acc11 = 0.;
+    for (int k0 = 0; k0 < k; k0 += TS) {
+        for (int idx = lid; idx < TS * TS; idx += 256) {
+            const int kk = idx / TS, c = idx % TS;
+            const int kr = k0 + kk;
+            double a = 0., b = 0.;
+            if (kr < k) {
+                if (r0 + c < m) a = X[(long long)kr * lx + r0 + c];
+                if (c0 + c < n) {
+                    const int wr = (kr < np_) ? rows[kr] : nbf + (kr - np_);
+                    b = W[(long long)wr * lw + c0 + c];
+                }
+            }
+            As[kk][c] = a;
+            Bs[kk][c] = b;
+        }
+        __syncthreads();
+        const int kmax = min(TS, k - k0);
+        #pragma unroll 8
+        for (int kk = 0; kk < kmax; ++kk) {
+            const double a0 = As[kk][ty * 2], a1 = As[kk][ty * 2 + 1];
+            const double b0 = Bs[kk][tx * 2], b1 = Bs[kk][tx * 2 + 1];
+            acc00 = fma(a0, b0, acc00); acc01 = fma(a0, b1, acc01);
+            acc10 = fma(a1, b0, acc10); acc11 = fma(a1, b1, acc11);
+        }
+        __syncthreads();
+    }
+    double* O = (double*)Op[t];
+    const int lo = ldo[t];
+    const int rr = r0 + ty * 2, cc = c0 + tx * 2;
+    double v[4] = {acc00, acc01, acc10, acc11};
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int r = rr + (q >> 1), c = cc + (q & 1);
+        if (r < m && c < n) O[(long long)r * lo + c] += v[q];
+    }
+}
+'''
+_cok = None
+
+
+def _couple_kernel():
+    global _cok
+    if _cok is None:
+        _cok = cp.RawKernel(_COUPLE, 'couple_ov')
+    return _cok
+
 class _WTables:
     __slots__ = ('w', 'ptr', 'ld', '__weakref__')
 
@@ -90,8 +162,8 @@ _PROF = os.environ.get('DLPNO_PROF') == '1'
 def stats_report(reset=True):
     if STATS:
         s = STATS
-        print(f"[ovgen] {s['runs']} chunks, {s['pairs']} pair embeddings, mean union {s['rows'] / s['runs']:.0f} rows, "
-              f"W GEMM {s['flops'] / 1e12:.1f} TF in {s['t_w']:.1f} s, {s['couples']} couples, "
+        print(f"[ovgen] {s['runs']} chunks, {s['pairs']} pair embeddings, mean union {s.get('rows', 0) / s['runs']:.0f} "
+              f"rows, W GEMM {s.get('flops', 0) / 1e12:.1f} TF in {s.get('t_w', 0):.1f} s, {s['couples']} couples, "
               f"{s['t']:.1f} s total", flush=True)
         if reset:
             STATS.clear()
@@ -288,6 +360,7 @@ class OverlapGen:
             d_ld = shp[LXu.group, 1]
             d_off = LXu.slot * shp[LXu.group, 0] * shp[LXu.group, 1]
             plans.append(dict(sel=sel, LS=LSc, U=cp.asarray(U), nU=len(U), inv=inv, LXu=LXu, plan=plan,
+                              cpl=(pp[sel], qq[sel], lay_o, idx_o),
                               src=cp.asarray(self._src_ptrs(inv)), lds=cp.asarray(self.c_ld[inv].astype(np.int32)),
                               ldd=cp.asarray(d_ld.astype(np.int32)), d_off=d_off,
                               npao=cp.asarray(self.npao[inv].astype(np.int32)),
@@ -316,6 +389,32 @@ class OverlapGen:
         out, _ = self._views(LS, ows)
         return self.run(P, out)
 
+    def _run_direct(self, P, out):
+        """S(p, q) of the chunk straight from the compact coefficients and
+        the W tables (only p's own rows; no union workspace)."""
+        if '_cd' not in P:
+            from electrolites.dlpno.vbatch import _shapes
+            pp, qq, lay, idx = P['cpl']
+            shp = _shapes(lay)
+            g = lay.group[idx]
+            k = self.npao[pp] + self.ne
+            P['_cd'] = dict(
+                x=cp.asarray(self._src_ptrs(pp)), ldx=cp.asarray(self.c_ld[pp].astype(np.int32)),
+                k=cp.asarray(k.astype(np.int32)), m=cp.asarray(self.nv[pp].astype(np.int32)),
+                w=cp.asarray(self._w_ptr[qq]), ldw=cp.asarray(self._w_ld[qq]),
+                n=cp.asarray(self.nv[qq].astype(np.int32)), poff=cp.asarray(self.off[pp]),
+                npao=cp.asarray(self.npao[pp].astype(np.int32)),
+                og=cp.asarray(g), ooff=cp.asarray(lay.slot[idx] * shp[g, 0] * shp[g, 1]),
+                ldo=cp.asarray(shp[g, 1].astype(np.int32)),
+                ntm=int(-(-self.nv[pp].max() // 32)), ntn=int(-(-self.nv[qq].max() // 32)), nt=len(pp))
+        d = P['_cd']
+        from electrolites.dlpno.vbatch import _base
+        optr = _base(out)[d['og']] + d['ooff'] * 8
+        _couple_kernel()((d['nt'], d['ntm'] * d['ntn']), (16, 16),
+                         (d['x'], d['ldx'], d['k'], d['m'], d['w'], d['ldw'], d['n'], d['poff'], d['npao'],
+                          self.pao_flat, np.int32(self.nbf), optr, d['ldo'], np.int32(d['ntn'])))
+        return out
+
     def run(self, P, out=None):
         """evaluate one prepared chunk into ``out`` (accumulates: zero it first),
         by default a new Ragged(P['LS']), which is returned."""
@@ -324,6 +423,14 @@ class OverlapGen:
             t0 = time.perf_counter()
         if out is None:
             out = Ragged(P['LS'])
+        if 'cpl' in P and os.environ.get('DLPNO_OVGEN_DIRECT', '1') == '1' and self._w_tables() is not None:
+            self._run_direct(P, out)
+            if _PROF:
+                cp.cuda.Device().synchronize()
+                for k_, v in (('runs', 1), ('pairs', len(P['inv'])), ('couples', P['plan'].nterms),
+                              ('t', time.perf_counter() - t0)):
+                    STATS[k_] = STATS.get(k_, 0) + v
+            return out
         LXu = P['LXu']
         need = LXu.nbytes() // 8
         ws = getattr(self, '_ws', None)
