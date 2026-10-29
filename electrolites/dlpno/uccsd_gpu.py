@@ -1273,6 +1273,9 @@ class UCCSDGPU:
                         continue
                     by += sum(L.nbytes() for L in ch['LS'])
                     for P in [P for ps in ch['preps'] for P in ps]:
+                        if P.get('direct'):
+                            n += 1
+                            continue
                         nv = sum(len(m) * c for m, (r, c) in zip(P['LXu'].members, P['LXu'].shapes))
                         n += 1
                         nU2 += P['nU']

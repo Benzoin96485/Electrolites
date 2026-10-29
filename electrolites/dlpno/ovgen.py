@@ -344,6 +344,13 @@ class OverlapGen:
         of a Ragged with out_layout, or (default) to a per-chunk Ragged
         P['LS'] whose item i is couple P['sel'][i]."""
         pp, qq = np.asarray(pp, np.int64), np.asarray(qq, np.int64)
+        if out_layout is not None and parts is None and len(pp) \
+                and os.environ.get('DLPNO_OVGEN_DIRECT', '1') == '1' and self._w_tables() is not None:
+            # direct couples from the W tables: no union workspace, so one
+            # launch for all the couples (10^5 chunks per CC iteration before)
+            idx_o = np.asarray(out_idx, np.int64)
+            return [dict(direct=True, sel=np.arange(len(pp)), LS=None, inv=np.unique(np.concatenate([pp, qq])),
+                         nterms=len(pp), cpl=(pp, qq, out_layout, idx_o))]
         plans = []
         for sel, U, inv in (parts if parts is not None else self.chunks(pp, qq)):
             if out_layout is None:
@@ -423,11 +430,13 @@ class OverlapGen:
             t0 = time.perf_counter()
         if out is None:
             out = Ragged(P['LS'])
-        if 'cpl' in P and os.environ.get('DLPNO_OVGEN_DIRECT', '1') == '1' and self._w_tables() is not None:
+        if P.get('direct') or ('cpl' in P and os.environ.get('DLPNO_OVGEN_DIRECT', '1') == '1'
+                               and self._w_tables() is not None):
             self._run_direct(P, out)
             if _PROF:
                 cp.cuda.Device().synchronize()
-                for k_, v in (('runs', 1), ('pairs', len(P['inv'])), ('couples', P['plan'].nterms),
+                nt = P['nterms'] if P.get('direct') else P['plan'].nterms
+                for k_, v in (('runs', 1), ('pairs', len(P['inv'])), ('couples', nt),
                               ('t', time.perf_counter() - t0)):
                     STATS[k_] = STATS.get(k_, 0) + v
             return out

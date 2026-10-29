@@ -82,6 +82,17 @@ def transpose_items(T, src, dst):
     return out
 
 
+def _to_dev_retry(to_dev, x):
+    """to_dev; on an out-of-memory error the pool's cached free blocks are
+    released and the copy retried once (a multi-GB group needs one contiguous
+    block; the pool's free blocks are fragmented after the overlap chunks)."""
+    try:
+        return to_dev(x)
+    except cp.cuda.memory.OutOfMemoryError:
+        cp.get_default_memory_pool().free_all_blocks()
+        return to_dev(x)
+
+
 class _K3:
     """3-external tensors Y[b, c, d] = (Z c | b d) of the pairs, grouped by
     padded shape, and batched contractions with per-term vectors."""
@@ -173,10 +184,10 @@ class _K3:
                 fut = None
                 if n_ + 1 < len(need) and isinstance(self.data[need[n_ + 1]], SpillRef):
                     fut = ex.submit(self.data[need[n_ + 1]].load)
-                Y = to_dev(h)
+                Y = _to_dev_retry(to_dev, h)
                 del h
             else:
-                Y = to_dev(self.data[g])
+                Y = _to_dev_retry(to_dev, self.data[g])
             for (kind, sn, dn, src, dst) in jobs:
                 for P in self.plans.get((kind, sn, dn), []):
                     if P['g'] == g:
@@ -848,7 +859,9 @@ class UCCSDGPUv(UCCSDGPU):
         # the S(kl, c) are fixed: when all chunks of this device fit (40% of
         # its free memory) each chunk keeps its own, generated once
         free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        keep = 8. * sum(sizes) < 0.3 * free and os.environ.get('DLPNO_KL_KEEP', '1') == '1'
+        # (regenerating them is cheap with the overlap W tables: keep them only
+        # when they take little of the device)
+        keep = 8. * sum(sizes) < 0.15 * free and os.environ.get('DLPNO_KL_KEEP', '1') == '1'
         ws = None
         if keep:
             try:
