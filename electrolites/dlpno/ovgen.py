@@ -69,25 +69,31 @@ _gwk = None
 # per (couple, 32 x 32 output tile), 16 x 16 threads with 2 x 2 outputs each.
 _COUPLE = r'''
 #define TS 32
-extern "C" __global__ void couple_ov(const long long* __restrict__ Xp, const int* __restrict__ ldx,
-                                     const int* __restrict__ kp, const int* __restrict__ mp,
-                                     const long long* __restrict__ Wq, const int* __restrict__ ldw,
-                                     const int* __restrict__ nq, const long long* __restrict__ poff,
-                                     const int* __restrict__ npao, const int* __restrict__ pao,
-                                     const int nbf, const long long* __restrict__ Op,
-                                     const int* __restrict__ ldo, const int ntn)
+// per couple t: pair p = P[t], pair q = Q[t], output item O[t]; per pair
+// tables (compact X, its rows, the W table) and per output-group tables
+extern "C" __global__ void couple_ov(const int* __restrict__ P, const int* __restrict__ Q,
+                                     const int* __restrict__ O,
+                                     const long long* __restrict__ xptr, const int* __restrict__ ldx,
+                                     const int* __restrict__ npao, const int* __restrict__ nv,
+                                     const long long* __restrict__ poff, const long long* __restrict__ wptr,
+                                     const int* __restrict__ ldw, const int* __restrict__ pao,
+                                     const int nbf, const int ne,
+                                     const long long* __restrict__ obase, const int* __restrict__ og,
+                                     const long long* __restrict__ ooff, const int* __restrict__ ldog,
+                                     const int ntn)
 {
     const int t = blockIdx.x;
-    const int m = mp[t], n = nq[t], k = kp[t], np_ = npao[t];
+    const int p = P[t], q = Q[t], o = O[t];
+    const int m = nv[p], n = nv[q], np_ = npao[p], k = np_ + ne;
     const int tm = blockIdx.y / ntn, tn = blockIdx.y % ntn;
     const int r0 = tm * TS, c0 = tn * TS;
     if (r0 >= m || c0 >= n) return;
-    const double* __restrict__ X = (const double*)Xp[t];
-    const double* __restrict__ W = (const double*)Wq[t];
-    const int* __restrict__ rows = pao + poff[t];
-    const int lx = ldx[t], lw = ldw[t];
-    __shared__ double As[TS][TS + 1];      // As[kk][a] = X[k0 + kk, r0 + a]
-    __shared__ double Bs[TS][TS + 1];      // Bs[kk][b] = W[row(k0 + kk), c0 + b]
+    const double* __restrict__ X = (const double*)xptr[p];
+    const double* __restrict__ W = (const double*)wptr[q];
+    const int* __restrict__ rows = pao + poff[p];
+    const int lx = ldx[p], lw = ldw[q];
+    __shared__ double As[TS][TS + 1];
+    __shared__ double Bs[TS][TS + 1];
     const int tx = threadIdx.x, ty = threadIdx.y, lid = ty * 16 + tx;
     double acc00 = 0., acc01 = 0., acc10 = 0., acc11 = 0.;
     for (int k0 = 0; k0 < k; k0 += TS) {
@@ -116,14 +122,15 @@ extern "C" __global__ void couple_ov(const long long* __restrict__ Xp, const int
         }
         __syncthreads();
     }
-    double* O = (double*)Op[t];
-    const int lo = ldo[t];
+    const int g = og[o];
+    double* Out = (double*)obase[g] + ooff[o];
+    const int lo = ldog[g];
     const int rr = r0 + ty * 2, cc = c0 + tx * 2;
     double v[4] = {acc00, acc01, acc10, acc11};
     #pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const int r = rr + (q >> 1), c = cc + (q & 1);
-        if (r < m && c < n) O[(long long)r * lo + c] += v[q];
+    for (int e = 0; e < 4; ++e) {
+        const int r = rr + (e >> 1), c = cc + (e & 1);
+        if (r < m && c < n) Out[(long long)r * lo + c] += v[e];
     }
 }
 '''
@@ -396,30 +403,52 @@ class OverlapGen:
         out, _ = self._views(LS, ows)
         return self.run(P, out)
 
+    def _pair_tabs(self):
+        """per pair device tables of the direct couple kernel (once)"""
+        t = getattr(self, '_ptabs', None)
+        if t is None:
+            npair = len(self.nv)
+            ar = np.arange(npair)
+            t = self._ptabs = dict(
+                x=cp.asarray(self._src_ptrs(ar)), ldx=cp.asarray(self.c_ld.astype(np.int32)),
+                npao=cp.asarray(self.npao.astype(np.int32)), nv=cp.asarray(self.nv.astype(np.int32)),
+                poff=cp.asarray(self.off), w=cp.asarray(self._w_ptr), ldw=cp.asarray(self._w_ld))
+        return t
+
+    def _out_tabs(self, lay):
+        """group / element offset of every item of an output layout (cached
+        per layout: the CC chunks reuse theirs every iteration)"""
+        c = self.__dict__.setdefault('_otabs', {})
+        e = c.get(id(lay))
+        if e is None or e[0] is not lay:
+            from electrolites.dlpno.vbatch import _shapes
+            shp = _shapes(lay)
+            if len(c) > 4096:
+                c.clear()
+            e = c[id(lay)] = (lay, cp.asarray(lay.group.astype(np.int32)),
+                              cp.asarray(lay.slot * shp[lay.group, 0] * shp[lay.group, 1]),
+                              cp.asarray(shp[:, 1].astype(np.int32)))
+        return e[1:]
+
     def _run_direct(self, P, out):
         """S(p, q) of the chunk straight from the compact coefficients and
-        the W tables (only p's own rows; no union workspace)."""
+        the W tables (only p's own rows; no union workspace).  Per couple only
+        (p, q, output item) is kept: 12 bytes (the 309-atom quintet has 2e8
+        couples per CC iteration)."""
         if '_cd' not in P:
-            from electrolites.dlpno.vbatch import _shapes
             pp, qq, lay, idx = P['cpl']
-            shp = _shapes(lay)
-            g = lay.group[idx]
-            k = self.npao[pp] + self.ne
-            P['_cd'] = dict(
-                x=cp.asarray(self._src_ptrs(pp)), ldx=cp.asarray(self.c_ld[pp].astype(np.int32)),
-                k=cp.asarray(k.astype(np.int32)), m=cp.asarray(self.nv[pp].astype(np.int32)),
-                w=cp.asarray(self._w_ptr[qq]), ldw=cp.asarray(self._w_ld[qq]),
-                n=cp.asarray(self.nv[qq].astype(np.int32)), poff=cp.asarray(self.off[pp]),
-                npao=cp.asarray(self.npao[pp].astype(np.int32)),
-                og=cp.asarray(g), ooff=cp.asarray(lay.slot[idx] * shp[g, 0] * shp[g, 1]),
-                ldo=cp.asarray(shp[g, 1].astype(np.int32)),
-                ntm=int(-(-self.nv[pp].max() // 32)), ntn=int(-(-self.nv[qq].max() // 32)), nt=len(pp))
+            P['_cd'] = dict(p=cp.asarray(pp.astype(np.int32)), q=cp.asarray(qq.astype(np.int32)),
+                            o=cp.asarray(np.asarray(idx).astype(np.int32)),
+                            ntm=int(-(-self.nv[pp].max() // 32)), ntn=int(-(-self.nv[qq].max() // 32)),
+                            nt=len(pp), lay=lay)
         d = P['_cd']
+        pt = self._pair_tabs()
+        og, ooff, ldog = self._out_tabs(d['lay'])
         from electrolites.dlpno.vbatch import _base
-        optr = _base(out)[d['og']] + d['ooff'] * 8
         _couple_kernel()((d['nt'], d['ntm'] * d['ntn']), (16, 16),
-                         (d['x'], d['ldx'], d['k'], d['m'], d['w'], d['ldw'], d['n'], d['poff'], d['npao'],
-                          self.pao_flat, np.int32(self.nbf), optr, d['ldo'], np.int32(d['ntn'])))
+                         (d['p'], d['q'], d['o'], pt['x'], pt['ldx'], pt['npao'], pt['nv'], pt['poff'],
+                          pt['w'], pt['ldw'], self.pao_flat, np.int32(self.nbf), np.int32(self.ne),
+                          _base(out), og, ooff, ldog, np.int32(d['ntn'])))
         return out
 
     def run(self, P, out=None):
