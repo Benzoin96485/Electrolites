@@ -116,13 +116,28 @@ class _K3:
         shp = np.array([shape(k) if shape is not None else fetch(k).shape for k in keys],
                        np.int64).reshape(-1, 3)
         pads = np.stack([padded(shp[:, 0]), padded(shp[:, 1]), padded(shp[:, 2])], 1)
-        uk, inv = np.unique(pads, axis=0, return_inverse=True)
-        inv = inv.reshape(-1)
+        uk0, inv0 = np.unique(pads, axis=0, return_inverse=True)
+        inv0 = inv0.reshape(-1)
+        # each shape group split into pieces of at most DLPNO_K3_GROUP_MB (a
+        # piece is brought to the device whole at every use: a 9.5 GB group
+        # found no room in the 309-atom quintet's second iteration)
+        import os
+        lim = float(os.environ.get('DLPNO_K3_GROUP_MB', '2048')) * 2 ** 20
+        uk, pieces = [], []
+        for g0 in range(len(uk0)):
+            mem0 = np.where(inv0 == g0)[0]
+            per = max(1, int(lim // (8. * np.prod(uk0[g0]))))
+            for a in range(0, len(mem0), per):
+                uk.append(uk0[g0])
+                pieces.append(mem0[a:a + per])
+        inv = np.zeros(len(keys), np.int64)
+        for g, mem in enumerate(pieces):
+            inv[mem] = g
         self.group = inv
         self.slot = np.zeros(len(keys), np.int64)
         self.data = []
         for g in range(len(uk)):
-            mem = np.where(inv == g)[0]
+            mem = pieces[g]
             self.slot[mem] = np.arange(len(mem))
             gshape = (len(mem),) + tuple(int(x) for x in uk[g])
             if store is not None:

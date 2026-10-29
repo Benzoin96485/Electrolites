@@ -1352,6 +1352,10 @@ class UCCSDGPU:
                 self._prof.report()
                 from electrolites.dlpno import ovgen
                 ovgen.stats_report()
+                try:
+                    self._dev_report()
+                except Exception as e:          # a report only
+                    print('[mem] CC device report failed:', e, flush=True)
             if verbose:
                 print(f'  GPU ULCCSD iter {it:3d} {e:.12f} {e - e_prev:.3e} {rn[0]:.3e} {rn[1]:.3e} '
                       f'{time.perf_counter() - t0:.2f}s', flush=True)

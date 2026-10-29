@@ -204,9 +204,16 @@ class Prof:
         if self._t0 is not None:
             k, t0 = self._t0
             self.t[k] = self.t.get(k, 0.) + now - t0
+            # device memory in use when the section ended (pool, GB)
+            self.mem[k] = cp.get_default_memory_pool().used_bytes() / 1e9
         self._t0 = (key, now) if key else None
+
+    @property
+    def mem(self):
+        return self.__dict__.setdefault('_mem', {})
 
     def report(self):
         if self.on and self.t:
-            print(f'[prof {self.name}]', ' '.join(f'{k}={v:.2f}s' for k, v in self.t.items()), flush=True)
+            print(f'[prof {self.name}]', ' '.join(f'{k}={v:.2f}s' for k, v in self.t.items()),
+                  '| pool used after (GB):', ' '.join(f'{k}={v:.1f}' for k, v in self.mem.items()), flush=True)
             self.t = {}
