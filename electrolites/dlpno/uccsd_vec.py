@@ -118,11 +118,11 @@ class _K3:
         pads = np.stack([padded(shp[:, 0]), padded(shp[:, 1]), padded(shp[:, 2])], 1)
         uk0, inv0 = np.unique(pads, axis=0, return_inverse=True)
         inv0 = inv0.reshape(-1)
-        # each shape group split into pieces of at most DLPNO_K3_GROUP_MB (a
+        # each shape group split into pieces of at most DLPNO_K3_GROUP_MB (512; a
         # piece is brought to the device whole at every use: a 9.5 GB group
         # found no room in the 309-atom quintet's second iteration)
         import os
-        lim = float(os.environ.get('DLPNO_K3_GROUP_MB', '2048')) * 2 ** 20
+        lim = float(os.environ.get('DLPNO_K3_GROUP_MB', '512')) * 2 ** 20
         uk, pieces = [], []
         for g0 in range(len(uk0)):
             mem0 = np.where(inv0 == g0)[0]
