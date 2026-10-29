@@ -1375,7 +1375,10 @@ class _DeviceDIIS:
             free += cp.get_default_memory_pool().free_bytes()
             # the history grows over the first iterations, after the plans
             # have taken their share: on the device only when it is small
-            self.host = (2 * self.nvec * v.nbytes > min(0.1 * free, 0.05 * tot)
+            # (also above 1 GB: the history grows by two vectors an iteration
+            # after the other stores have taken the device; the 309-atom
+            # mimochrome quintet ran out of device memory in iteration 5)
+            self.host = (2 * self.nvec * v.nbytes > min(0.1 * free, 0.05 * tot, 1 << 30)
                          or os.environ.get('DLPNO_DIIS_HOST') == '1')       # testing
             from electrolites.dlpno.dfints import _host_available, scratch_dir
             env = os.environ.get('DLPNO_DIIS_DISK', 'auto')
