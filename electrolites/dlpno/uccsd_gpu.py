@@ -1256,6 +1256,14 @@ class UCCSDGPU:
               f'held {pool.total_bytes() / 1e9:.1f} GB; largest: '
               + ', '.join(f'{k} {d / 1e9:.1f}' + (f' (+{m / 1e9:.1f} mapped)' if m else '')
                           for d, m, k in rows[:12]), flush=True)
+        from electrolites.dlpno import mgpu
+        per = []
+        for d in mgpu.devices():
+            with cp.cuda.Device(d):
+                f_, t_ = cp.cuda.runtime.memGetInfo()
+                per.append(f'GPU {d} free {f_ / 1e9:.1f} pool used {pool.used_bytes() / 1e9:.1f} '
+                           f'held {pool.total_bytes() / 1e9:.1f}')
+        print('[mem] per device: ' + '; '.join(per), flush=True)
 
     def _ovgen_report(self):
         """per iteration work of the overlaps generated on the fly, from the

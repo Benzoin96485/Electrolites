@@ -249,10 +249,10 @@ class OverlapGen:
         for d in devs:
             with cp.cuda.Device(d):
                 free[d] = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        frac = 1.0 if env == '1' else 0.4
+        frac = 1.0 if env == '1' else float(os.environ.get('DLPNO_OVGEN_W_FRAC', '0.55'))
         # the home device runs the chunks (workspaces, plans, DF / 3-external
         # groups): it takes a smaller share
-        left = {d: frac * free[d] * (0.5 if d == home and len(devs) > 1 else 1.) for d in devs}
+        left = {d: frac * free[d] * (0.4 if d == home and len(devs) > 1 else 1.) for d in devs}
         place = []
         for g, (m, (r, c)) in enumerate(zip(LW.members, LW.shapes)):
             nb = 8. * len(m) * r * c
