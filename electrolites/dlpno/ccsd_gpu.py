@@ -1291,7 +1291,8 @@ class CCSDGPU:
         self.init_state()
         # DLPNO_CC_AMP=<file on scratch>: the amplitudes are saved after every
         # iteration and, when the file exists, read as the starting point
-        # (CC restarts across allocations; the DIIS history starts afresh)
+        # (CC restarts across allocations; the DIIS history is saved next to
+        # it, ``<file>.diis``, and continued; DLPNO_CC_DIIS_RESUME=0 restarts it)
         amp = os.environ.get('DLPNO_CC_AMP')
         if amp and os.path.exists(amp):
             z = np.load(amp)
@@ -1299,6 +1300,9 @@ class CCSDGPU:
             self.T.set_flat(cp.asarray(z['t2']))
             print(f'  CC amplitudes read from {amp} (iteration {int(z["it"])})', flush=True)
         diis = _DeviceDIIS(opt['DIIS_MAX_VECS'])
+        if amp and os.path.exists(amp) and 'tok' in z and os.environ.get('DLPNO_CC_DIIS_RESUME', '1') == '1':
+            if diis.load(amp + '.diis', float(z['tok']), int(self.T1.flat().size + self.T.flat().size)):
+                print(f'  DIIS history read ({len(diis.x)} vectors)', flush=True)
         e_prev = 0.
         weak = cp.asarray(~self.strong)
         if getattr(self.ref, 'verbose', 0) >= 2:
@@ -1330,7 +1334,9 @@ class CCSDGPU:
             e = self.energy()
             if amp:
                 tmp = amp + '.tmp.npz'
-                np.savez(tmp, t1=cp.asnumpy(self.T1.flat()), t2=cp.asnumpy(self.T.flat()), it=it)
+                tok = time.time()
+                diis.save(amp + '.diis', tok)
+                np.savez(tmp, t1=cp.asnumpy(self.T1.flat()), t2=cp.asnumpy(self.T.flat()), it=it, tok=tok)
                 os.replace(tmp, amp)
             if it % 10 == 0 or (it <= 2 and os.environ.get('DLPNO_PROF') == '1'):
                 self._prof.report()
@@ -1427,6 +1433,79 @@ class _DeviceDIIS:
     def _dev(v):
         return v if isinstance(v, cp.ndarray) else cp.asarray(v)
 
+    # --- the history in files next to the saved amplitudes (DLPNO_CC_AMP),
+    # so that a restart in another allocation continues the extrapolation
+    # instead of starting it afresh (each new pair is written once)
+
+    def save(self, d, tok):
+        os.makedirs(d, exist_ok=True)
+        ids = self.__dict__.setdefault('_ids', [])
+        done = self.__dict__.setdefault('_written', set())
+        S = self.SEG
+        for i, x, e in zip(ids, self.x, self.e):
+            if i in done:
+                continue
+            for nm, v in (('x', x), ('e', e)):
+                m = np.lib.format.open_memmap(os.path.join(d, f'{nm}{i}.npy'), mode='w+',
+                                              dtype=np.float64, shape=(v.size,))
+                for a in range(0, v.size, S):
+                    m[a:a + S] = cp.asnumpy(v[a:a + S]) if isinstance(v, cp.ndarray) else v[a:a + S]
+                m.flush()
+                del m
+            done.add(i)
+        tmp = os.path.join(d, 'index.tmp.npz')
+        np.savez(tmp, ids=np.array(ids, np.int64), G=self.G, tok=tok, nxt=self.__dict__.get('_next', 0))
+        os.replace(tmp, os.path.join(d, 'index.npz'))
+        for i in sorted(done - set(ids)):
+            for nm in ('x', 'e'):
+                try:
+                    os.remove(os.path.join(d, f'{nm}{i}.npy'))
+                except OSError:
+                    pass
+            done.discard(i)
+
+    def load(self, d, tok, size):
+        """the history saved with amplitudes ``tok`` (vectors of ``size``
+        elements); False when there is none that matches."""
+        fn = os.path.join(d, 'index.npz')
+        if not os.path.exists(fn):
+            return False
+        z = np.load(fn)
+        if float(z['tok']) != float(tok):
+            return False
+        ids = [int(i) for i in z['ids']]
+        vs = []
+        for i in ids:
+            pair = []
+            for nm in ('x', 'e'):
+                p = os.path.join(d, f'{nm}{i}.npy')
+                if not os.path.exists(p):
+                    return False
+                v = np.load(p, mmap_mode='r')
+                if v.size != size:
+                    return False
+                pair.append(v)
+            vs.append(pair)
+        for x, e in vs:
+            for v, lst in ((x, self.x), (e, self.e)):
+                lst.append(self._restore(v))
+        self.G = np.array(z['G'])
+        self._ids = ids
+        self._next = int(z['nxt'])
+        self._written = set(ids)
+        return True
+
+    def _restore(self, v):
+        """a saved history vector (memory-mapped) into this DIIS's storage"""
+        if self.host is None:
+            free, tot = cp.cuda.runtime.memGetInfo()
+            free += cp.get_default_memory_pool().free_bytes()
+            self.host = (2 * self.nvec * v.nbytes > min(0.1 * free, 0.05 * tot, 1 << 30)
+                         or os.environ.get('DLPNO_DIIS_HOST') == '1')
+        if not self.host:
+            return cp.asarray(np.ascontiguousarray(v))
+        return self._keep(v)
+
     SEG = 1 << 26        # elements per host -> device slice (512 MB)
 
     def _dot(self, e, v):
@@ -1444,8 +1523,12 @@ class _DeviceDIIS:
         self.G = G
         self.x.append(self._keep(x))
         self.e.append(self._keep(e))
+        ids = self.__dict__.setdefault('_ids', [])
+        ids.append(self.__dict__.get('_next', 0))
+        self._next = ids[-1] + 1
         if len(self.x) > self.nvec:
             k = int(np.argmax(np.diag(self.G)))
+            ids.pop(k)
             xk, ek = self.x.pop(k), self.e.pop(k)
             self._drop(xk)
             self._drop(ek)

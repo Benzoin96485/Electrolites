@@ -1319,7 +1319,8 @@ class UCCSDGPU:
         T1 = Ragged(self.LT1)
         # DLPNO_CC_AMP=<file on scratch>: amplitudes saved after every
         # iteration and read back when present (restarts across allocations;
-        # the DIIS history starts afresh)
+        # the DIIS history is saved next to it, ``<file>.diis``, and continued;
+        # DLPNO_CC_DIIS_RESUME=0 restarts it)
         import os
         amp = os.environ.get('DLPNO_CC_AMP')
         if amp and os.path.exists(amp):
@@ -1328,12 +1329,19 @@ class UCCSDGPU:
             T.set_flat(cp.asarray(z['t2']))
             print(f'  CC amplitudes read from {amp} (iteration {int(z["it"])})', flush=True)
         diis = _DeviceDIIS(opt['DIIS_MAX_VECS'])
+        if amp and os.path.exists(amp) and 'tok' in z and os.environ.get('DLPNO_CC_DIIS_RESUME', '1') == '1':
+            if diis.load(amp + '.diis', float(z['tok']), int(T1.flat().size + T.flat().size)):
+                print(f'  DIIS history read ({len(diis.x)} vectors)', flush=True)
         e_prev = 0.
         ci = np.array([self.sidx[k] for k in self.canon], np.int64)
         for it in range(1, opt['MAXITER'] + 1):
             t0 = time.perf_counter()
             R1, R = self.residuals(T, T1)
             rn = _rnorm(R1, R)
+            # the update makes several amplitude-sized temporaries: the pool's
+            # cached blocks (fragmented by the residual) back to the driver
+            # first (the full mimochrome quintet ran out of memory here)
+            cp.get_default_memory_pool().free_all_blocks()
             if os.environ.get('DLPNO_DEBUG_R1'):
                 rr = R1.rms_per_item().get()
                 top = np.argsort(rr)[::-1][:4]
@@ -1354,7 +1362,9 @@ class UCCSDGPU:
             e, ew = self.energy(T, T1)
             if amp:
                 tmp = amp + '.tmp.npz'
-                np.savez(tmp, t1=cp.asnumpy(T1.flat()), t2=cp.asnumpy(T.flat()), it=it)
+                tok = time.time()
+                diis.save(amp + '.diis', tok)
+                np.savez(tmp, t1=cp.asnumpy(T1.flat()), t2=cp.asnumpy(T.flat()), it=it, tok=tok)
                 os.replace(tmp, amp)
             if getattr(self, '_prof', None) is not None and (it <= 2 or it % 10 == 0):
                 self._prof.report()

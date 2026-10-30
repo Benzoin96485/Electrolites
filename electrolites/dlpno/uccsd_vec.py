@@ -370,6 +370,21 @@ class ChunkedSpinPlan:
             R = Ragged(ch['LS'][s])
             for P in ch['preps'][s]:
                 self.gens[s].run(P, R)
+            if os.environ.get('DLPNO_DEBUG_KLS') == '1' and not ch.get('_dbg%d' % s) and ch['preps'][s] \
+                    and ch['preps'][s][0].get('direct'):          # debugging
+                ch['_dbg%d' % s] = True
+                pp, qq, lay, idx = ch['preps'][s][0]['cpl']
+                os.environ['DLPNO_OVGEN_DIRECT'] = '0'
+                try:
+                    ps = self.gens[s].prepare(pp, qq, out_layout=lay, out_idx=idx)
+                finally:
+                    os.environ['DLPNO_OVGEN_DIRECT'] = '1'
+                ref = Ragged(lay)
+                for P in ps:
+                    self.gens[s].run(P, ref)
+                errs = [float(cp.abs(a - b).max()) if a.size else 0. for a, b in zip(R.data, ref.data)]
+                print(f'[dbg cc] spin {s} couples {len(pp)} max|direct-union| {max(errs):.3e} '
+                      f'dev {cp.cuda.Device().id} gen dev {self.gens[s].S.device.id}', flush=True)
             S.append(R)
         bud = getattr(self, 'budget', None)
         nb = sum(L.nbytes() for L in ch['LS'])
@@ -940,6 +955,22 @@ class UCCSDGPUv(UCCSDGPU):
             if ch.get('gens') is not None:
                 for P in ch['gen'][s]:
                     ch['gens'][s].run(P, ch['Sc'][s])
+                if os.environ.get('DLPNO_DEBUG_KLS') == '1' and not ch.get('_dbg%d' % s):   # debugging
+                    ch['_dbg%d' % s] = True
+                    kl, cl, lay, cu = ch['cpl'][s]
+                    os.environ['DLPNO_OVGEN_DIRECT'] = '0'
+                    try:
+                        ps = ch['gens'][s].prepare(kl, cu, out_layout=lay, out_idx=np.arange(len(kl)))
+                    finally:
+                        os.environ['DLPNO_OVGEN_DIRECT'] = '1'
+                    ref = Ragged(lay)
+                    for P in ps:
+                        ch['gens'][s].run(P, ref)
+                    errs = [float(cp.abs(a - b).max()) if a.size else 0. for a, b in zip(ch['Sc'][s].data, ref.data)]
+                    g = int(np.argmax(errs))
+                    print(f'[dbg kl] spin {s} couples {len(kl)} max|direct-union| {max(errs):.3e} group {g} '
+                          f'shape {lay.shapes[g]} n {len(lay.members[g])} dev {cp.cuda.Device().id} '
+                          f'P {[P.get("direct", False) for P in ch["gen"][s]]}', flush=True)
             else:
                 kt = ch.get('ktab') or (self.LXk, self.Xk, self.MXk)
                 ch['gen'][s].run(ch['Sc'][s], [kt[1][s], kt[2][s]])

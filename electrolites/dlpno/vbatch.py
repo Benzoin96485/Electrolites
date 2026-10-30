@@ -195,7 +195,7 @@ def _base(rag):
     key = tuple(d.data.ptr for d in rag.data)
     b = _BASE.get(key)
     if b is None:
-        if len(_BASE) > 4096:
+        if len(_BASE) > int(os.environ.get('DLPNO_BASE_MAX', '4096')):
             _BASE.clear()
         b = _BASE[key] = cp.asarray(np.array(key, np.int64))
     return b

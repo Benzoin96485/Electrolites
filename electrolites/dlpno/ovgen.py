@@ -253,6 +253,8 @@ class OverlapGen:
         # the home device runs the chunks (workspaces, plans, DF / 3-external
         # groups): it takes a smaller share
         left = {d: frac * free[d] * (0.4 if d == home and len(devs) > 1 else 1.) for d in devs}
+        if os.environ.get('DLPNO_OVGEN_W_HOME') == '0' and len(devs) > 1:          # testing
+            left[home] = 0.
         place = []
         for g, (m, (r, c)) in enumerate(zip(LW.members, LW.shapes)):
             nb = 8. * len(m) * r * c
@@ -279,8 +281,13 @@ class OverlapGen:
                 if place[g] == home:
                     data[g][s, :nr, :nv] = w
                 else:
+                    # the peer copy runs on the target device's stream: w (a
+                    # home-device temporary) must outlive it, or the next
+                    # pair's w reuses its memory while the copy is in flight
+                    cp.cuda.Device().synchronize()
                     with cp.cuda.Device(place[g]):
                         data[g][s, :nr, :nv] = cp.asarray(w)
+                        cp.cuda.Device(place[g]).synchronize()
         cp.cuda.Device().synchronize()
         self._w = (LW, Ragged(LW, data))
         shp = np.array(LW.shapes, np.int64).reshape(-1, 2)
@@ -423,7 +430,7 @@ class OverlapGen:
         if e is None or e[0] is not lay:
             from electrolites.dlpno.vbatch import _shapes
             shp = _shapes(lay)
-            if len(c) > 4096:
+            if len(c) > int(os.environ.get('DLPNO_OTABS_MAX', '4096')):
                 c.clear()
             e = c[id(lay)] = (lay, cp.asarray(lay.group.astype(np.int32)),
                               cp.asarray(lay.slot * shp[lay.group, 0] * shp[lay.group, 1]),
@@ -449,6 +456,12 @@ class OverlapGen:
                          (d['p'], d['q'], d['o'], pt['x'], pt['ldx'], pt['npao'], pt['nv'], pt['poff'],
                           pt['w'], pt['ldw'], self.pao_flat, np.int32(self.nbf), np.int32(self.ne),
                           _base(out), og, ooff, ldog, np.int32(d['ntn'])))
+        # synchronised: without it the multi-device CC (kl terms on the other
+        # GPUs) gave run-to-run different, wrong energies on the Cu macrocycle
+        # (1e-6..1e-2 Eh in the first iterations); the hazard is not located
+        # yet (DLPNO_OVGEN_SYNC=0 for investigating it)
+        if os.environ.get('DLPNO_OVGEN_SYNC', '1') == '1':
+            cp.cuda.Device().synchronize()
         return out
 
     def run(self, P, out=None):
