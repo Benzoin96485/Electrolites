@@ -34,6 +34,25 @@ _OCC = [((0, 1, 2), 1.), ((1, 0, 2), -1.), ((2, 1, 0), -1.)]
 _VIR = _OCC
 
 
+def _place_tables(sizes, devs):
+    """device of each (T) pair table (element counts): the largest first, each
+    on the device with the most free memory left (DLPNO_T_TABLES_HOME=1: all
+    on the current one)."""
+    home = cp.cuda.Device().id
+    if len(devs) == 1 or os.environ.get('DLPNO_T_TABLES_HOME') == '1':
+        return {k: home for k in sizes}
+    free = {}
+    for d in devs:
+        with cp.cuda.Device(d):
+            free[d] = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+    place = {}
+    for k in sorted(sizes, key=lambda k: -sizes[k]):
+        d = max(devs, key=lambda x: free[x])
+        place[k] = d
+        free[d] -= 8. * sizes[k]
+    return place
+
+
 class UTriplesGPU:
     """Mixin for uhf.UDLPNO replacing tno_transform / lccsd_t0 /
     lccsd_t_iterations of the host reference."""
@@ -82,13 +101,35 @@ class UTriplesGPU:
         npo = np.array([len(p) for p in self.pao[:npair]])
         npn = np.array([self.Xpno[p].shape[1] for p in range(npair)])
         VA, VB, PP, VN = (int(padded(x.max())) for x in (nva, nvb, npo, npn))
-        # padded tables assembled on the device (host copies of these padded
-        # tables would cost tens of GB per process for large systems)
-        XA = cp.zeros((npair, PP, VA))
-        XB = cp.zeros((npair, PP + ns, VB))
-        XN = cp.zeros((npair, PP, VN))
+        # PNO coefficients as row blocks back to back (pointer offsets; the
+        # closed-shell layout) instead of padded to the largest PAO domain
+        # (mimochrome's quintet: 33418 pairs x 1800 rows x 160 columns, ~77 GB
+        # each); beta blocks are their PAO rows followed by the SOMO rows, a
+        # zero tail keeps the padded reads of the last block in bounds
+        offA = np.concatenate([[0], np.cumsum(npo * VA)]).astype(np.uint64)
+        offB = np.concatenate([[0], np.cumsum((npo + ns) * VB)]).astype(np.uint64)
+        offN = np.concatenate([[0], np.cumsum(npo * VN)]).astype(np.uint64)
+        sop = list(self.T2b)
+        VM = max(VA, VB)
+        # the large tables are spread over the devices and read in place (peer
+        # access) by the per-device (T0) workers instead of replicated
+        from electrolites.dlpno import mgpu
+        sizes = dict(XA=int(offA[-1]) + PP * VA, XB=int(offB[-1]) + (PP + ns) * VB,
+                     XN=int(offN[-1]) + PP * VN, TS=len(sop) * VM * VM, DN=npair * VN * VN)
+        place = _place_tables(sizes, mgpu.devices())
+
+        def zeros_on(name, shape):
+            with cp.cuda.Device(place[name]):
+                return cp.zeros(shape)
+        XA = zeros_on('XA', sizes['XA'])
+        XB = zeros_on('XB', sizes['XB'])
+        XN = zeros_on('XN', sizes['XN'])
         dom = np.zeros((npair, PP), np.int64)
         dmk = np.zeros((npair, PP))
+        # beta rows: the pair's PAO rows, then the SOMO rows (nbf + s), then
+        # masked padding (the row order of the compact beta blocks)
+        domB = np.zeros((npair, PP + ns), np.int64)
+        dmkB = np.zeros((npair, PP + ns))
         # the pair densities depend on the amplitudes only: computed once and
         # kept for the later (T0) passes (and shipped to worker processes)
         dc = getattr(self, '_dn_cache', None)
@@ -97,15 +138,20 @@ class UTriplesGPU:
             DN = np.zeros((npair, VN, VN))
         else:
             DN = dc[1]
+        nbf = self.orb.nbf
+        for tab, off, V, src, cols, extra in ((XA, offA, VA, self.Xa, nva, 0), (XB, offB, VB, self.Xb, nvb, ns),
+                                              (XN, offN, VN, self.Xpno, npn, 0)):
+            with cp.cuda.Device(tab.device.id):
+                for p in range(npair):
+                    x = src[p].get() if hasattr(src[p], 'get') else np.asarray(src[p])
+                    tab[int(off[p]):int(off[p + 1])].reshape(npo[p] + extra, V)[:, :cols[p]] = cp.asarray(x)
         for p in range(npair):
             n_ = npo[p]
-            XA[p, :n_, :nva[p]] = cp.asarray(self.Xa[p])
-            xb = cp.asarray(self.Xb[p])
-            XB[p, :n_, :nvb[p]] = xb[:n_]
-            XB[p, PP:, :nvb[p]] = xb[n_:]
-            XN[p, :n_, :npn[p]] = cp.asarray(self.Xpno[p])
             dom[p, :n_] = self.pao[p]
             dmk[p, :n_] = 1.
+            domB[p, :n_] = self.pao[p]
+            domB[p, n_:n_ + ns] = nbf + np.arange(ns)
+            dmkB[p, :n_ + ns] = 1.
             if fresh and pl.pairs[p][0] <= pl.pairs[p][1]:
                 DN[p, :npn[p], :npn[p]] = self._pair_density_blocks(p)
         if fresh:
@@ -113,21 +159,30 @@ class UTriplesGPU:
                 if pl.pairs[p][0] > pl.pairs[p][1]:
                     DN[p] = DN[pl.ji[p]]
             self._dn_cache = (self.T2b, DN)
-        sop = list(self.T2b)
         self._tsidx = {k: n for n, k in enumerate(sop)}
-        VM = max(VA, VB)
-        TS = cp.zeros((len(sop), VM, VM))
-        for n, k in enumerate(sop):
-            M = self.T2b[k]
-            TS[n, :M.shape[0], :M.shape[1]] = cp.asarray(M)
+        TS = zeros_on('TS', (len(sop), VM, VM))
+        with cp.cuda.Device(TS.device.id):
+            for n, k in enumerate(sop):
+                M = self.T2b[k]
+                TS[n, :M.shape[0], :M.shape[1]] = cp.asarray(M.get() if hasattr(M, 'get') else M)
+        with cp.cuda.Device(place['DN']):
+            DNd = cp.asarray(DN)
         T1 = np.zeros((len(self.so), VM))
         for I, (x, s) in enumerate(self.so):
             dd = pl.ij[x, x]
             t = self.T1[I][self._vslice(dd, s)]
             T1[I, :len(t)] = t
-        self._pt = dict(VA=VA, VB=VB, PP=PP, VN=VN, XA=XA, XB=XB,
-                        XN=XN, DN=cp.asarray(DN), dom=cp.asarray(dom),
-                        dmk=cp.asarray(dmk), TS=TS, T1=cp.asarray(T1))
+        self._pt = dict(VA=VA, VB=VB, PP=PP, VN=VN, XA=mgpu.Shared(XA), XB=mgpu.Shared(XB),
+                        XN=mgpu.Shared(XN), DN=mgpu.Shared(DNd), dom=cp.asarray(dom),
+                        dmk=cp.asarray(dmk), TS=mgpu.Shared(TS), T1=cp.asarray(T1),
+                        offA=cp.asarray(offA[:-1]), offB=cp.asarray(offB[:-1]), offN=cp.asarray(offN[:-1]),
+                        domB=cp.asarray(domB), dmkB=cp.asarray(dmkB))
+        if getattr(self, 'verbose', 0) >= 2:
+            nb = sum(v.nbytes for v in self._pt.values() if isinstance(v, cp.ndarray))
+            print(f'[mem] (T) pair tables: {npair} pairs, {len(sop)} spin pairs, PAO pad {PP}, '
+                  f'PNOs {VA}/{VB}/{VN}: ' + ', '.join(f'{k} {8e-9 * v:.1f} GB on GPU {place[k]}'
+                                                        for k, v in sizes.items())
+                  + f', other {nb / 1e9:.1f} GB', flush=True)
         self.Fa_lp_d, self.Fb_lp_d = cp.asarray(self.Fa_lp), cp.asarray(self.Fb_lp)
 
     def _pair_density_blocks(self, p):
@@ -177,18 +232,12 @@ class UTriplesGPU:
             parts = [self._proj(Z, s, bidx[c0:c0 + step], pidx[c0:c0 + step]) for c0 in range(0, n, step)]
             return cp.concatenate(parts, axis=0)
         from electrolites.dlpno.gather import gather_rows, xT_z_by_pointer
-        dom, dmk = pt['dom'][pidx], pt['dmk'][pidx]
         if s == 0:
-            Zg = gather_rows(Z[0], bidx, dom, dmk)
-            return xT_z_by_pointer(pt['XA'], pidx, Zg)
-        nbf, ns = self.orb.nbf, self.ns
-        if ns:
-            # the SOMO rows of the beta virtuals follow the PAO rows
-            so_rows = cp.broadcast_to(nbf + cp.arange(ns, dtype=cp.int64), (n, ns))
-            dom = cp.concatenate([dom, so_rows], axis=1)
-            dmk = cp.concatenate([dmk, cp.ones((n, ns))], axis=1)
-        Zg = gather_rows(Z[1], bidx, dom, dmk)
-        return xT_z_by_pointer(pt['XB'], pidx, Zg)
+            Zg = gather_rows(Z[0], bidx, pt['dom'][pidx], pt['dmk'][pidx])
+            return xT_z_by_pointer(pt['XA'].a, pidx, Zg, offs=pt['offA'], VP=pt['VA'])
+        # the SOMO rows of the beta virtuals follow each pair's PAO rows
+        Zg = gather_rows(Z[1], bidx, pt['domB'][pidx], pt['dmkB'][pidx])
+        return xT_z_by_pointer(pt['XB'].a, pidx, Zg, offs=pt['offB'], VP=pt['VB'])
 
     # ------------------------------------------------------------------
     def tno_transform(self, t_cut):
@@ -217,8 +266,9 @@ class UTriplesGPU:
         for (a, c) in ((0, 1), (1, 2), (0, 2)):
             pp = cp.asarray(pl.ij[tr[:, a], tr[:, c]])
             Zg = Z[cp.arange(b)[:, None], pt['dom'][pp]] * pt['dmk'][pp][:, :, None]
-            sp = cp.matmul(pt['XN'][pp].transpose(0, 2, 1), Zg)              # (b, VN, Pv)
-            Dt += cp.matmul(sp.transpose(0, 2, 1), cp.matmul(pt['DN'][pp], sp))
+            from electrolites.dlpno.gather import xT_z_by_pointer
+            sp = xT_z_by_pointer(pt['XN'].a, pp, Zg, offs=pt['offN'], VP=pt['VN'])   # (b, VN, Pv)
+            Dt += cp.matmul(sp.transpose(0, 2, 1), cp.matmul(pt['DN'].a[pp], sp))
         del Z
         Dt /= 3.
         Dt -= cp.eye(Pv)[None] * (~keep)[:, :, None]
@@ -624,7 +674,7 @@ class UTriplesGPU:
                     return chunk_pproj(rB, rC, sp_)[gsb]
                 S1 = pproj(s1)                                          # (n, VP1, V1)
                 S2 = pproj(s2)
-                Tm = pt['TS'][cp.asarray(items)][:, :S1.shape[1], :S2.shape[1]]
+                Tm = pt['TS'].a[cp.asarray(items)][:, :S1.shape[1], :S2.shape[1]]
                 v = cp.matmul(tr(S1), cp.matmul(Tm, S2)) * cp.asarray(signs)[:, None, None]
                 cache[key] = v
                 return v
@@ -685,7 +735,7 @@ class UTriplesGPU:
                     v1, v2 = int(n1[q[0]]), int(n2[q[0]])
                     a1 = S1[gq, :v1]
                     a2 = S2[gq, :v2]
-                    Tq = pt['TS'][cp.asarray(itf[q]), :v1, :v2]
+                    Tq = pt['TS'].a[cp.asarray(itf[q]), :v1, :v2]
                     v[gq] = cp.matmul(tr(a1), cp.matmul(Tq, a2)) * cp.asarray(sgf[q])[:, None, None]
                 v = v.reshape(n, L, S1.shape[2], S2.shape[2])
                 cache[key] = v

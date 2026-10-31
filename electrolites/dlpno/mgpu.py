@@ -45,6 +45,19 @@ def enable_peer(devs):
             _peer.add((i, j))
 
 
+class Shared:
+    """an array read in place from every device (peer access) instead of
+    replicated by ``replicate`` / ``device_view``: ``.a``"""
+    __slots__ = ('a',)
+
+    def __init__(self, a):
+        self.a = a
+
+    @property
+    def nbytes(self):
+        return self.a.nbytes
+
+
 def replicate(x):
     """x (cupy array, or dict / list / tuple of them) on the current device."""
     if isinstance(x, cp.ndarray):
@@ -220,6 +233,9 @@ def _mp_worker(dev, ctrl, tasks, results, warm):
     import traceback
     import cupy as cp_
     cp_.cuda.Device(dev).use()
+    # one process per GPU: its tables stay on its own device (peer pointers
+    # do not cross processes)
+    os.environ['DLPNO_T_TABLES_HOME'] = '1'
     for m in warm:                          # the modules the passes unpickle
         importlib.import_module(m)
     cp_.zeros(1).sum()
