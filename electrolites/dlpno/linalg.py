@@ -6,6 +6,7 @@ which unlike ``syevjBatched`` has no n <= 32 limit and unlike a loop of
 ``cupy.linalg.eigh`` when the symbol is missing.
 """
 import ctypes
+import os
 
 import numpy as np
 import cupy as cp
@@ -150,6 +151,21 @@ def orthonormal_domain(S, nn, s_cut, method='pivchol'):
         w, U = eigh_batched(Sn)
         keep = w > s_cut
     X = dn[:, :, None] * U * cp.where(keep, 1. / cp.sqrt(cp.where(keep, w, 1.)), 0.)[:, None, :]
+    if os.environ.get('DLPNO_ORTHO_REFINE', '1') == '1':
+        # one Loewdin step X <- X (X^T S X)^-1/2 on the kept columns: the
+        # eigenvectors of the near-null directions (w down to ~S_CUT) are
+        # accurate only to eps/w, so the scaled columns are orthonormal only
+        # to ~1e-6; quantities built in this basis (the triplets' TNO
+        # densities) then depended on the batch the eigensolver ran in (the
+        # open-shell (T0) per-triplet energies changed by up to 1% with the
+        # triplet chunking).  After the step, X spans the same space and is
+        # orthonormal to rounding, so the results depend on the span only.
+        km = keep[:, :, None] & keep[:, None, :]
+        C = cp.matmul(X.transpose(0, 2, 1), cp.matmul(S, X))
+        C = cp.where(km, C, 0.) + cp.eye(n)[None] * (~keep)[:, :, None]
+        c, V = eigh_batched(C)
+        X = cp.matmul(X, cp.matmul(V * (1. / cp.sqrt(c))[:, None, :], V.transpose(0, 2, 1)))
+        X = X * keep[:, None, :]
     return X, keep
 
 
