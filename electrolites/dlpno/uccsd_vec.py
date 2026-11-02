@@ -269,7 +269,11 @@ class _K3:
 class ChunkedSpinPlan:
     """A _SpinPlan whose overlap operands ('S') are not stored: its terms
     are split into chunks (by output item) and each chunk's overlaps are
-    generated on the device right before the chunk runs (ovgen)."""
+    generated on the device right before the chunk runs (ovgen).  With
+    several GPUs the chunks are spread over them (balanced by overlap
+    bytes): each device generates its chunks' overlaps and runs them on
+    replicas of the other operands, and its output is added into the home
+    device's (DLPNO_CC_PLAN_MGPU=0 keeps them on the home device)."""
 
     MAX_BYTES = 1 << 29
 
@@ -321,13 +325,16 @@ class ChunkedSpinPlan:
             bounds.append((start, start + L))
             start += L
         gens = owner._ovgens
+        devs, home = owner._plan_devs()
+        self.owner, self.home = owner, home
+        load = {d: 0. for d in devs}
         colarr = {k: np.asarray(v) for k, v in terms._mat().items()}
         for (a, b) in bounds:
             sel = order[a:b]
             loc_terms = _Terms()
             sub = {k: v[sel] for k, v in colarr.items()}
             lays = dict(layouts)
-            LSc, preps = [], []
+            LSc, preps, pq = [], [], []
             for s in (0, 1):
                 ids = []
                 for j, (c, sc) in enumerate(scols):
@@ -335,12 +342,7 @@ class ChunkedSpinPlan:
                     ids.append(codes[sel, j][msk] % BIG)
                 uni = np.unique(np.concatenate(ids)) if ids else np.zeros(0, np.int64)
                 LSc.append(Layout(nvs[kp[s][uni], s], nvs[kq[s][uni], s]))
-                stores = getattr(owner, '_sstores', None)
-                if stores is not None:
-                    preps.append(stores[s].tables(LSc[s], uni) if len(uni) else [])
-                else:
-                    preps.append(gens[s].prepare(kp[s][uni], kq[s][uni], out_layout=LSc[s],
-                                                 out_idx=np.arange(len(uni))) if len(uni) else [])
+                pq.append((kp[s][uni], kq[s][uni], uni))
                 for j, (c, sc) in enumerate(scols):
                     msk = (codes[sel, j] // BIG) == s
                     loc = np.searchsorted(uni, codes[sel, j][msk] % BIG)
@@ -351,9 +353,23 @@ class ChunkedSpinPlan:
             loc_terms._cols = dict(sub)
             loc_terms._rows = None
             lays['S'] = LSc
-            plan = _SpinPlan(lays, out_layout, loc_terms, out_col, specs, out_row=out_row,
-                             transpose_out=transpose_out, dot_left=dot_left)
-            self.chunks.append(dict(sel=cp.asarray(sel), LS=LSc, preps=preps, plan=plan, nt=len(sel)))
+            dev = min(devs, key=lambda d: load[d])
+            load[dev] += sum(L.nbytes() for L in LSc) + 1e4
+            gd = gens if dev == home else owner._gen_views_on(dev)
+            stores = getattr(owner, '_sstores', None)
+            for s in (0, 1):
+                if stores is not None:
+                    preps.append(stores[s].tables(LSc[s], pq[s][2]) if len(pq[s][0]) else [])
+                else:
+                    preps.append(gd[s].prepare(pq[s][0], pq[s][1], out_layout=LSc[s],
+                                               out_idx=np.arange(len(pq[s][0]))) if len(pq[s][0]) else [])
+            with cp.cuda.Device(dev):
+                plan = _SpinPlan(lays, out_layout, loc_terms, out_col, specs, out_row=out_row,
+                                 transpose_out=transpose_out, dot_left=dot_left)
+            self.chunks.append(dict(sel=cp.asarray(sel), LS=LSc, preps=preps, plan=plan, nt=len(sel),
+                                    dev=dev, gens=gd))
+        self.kinds = sorted({k for ch in self.chunks for (_, _, kd) in ch['plan'].parts
+                             for (k, _) in kd if k != 'S'})
         self.gens = gens
         self.budget = getattr(owner, '_s_budget', None)
         self.stores = getattr(owner, '_sstores', None)
@@ -366,10 +382,11 @@ class ChunkedSpinPlan:
             return [_SStore.gather(ch['LS'][s], ch['preps'][s]) if len(ch['preps'][s]) else Ragged(ch['LS'][s])
                     for s in (0, 1)]
         S = []
+        gens = ch.get('gens') or self.gens
         for s in (0, 1):
             R = Ragged(ch['LS'][s])
             for P in ch['preps'][s]:
-                self.gens[s].run(P, R)
+                gens[s].run(P, R)
             if os.environ.get('DLPNO_DEBUG_KLS') == '1' and not ch.get('_dbg%d' % s) and ch['preps'][s] \
                     and ch['preps'][s][0].get('direct'):          # debugging
                 ch['_dbg%d' % s] = True
@@ -391,24 +408,62 @@ class ChunkedSpinPlan:
         # kept only while DLPNO_S_KEEP_FREE of the device stays free (as the
         # closed-shell plans): the budget was set before the plans and stores
         fr, tot = cp.cuda.runtime.memGetInfo()
+        dv = cp.cuda.Device().id
+        if bud is not None and dv not in bud.left and os.environ.get('DLPNO_S_KEEP_OTHER') == '1':
+            # another device's chunks: its budget from its memory at the first run
+            with bud.lock:
+                bud.left.setdefault(dv, float(os.environ.get('DLPNO_S_KEEP', '0.3'))
+                                    * (fr + cp.get_default_memory_pool().free_bytes()))
         if bud is not None and fr - nb > float(os.environ.get('DLPNO_S_KEEP_FREE', '0.4')) * tot \
-                and bud.take(cp.cuda.Device().id, nb):
+                and bud.take(dv, nb):
             ch['S'] = S                   # kept: not regenerated in later iterations
         return S
 
+    def _per_device(self, stores, fn, out=None):
+        """fn(n, chunk, stores, out) for every chunk n on its device (the
+        other devices on replicas of the operands and into a zeroed copy of
+        ``out``, returned in {device: copy}); returns ({n: result}, copies)."""
+        home = getattr(self, 'home', cp.cuda.Device().id)
+        byd = {}
+        for n, ch in enumerate(self.chunks):
+            byd.setdefault(ch.get('dev', home), []).append(n)
+        res, outs = {}, {}
+
+        def work(dv):
+            st_, o_ = stores, out
+            if dv != home:
+                st_ = self.owner._dev_stores(dv, stores, self.kinds)
+                if out is not None:
+                    o_ = outs[dv] = self.owner._dev_out(dv, ('cplan', id(out.layout)), out.layout)
+            for n in byd[dv]:
+                st = dict(st_)
+                st['S'] = self._S(self.chunks[n])
+                res[n] = fn(n, self.chunks[n], st, o_)
+        if list(byd) in ([home], []):
+            for dv in byd:
+                work(dv)
+            return res, outs
+        from electrolites.dlpno import mgpu
+        # the replicas are copied on the other devices' streams
+        cp.cuda.get_current_stream().synchronize()
+        mgpu.run_per_device(work, sorted(byd))
+        return res, outs
+
     def run(self, out, stores, w=None):
-        for ch in self.chunks:
-            st = dict(stores)
-            st['S'] = self._S(ch)
-            ch['plan'].run(out, st, w=None if w is None else w[ch['sel']])
+        ws = None if w is None else [w[ch['sel']] for ch in self.chunks]
+        _, outs = self._per_device(stores, lambda n, ch, st, o_: ch['plan'].run(
+            o_, st, w=None if ws is None else cp.asarray(ws[n])), out=out)
+        for o_ in outs.values():
+            for D, S_ in zip(out.data, o_.data):
+                if D.size:
+                    D += cp.asarray(S_)
         return out
 
     def dots(self, stores, n):
         out = cp.zeros(n)
-        for ch in self.chunks:
-            st = dict(stores)
-            st['S'] = self._S(ch)
-            out[ch['sel']] = ch['plan'].dots(st, ch['nt'])
+        res, _ = self._per_device(stores, lambda n_, ch, st, o_: ch['plan'].dots(st, ch['nt']))
+        for n_, r in res.items():
+            out[self.chunks[n_]['sel']] = cp.asarray(r)
         return out
 
 
@@ -858,9 +913,26 @@ class UCCSDGPUv(UCCSDGPU):
                 d.fill(0.)
         return r
 
+    def _gen_views_on(self, dev):
+        """the home device's overlap generators for chunks run on device
+        ``dev``: their coefficients and W tables read in place (peer access),
+        only the small per-run tables made on ``dev``."""
+        g = self.__dict__.setdefault('_ovg_view', {})
+        if dev not in g:
+            import copy
+            vs = []
+            for gen in self._ovgens:
+                v = copy.copy(gen)
+                for k in ('_ptabs', '_otabs', '_ows', '_ws'):
+                    v.__dict__.pop(k, None)
+                vs.append(v)
+            g[dev] = vs
+        return g[dev]
+
     def _gens_on(self, dev):
         """overlap generators on device ``dev`` (built once per device)."""
-        if dev == getattr(self, '_kl_home', dev) and getattr(self, '_ovgens', None) is not None:
+        if dev == getattr(self, '_ovgens_dev', getattr(self, '_kl_home', dev)) \
+                and getattr(self, '_ovgens', None) is not None:
             return self._ovgens
         g = self.__dict__.setdefault('_ovg_dev', {})
         if dev not in g:
@@ -1232,6 +1304,56 @@ class UCCSDGPUv(UCCSDGPU):
         npair = self.npair
         self._ovgens = [OverlapGen(Spao, u.pao, [u.Xa[p] for p in range(npair)]),
                         OverlapGen(Spao, u.pao, [u.Xb[p] for p in range(npair)], ne=u.ns)]
+        self._ovgens_dev = cp.cuda.Device().id
+
+    def _plan_devs(self):
+        """(devices, home) the chunked plans spread their chunks over: all
+        GPUs unless the overlaps come from the store of the other devices
+        (DLPNO_CC_PLAN_MGPU=0: the home device only)."""
+        from electrolites.dlpno import mgpu
+        home = cp.cuda.Device().id
+        devs = mgpu.devices()
+        if len(devs) < 2 or home not in devs or getattr(self, '_sstores', None) is not None \
+                or os.environ.get('DLPNO_CC_PLAN_MGPU', '1') != '1':
+            return [home], home
+        return devs, home
+
+    #: stores that do not change during the iterations (replicated once per device)
+    STATIC_STORES = ('G', 'NP', 'Kx', 'K1Z', 'J1R', 'U0')
+
+    def _dev_stores(self, dv, stores, kinds):
+        """the operands ``kinds`` of ``stores`` on device ``dv`` (the current
+        one): the static ones replicated once, the others copied into
+        persistent buffers; a static one is read from the home device (peer
+        access) when its replica would leave less than DLPNO_CC_REP_FREE of
+        the device free."""
+        out = {}
+        from electrolites.dlpno import mgpu
+        rep = lambda x: Ragged(x.layout, mgpu.replicate(x.data))
+        for k in kinds:
+            x = stores.get(k)
+            if x is None:
+                continue
+            if k in self.STATIC_STORES:
+                c = self.__dict__.setdefault('_static_rep', {}).setdefault(dv, {})
+                e = c.get(k)
+                if e is None or e[0] is not x:
+                    nb = sum(v.layout.nbytes() for v in x) if isinstance(x, (list, tuple)) else x.layout.nbytes()
+                    fr, tot = cp.cuda.runtime.memGetInfo()
+                    y = x
+                    if fr + cp.get_default_memory_pool().free_bytes() - nb \
+                            > float(os.environ.get('DLPNO_CC_REP_FREE', '0.5')) * tot:
+                        try:
+                            y = [rep(v) for v in x] if isinstance(x, (list, tuple)) else rep(x)
+                        except cp.cuda.memory.OutOfMemoryError:
+                            y = x
+                    e = c[k] = (x, y)
+                out[k] = e[1]
+            elif isinstance(x, (list, tuple)):
+                out[k] = [self._dev_rep(dv, ('cp', k, s), v) for s, v in enumerate(x)]
+            else:
+                out[k] = self._dev_rep(dv, ('cp', k), x)
+        return out
 
     def _et(self):
         et = _Terms()

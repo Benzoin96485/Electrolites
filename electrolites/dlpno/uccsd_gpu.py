@@ -1334,9 +1334,13 @@ class UCCSDGPU:
                 print(f'  DIIS history read ({len(diis.x)} vectors)', flush=True)
         e_prev = 0.
         ci = np.array([self.sidx[k] for k in self.canon], np.int64)
+        from electrolites.dlpno.devmem import Prof
+        sprof = Prof('ULCCSD step')
         for it in range(1, opt['MAXITER'] + 1):
             t0 = time.perf_counter()
+            sprof('residual')
             R1, R = self.residuals(T, T1)
+            sprof('update')
             rn = _rnorm(R1, R)
             # the update makes several amplitude-sized temporaries: the pool's
             # cached blocks (fragmented by the residual) back to the driver
@@ -1355,19 +1359,24 @@ class UCCSDGPU:
             err = (cp.concatenate([s1.flat(), s2.flat()]) if _diis_step(opt)
                    else cp.concatenate([R1.flat(), R.flat()]))
             del s1, s2
+            sprof('diis')
             x = diis.update(cp.concatenate([T1.flat(), T.flat()]), err)
             del err
             T1.set_flat(x[:n1])
             T.set_flat(x[n1:])
+            sprof('energy')
             e, ew = self.energy(T, T1)
+            sprof('save')
             if amp:
                 tmp = amp + '.tmp.npz'
                 tok = time.time()
                 diis.save(amp + '.diis', tok)
                 np.savez(tmp, t1=cp.asnumpy(T1.flat()), t2=cp.asnumpy(T.flat()), it=it, tok=tok)
                 os.replace(tmp, amp)
+            sprof(None)
             if getattr(self, '_prof', None) is not None and (it <= 2 or it % 10 == 0):
                 self._prof.report()
+                sprof.report()
                 from electrolites.dlpno import ovgen
                 ovgen.stats_report()
                 try:
