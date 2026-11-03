@@ -266,14 +266,27 @@ class _K3:
             cupyx.scatter_add(dst.data[gd], ds, vals[q][:, :pr, :pc])
 
 
+def _drop_ptr_caches(plan):
+    """forget the cached element pointers of a _SpinPlan's operands: those of
+    overlaps regenerated every run never hit again (with 10^8 terms the
+    stale tables filled the devices)."""
+    for p in plan.parts:
+        p = p[0]
+        ops = list(getattr(p, 'ops', [])) + list(getattr(getattr(p, 'chain', None), 'ops', []))
+        ops += [getattr(p, 'lop', None), getattr(p, 'tptr_op', None)]
+        for o in ops:
+            if o is not None:
+                o.__dict__.pop('_pc', None)
+
+
 class ChunkedSpinPlan:
     """A _SpinPlan whose overlap operands ('S') are not stored: its terms
     are split into chunks (by output item) and each chunk's overlaps are
     generated on the device right before the chunk runs (ovgen).  With
     several GPUs the chunks are spread over them (balanced by overlap
-    bytes): each device generates its chunks' overlaps and runs them on
-    replicas of the other operands, and its output is added into the home
-    device's (DLPNO_CC_PLAN_MGPU=0 keeps them on the home device)."""
+    bytes): each device generates its chunks' overlaps and runs them on the
+    home device's operands, and its output is added into the home device's
+    (DLPNO_CC_PLAN_MGPU=0 keeps them on the home device)."""
 
     MAX_BYTES = 1 << 29
 
@@ -421,8 +434,11 @@ class ChunkedSpinPlan:
 
     def _per_device(self, stores, fn, out=None):
         """fn(n, chunk, stores, out) for every chunk n on its device (the
-        other devices on replicas of the operands and into a zeroed copy of
-        ``out``, returned in {device: copy}); returns ({n: result}, copies)."""
+        other devices read the home device's operands in place, peer access,
+        or with DLPNO_CC_PLAN_COPY=1 replicas of them: 3% faster on the Cu
+        macrocycle but ~10 GB a device the large systems do not have; and
+        write into a zeroed copy of ``out``, returned in {device: copy});
+        returns ({n: result}, copies)."""
         home = getattr(self, 'home', cp.cuda.Device().id)
         byd = {}
         for n, ch in enumerate(self.chunks):
@@ -432,13 +448,28 @@ class ChunkedSpinPlan:
         def work(dv):
             st_, o_ = stores, out
             if dv != home:
-                st_ = self.owner._dev_stores(dv, stores, self.kinds)
+                if os.environ.get('DLPNO_CC_PLAN_COPY', '0') == '1':
+                    st_ = self.owner._dev_stores(dv, stores, self.kinds)
                 if out is not None:
-                    o_ = outs[dv] = self.owner._dev_out(dv, ('cplan', id(out.layout)), out.layout)
-            for n in byd[dv]:
-                st = dict(st_)
-                st['S'] = self._S(self.chunks[n])
-                res[n] = fn(n, self.chunks[n], st, o_)
+                    o_ = outs[dv] = self.owner._dev_out_ws(dv, out.layout)
+            try:
+                for n in byd[dv]:
+                    st = dict(st_)
+                    ch = self.chunks[n]
+                    st['S'] = self._S(ch)
+                    res[n] = fn(n, ch, st, o_)
+                    if ch.get('S') is None:
+                        _drop_ptr_caches(ch['plan'])
+            except cp.cuda.memory.OutOfMemoryError:
+                fr = cp.cuda.runtime.memGetInfo()[0]
+                pool = cp.get_default_memory_pool()
+                print(f'[mem] chunked plan out of memory on GPU {dv}: free {fr / 1e9:.1f} GB, pool used '
+                      f'{pool.used_bytes() / 1e9:.1f} held {pool.total_bytes() / 1e9:.1f} GB', flush=True)
+                try:
+                    self.owner._dev_report()
+                except Exception:          # a report only
+                    pass
+                raise
         if list(byd) in ([home], []):
             for dv in byd:
                 work(dv)
@@ -1670,6 +1701,29 @@ class UCCSDGPUv(UCCSDGPU):
             for d_ in r.data:
                 d_.fill(0.)
         return r
+
+    def _dev_out_ws(self, dv, layout):
+        """zeroed Ragged of ``layout`` on device ``dv`` (the current one) in
+        one persistent workspace shared by all output layouts (a buffer per
+        layout took ~6 GB a device on the mimochrome quintet); the view of a
+        layout is kept while the workspace is (stable addresses)."""
+        c = self.__dict__.setdefault('_reps', {}).setdefault(dv, {})
+        nb = layout.nbytes() // 8
+        ws = c.get('out.ws')
+        if ws is None or ws.size < nb:
+            c.pop('out.ws', None)
+            c['out.views'] = {}
+            ws = c['out.ws'] = cp.empty(max(nb, 1))
+        v = c['out.views'].get(id(layout))
+        if v is None or v.layout is not layout:
+            data, off = [], 0
+            for m, (r, cc) in zip(layout.members, layout.shapes):
+                n = len(m) * r * cc
+                data.append(ws[off:off + n].reshape(len(m), r, cc))
+                off += n
+            v = c['out.views'][id(layout)] = Ragged(layout, data)
+        ws[:nb].fill(0.)
+        return v
 
     def _dev_vec(self, dv, name, x, zero=False):
         c = self.__dict__.setdefault('_reps', {}).setdefault(dv, {})
