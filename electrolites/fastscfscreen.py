@@ -4,19 +4,40 @@
 GPU4PySCF's direct SCF already builds J and K incrementally from
 ``dm - dm_last``, but at the converged precision, ``direct_scf_tol`` (1e-13),
 from the first cycle on -- when the density is still wrong in the third
-digit.  Here, while the largest element of ``dm - dm_last`` is above
-``SWITCH`` (1e-3), the J and K builds screen at ``LOOSE`` (1e-10); at the
-first cycle below it the Fock matrix is **rebuilt from scratch** at
-``direct_scf_tol`` (``dm_last``/``vhf_last`` dropped for that call) and the
-SCF continues incrementally and tight.  Everything the converged answer is
-made of -- the last full build and every increment after it -- is at the
-original threshold; the loose cycles only shape the path there.
+digit.  Here, while the density step is above ``SWITCH`` (1e-3), the J and K
+builds screen at ``LOOSE`` (1e-10); at the first cycle below it the Fock
+matrix is **rebuilt from scratch** at ``direct_scf_tol`` (``dm_last``/
+``vhf_last`` dropped for that call) and the SCF continues incrementally and
+tight.  Everything the converged answer is made of -- the last full build and
+every increment after it -- is at the original threshold; the loose cycles
+only shape the path there.
+
+The step is the largest element of ``S^1/2 (dm - dm_last) S^1/2``, the density
+change in the Loewdin basis, not of ``dm - dm_last`` itself.  With diffuse
+functions (def2-TZVPD, aug-cc-pVXZ) the overlap is close to singular and AO
+density elements carry the near-linear-dependent combinations with large
+coefficients of opposite sign: on a 64-atom anion in wB97M-V/def2-TZVPD,
+``max|dm - dm_last|`` was still 1e-3 when ``|g|`` was 3e-6, 70 to 400 times
+the Loewdin step.  A switch on the AO step then never came, and it cannot be
+waited for: a loose build drops quartets below ``LOOSE`` in absolute terms,
+not as a fraction of the increment, and the dropped part accumulates in
+``vhf`` until the rebuild.  Once the increments are that small, the
+incremental Fock matrix is mostly that error; its energy sank 1.6e-5 Eh below
+the converged one, ``|g|`` sat at 1-7e-4, and the density kept moving enough
+to keep the screen loose -- 84 vacuum and 72 embedded cycles where the tight
+SCF takes 37 and 14.  The Loewdin step falls through 1e-3 where the SCF
+leaves its erratic first cycles (``|g|`` 1.4e-3 there), and the SCF is back to
+37 and 14.  ``MAX_LOOSE`` (30) loose builds end the loose phase whatever the
+step, so its error stays bounded on a system the step does not catch.  Where
+the overlap is not near singular the two steps switch within a cycle or two
+of each other (``docs/README_fastscfscreen.md``).
 
 Measured (B3LYP/def2-SVP, ``conv_tol`` 1e-9; ``docs/KERNEL_TARGETS_1.8.1.md``
 §13.24): taxol 18.6 -> 15.5 s, PfPMT 65.1 -> 50.5 s, the Ni dithiolene anion
 (UKS, 35 cycles) unchanged; converged energies within 1e-10 Eh of the tight
 run, and within PfPMT's own SCF noise there.  1e-9 as the loose threshold
-moved taxol's energy by 1e-8 and was rejected.
+moved taxol's energy by 1e-8 and was rejected.  The 64-atom anion above,
+wB97M-V/def2-TZVPD: 1.18x over the vacuum SCF's cycles 2-37.
 
 The wrapper sits on the SCF classes' ``get_veff`` (``RKS``, ``UKS``,
 ``RHF``, ``UHF``), around whatever is there (``fastrsh``'s, for RKS); it
@@ -35,7 +56,9 @@ import cupy as cp
 _OFF = bool(os.environ.get('FASTSCFSCREEN_OFF'))
 LOOSE = float(os.environ.get('FASTSCFSCREEN_LOOSE', 1e-10))
 SWITCH = float(os.environ.get('FASTSCFSCREEN_SWITCH', 1e-3))
-STATS = {'loose_builds': 0, 'rebuilds': 0, 'tight_builds': 0}
+MAX_LOOSE = int(os.environ.get('FASTSCFSCREEN_MAX_LOOSE', 30))
+STATS = {'loose_builds': 0, 'rebuilds': 0, 'tight_builds': 0,
+         'capped': 0}
 
 
 def stats():
@@ -55,6 +78,23 @@ def _opts(mf):
     return out
 
 
+def _step(mf, dm, dm_last):
+    """``max|S^1/2 (dm - dm_last) S^1/2|``, or the AO step where the overlap
+    does not match the density's shape."""
+    ddm = cp.asarray(dm) - cp.asarray(dm_last)
+    x = mf.__dict__.get('_fastscfscreen_x')
+    if x is None:
+        try:
+            w, u = cp.linalg.eigh(cp.asarray(mf.get_ovlp()))
+            x = (u * cp.sqrt(cp.maximum(w, 0.))) @ u.T
+        except Exception:                   # an SCF class without a plain S
+            x = False
+        mf.__dict__['_fastscfscreen_x'] = x
+    if x is False or x.shape[-1] != ddm.shape[-1]:
+        return float(abs(ddm).max())
+    return float(abs(x @ ddm @ x).max())
+
+
 def _wrap_get_veff(get_veff):
     @functools.wraps(get_veff)
     def run(mf, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
@@ -64,17 +104,24 @@ def _wrap_get_veff(get_veff):
         incremental = (dm_last is not None and vhf_last is not None
                        and not isinstance(dm_last, (int, float)))
         if not incremental:
-            # the first build of a run (or a caller's own full build)
+            # the first build of a run (or a caller's own full build); the
+            # overlap is taken again, since the molecule may have moved
             mf.__dict__['_fastscfscreen_phase'] = 'loose'
+            mf.__dict__['_fastscfscreen_nloose'] = 0
+            mf.__dict__.pop('_fastscfscreen_x', None)
             STATS['tight_builds'] += 1
             return get_veff(mf, mol, dm, dm_last, vhf_last, hermi)
         phase = mf.__dict__.get('_fastscfscreen_phase', 'tight')
         if phase == 'loose':
-            ddm = float(abs(cp.asarray(dm) - cp.asarray(dm_last)).max())
-            if ddm < SWITCH:
+            nloose = mf.__dict__.get('_fastscfscreen_nloose', 0)
+            capped = nloose >= MAX_LOOSE
+            if capped or _step(mf, dm, dm_last) < SWITCH:
                 mf.__dict__['_fastscfscreen_phase'] = 'tight'
+                mf.__dict__.pop('_fastscfscreen_x', None)
                 STATS['rebuilds'] += 1
+                STATS['capped'] += int(capped)
                 return get_veff(mf, mol, dm, None, None, hermi)
+            mf.__dict__['_fastscfscreen_nloose'] = nloose + 1
             STATS['loose_builds'] += 1
             tight = mf.direct_scf_tol
             mf.direct_scf_tol = max(tight, LOOSE)
