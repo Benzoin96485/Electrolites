@@ -115,7 +115,11 @@ class _Packed:
         out = cp.zeros(self.shape)
         nmax = int(self.dims.astype(np.int64).prod(axis=1).max()) if m else 0
         if nmax:
-            src = cp.asarray(self.buf if self.ref is None else self.ref.load())
+            if self.ref is None:
+                src = cp.asarray(self.buf)
+            else:
+                pf = getattr(self, 'prefetch', None)
+                src = cp.asarray(pf.get(self.ref) if pf is not None else self.ref.load())
             _PAD((min(1024, -(-nmax // 256)), m), (256,),
                  (src, cp.asarray(self.off), cp.asarray(self.dims.ravel()), out,
                   np.int32(X), np.int32(Y), np.int32(Z)))

@@ -91,6 +91,83 @@ class SpillRef:
         return out.reshape(self.shape)
 
 
+class Prefetcher:
+    """Reads a fixed list of SpillRefs over and over, in that order, in
+    background threads, ahead of their use and up to ``budget`` bytes held
+    (pageable host memory): a consumer that takes the refs in about the
+    same order, once per pass (the CC's DF groups every iteration), finds
+    them read while the iteration did other work.  ``get(ref)`` returns
+    the array (read directly when the ref is not in the list)."""
+
+    def __init__(self, refs, budget, nio=2):
+        import threading
+        self.refs = list(refs)
+        self.pos = {id(r): k for k, r in enumerate(self.refs)}
+        self.uses = [0] * len(self.refs)
+        # at most one pass ahead
+        self.total = float(sum(r.nbytes for r in self.refs))
+        self.budget = min(float(budget), self.total)
+        self.ready = {}            # absolute index -> array
+        self.held = 0.
+        self.next = 0              # next absolute index to read
+        self.stop = False
+        self.wait_s = 0.
+        self.cv = threading.Condition()
+        self.th = [threading.Thread(target=self._run, daemon=True) for _ in range(nio)]
+        for t in self.th:
+            t.start()
+
+    def _run(self):
+        n = len(self.refs)
+        while True:
+            with self.cv:
+                while not self.stop and self.held > 0 \
+                        and self.held + self.refs[self.next % n].nbytes > self.budget:
+                    self.cv.wait()
+                if self.stop or not n:
+                    return
+                a = self.next
+                self.next += 1
+                r = self.refs[a % n]
+                self.held += r.nbytes
+            try:
+                x = r.load()
+            except BaseException as e:      # noqa: B902 - handed to the consumer
+                x = e
+            with self.cv:
+                self.ready[a] = x
+                self.cv.notify_all()
+
+    def get(self, ref):
+        import time
+        k = self.pos.get(id(ref))
+        if k is None or self.stop:
+            return ref.load()
+        n = len(self.refs)
+        with self.cv:
+            a = self.uses[k] * n + k
+            self.uses[k] += 1
+            t0 = time.perf_counter()
+            while a not in self.ready:
+                if a < self.next - n * len(self.th) - 1 or not self.cv.wait(timeout=600.):
+                    # out of step (never read, or the readers stalled): read it here
+                    print(f'[mem] DF prefetch out of step at {a} (next {self.next}): direct read', flush=True)
+                    return ref.load()
+            self.wait_s += time.perf_counter() - t0
+            x = self.ready.pop(a)
+            self.held -= ref.nbytes
+            self.cv.notify_all()
+        if isinstance(x, BaseException):
+            raise x
+        return x
+
+    def close(self):
+        with self.cv:
+            self.stop = True
+            self.ready.clear()
+            self.cv.notify_all()
+
+
 def as_host(x):
     """numpy array of a (device / host / spilled) array."""
     if isinstance(x, SpillRef):

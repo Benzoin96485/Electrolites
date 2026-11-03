@@ -189,6 +189,17 @@ class _K3:
         # groups on scratch: the next one read by a helper thread while the
         # current one is applied
         ex = fut = None
+        pf = getattr(self, 'prefetch', None)
+        if pf is not None:
+            for g in need:
+                d = self.data[g]
+                Y = _to_dev_retry(to_dev, pf.get(d) if isinstance(d, SpillRef) else d)
+                for (kind, sn, dn, src, dst) in jobs:
+                    for P in self.plans.get((kind, sn, dn), []):
+                        if P['g'] == g:
+                            self._apply(kind, P, Y, src, dst)
+                del Y
+            return
         if any(isinstance(self.data[g], SpillRef) for g in need):
             from concurrent.futures import ThreadPoolExecutor
             ex = ThreadPoolExecutor(1)
@@ -210,6 +221,13 @@ class _K3:
             del Y
         if ex is not None:
             ex.shutdown()
+
+    def store_refs(self, keys):
+        """the groups on scratch that run_all of the plans ``keys`` reads, in
+        its order"""
+        from electrolites.dlpno.devmem import SpillRef
+        need = sorted({P['g'] for k in keys for P in self.plans.get(k, [])})
+        return [self.data[g] for g in need if isinstance(self.data[g], SpillRef)]
 
     def run(self, kind, src_name, dst_name, src, dst):
         self.run_all([(kind, src_name, dst_name, src, dst)])
@@ -1627,7 +1645,7 @@ class UCCSDGPUv(UCCSDGPU):
         prof('k3')
         Z = self._tmp('Z', self.LZ)
         V1 = self._tmp('V1', self.LV1)
-        self.k3.run_all([('c3', 'Pt', 'Z', Pt, Z), ('c2', 'Pt', 'Z', Pt, Z), ('a', 'T', 'V1', T, V1)])
+        self.k3.run_all([(k + (Pt, Z) if k[2] == 'Z' else k + (T, V1)) for k in self.K3_JOBS])
         st['K1Z'] = self.K1Z
         prof('ring')
         self.p_zk1.run(Z, st, w=cp.full(self.p_zk1.n, -1.) if self.p_zk1.n else None)
@@ -1774,12 +1792,81 @@ class UCCSDGPUv(UCCSDGPU):
                     if D.data[g].size:
                         D.data[g] += cp.asarray(S_.data[g])
 
+    DF_KEYS = ('Qov', 'Qvv', 'Qmz', 'Qaz')
+    K3_JOBS = (('c3', 'Pt', 'Z'), ('c2', 'Pt', 'Z'), ('a', 'T', 'V1'))
+
+    def _df_prefetch(self, home):
+        """DF groups on scratch: read in background threads ahead of their
+        use, in the order the devices take them, up to DLPNO_CC_DF_PREFETCH_GB
+        (default half the host's available memory) held at a time; the reads
+        of the next iteration's first groups overlap this iteration's other
+        terms (DLPNO_CC_DF_PREFETCH=0: read at use)."""
+        if getattr(self, '_pf_on', False):
+            if os.environ.get('DLPNO_PROF') == '1':
+                for nm in ('_dfpf', '_k3pf'):
+                    pf = getattr(self, nm, None)
+                    if pf is not None:
+                        print(f'[prof {nm[1:3]} prefetch] waited {pf.wait_s:.1f} s, held {pf.held / 1e9:.1f} GB',
+                              flush=True)
+                        pf.wait_s = 0.
+            return
+        self._pf_on = True
+        if getattr(self, '_df_store', None) is None or os.environ.get('DLPNO_CC_DF_PREFETCH', '1') != '1':
+            return
+        from electrolites.dlpno.devmem import Prefetcher
+        by = {}
+        for d in self.dfg:
+            by.setdefault(d.get('dev', home), []).append(d)
+        refs, packs = [], []
+        for j in range(max((len(v) for v in by.values()), default=0)):
+            for dv in sorted(by):
+                if j >= len(by[dv]):
+                    continue
+                d = by[dv][j]
+                for s in (0, 1):
+                    for key in self.DF_KEYS:
+                        x = d.get((key, s))
+                        if isinstance(x, _Packed) and x.ref is not None:
+                            refs.append(x.ref)
+                            packs.append(x)
+        gb = os.environ.get('DLPNO_CC_DF_PREFETCH_GB')
+        budget = float(gb) * 1e9 if gb else 0.5 * _host_available()
+        nio = int(os.environ.get('DLPNO_CC_DF_PREFETCH_IO', '2'))
+        # the 3-external groups of the residual's K3 applies (on the same
+        # store): their own reader, taken from the same budget
+        k3r = self.k3.store_refs(self.K3_JOBS)
+        if k3r:
+            self._k3pf = Prefetcher(k3r, min(0.25 * budget, sum(r.nbytes for r in k3r)), nio=1)
+            self.k3.prefetch = self._k3pf
+            budget -= self._k3pf.budget
+        if refs:
+            self._dfpf = Prefetcher(refs, budget, nio=nio)
+            for x in packs:
+                x.prefetch = self._dfpf
+        if getattr(self.u, 'verbose', 0) >= 2:
+            print(f'[mem] DF groups prefetched from scratch: {sum(r.nbytes for r in refs) / 1e9:.1f} GB '
+                  f'in {len(refs)} reads, up to {budget / 1e9:.1f} GB held; 3-external '
+                  f'{sum(r.nbytes for r in k3r) / 1e9:.1f} GB', flush=True)
+
+    def kernel(self, verbose=True):
+        try:
+            return super().kernel(verbose)
+        finally:
+            for nm in ('_dfpf', '_k3pf'):
+                pf = getattr(self, nm, None)
+                if pf is not None:
+                    pf.close()
+                    setattr(self, nm, None)
+            self.k3.__dict__.pop('prefetch', None)
+            self._pf_on = False
+
     def _df_all(self, T, T1, Tn, Fv, Fbov, R, R1, beta):
         """DF terms of all groups; with several GPUs every device runs its
         own groups on replicas of T, Tn and its outputs are added into the
         home device's."""
         home = cp.cuda.Device().id
         devs = sorted({d.get('dev', home) for d in self.dfg})
+        self._df_prefetch(home)
         if devs in ([home], []):
             for gi, d in enumerate(self.dfg):
                 self._df_run(gi, d, T, T1, Tn, Fv, Fbov, R, R1, beta)
