@@ -65,11 +65,13 @@ class SpillRef:
 
     def load(self, threads=8):
         """the array (large ones read by several threads: one stream reads
-        the scratch file system at ~0.8 GB/s, eight at ~3.5 GB/s)"""
+        the scratch file system at ~0.8 GB/s, eight at ~3.5 GB/s; a node
+        reaches ~4 GB/s with ~64 reads in flight).  preadv releases the GIL
+        (np.fromfile held it while the CC's device threads waited)."""
         n = int(np.prod(self.shape))
         nb = n * self.dtype.itemsize
-        if nb < (64 << 20) or threads <= 1:
-            return np.fromfile(self.path, dtype=self.dtype, count=n, offset=self.offset).reshape(self.shape)
+        if nb < (64 << 20):
+            threads = 1
         import os
         from concurrent.futures import ThreadPoolExecutor
         out = np.empty(n, self.dtype)
@@ -84,8 +86,11 @@ class SpillRef:
                     if r <= 0:
                         raise IOError(f'short read {self.path}')
                     a += r
-            with ThreadPoolExecutor(threads) as ex:
-                list(ex.map(rd, range(threads)))
+            if threads <= 1:
+                rd(0)
+            else:
+                with ThreadPoolExecutor(threads) as ex:
+                    list(ex.map(rd, range(threads)))
         finally:
             os.close(fd)
         return out.reshape(self.shape)
@@ -111,6 +116,7 @@ class Prefetcher:
         self.held = 0.
         self.next = 0              # next absolute index to read
         self.stop = False
+        self.paused = False
         self.wait_s = 0.
         self.cv = threading.Condition()
         self.th = [threading.Thread(target=self._run, daemon=True) for _ in range(nio)]
@@ -121,8 +127,8 @@ class Prefetcher:
         n = len(self.refs)
         while True:
             with self.cv:
-                while not self.stop and self.held > 0 \
-                        and self.held + self.refs[self.next % n].nbytes > self.budget:
+                while not self.stop and (self.paused or self.held > 0
+                                         and self.held + self.refs[self.next % n].nbytes > self.budget):
                     self.cv.wait()
                 if self.stop or not n:
                     return
@@ -160,6 +166,13 @@ class Prefetcher:
         if isinstance(x, BaseException):
             raise x
         return x
+
+    def pause(self, on=True):
+        """no new reads while paused (reads in flight complete): for phases
+        that the reads slow down"""
+        with self.cv:
+            self.paused = on
+            self.cv.notify_all()
 
     def close(self):
         with self.cv:

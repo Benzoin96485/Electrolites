@@ -1615,6 +1615,11 @@ class UCCSDGPUv(UCCSDGPU):
         beta = cp.zeros(self.nbeta)
         prof('df')
         self._df_all(T, T1, Tn, Fv, Fbov, R, R1, beta)
+        # the background reads of the DF groups slow the multi-device terms
+        # that overlap them (kl / ring by 40-50% on the mimochrome quintet):
+        # they run only during the DF and K3 terms and between residuals; the
+        # prefetch budget, not the time to read, limits what is ready
+        self._pf_pause(True)
         prof('kl')
         st['Fv'] = Fv
         # F'_vv projections and the oooo ladder, with S(kl, c) generated per chunk
@@ -1645,7 +1650,9 @@ class UCCSDGPUv(UCCSDGPU):
         prof('k3')
         Z = self._tmp('Z', self.LZ)
         V1 = self._tmp('V1', self.LV1)
+        self._pf_pause(False)
         self.k3.run_all([(k + (Pt, Z) if k[2] == 'Z' else k + (T, V1)) for k in self.K3_JOBS])
+        self._pf_pause(True)
         st['K1Z'] = self.K1Z
         prof('ring')
         self.p_zk1.run(Z, st, w=cp.full(self.p_zk1.n, -1.) if self.p_zk1.n else None)
@@ -1682,6 +1689,7 @@ class UCCSDGPUv(UCCSDGPU):
         if self.p_r1b.n:
             self.p_r1b.run(R1, st, w=self.r1b.fd('w'))
         R = self._mask_strong(R)
+        self._pf_pause(False)
         prof(None)
         self.last = dict(Fpp=Fpp, beta=beta, Z=Z, Tn=Tn, Fv=Fv, Fk=Fk, U=Uv)
         return R1, R
@@ -1831,12 +1839,12 @@ class UCCSDGPUv(UCCSDGPU):
                             packs.append(x)
         gb = os.environ.get('DLPNO_CC_DF_PREFETCH_GB')
         budget = float(gb) * 1e9 if gb else 0.5 * _host_available()
-        nio = int(os.environ.get('DLPNO_CC_DF_PREFETCH_IO', '2'))
+        nio = int(os.environ.get('DLPNO_CC_DF_PREFETCH_IO', '8'))
         # the 3-external groups of the residual's K3 applies (on the same
         # store): their own reader, taken from the same budget
         k3r = self.k3.store_refs(self.K3_JOBS)
         if k3r:
-            self._k3pf = Prefetcher(k3r, min(0.25 * budget, sum(r.nbytes for r in k3r)), nio=1)
+            self._k3pf = Prefetcher(k3r, min(0.25 * budget, sum(r.nbytes for r in k3r)), nio=2)
             self.k3.prefetch = self._k3pf
             budget -= self._k3pf.budget
         if refs:
@@ -1848,7 +1856,22 @@ class UCCSDGPUv(UCCSDGPU):
                   f'in {len(refs)} reads, up to {budget / 1e9:.1f} GB held; 3-external '
                   f'{sum(r.nbytes for r in k3r) / 1e9:.1f} GB', flush=True)
 
+    def _pf_pause(self, on):
+        for nm in ('_dfpf', '_k3pf'):
+            pf = getattr(self, nm, None)
+            if pf is not None and os.environ.get('DLPNO_CC_PREFETCH_PAUSE', '1') == '1':
+                pf.pause(on)
+
     def kernel(self, verbose=True):
+        # the build's freed pinned blocks and heap back to the OS first: the
+        # DF prefetch budget is taken from the host's available memory
+        from electrolites.dlpno.devmem import trim_host
+        from electrolites.dlpno.uccsd_gpu import _rss
+        r0 = _rss()
+        trim_host()
+        if getattr(self.u, 'verbose', 0) >= 2:
+            print(f'[mem] CC start: host RSS {r0:.1f} -> {_rss():.1f} GB after trim, available '
+                  f'{_host_available() / 1e9:.1f} GB', flush=True)
         try:
             return super().kernel(verbose)
         finally:
