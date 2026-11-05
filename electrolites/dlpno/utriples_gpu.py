@@ -299,7 +299,10 @@ class UTriplesGPU:
         gi, m = cp.asarray(idx), cp.asarray(msk)
         mm = m[:, :, None] * m[:, None, :]
         St = S_d[gi[:, :, None], gi[:, None, :]] * mm
+        prof = self._prof if getattr(self, '_prof', None) is not None else (lambda k: None)
+        prof('tno:ortho')
         X, keep = orthonormal_domain(St, npao, opt['S_CUT'], getattr(self, 'PAO_ORTHO', 'pivchol'))
+        prof('tno:dt')
         Z = cp.matmul(S_d[:, gi].transpose(1, 0, 2) * m[:, None, :], X)      # (b, nbf, Pv)
         Dt = cp.zeros((b, Pv, Pv))
         tr = trip[ch]
@@ -312,7 +315,9 @@ class UTriplesGPU:
         del Z
         Dt /= 3.
         Dt -= cp.eye(Pv)[None] * (~keep)[:, :, None]
+        prof('tno:eig')
         occ, Vt = eigh_batched(Dt)
+        prof('tno:semi')
         occ, Vt = occ[:, ::-1], Vt[:, :, ::-1]
         nkeep = keep.sum(axis=1)
         cut = cp.asarray(self.tno_scale[ch] * t_cut)
@@ -507,6 +512,8 @@ class UTriplesGPU:
 
     def _ut0_item(self, Pv, ch, save):
         nbf = self.orb.nbf
+        from electrolites.dlpno.devmem import Prof
+        self.__dict__.setdefault('_prof', Prof('U(T0)'))('tno')
         tn = self._tno_chunk(ch, Pv, self._t_cut_tno)
         Va, Vb = tn['Xa'].shape[2], tn['Xbp'].shape[2]
         A = int(-(-self._naux_t[ch].max() // 32) * 32)
