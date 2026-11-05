@@ -1222,11 +1222,23 @@ class UCCSDGPUv(UCCSDGPU):
         devs = mgpu.devices()
         home = cp.cuda.Device().id
         load = np.zeros(len(devs))
+        # the home device takes a share of the chunks (DLPNO_KL_HOME_SHARE, a
+        # fraction of an equal share; default 1 while half of it is free, else
+        # 0: it keeps the overlaps, 3-external tensors and plans)
+        share = os.environ.get('DLPNO_KL_HOME_SHARE')
+        if share is None:
+            fr, tot = cp.cuda.runtime.memGetInfo()
+            share = 1. if fr + cp.get_default_memory_pool().free_bytes() > .5 * tot else 0.
+        share = float(share)
+        wt = np.ones(len(devs))
         if len(devs) > 1:
-            load[devs.index(home)] = np.inf
+            if share > 0:
+                wt[devs.index(home)] = 1. / share
+            else:
+                load[devs.index(home)] = np.inf
         for d in self.klchunks:
             r = devs.index(home) if os.environ.get('DLPNO_DBG_KL_HOME') else int(np.argmin(load))
-            load[r] += len(d['rb']) + len(d['fv'][0]) + len(d['fv'][1]) + 1
+            load[r] += (len(d['rb']) + len(d['fv'][0]) + len(d['fv'][1]) + 1) * wt[r]
             d['dev'] = devs[r]
             with cp.cuda.Device(devs[r]):
                 cl = dict(Sc=[c[2] for c in d['cpl']], T=self.LT, G=self.LT)
