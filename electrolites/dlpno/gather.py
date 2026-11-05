@@ -186,16 +186,19 @@ def gather_rows(Z, bidx, rows, mask):
     return out
 
 
-def xT_z_by_pointer(tab, pidx, Zg, offs=None, VP=None):
+def xT_z_by_pointer(tab, pidx, Zg, offs=None, VP=None, ld=None):
     """out[i] = tab[pidx[i]]^T Zg[i] with tab (np, P, VP) and Zg (n, P, V),
     as one pointer-batched GEMM (no gathered copy of the table rows).  With
     ``offs``: ``tab`` is a flat buffer of row blocks (rows, VP) starting at
     element offsets offs[p] (rows beyond a block's own are read from the next
-    one / the zero tail and must meet zero rows of Zg)."""
+    one / the zero tail and must meet zero rows of Zg).  ``ld``: the table's
+    row length when only its first VP columns are wanted (flat layout)."""
     from cupy_backends.cuda.libs import cublas
     n, P, V = Zg.shape
     if VP is None:
         VP = tab.shape[2]
+    if ld is None:
+        ld = VP
     out = cp.empty((n, VP, V))
     if n == 0:
         return out
@@ -214,7 +217,7 @@ def xT_z_by_pointer(tab, pidx, Zg, offs=None, VP=None):
     cublas.setPointerMode(handle, cublas.CUBLAS_POINTER_MODE_HOST)
     # column-major: C^T (V x VP) = Zg^T (V x P) . tab_i (P x VP)
     cublas.dgemmBatched(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_T, V, VP, P,
-                        one.ctypes.data, Ap.data.ptr, V, Bp.data.ptr, VP,
+                        one.ctypes.data, Ap.data.ptr, V, Bp.data.ptr, ld,
                         zero.ctypes.data, Cp.data.ptr, V, n)
     return out
 

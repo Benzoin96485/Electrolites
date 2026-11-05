@@ -176,7 +176,7 @@ class UTriplesGPU:
                         XN=mgpu.Shared(XN), DN=mgpu.Shared(DNd), dom=cp.asarray(dom),
                         dmk=cp.asarray(dmk), TS=mgpu.Shared(TS), T1=cp.asarray(T1),
                         offA=cp.asarray(offA[:-1]), offB=cp.asarray(offB[:-1]), offN=cp.asarray(offN[:-1]),
-                        domB=cp.asarray(domB), dmkB=cp.asarray(dmkB))
+                        domB=cp.asarray(domB), dmkB=cp.asarray(dmkB), nrow=(npo, npo + ns))
         if getattr(self, 'verbose', 0) >= 2:
             nb = sum(v.nbytes for v in self._pt.values() if isinstance(v, cp.ndarray))
             print(f'[mem] (T) pair tables: {npair} pairs, {len(sop)} spin pairs, PAO pad {PP}, '
@@ -222,6 +222,8 @@ class UTriplesGPU:
     def _proj(self, Z, s, bidx, pidx):
         """S(triplet b, pair p)^T for spin s: (n, VP_s, V_s) = X_p^T Z_b[rows of p]."""
         pt = self._pt
+        if os.environ.get('DLPNO_T_PROJ_BUCKET', '1') == '1':
+            return self._proj_buckets(Z, s, bidx, pidx)
         bidx = cp.asarray(bidx)
         pidx = cp.asarray(pidx)
         n = len(pidx)
@@ -238,6 +240,44 @@ class UTriplesGPU:
         # the SOMO rows of the beta virtuals follow each pair's PAO rows
         Zg = gather_rows(Z[1], bidx, pt['domB'][pidx], pt['dmkB'][pidx])
         return xT_z_by_pointer(pt['XB'].a, pidx, Zg, offs=pt['offB'], VP=pt['VB'])
+
+    def _proj_buckets(self, Z, s, bidx, pidx):
+        """_proj with the couples bucketed by their pair's own PAO rows
+        (rounded up to 64) and PNO count (to 16): the padded form ran every
+        couple over the largest domain and PNO count of the system (mimochrome:
+        688 rows, 160 PNOs, vs a few hundred and ~20), and these projections
+        were the largest part of the (T0) time.  Columns beyond a pair's
+        bucket stay zero (the padded tables are zero there)."""
+        from electrolites.dlpno.gather import gather_rows, xT_z_by_pointer
+        pt = self._pt
+        ph = cp.asnumpy(pidx) if isinstance(pidx, cp.ndarray) else np.asarray(pidx, np.int64)
+        bd = cp.asarray(bidx)
+        n = len(ph)
+        V_ = Z[s].shape[2]
+        VPm = pt['VA'] if s == 0 else pt['VB']
+        out = cp.zeros((n, VPm, V_))
+        if n == 0:
+            return out
+        rows_t, mask_t = (pt['dom'], pt['dmk']) if s == 0 else (pt['domB'], pt['dmkB'])
+        tab, offs = (pt['XA'].a, pt['offA']) if s == 0 else (pt['XB'].a, pt['offB'])
+        cap = rows_t.shape[1]
+        Pb = np.minimum(-(-pt['nrow'][s][ph] // 64) * 64, cap)
+        Vb = np.minimum(-(-self._nvs_tab()[ph, s] // 16) * 16, VPm)
+        key = Pb * (VPm + 1) + Vb
+        o = np.argsort(key, kind='stable')
+        uk, st = np.unique(key[o], return_index=True)
+        for k, a, b in zip(uk, st, np.r_[st[1:], n]):
+            P_, VP_ = int(k // (VPm + 1)), int(k % (VPm + 1))
+            if VP_ == 0 or P_ == 0:
+                continue
+            q = o[a:b]
+            step = max(1, int((1 << 28) // (8 * P_ * (VP_ + V_))))
+            for c0 in range(0, len(q), step):
+                gq = cp.asarray(q[c0:c0 + step])
+                pq = cp.asarray(ph[q[c0:c0 + step]])
+                Zg = gather_rows(Z[s], bd[gq], rows_t[pq, :P_], mask_t[pq, :P_])
+                out[gq, :VP_] = xT_z_by_pointer(tab, pq, Zg, offs=offs, VP=VP_, ld=VPm)
+        return out
 
     # ------------------------------------------------------------------
     def tno_transform(self, t_cut):
@@ -713,6 +753,7 @@ class UTriplesGPU:
                     return S.reshape((n * L,) + S.shape[2:])
                 S1 = lproj(s1)
                 S2 = lproj(s2)
+                prof('w:talmm')
                 # only the couples that exist, bucketed by their pair's PNO
                 # count (the pair tables are padded to the largest pair)
                 okf = ok.reshape(-1)
