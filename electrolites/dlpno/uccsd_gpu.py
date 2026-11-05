@@ -1448,10 +1448,13 @@ class UCCSDGPU:
                 sprof.report()
                 from electrolites.dlpno import ovgen
                 ovgen.stats_report()
-                try:
-                    self._dev_report()
-                except Exception as ex:          # a report only
-                    print('[mem] CC device report failed:', ex, flush=True)
+                # the device report walks every store (~200 s on the mimochrome
+                # quintet, 40% of an iteration): after the first iteration only
+                if it == 1:
+                    try:
+                        self._dev_report()
+                    except Exception as ex:          # a report only
+                        print('[mem] CC device report failed:', ex, flush=True)
             if verbose:
                 print(f'  GPU ULCCSD iter {it:3d} {e:.12f} {e - e_prev:.3e} {rn[0]:.3e} {rn[1]:.3e} '
                       f'{time.perf_counter() - t0:.2f}s', flush=True)
