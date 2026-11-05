@@ -271,6 +271,49 @@ class _SpinPlan:
         return out
 
 
+class _AmpSaver:
+    """writes the amplitudes (host copies) and the new DIIS vectors to
+    scratch in a background thread while the next iteration runs: on the
+    mimochrome quintet the ~4 GB a save took 13-50 s of each iteration (the
+    DF prefetch reads the same file system meanwhile).  One save at a time;
+    ``join`` re-raises its error.  ``fp``: the PNO fingerprint saved with
+    them (a restart uses them only with the same PNOs)."""
+
+    def __init__(self, fp=None):
+        self.th = None
+        self.err = None
+        self.fp = fp
+
+    def start(self, amp, diis, t1, t2, it):
+        import threading
+        self.join()
+        dev = cp.cuda.Device().id
+
+        def run():
+            try:
+                with cp.cuda.Device(dev):
+                    tmp = amp + '.tmp.npz'
+                    tok = time.time()
+                    diis.save(amp + '.diis', tok)
+                    extra = {} if self.fp is None else dict(fp=self.fp)
+                    np.savez(tmp, t1=t1, t2=t2, it=it, tok=tok, **extra)
+                    os.replace(tmp, amp)
+            except BaseException as e:     # noqa: B902 - re-raised by join
+                self.err = e
+        self.th = threading.Thread(target=run, daemon=True)
+        self.th.start()
+        if os.environ.get('DLPNO_CC_SAVE_ASYNC', '1') != '1':
+            self.join()
+
+    def join(self):
+        if self.th is not None:
+            self.th.join()
+            self.th = None
+        if self.err is not None:
+            e, self.err = self.err, None
+            raise e
+
+
 def _rss():
     try:
         for l in open('/proc/self/status'):
@@ -1323,17 +1366,46 @@ class UCCSDGPU:
         # DLPNO_CC_DIIS_RESUME=0 restarts it)
         import os
         amp = os.environ.get('DLPNO_CC_AMP')
+        fp = self._pno_fingerprint() if amp else None
+        z = None
         if amp and os.path.exists(amp):
             z = np.load(amp)
+            if 'fp' in z and (z['fp'].shape != fp.shape or not np.allclose(z['fp'], fp, rtol=1e-8, atol=1e-10)):
+                # the PNOs of a run that recomputed them may differ (signs,
+                # rotations: batch-dependent eigensolvers); amplitudes in another
+                # PNO basis made the resumed iterations stall
+                print(f'  CC amplitudes in {amp} belong to other PNOs: not used', flush=True)
+                z = None
+        if z is not None:
             T1.set_flat(cp.asarray(z['t1']))
             T.set_flat(cp.asarray(z['t2']))
             print(f'  CC amplitudes read from {amp} (iteration {int(z["it"])})', flush=True)
         diis = _DeviceDIIS(opt['DIIS_MAX_VECS'])
-        if amp and os.path.exists(amp) and 'tok' in z and os.environ.get('DLPNO_CC_DIIS_RESUME', '1') == '1':
+        if z is not None and 'tok' in z and os.environ.get('DLPNO_CC_DIIS_RESUME', '1') == '1':
             if diis.load(amp + '.diis', float(z['tok']), int(T1.flat().size + T.flat().size)):
                 print(f'  DIIS history read ({len(diis.x)} vectors)', flush=True)
         e_prev = 0.
         ci = np.array([self.sidx[k] for k in self.canon], np.int64)
+        saver = _AmpSaver(fp)
+        try:
+            return self._iterate(T, T1, diis, amp, saver, e_prev, opt, verbose)
+        finally:
+            saver.join()
+
+    def _pno_fingerprint(self):
+        """(npair, 2) sign-sensitive checksums of every pair's PNO
+        coefficients per spin, saved with the amplitudes"""
+        u = self.u
+        vals = []
+        for p in range(self.npair):
+            for X in (u.Xa[p], u.Xb[p]):
+                X = cp.asarray(X)
+                r = cp.cos(.7 * cp.arange(X.shape[0]))
+                c = cp.arange(1., X.shape[1] + 1.)
+                vals.append(r @ X @ c)
+        return cp.asnumpy(cp.stack(vals)).reshape(self.npair, 2) if vals else np.zeros((0, 2))
+
+    def _iterate(self, T, T1, diis, amp, saver, e_prev, opt, verbose):
         from electrolites.dlpno.devmem import Prof
         sprof = Prof('ULCCSD step')
         for it in range(1, opt['MAXITER'] + 1):
@@ -1360,6 +1432,7 @@ class UCCSDGPU:
                    else cp.concatenate([R1.flat(), R.flat()]))
             del s1, s2
             sprof('diis')
+            saver.join()                  # the previous save reads the history
             x = diis.update(cp.concatenate([T1.flat(), T.flat()]), err)
             del err
             T1.set_flat(x[:n1])
@@ -1368,11 +1441,7 @@ class UCCSDGPU:
             e, ew = self.energy(T, T1)
             sprof('save')
             if amp:
-                tmp = amp + '.tmp.npz'
-                tok = time.time()
-                diis.save(amp + '.diis', tok)
-                np.savez(tmp, t1=cp.asnumpy(T1.flat()), t2=cp.asnumpy(T.flat()), it=it, tok=tok)
-                os.replace(tmp, amp)
+                saver.start(amp, diis, cp.asnumpy(T1.flat()), cp.asnumpy(T.flat()), it)
             sprof(None)
             if getattr(self, '_prof', None) is not None and (it <= 2 or it % 10 == 0):
                 self._prof.report()
@@ -1381,8 +1450,8 @@ class UCCSDGPU:
                 ovgen.stats_report()
                 try:
                     self._dev_report()
-                except Exception as e:          # a report only
-                    print('[mem] CC device report failed:', e, flush=True)
+                except Exception as ex:          # a report only
+                    print('[mem] CC device report failed:', ex, flush=True)
             if verbose:
                 print(f'  GPU ULCCSD iter {it:3d} {e:.12f} {e - e_prev:.3e} {rn[0]:.3e} {rn[1]:.3e} '
                       f'{time.perf_counter() - t0:.2f}s', flush=True)
