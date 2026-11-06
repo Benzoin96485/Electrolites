@@ -242,8 +242,8 @@ class UTriplesGPU:
         return xT_z_by_pointer(pt['XB'].a, pidx, Zg, offs=pt['offB'], VP=pt['VB'])
 
     def _proj_buckets(self, Z, s, bidx, pidx):
-        """_proj with the couples bucketed by their pair's own PAO rows
-        (rounded up to 64) and PNO count (to 16): the padded form ran every
+        """_proj with the couples bucketed by their pair's own PAO rows and
+        PNO count (coarse levels): the padded form ran every
         couple over the largest domain and PNO count of the system (mimochrome:
         688 rows, 160 PNOs, vs a few hundred and ~20), and these projections
         were the largest part of the (T0) time.  Columns beyond a pair's
@@ -261,8 +261,13 @@ class UTriplesGPU:
         rows_t, mask_t = (pt['dom'], pt['dmk']) if s == 0 else (pt['domB'], pt['dmkB'])
         tab, offs = (pt['XA'].a, pt['offA']) if s == 0 else (pt['XB'].a, pt['offB'])
         cap = rows_t.shape[1]
-        Pb = np.minimum(-(-pt['nrow'][s][ph] // 64) * 64, cap)
-        Vb = np.minimum(-(-self._nvs_tab()[ph, s] // 16) * 16, VPm)
+        # a few coarse levels: every bucket is ~15 launches, and the (T0)
+        # worker threads share one interpreter lock (rounding to 64 rows / 16
+        # PNOs gave ~100 buckets per call and made the mimochrome (T0) slower)
+        Pl = np.unique(np.minimum(-(-np.array([cap / 4., cap / 2., cap]) // 64) * 64, cap).astype(np.int64))
+        Vl = np.unique(np.minimum(np.array([32, 64, VPm]), VPm))
+        Pb = Pl[np.minimum(np.searchsorted(Pl, pt['nrow'][s][ph]), len(Pl) - 1)]
+        Vb = Vl[np.minimum(np.searchsorted(Vl, self._nvs_tab()[ph, s]), len(Vl) - 1)]
         key = Pb * (VPm + 1) + Vb
         o = np.argsort(key, kind='stable')
         uk, st = np.unique(key[o], return_index=True)
@@ -766,10 +771,14 @@ class UTriplesGPU:
                 okf = ok.reshape(-1)
                 pf = pil.reshape(-1)
                 nvt = self._nvs_tab()
-                # bucket key: the two spins' PNO counts rounded up to 16
-                # (alpha and beta spaces differ by the SOMOs)
-                n1 = np.minimum(-(-nvt[pf, s1] // 16) * 16, S1.shape[1])
-                n2 = np.minimum(-(-nvt[pf, s2] // 16) * 16, S2.shape[1])
+                # bucket key: the two spins' PNO counts rounded up to a few
+                # coarse levels (16, 32, 64, all: each bucket is a few launches
+                # and the worker threads share the GIL; alpha and beta spaces
+                # differ by the SOMOs)
+                lv1 = np.unique(np.minimum([16, 32, 64, S1.shape[1]], S1.shape[1]))
+                lv2 = np.unique(np.minimum([16, 32, 64, S2.shape[1]], S2.shape[1]))
+                n1 = lv1[np.minimum(np.searchsorted(lv1, nvt[pf, s1]), len(lv1) - 1)]
+                n2 = lv2[np.minimum(np.searchsorted(lv2, nvt[pf, s2]), len(lv2) - 1)]
                 if os.environ.get('DLPNO_DBG_NOBUCKET'):
                     n1 = np.full_like(n1, S1.shape[1])
                     n2 = np.full_like(n2, S2.shape[1])
