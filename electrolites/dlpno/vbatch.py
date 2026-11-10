@@ -148,17 +148,33 @@ class _Op:
 
 
 _BASE = {}
+# Address tables outlive the Ragged operands that created them. Allocating
+# these small persistent arrays from the caller's temporary pool can pin
+# much larger split blocks after the operands have been released. Keep the
+# cache's storage in its own pool; CuPy maintains separate arenas per device.
+_BASE_POOL = cp.cuda.MemoryPool()
 
 
 def _base(rag):
     """device array of the group buffer addresses of a Ragged (cached by
     address tuple: a host->device copy synchronises the stream)."""
     key = tuple(d.data.ptr for d in rag.data)
+    from .reverse import _capture_backend
+    if _capture_backend.get() is not None:
+        # CUDA Graph capture cannot upload a fresh host address table. Write
+        # the fixed pointer values as scalar kernel arguments on the device.
+        # This temporary belongs to the graph's private reserved pool.
+        b = cp.empty(len(key), dtype=cp.int64)
+        for index, pointer in enumerate(key):
+            b[index:index+1].fill(np.int64(pointer))
+        return b
     b = _BASE.get(key)
     if b is None:
         if len(_BASE) > 4096:
             _BASE.clear()
-        b = _BASE[key] = cp.asarray(np.array(key, np.int64))
+        with cp.cuda.using_allocator(_BASE_POOL.malloc):
+            b = cp.asarray(np.array(key, np.int64))
+        _BASE[key] = b
     return b
 
 
@@ -269,9 +285,16 @@ class VChainPlan:
         og, ooff, _ = self.out
         optr = _base(out)[og] + ooff * 8
         if w is None:
-            if getattr(self, '_al', None) is None or self._al[0] != alpha:
-                self._al = (alpha, cp.full(nt, float(alpha)))
-            al = self._al[1]
+            from .reverse import _capture_backend
+            if _capture_backend.get() is not None:
+                # One chain can be reused with alternating alpha values.
+                # Do not replace its persistent cache by a temporary array
+                # owned by a captured graph that will be released earlier.
+                al = cp.full(nt, float(alpha))
+            else:
+                if getattr(self, '_al', None) is None or self._al[0] != alpha:
+                    self._al = (alpha, cp.full(nt, float(alpha)))
+                al = self._al[1]
         else:
             al = (w * alpha).astype(cp.float64)
         if getattr(self, '_ones', None) is None:

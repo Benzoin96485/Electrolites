@@ -27,10 +27,13 @@ from electrolites.features import attach
 
 class DLPNO_CCSD_T:
     def __init__(self, mf, pno='normal', triples='t0', auxbasis=None,
-                 frozen_core=True, **opts):
+                 frozen_core=True, integral_backend='dense', **opts):
         self.mf = mf
         self.pno, self.triples, self.auxbasis = pno, triples, auxbasis
         self.frozen_core = frozen_core
+        if integral_backend not in ('dense', 'local'):
+            raise ValueError("integral_backend must be 'dense' or 'local'")
+        self.integral_backend = integral_backend
         self.opts = opts
         self.solver = None
         self.e = {}
@@ -44,6 +47,11 @@ class DLPNO_CCSD_T:
         occ = np.asarray(mf.mo_occ)
         kw = dict(pno=self.pno, triples=self.triples, auxbasis=self.auxbasis,
                   frozen_core=self.frozen_core, **self.opts)
+        if self.integral_backend == 'local':
+            if occ.ndim != 1 or np.any((occ > .5) & (occ < 1.5)):
+                raise NotImplementedError('Local integral adjoints currently require closed-shell RHF')
+            from electrolites.dlpno.local_gpu import LocalGPUDLPNO
+            return LocalGPUDLPNO(mf, **kw)
         if occ.ndim == 2:
             from electrolites.dlpno.uhf import UDLPNO
             return UDLPNO(mf, reference='qro', **kw)
@@ -68,6 +76,19 @@ class DLPNO_CCSD_T:
         return self.e.get('tot')
 
     run = kernel
+
+    def nuc_grad_method(self, method='auto', **kwargs):
+        if method == 'auto':
+            method = 'adjoint' if self.integral_backend == 'local' else 'direct'
+        if method == 'adjoint':
+            from electrolites.dlpno.local import LocalGradients
+            return LocalGradients(self, **kwargs)
+        if method != 'direct':
+            raise ValueError("method must be 'auto', 'direct' or 'adjoint'")
+        from electrolites.dlpno.gradient import Gradients
+        return Gradients(self, **kwargs)
+
+    Gradients = nuc_grad_method
 
 
 def _dlpno(self, pno='normal', triples='t0', **kw):

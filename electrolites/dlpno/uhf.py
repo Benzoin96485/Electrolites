@@ -25,7 +25,7 @@ import time
 import numpy as np
 import scipy.linalg
 import cupy as cp
-from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno.gather import blocks as gather_blocks, xtbx
 from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx.scipy.linalg as cpla
 
@@ -846,11 +846,11 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
             step = max(1, int((1 << 28) // (8 * na * P * P)))
             for r0 in range(0, len(rows), step):
                 sl = slice(r0, r0 + step)
-                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl])
+                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl], ru=True)
                 oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                 for s, Xs in ((0, Xa_d), (1, Xbp_d)):
                     xr = Xs[gr[sl]]
-                    qvv[s][gr[sl][:, None], oo] = cp.matmul(cp.matmul(tr(xr)[:, None], blk), xr[:, None])
+                    qvv[s][gr[sl][:, None], oo] = xtbx(blk, xr, xr)
         if ns:
             qsu = dfi.qia[ga[:, :, None, None], so[None, None, :, None], gp[:, None, None, :]]
             qsu = qsu * (gam[:, :, None, None] * gpm[:, None, None, :])
@@ -880,7 +880,8 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         chunks = []
         for Pv in np.unique(P):
             sel = [c for c, pv in zip(clist, P) if pv == Pv]
-            sel.sort(key=lambda c: len(self.ribfs[c]))
+            o_ = self.dfi.spatial_order([np.unique(self.ribf_atom[self.ribfs[c]]) for c in sel])
+            sel = [sel[k] for k in o_]
             ch = []
             for c in sel + [None]:
                 if c is not None:
@@ -986,8 +987,32 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
         for n, key in enumerate(keys):
             by_p.setdefault(key[0], []).append(n)
         out = [None] * len(keys)
+        from electrolites.dlpno import mgpu
+        home = cp.cuda.Device().id
+
+        def setup(d):
+            w = mgpu.device_view(self, ('S_pao_d', 'Fa_pao_d', 'Fb_pao_d', 'J2c'),
+                                 sub={'dfi': ('qia', 'qij', 'J2c')})
+            w._chol = {}
+            return w
+
+        def work(w, it):
+            p, idx = it
+            res = w._ring_np_pair(p, idx, keys)
+            if cp.cuda.Device().id != home:
+                with cp.cuda.Device(home):
+                    res = mgpu.replicate(res)
+            for n, v in zip(idx, res):
+                out[n] = v
+        items = sorted(by_p.items(), key=lambda kv: -len(kv[1]))
+        mgpu.run_queue(items, work, setup=setup)
+        return out
+
+    def _ring_np_pair(self, p, idx, keys):
+        pl, so = self.pl, self.so
         nbf, ns = self.orb.nbf, self.ns
-        for p, idx in by_p.items():
+        out = {}
+        if True:
             aux = self.ribfs[p]
             L = self._halfL(p)
             lm = list(self.lmos[p])
@@ -1076,7 +1101,7 @@ class UDLPNO(UTriplesGPU, RefUDLPNO2):
                     res = cp.matmul(Z, cp.asarray(Xs))
                 for r_, n in enumerate(lst):
                     out[n] = res[r_, :, :ws[r_]].copy()
-        return out
+        return [out[n] for n in idx]
 
     # ------------------------------------------------------------------
     def lccsd_iterations(self):

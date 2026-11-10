@@ -291,37 +291,89 @@ class LMP2GPU:
         npair = len(pl)
         nv = np.array([x.shape[1] for x in self.X], dtype=np.int64)
         LP = Layout(nv, nv)
-        cps, cqs, outs, ws = [], [], [], []
-        for p, (i, j) in enumerate(pl.pairs):
-            for k in range(n):
-                kj, ik = pl.ij[k, j], pl.ij[i, k]
-                if kj >= 0 and i != k and abs(f[i, k]) > opt['F_CUT']:
-                    cps.append(p); cqs.append(kj); outs.append(kj); ws.append(-f[i, k])
-                if ik >= 0 and j != k and abs(f[k, j]) > opt['F_CUT']:
-                    cps.append(p); cqs.append(ik); outs.append(ik); ws.append(-f[k, j])
-        cps, cqs = np.array(cps, np.int64), np.array(cqs, np.int64)
-        # the overlaps S(ij, kj) are regenerated per chunk every iteration
+        # couplings ij <- kj (f_ik) and ij <- ik (f_kj), vectorised
+        pi = np.array([i for i, j in pl.pairs], np.int64)
+        pj = np.array([j for i, j in pl.pairs], np.int64)
+        cps, cqs, ws = [], [], []
+        for side in (0, 1):
+            x = pi if side == 0 else pj                      # the replaced LMO
+            other = pj if side == 0 else pi
+            # Vectorise only existing neighbors. An all-pairs-by-all-LMOs
+            # table would restore quadratic setup for the local driver.
+            adjacent = [np.asarray(pl.neighbors(int(j)), dtype=np.int64) for j in other]
+            pp_ = np.repeat(np.arange(npair), [len(row) for row in adjacent])
+            kk = np.concatenate(adjacent) if adjacent else np.zeros(0, np.int64)
+            q = pl.ij[kk, other[pp_]] if side == 0 else pl.ij[other[pp_], kk]
+            weight = f[x[pp_], kk]
+            ok = (q >= 0) & (kk != x[pp_]) & (np.abs(weight) > opt['F_CUT'])
+            cps.append(pp_[ok])
+            cqs.append(q[ok])
+            ws.append(-weight[ok])
+        # keep the reference term order: by pair, then k, then side
+        cps, cqs, ws = np.concatenate(cps), np.concatenate(cqs), np.concatenate(ws)
+        # the overlaps S(ij, kj): per device (couples split by output pair),
+        # kept when they fit, else regenerated per chunk every iteration
         from electrolites.dlpno.ovgen import OverlapGen
         from electrolites.dlpno.vbatch import VChainPlan
-        gen = OverlapGen(self.S_pao_d, self.pao, self.X)
-        wall = np.array(ws)
+        from electrolites.dlpno import mgpu
         import os
+        devs = mgpu.devices()
+        home = cp.cuda.Device().id
+        order = np.argsort(cps, kind='stable')
+        parts = np.array_split(order, len(devs))
         mode = os.environ.get('DLPNO_ONFLY_S', 'auto')
-        need = float(np.sum(8. * nv[cps] * nv[cqs]))
-        free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
-        onfly = (need > 0.5 * free) if mode == 'auto' else mode == '1'
-        if onfly:
-            chunks = gen.prepare(cps, cqs)
-        else:                       # one chunk whose S is generated once and kept
-            LSall = Layout(nv[cps], nv[cqs])
-            Sall = Ragged(LSall)
-            for P_ in gen.prepare(cps, cqs, out_layout=LSall, out_idx=np.arange(len(cps))):
-                gen.run(P_, Sall)
-            chunks = [dict(sel=np.arange(len(cps)), LS=LSall, S=Sall)]
-        for P in chunks:
-            ar = np.arange(len(P['sel']))
-            P['res'] = VChainPlan(LP, cps[P['sel']], [op(P['LS'], ar), op(LP, cqs[P['sel']]), op(P['LS'], ar, True)])
-            P['w'] = cp.asarray(wall[P['sel']])
+        chunks = []
+        for d, sel_d in zip(devs, parts):
+            if not len(sel_d):
+                continue
+            with cp.cuda.Device(d):
+                gen = OverlapGen(cp.asarray(self.S_pao_d), self.pao, self.X)
+                cp_d, cq_d = cps[sel_d], cqs[sel_d]
+                need = float(np.sum(8. * nv[cp_d] * nv[cq_d]))
+                free = cp.cuda.runtime.memGetInfo()[0] + cp.get_default_memory_pool().free_bytes()
+                onfly = (need > 0.5 * free) if mode == 'auto' else mode == '1'
+                if onfly:
+                    ch = gen.prepare(cp_d, cq_d)
+                else:                       # one chunk whose S is generated once and kept
+                    LSall = Layout(nv[cp_d], nv[cq_d])
+                    Sall = Ragged(LSall)
+                    for P_ in gen.prepare(cp_d, cq_d, out_layout=LSall, out_idx=np.arange(len(cp_d))):
+                        gen.run(P_, Sall)
+                    ch = [dict(sel=np.arange(len(cp_d)), LS=LSall, S=Sall)]
+                for P in ch:
+                    ar = np.arange(len(P['sel']))
+                    P['res'] = VChainPlan(LP, cp_d[P['sel']], [op(P['LS'], ar), op(LP, cq_d[P['sel']]),
+                                                               op(P['LS'], ar, True)])
+                    P['w'] = cp.asarray(ws[sel_d][P['sel']])
+                    P['dev'], P['gen'] = d, gen
+                chunks += ch
+        cp.cuda.Device(home).use()
+        cdevs = sorted({P['dev'] for P in chunks})
+
+        def coupling(R, T):
+            if cdevs in ([home], []):
+                for P in chunks:
+                    Sc = P['S'] if 'S' in P else P['gen'].run(P)
+                    P['res'].run(R, [Sc, T, Sc], w=P['w'])
+                return
+            outs = {}
+
+            def work(d):
+                if d == home:
+                    R_, T_ = R, T
+                else:
+                    R_, T_ = Ragged(R.layout), Ragged(T.layout, mgpu.replicate(T.data))
+                for P in chunks:
+                    if P['dev'] == d:
+                        Sc = P['S'] if 'S' in P else P['gen'].run(P)
+                        P['res'].run(R_, [Sc, T_, Sc], w=P['w'])
+                outs[d] = R_
+            mgpu.run_per_device(work, cdevs)
+            for d, R_ in outs.items():
+                if d != home:
+                    for g in range(len(R.data)):
+                        if R.data[g].size:
+                            R.data[g] += cp.asarray(R_.data[g])
         K = Ragged.from_list(LP, self.K)
         T = Ragged.from_list(LP, self.T)
         fd = np.diag(f)
@@ -342,9 +394,7 @@ class LMP2GPU:
         e_prev = 0.
         for it in range(1, opt['MAXITER'] + 1):
             R = K + D * T
-            for P in chunks:
-                Sc = P['S'] if 'S' in P else gen.run(P)
-                P['res'].run(R, [Sc, T, Sc], w=P['w'])
+            coupling(R, T)
             rms = float(R.rms_per_item().max())
             T = T - R / D
             T.set_flat(diis.update(T.flat(), R.flat()))

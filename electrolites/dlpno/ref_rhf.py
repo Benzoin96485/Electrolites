@@ -19,6 +19,7 @@ the thresholds themselves:
 import time
 
 import numpy as np
+from electrolites.dlpno.overlap_plan import subset_positions
 import scipy.linalg
 
 from pyscf import lib, df
@@ -132,6 +133,17 @@ class RefDLPNO:
         if self.verbose >= 4:
             print(*args, flush=True)
 
+    def nuc_grad_method(self, method='direct', **kwargs):
+        if method == 'adjoint':
+            from .local import LocalGradients
+            return LocalGradients(self, **kwargs)
+        if method != 'direct':
+            raise ValueError("method must be 'direct' or 'adjoint'")
+        from .gradient import Gradients
+        return Gradients(self, **kwargs)
+
+    Gradients = nuc_grad_method
+
     # ------------------------------------------------------------------
     def setup(self):
         t = time.perf_counter()
@@ -182,16 +194,14 @@ class RefDLPNO:
                           self.bf_atom, self.atom_bfs, self.atom_ribfs)
 
     def set_pairs(self, mask, dom):
-        self.pl = pl = su.PairList(self.n, mask)
+        self.pl = pl = su.PairList(self.n, mask, sparse=getattr(self, 'sparse_pairs', False))
         self.dom = dom
         self.pao = [su.union(dom.lmo_paos[i], dom.lmo_paos[j]) for (i, j) in pl.pairs]
         self.ribfs = [su.union(dom.lmo_ribfs[i], dom.lmo_ribfs[j]) for (i, j) in pl.pairs]
         self.lmos = [pl.lmos(p) for p in range(len(pl))]
         self.lmo_pos = []
         for p in range(len(pl)):
-            d = -np.ones(self.n, dtype=int)
-            d[self.lmos[p]] = np.arange(len(self.lmos[p]))
-            self.lmo_pos.append(d)
+            self.lmo_pos.append({int(i): k for k, i in enumerate(self.lmos[p])})
         self._S = {}
 
     # ------------------------------------------------------------------
@@ -219,10 +229,13 @@ class RefDLPNO:
         for p, (i, j) in enumerate(pl.pairs):
             if i > j:
                 continue
-            X, e, K, T = self._K_pao(p)
-            e_ij[p] = np.sum(K * (2 * T - T.T))
+            e_ij[p] = self._sc_mp2_pair_energy(p)
             e_ij[pl.ji[p]] = e_ij[p]
         return e_ij
+
+    def _sc_mp2_pair_energy(self, p):
+        X, e, K, T = self._K_pao(p)
+        return np.sum(K * (2 * T - T.T))
 
     def lmp2_pnos(self):
         """Refined prescreening: PNOs for the LMP2 (Psi4
@@ -237,43 +250,52 @@ class RefDLPNO:
         for p, (i, j) in enumerate(pl.pairs):
             if i > j:
                 continue
-            X, e, K, T = self._K_pao(p)
-            Tt = 2 * T - T.T
-            e_ij = np.sum(K * Tt)
-            D = Tt @ T.T + Tt.T @ T
-            if i == j:
-                D *= .5
-            occ, U = np.linalg.eigh(D)
-            occ, U = occ[::-1], U[:, ::-1]
-            scale = 1.
-            if i == j:
-                scale *= opt['T_CUT_PNO_DIAG_SCALE']
-            if i < self.ncore_scale or j < self.ncore_scale:
-                scale *= opt['T_CUT_PNO_CORE_SCALE']
-            occ_total = occ.sum()
-            Kn = U.T @ K @ U
-            Ttn = U.T @ Tt @ U
-            e_pno = occ_pno = 0.
-            a_curr = []
-            nfin = 0
-            for a in range(len(occ)):
-                if (abs(occ[a]) >= scale * opt['T_CUT_PNO_MP2']
-                        or occ_pno / occ_total < opt['T_CUT_TRACE_MP2']
-                        or abs(e_pno) < opt['T_CUT_ENERGY_MP2'] * abs(e_ij)
-                        or a < opt['MIN_PNOS']):
-                    e_pno = np.sum(Kn[np.ix_(a_curr, a_curr)] * Ttn[np.ix_(a_curr, a_curr)])
-                    occ_pno += occ[a]
-                    a_curr.append(a)
-                    nfin += 1
-            nfin = max(1, nfin)
-            U = U[:, :nfin]
-            V, ep = su.canonicalize(U, np.diag(e))
-            U = U @ V
-            Kp = U.T @ K @ U
-            Tp = U.T @ T @ U
-            self.de_pno[p] = e_ij - np.sum(Kp * (2 * Tp - Tp.T))
-            self._store_pair(p, X @ U, ep, Kp, Tp)
+            X, e, K, T, correction = self._lmp2_pno_pair(p)
+            self.de_pno[p] = correction
+            self._store_pair(p, X, e, K, T)
         self.de_pno_total = self.de_pno.sum()
+
+
+    def _lmp2_pno_pair(self, p):
+        """Pure semicanonical MP2-to-PNO transformation for one pair."""
+        opt = self.opt
+        i, j = self.pl.pairs[p]
+        X, e, K, T = self._K_pao(p)
+        Tt = 2 * T - T.T
+        e_ij = np.sum(K * Tt)
+        D = Tt @ T.T + Tt.T @ T
+        if i == j:
+            D *= .5
+        occ, U = np.linalg.eigh(D)
+        occ, U = occ[::-1], U[:, ::-1]
+        scale = 1.
+        if i == j:
+            scale *= opt['T_CUT_PNO_DIAG_SCALE']
+        if i < self.ncore_scale or j < self.ncore_scale:
+            scale *= opt['T_CUT_PNO_CORE_SCALE']
+        occ_total = occ.sum()
+        Kn = U.T @ K @ U
+        Ttn = U.T @ Tt @ U
+        e_pno = occ_pno = 0.
+        a_curr = []
+        nfin = 0
+        for a in range(len(occ)):
+            if (abs(occ[a]) >= scale * opt['T_CUT_PNO_MP2']
+                    or occ_pno / occ_total < opt['T_CUT_TRACE_MP2']
+                    or abs(e_pno) < opt['T_CUT_ENERGY_MP2'] * abs(e_ij)
+                    or a < opt['MIN_PNOS']):
+                e_pno = np.sum(Kn[np.ix_(a_curr, a_curr)] * Ttn[np.ix_(a_curr, a_curr)])
+                occ_pno += occ[a]
+                a_curr.append(a)
+                nfin += 1
+        nfin = max(1, nfin)
+        U = U[:, :nfin]
+        V, ep = su.canonicalize(U, np.diag(e))
+        U = U @ V
+        Kp = U.T @ K @ U
+        Tp = U.T @ T @ U
+        correction = e_ij - np.sum(Kp * (2 * Tp - Tp.T))
+        return X @ U, ep, Kp, Tp, correction
 
     def _store_pair(self, p, X, e, K, T):
         q = self.pl.ji[p]
@@ -312,7 +334,7 @@ class RefDLPNO:
                     continue
                 e = self.e_pno[p]
                 r = self.K[p] + (e[:, None] + e[None, :] - f[i, i] - f[j, j]) * self.T[p]
-                for k in range(self.n):
+                for k in np.union1d(pl.neighbors(i), pl.neighbors(j)):
                     kj, ik = pl.ij[k, j], pl.ij[i, k]
                     if kj >= 0 and i != k and abs(f[i, k]) > opt['F_CUT']:
                         s = self.S(p, kj)
@@ -419,63 +441,72 @@ class RefDLPNO:
         for p, (i, j) in enumerate(pl.pairs):
             if i > j:
                 continue
-            q = pl.ji[p]
-            aux, paos, lm, X = self.ribfs[p], self.pao[p], self.lmos[p], self.X[p]
-            na, nl, nv = len(aux), len(lm), X.shape[1]
-            q_pair = self.qij[aux, i, j]
-            q_io = self.qij[np.ix_(aux, [i], lm)][:, 0]
-            q_jo = self.qij[np.ix_(aux, [j], lm)][:, 0]
-            q_iv = self.qia[np.ix_(aux, [i], paos)][:, 0] @ X
-            q_jv = self.qia[np.ix_(aux, [j], paos)][:, 0] @ X
-            q_ov = self.qia[np.ix_(aux, lm, paos)] @ X
-            q_vv = lib.einsum('ua,Quv,vb->Qab', X, self.qab[np.ix_(aux, paos, paos)], X)
-            A = self.J2c[np.ix_(aux, aux)]
-            cho = scipy.linalg.cho_factor(A)
-            q_io_c = scipy.linalg.cho_solve(cho, q_io)
-            q_jo_c = scipy.linalg.cho_solve(cho, q_jo)
-            q_iv_c = scipy.linalg.cho_solve(cho, q_iv)
-            q_jv_c = scipy.linalg.cho_solve(cho, q_jv)
-            ih = _sym_inv_sqrt_solver(A)
-            q_pair, q_io, q_jo, q_iv, q_jv, q_ov, q_vv = map(
-                ih, (q_pair, q_io, q_jo, q_iv, q_jv, q_ov, q_vv))
-            if self.strong[p]:
-                ext = su.union(paos, *[self.dom.lmo_paos[k] for k in lm])
-                pos = -np.ones(orb.nbf, dtype=int)
-                pos[ext] = np.arange(len(ext))
-                q_vvp = lib.einsum('ua,Quv->Qav', X, self.qab[np.ix_(aux, paos, ext)])
-                Kio = (q_io_c.T @ q_vvp.reshape(na, -1)).reshape(nl, nv, len(ext))
-                Kjo = (q_jo_c.T @ q_vvp.reshape(na, -1)).reshape(nl, nv, len(ext))
-                q_ovx = self.qia[np.ix_(aux, lm, ext)]
-                Koviv = (q_ovx.reshape(na, -1).T @ q_iv_c).reshape(nl, len(ext), nv)
-                Kovjv = (q_ovx.reshape(na, -1).T @ q_jv_c).reshape(nl, len(ext), nv)
-                Jp, Kp, Jq, Kq = [], [], [], []
-                for kk, k in enumerate(lm):
-                    kj, ik = pl.ij[k, j], pl.ij[i, k]
-                    Jp.append(Kio[kk][:, pos[self.pao[kj]]] @ self.X[kj])
-                    Kp.append((self.X[kj].T @ Koviv[kk][pos[self.pao[kj]]]).T)
-                    Jq.append(Kjo[kk][:, pos[self.pao[ik]]] @ self.X[ik])
-                    Kq.append((self.X[ik].T @ Kovjv[kk][pos[self.pao[ik]]]).T)
-                self.J_ikac[p], self.K_iakc[p] = Jp, Kp
-                if q != p:
-                    self.J_ikac[q], self.K_iakc[q] = Jq, Kq
-            self.K_mibj[p] = q_io.T @ q_jv
-            self.J_ijmb[p] = q_pair @ q_ov.reshape(na, -1)
-            self.J_ijmb[p] = self.J_ijmb[p].reshape(nl, nv)
-            self.K_ivvv[p] = q_iv.T @ q_vv.reshape(na, -1)
+            for (name, index), value in self._pno_pair_integrals(p).items():
+                getattr(self, name)[index] = value
+
+    def _pno_pair_integrals(self, p):
+        """One pair's integral outputs, without mutating the driver."""
+        pl, orb = self.pl, self.orb
+        i, j = pl.pairs[p]
+        outputs = {}
+        q = pl.ji[p]
+        aux, paos, lm, X = self.ribfs[p], self.pao[p], self.lmos[p], self.X[p]
+        na, nl, nv = len(aux), len(lm), X.shape[1]
+        q_pair = self.qij[aux, i, j]
+        q_io = self.qij[np.ix_(aux, [i], lm)][:, 0]
+        q_jo = self.qij[np.ix_(aux, [j], lm)][:, 0]
+        q_iv = self.qia[np.ix_(aux, [i], paos)][:, 0] @ X
+        q_jv = self.qia[np.ix_(aux, [j], paos)][:, 0] @ X
+        q_ov = self.qia[np.ix_(aux, lm, paos)] @ X
+        q_vv = lib.einsum('ua,Quv,vb->Qab', X, self.qab[np.ix_(aux, paos, paos)], X)
+        A = self.J2c[np.ix_(aux, aux)]
+        cho = scipy.linalg.cho_factor(A)
+        q_io_c = scipy.linalg.cho_solve(cho, q_io)
+        q_jo_c = scipy.linalg.cho_solve(cho, q_jo)
+        q_iv_c = scipy.linalg.cho_solve(cho, q_iv)
+        q_jv_c = scipy.linalg.cho_solve(cho, q_jv)
+        ih = _sym_inv_sqrt_solver(A)
+        q_pair, q_io, q_jo, q_iv, q_jv, q_ov, q_vv = map(
+            ih, (q_pair, q_io, q_jo, q_iv, q_jv, q_ov, q_vv))
+        if self.strong[p]:
+            ext = su.union(paos, *[self.dom.lmo_paos[k] for k in lm])
+            q_vvp = lib.einsum('ua,Quv->Qav', X, self.qab[np.ix_(aux, paos, ext)])
+            Kio = (q_io_c.T @ q_vvp.reshape(na, -1)).reshape(nl, nv, len(ext))
+            Kjo = (q_jo_c.T @ q_vvp.reshape(na, -1)).reshape(nl, nv, len(ext))
+            q_ovx = self.qia[np.ix_(aux, lm, ext)]
+            Koviv = (q_ovx.reshape(na, -1).T @ q_iv_c).reshape(nl, len(ext), nv)
+            Kovjv = (q_ovx.reshape(na, -1).T @ q_jv_c).reshape(nl, len(ext), nv)
+            Jp, Kp, Jq, Kq = [], [], [], []
+            for kk, k in enumerate(lm):
+                kj, ik = pl.ij[k, j], pl.ij[i, k]
+                pos_kj = subset_positions(ext, self.pao[kj])
+                pos_ik = subset_positions(ext, self.pao[ik])
+                Jp.append(Kio[kk][:, pos_kj] @ self.X[kj])
+                Kp.append((self.X[kj].T @ Koviv[kk][pos_kj]).T)
+                Jq.append(Kjo[kk][:, pos_ik] @ self.X[ik])
+                Kq.append((self.X[ik].T @ Kovjv[kk][pos_ik]).T)
+            outputs['J_ikac', p], outputs['K_iakc', p] = Jp, Kp
             if q != p:
-                self.K_mibj[q] = q_jo.T @ q_iv
-                self.J_ijmb[q] = self.J_ijmb[p]
-                self.K_ivvv[q] = q_jv.T @ q_vv.reshape(na, -1)
-            if self.strong[p]:
-                self.iQk[p], self.iQa[p] = q_io, q_iv
-                self.Qma[p], self.Qab[p] = q_ov, q_vv
-                if q != p:
-                    self.iQk[q], self.iQa[q] = q_jo, q_jv
-                    self.Qma[q], self.Qab[q] = q_ov, q_vv
-            K = self.K[p]
-            self.L_iajb[p] = 2 * K - K.T
+                outputs['J_ikac', q], outputs['K_iakc', q] = Jq, Kq
+        outputs['K_mibj', p] = q_io.T @ q_jv
+        outputs['J_ijmb', p] = q_pair @ q_ov.reshape(na, -1)
+        outputs['J_ijmb', p] = outputs['J_ijmb', p].reshape(nl, nv)
+        outputs['K_ivvv', p] = q_iv.T @ q_vv.reshape(na, -1)
+        if q != p:
+            outputs['K_mibj', q] = q_jo.T @ q_iv
+            outputs['J_ijmb', q] = outputs['J_ijmb', p]
+            outputs['K_ivvv', q] = q_jv.T @ q_vv.reshape(na, -1)
+        if self.strong[p]:
+            outputs['iQk', p], outputs['iQa', p] = q_io, q_iv
+            outputs['Qma', p], outputs['Qab', p] = q_ov, q_vv
             if q != p:
-                self.L_iajb[q] = self.L_iajb[p].T
+                outputs['iQk', q], outputs['iQa', q] = q_jo, q_jv
+                outputs['Qma', q], outputs['Qab', q] = q_ov, q_vv
+        K = self.K[p]
+        outputs['L_iajb', p] = 2 * K - K.T
+        if q != p:
+            outputs['L_iajb', q] = outputs['L_iajb', p].T
+        return outputs
 
     # ------------------------------------------------------------------
     # LCCSD
@@ -655,51 +686,58 @@ class RefDLPNO:
             if not self.strong[p]:
                 continue
             q = pl.ji[p]
-            lm = self.lmos[p]
+            tot, nonsymmetric = self._R2_pair(p, beta, gamma, delta, Fdd)
             if i <= j:
-                Kij = self.iQa_t1[p].T @ self.iQa_t1[q]
-                Qab_t1 = self.Qab[p] - lib.einsum('ka,qkb->qab', self.T_n[p], self.Qma[p])
-                A = lib.einsum('qac,cd,qbd->ab', Qab_t1, self.T[p], Qab_t1)
-                B = np.zeros_like(A)
-                Fbc = self.Fab[p].copy()
-                for kk, k in enumerate(lm):
-                    for ll, l in enumerate(lm):
-                        kl = pl.ij[k, l]
-                        if kl < 0:
-                            continue
-                        s = self.S(kl, p)
-                        B += beta[p][kk, ll] * (s.T @ self.T[kl] @ s)
-                        Ttkl = 2 * self.T[kl] - self.T[kl].T
-                        Fbc -= s.T @ (Ttkl @ self.K[kl].T) @ s
-                E = self.T[p] @ Fbc.T + Fbc @ self.T[p]
-                tot = Kij + A + B + E
                 R[p] += tot
                 if i != j:
                     R[q] += tot.T
-            C = np.zeros_like(self.T[p])
-            D = np.zeros_like(self.T[p])
-            for kk, k in enumerate(lm):
-                ki, kj, ik, jk = pl.ij[k, i], pl.ij[k, j], pl.ij[i, k], pl.ij[j, k]
-                gt = self.J_ikac[p][kk] + self.S(p, ki) @ gamma[ki] @ self.S(ki, kj)
-                C -= gt @ self.T[kj].T @ self.S(kj, p)
-                dt = 2 * self.K_iakc[p][kk] - self.J_ikac[p][kk]
-                dt = dt + self.S(p, ik) @ delta[ik] @ self.S(ik, jk)
-                Ttjk = 2 * self.T[jk] - self.T[jk].T
-                D += dt @ Ttjk.T @ self.S(jk, p)
-            Rn[p] += .5 * C + C.T + .5 * D
-            G = np.zeros_like(self.T[p])
-            for k in range(self.n):
-                ik = pl.ij[i, k]
-                if ik < 0:
-                    continue
-                G -= Fdd[k, j] * (self.S(p, ik) @ self.T[ik] @ self.S(ik, p))
-            Rn[p] += G
+            Rn[p] += nonsymmetric
         for p in range(npair):
             if self.strong[p]:
                 R[p] += Rn[p] + Rn[pl.ji[p]].T
             else:
                 R[p] = np.zeros_like(self.T[p])
         return R
+
+    def _R2_pair(self, p, beta, gamma, delta, Fdd):
+        """Pure pair contribution, shared by the primal and local replay."""
+        pl = self.pl
+        i, j = pl.pairs[p]
+        q, lm = pl.ji[p], self.lmos[p]
+        tot = np.zeros_like(self.T[p])
+        if i <= j:
+            Kij = self.iQa_t1[p].T @ self.iQa_t1[q]
+            Qab_t1 = self.Qab[p] - lib.einsum('ka,qkb->qab', self.T_n[p], self.Qma[p])
+            A = lib.einsum('qac,cd,qbd->ab', Qab_t1, self.T[p], Qab_t1)
+            B = np.zeros_like(A)
+            Fbc = self.Fab[p].copy()
+            for kk, k in enumerate(lm):
+                for ll, l in enumerate(lm):
+                    kl = pl.ij[k, l]
+                    if kl < 0:
+                        continue
+                    s = self.S(kl, p)
+                    B += beta[p][kk, ll] * (s.T @ self.T[kl] @ s)
+                    Ttkl = 2 * self.T[kl] - self.T[kl].T
+                    Fbc -= s.T @ (Ttkl @ self.K[kl].T) @ s
+            E = self.T[p] @ Fbc.T + Fbc @ self.T[p]
+            tot = Kij + A + B + E
+        C = np.zeros_like(self.T[p])
+        D = np.zeros_like(self.T[p])
+        for kk, k in enumerate(lm):
+            ki, kj, ik, jk = pl.ij[k, i], pl.ij[k, j], pl.ij[i, k], pl.ij[j, k]
+            gt = self.J_ikac[p][kk] + self.S(p, ki) @ gamma[ki] @ self.S(ki, kj)
+            C -= gt @ self.T[kj].T @ self.S(kj, p)
+            dt = 2 * self.K_iakc[p][kk] - self.J_ikac[p][kk]
+            dt = dt + self.S(p, ik) @ delta[ik] @ self.S(ik, jk)
+            Ttjk = 2 * self.T[jk] - self.T[jk].T
+            D += dt @ Ttjk.T @ self.S(jk, p)
+        nonsymmetric = .5 * C + C.T + .5 * D
+        G = np.zeros_like(self.T[p])
+        for k in pl.neighbors(i):
+            ik = pl.ij[i, k]
+            G -= Fdd[k, j] * (self.S(p, ik) @ self.T[ik] @ self.S(ik, p))
+        return tot, nonsymmetric + G
 
     def lccsd_iterations(self):
         opt, pl, n = self.opt, self.pl, self.n
@@ -780,98 +818,110 @@ class RefDLPNO:
                         for (i, j, k) in self.trip]
         self.t_paos = [su.union(dom.lmo_paos[i], dom.lmo_paos[j], dom.lmo_paos[k])
                        for (i, j, k) in self.trip]
-        self.t_lmos = [np.where((pl.ij[i] >= 0) & (pl.ij[j] >= 0) & (pl.ij[k] >= 0))[0]
+        self.t_lmos = [np.intersect1d(pl.lmos(pl.ij[i, j]), pl.neighbors(k), assume_unique=True)
                        for (i, j, k) in self.trip]
         self.tno_scale = np.ones(len(self.trip))
 
     def tno_transform(self, t_cut):
-        opt, pl, orb = self.opt, self.pl, self.orb
         self.X_tno, self.e_tno = [], []
-        for t, (i, j, k) in enumerate(self.trip):
-            paos = self.t_paos[t]
-            Xp, ep = su.orthocanonicalize(orb.S_pao[np.ix_(paos, paos)],
-                                          orb.F_pao[np.ix_(paos, paos)], opt['S_CUT'])
-            D = 0.
-            for a, b in ((i, j), (j, k), (i, k)):
-                p = pl.ij[a, b]
-                T = self.T[p]
-                Tt = 2 * T - T.T
-                Dp = Tt @ T.T + Tt.T @ T
-                if a == b:
-                    Dp *= .5
-                s = self.X[p].T @ orb.S_pao[np.ix_(self.pao[p], paos)] @ Xp
-                D = D + s.T @ Dp @ s
-            D /= 3.
-            occ, U = np.linalg.eigh(D)
-            occ, U = occ[::-1], U[:, ::-1]
-            nfin = sum(1 for a in range(len(occ))
-                       if abs(occ[a]) >= self.tno_scale[t] * t_cut or a < opt['MIN_TNOS'])
-            nfin = max(1, nfin)
-            U = U[:, :nfin]
-            V, e = su.canonicalize(U, np.diag(ep))
-            self.X_tno.append(Xp @ U @ V)
+        for t in range(len(self.trip)):
+            X, e = self._tno_triplet(t, t_cut)
+            self.X_tno.append(X)
             self.e_tno.append(e)
+
+    def _tno_triplet(self, t, t_cut):
+        """One TNO subspace, without changing the screening-stage state."""
+        opt, pl, orb = self.opt, self.pl, self.orb
+        i, j, k = self.trip[t]
+        paos = self.t_paos[t]
+        Xp, ep = su.orthocanonicalize(orb.S_pao[np.ix_(paos, paos)],
+                                      orb.F_pao[np.ix_(paos, paos)], opt['S_CUT'])
+        D = 0.
+        for a, b in ((i, j), (j, k), (i, k)):
+            p = pl.ij[a, b]
+            T = self.T[p]
+            Tt = 2 * T - T.T
+            Dp = Tt @ T.T + Tt.T @ T
+            if a == b:
+                Dp *= .5
+            s = self.X[p].T @ orb.S_pao[np.ix_(self.pao[p], paos)] @ Xp
+            D = D + s.T @ Dp @ s
+        D /= 3.
+        occ, U = np.linalg.eigh(D)
+        occ, U = occ[::-1], U[:, ::-1]
+        nfin = sum(1 for a in range(len(occ))
+                   if abs(occ[a]) >= self.tno_scale[t] * t_cut or a < opt['MIN_TNOS'])
+        nfin = max(1, nfin)
+        U = U[:, :nfin]
+        V, e = su.canonicalize(U, np.diag(ep))
+        return Xp @ U @ V, e
 
     def _S_tp(self, t, p):
         """S(a_triplet, a_pair)."""
         return self.X_tno[t].T @ self.orb.S_pao[np.ix_(self.t_paos[t], self.pao[p])] @ self.X[p]
 
-    def lccsd_t0(self, save=False):
+    def _triplet_t0(self, t):
+        """One triplet, with no mutation of the energy or amplitude state."""
         pl, f = self.pl, self.orb.F_lmo
-        E = 0.
-        self.e_ijk = np.zeros(len(self.trip))
+        i, j, k = self.trip[t]
+        aux, paos, lm, X = self.t_ribfs[t], self.t_paos[t], self.t_lmos[t], self.X_tno[t]
+        nv = X.shape[1]
+        qo = {a: self.qij[np.ix_(aux, [a], lm)][:, 0] for a in (i, j, k)}
+        qv = {a: self.qia[np.ix_(aux, [a], paos)][:, 0] @ X for a in (i, j, k)}
+        q_vv = lib.einsum('ua,Quv,vb->Qab', X, self.qab[np.ix_(aux, paos, paos)], X)
+        A = self.J2c[np.ix_(aux, aux)]
+        cho = scipy.linalg.cho_factor(A)
+        qvc = {a: scipy.linalg.cho_solve(cho, qv[a]) for a in qv}
+        ih = _sym_inv_sqrt_solver(A)
+        qv = {a: ih(v) for a, v in qv.items()}
+        qo = {a: ih(v) for a, v in qo.items()}
+        na = len(aux)
+        Kvvv = {a: (qvc[a].T @ q_vv.reshape(na, -1)).reshape(nv, nv, nv) for a in qv}
+        Kov = {(a, b): qo[a].T @ qv[b] for a in qv for b in qv}
+        perms = [(i, j, k), (i, k, j), (j, i, k), (j, k, i), (k, i, j), (k, j, i)]
+        Wp = []
+        for (I, J, K) in perms:
+            kj = pl.ij[K, J]
+            s = self._S_tp(t, kj)
+            Tkj = s @ self.T[kj] @ s.T
+            w = lib.einsum('abd,cd->abc', Kvvv[I], Tkj)
+            Kl = Kov[(J, K)]
+            for ll, l in enumerate(lm):
+                il = pl.ij[I, l]
+                s = self._S_tp(t, il)
+                Til = s @ self.T[il] @ s.T
+                w -= Til[:, :, None] * Kl[ll][None, None, :]
+            Wp.append(w)
+        W = (Wp[0] + Wp[1].transpose(0, 2, 1) + Wp[2].transpose(1, 0, 2)
+             + Wp[3].transpose(2, 0, 1) + Wp[4].transpose(1, 2, 0)
+             + Wp[5].transpose(2, 1, 0))
+        Ti = self._S_tp(t, pl.ij[i, i]) @ self.T1[i]
+        Tj = self._S_tp(t, pl.ij[j, j]) @ self.T1[j]
+        Tk = self._S_tp(t, pl.ij[k, k]) @ self.T1[k]
+        Kjk = qv[j].T @ qv[k]
+        Kik = qv[i].T @ qv[k]
+        Kij = qv[i].T @ qv[j]
+        V = (W + Ti[:, None, None] * Kjk[None] + Tj[None, :, None] * Kik[:, None, :]
+             + Tk[None, None, :] * Kij[:, :, None])
+        e = self.e_tno[t]
+        Dn = e[:, None, None] + e[None, :, None] + e[None, None, :] - f[i, i] - f[j, j] - f[k, k]
+        T3 = -W / Dn
+        eijk = self._e_ijk(i, j, k, V, T3)
+        return eijk, W, V, T3
+
+    def lccsd_t0(self, save=False):
+        E, energies = 0., []
         if save:
             self.W3, self.V3, self.T3 = [], [], []
-        for t, (i, j, k) in enumerate(self.trip):
-            aux, paos, lm, X = self.t_ribfs[t], self.t_paos[t], self.t_lmos[t], self.X_tno[t]
-            nv = X.shape[1]
-            qo = {a: self.qij[np.ix_(aux, [a], lm)][:, 0] for a in (i, j, k)}
-            qv = {a: self.qia[np.ix_(aux, [a], paos)][:, 0] @ X for a in (i, j, k)}
-            q_vv = lib.einsum('ua,Quv,vb->Qab', X, self.qab[np.ix_(aux, paos, paos)], X)
-            A = self.J2c[np.ix_(aux, aux)]
-            cho = scipy.linalg.cho_factor(A)
-            qvc = {a: scipy.linalg.cho_solve(cho, qv[a]) for a in qv}
-            ih = _sym_inv_sqrt_solver(A)
-            qv = {a: ih(v) for a, v in qv.items()}
-            qo = {a: ih(v) for a, v in qo.items()}
-            na = len(aux)
-            Kvvv = {a: (qvc[a].T @ q_vv.reshape(na, -1)).reshape(nv, nv, nv) for a in qv}
-            Kov = {(a, b): qo[a].T @ qv[b] for a in qv for b in qv}
-            perms = [(i, j, k), (i, k, j), (j, i, k), (j, k, i), (k, i, j), (k, j, i)]
-            Wp = []
-            for (I, J, K) in perms:
-                kj = pl.ij[K, J]
-                s = self._S_tp(t, kj)
-                Tkj = s @ self.T[kj] @ s.T
-                w = lib.einsum('abd,cd->abc', Kvvv[I], Tkj)
-                Kl = Kov[(J, K)]
-                for ll, l in enumerate(lm):
-                    il = pl.ij[I, l]
-                    s = self._S_tp(t, il)
-                    Til = s @ self.T[il] @ s.T
-                    w -= Til[:, :, None] * Kl[ll][None, None, :]
-                Wp.append(w)
-            W = (Wp[0] + Wp[1].transpose(0, 2, 1) + Wp[2].transpose(1, 0, 2)
-                 + Wp[3].transpose(2, 0, 1) + Wp[4].transpose(1, 2, 0)
-                 + Wp[5].transpose(2, 1, 0))
-            Ti = self._S_tp(t, pl.ij[i, i]) @ self.T1[i]
-            Tj = self._S_tp(t, pl.ij[j, j]) @ self.T1[j]
-            Tk = self._S_tp(t, pl.ij[k, k]) @ self.T1[k]
-            Kjk = qv[j].T @ qv[k]
-            Kik = qv[i].T @ qv[k]
-            Kij = qv[i].T @ qv[j]
-            V = (W + Ti[:, None, None] * Kjk[None] + Tj[None, :, None] * Kik[:, None, :]
-                 + Tk[None, None, :] * Kij[:, :, None])
-            e = self.e_tno[t]
-            Dn = e[:, None, None] + e[None, :, None] + e[None, None, :] - f[i, i] - f[j, j] - f[k, k]
-            T3 = -W / Dn
-            eijk = self._e_ijk(i, j, k, V, T3)
-            self.e_ijk[t] = eijk
+        for t in range(len(self.trip)):
+            eijk, W, V, T3 = self._triplet_t0(t)
+            energies.append(eijk)
             E += eijk
             if save:
                 self.W3.append(W)
                 self.V3.append(V)
                 self.T3.append(T3)
+        self.e_ijk = np.array(energies)
         return E
 
     @staticmethod
@@ -905,12 +955,52 @@ class RefDLPNO:
     def _matmul_3d(self, A, S):
         return lib.einsum('aA,bB,cC,ABC->abc', S, S, S, A)
 
+    def _triples_couplings(self):
+        """Sparse substitutions of one occupied index, in legacy sum order."""
+        cached = getattr(self, '_triplet_connections', None)
+        if cached is not None and cached[0] is self.trip:
+            return cached[1]
+        partners = {}
+        for a, b, c in self.trip_idx:
+            partners.setdefault((a, b), set()).add(c)
+        connections = []
+        for i, j, k in self.trip:
+            rows = []
+            for slot, (a, b, old) in enumerate(((i, j, k), (i, k, j), (j, k, i))):
+                for occ in partners.get((a, b), ()):
+                    if occ == old:
+                        continue
+                    key = ((i, j, occ), (i, occ, k), (occ, j, k))[slot]
+                    rows.append((occ, slot, key, self.trip_idx[key], old))
+            rows.sort(key=lambda item: item[:2])
+            connections.append([(key, u, occ, old) for occ, _, key, u, old in rows])
+        self._triplet_connections = self.trip, connections
+        return connections
+
+    def _triplet_residual(self, t, connections):
+        """One coupled triples residual, with no amplitude mutation."""
+        i, j, k = self.trip[t]
+        f, orb, e = self.orb.F_lmo, self.orb, self.e_tno[t]
+        den = (e[:, None, None]+e[None, :, None]+e[None, None, :]
+               -f[i, i]-f[j, j]-f[k, k])
+        r = self.W3[t]+self.T3[t]*den
+        for key, u, occ, old in connections:
+            fl = f[occ, old]
+            if abs(fl) < self.opt['F_CUT_T']:
+                continue
+            s = (self.X_tno[t].T@orb.S_pao[np.ix_(self.t_paos[t], self.t_paos[u])]
+                 @self.X_tno[u])
+            r -= fl*self._matmul_3d(_permute(self.T3[u], *key), s)
+        return r
+
     def lccsd_t_iterations(self):
-        opt, f, n = self.opt, self.orb.F_lmo, self.n
+        opt, f = self.opt, self.orb.F_lmo
         ntrip = len(self.trip)
+        if ntrip == 0:
+            return 0.
         e_old = np.zeros(ntrip)
         e_prev = 0.
-        orb = self.orb
+        connections = self._triples_couplings()
         for it in range(1, opt['MAXITER'] + 1):
             rms = np.zeros(ntrip)
             for t, (i, j, k) in enumerate(self.trip):
@@ -919,17 +1009,7 @@ class RefDLPNO:
                 e = self.e_tno[t]
                 Dn = (e[:, None, None] + e[None, :, None] + e[None, None, :]
                       - f[i, i] - f[j, j] - f[k, k])
-                R = self.W3[t] + self.T3[t] * Dn
-                for l in range(n):
-                    for (key, fl, perm) in (((i, j, l), f[l, k], (i, j, l)) if l != k else (None, 0, None),
-                                            ((i, l, k), f[l, j], (i, l, k)) if l != j else (None, 0, None),
-                                            ((l, j, k), f[l, i], (l, j, k)) if l != i else (None, 0, None)):
-                        if key is None or key not in self.trip_idx or abs(fl) < opt['F_CUT_T']:
-                            continue
-                        u = self.trip_idx[key]
-                        s = (self.X_tno[t].T @ orb.S_pao[np.ix_(self.t_paos[t], self.t_paos[u])]
-                             @ self.X_tno[u])
-                        R -= fl * self._matmul_3d(_permute(self.T3[u], *perm), s)
+                R = self._triplet_residual(t, connections[t])
                 self.T3[t] = self.T3[t] - R / Dn
                 rms[t] = _rms(R)
             e_old = self.e_ijk.copy()
@@ -951,14 +1031,16 @@ class RefDLPNO:
         t = time.perf_counter()
         self.setup()
         n = self.n
-        mask = ((self.doi_ij > opt['T_CUT_DO_IJ']) | (np.abs(self.dip_b) > opt['T_CUT_PRE'])
-                | np.eye(n, dtype=bool))
-        self.de_dipole = float(np.sum(self.dip_e[~mask]))
+        mask = (self._initial_pair_mask if hasattr(self, '_initial_pair_mask') else
+                ((self.doi_ij > opt['T_CUT_DO_IJ']) | (np.abs(self.dip_b) > opt['T_CUT_PRE'])
+                 | np.eye(n, dtype=bool)))
+        self.de_dipole = (float(self._distant_tail_energy) if hasattr(self, '_distant_tail_energy')
+                          else float(np.sum(self.dip_e[~mask])))
         t = time.perf_counter()
         # crude prescreening
         self.set_pairs(mask, self.domains(opt['T_CUT_MKN'] * 100, opt['T_CUT_DO'] * 2))
         e_crude = self.sc_mp2_pair_energies()
-        keep = np.zeros((n, n), bool)
+        keep = su.empty_mask_like(mask)
         self.de_lmp2_eliminated = 0.
         for p, (i, j) in enumerate(self.pl.pairs):
             if abs(e_crude[p]) >= opt['T_CUT_PAIRS_MP2'] or i == j:

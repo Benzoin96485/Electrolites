@@ -8,7 +8,9 @@ Pinski et al., JCP 143, 034108 (2015) and their Psi4 implementation
 fitting domains, PAO domains completed by atom.
 """
 import numpy as np
+from .screening import row_above, column_above, mask_pairs, empty_mask_like
 import scipy.linalg
+from contextvars import ContextVar
 
 from pyscf import lib
 from pyscf.dft import gen_grid, numint, radi
@@ -29,15 +31,27 @@ def asnumpy(a):
 # small dense helpers
 # --------------------------------------------------------------------------
 
+# Optional validation trace.  Context-local state avoids monkey-patching
+# numeric routines or retaining selection histories in production runs.
+orthogonalization_trace = ContextVar('dlpno_orthogonalization_trace', default=None)
+
 def pivoted_cholesky(S, tol):
     """Indices chosen by a pivoted Cholesky of S, stopping at diag < tol
     (Psi4 ``Matrix::pivoted_cholesky``)."""
+    # Match the GPU/Psi4 PAO convention: order functions by increasing
+    # off-diagonal overlap before pivot selection. At finite S_CUT,
+    # choosing another set of columns changes the retained approximate
+    # subspace even when its rank is unchanged.
+    order = np.argsort(np.sum(abs(S), axis=1)-abs(np.diag(S)), kind='stable')
+    S = S[np.ix_(order, order)]
     n = S.shape[0]
     L = np.zeros((n, n))
     d = np.array(np.diag(S), dtype=float)
     piv = []
     for m in range(n):
-        p = int(np.argmax(d))
+        maximum = d.max()
+        tie = 16*np.finfo(float).eps*max(1., abs(maximum))
+        p = int(np.flatnonzero(d >= maximum-tie)[0])
         if d[p] < tol:
             break
         piv.append(p)
@@ -46,6 +60,10 @@ def pivoted_cholesky(S, tol):
         L[:, m] = lp
         d = d - lp * lp
         d[piv] = -1.
+    piv = [int(order[p]) for p in piv]
+    trace = orthogonalization_trace.get()
+    if trace is not None:
+        trace.append([n, sorted(piv), len(piv)])
     return piv
 
 
@@ -285,12 +303,12 @@ class Domains:
     def __init__(self, mkn_pops, doi_iu, t_cut_mkn, t_cut_do, bf_atom,
                  atom_bfs, atom_ribfs):
         n = doi_iu.shape[0]
-        self.lmo_riatoms = [np.where(np.abs(mkn_pops[:, i]) > t_cut_mkn)[0]
+        self.lmo_riatoms = [column_above(mkn_pops, i, t_cut_mkn)
                             for i in range(n)]
         self.lmo_ribfs = [np.concatenate([atom_ribfs[a] for a in at]).astype(int)
                           if len(at) else np.zeros(0, int)
                           for at in self.lmo_riatoms]
-        self.lmo_paos = [contract_to_atoms(np.where(np.abs(doi_iu[i]) > t_cut_do)[0],
+        self.lmo_paos = [contract_to_atoms(row_above(doi_iu, i, t_cut_do),
                                            bf_atom, atom_bfs) for i in range(n)]
 
 
@@ -300,17 +318,50 @@ def union(*lists):
     return np.unique(np.concatenate([np.asarray(l, dtype=int) for l in lists]))
 
 
-class PairList:
-    """Ordered LMO pairs (both ij and ji) with dense lookup."""
+class SparsePairIndex:
+    """Constant-time pair lookup with storage proportional to kept pairs."""
 
-    def __init__(self, n, mask):
+    def __init__(self, n, pairs):
+        self.shape = (n, n)
+        self.entries = {tuple(pair): p for p, pair in enumerate(pairs)}
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key, slice(None))
+        i, j = key
+        if np.isscalar(i) and np.isscalar(j):
+            return self.entries.get((int(i), int(j)), -1)
+        slice_i, slice_j = isinstance(i, slice), isinstance(j, slice)
+        i = np.arange(self.shape[0])[i] if slice_i else np.asarray(i)
+        j = np.arange(self.shape[1])[j] if slice_j else np.asarray(j)
+        if slice_i and j.ndim:
+            i, j = i.reshape((-1,)+(1,)*j.ndim), j[None]
+        elif slice_j and i.ndim:
+            i = i[..., None]
+        rows, cols = np.broadcast_arrays(i, j)
+        return np.fromiter((self.entries.get((int(a), int(b)), -1)
+                            for a, b in zip(rows.ravel(), cols.ravel())),
+                           dtype=int, count=rows.size).reshape(rows.shape)
+
+
+class PairList:
+    """Ordered LMO pairs (both ij and ji) with optional sparse lookup."""
+
+    def __init__(self, n, mask, sparse=False):
         self.n = n
-        self.ij = -np.ones((n, n), dtype=int)
-        pairs = [(i, j) for i in range(n) for j in range(n) if mask[i, j]]
+        pairs = mask_pairs(mask)
         self.pairs = pairs
-        for p, (i, j) in enumerate(pairs):
-            self.ij[i, j] = p
+        if sparse:
+            self.ij = SparsePairIndex(n, pairs)
+        else:
+            self.ij = -np.ones((n, n), dtype=int)
+            for p, (i, j) in enumerate(pairs):
+                self.ij[i, j] = p
         self.ji = np.array([self.ij[j, i] for (i, j) in pairs], dtype=int)
+        self._neighbors = [[] for _ in range(n)]
+        for i, j in pairs:
+            self._neighbors[i].append(j)
+        self._neighbors = [np.asarray(row, dtype=int) for row in self._neighbors]
 
     def __len__(self):
         return len(self.pairs)
@@ -318,4 +369,7 @@ class PairList:
     def lmos(self, p):
         """LMOs m with (i,m) and (j,m) both valid pairs."""
         i, j = self.pairs[p]
-        return np.where((self.ij[i] >= 0) & (self.ij[j] >= 0))[0]
+        return np.intersect1d(self._neighbors[i], self._neighbors[j], assume_unique=True)
+
+    def neighbors(self, i):
+        return self._neighbors[i]

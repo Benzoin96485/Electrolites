@@ -50,7 +50,7 @@ def _decide_qab_host(nbytes):
 class ExtDomains:
     """Psi4's extended LMO / PAO domains of each auxiliary atom."""
 
-    def __init__(self, natm, lmo_riatoms, lmo_paos, pairs, nbf):
+    def __init__(self, natm, lmo_riatoms, lmo_paos, pairs, nbf, *, sparse_positions=False):
         n = len(lmo_riatoms)
         ext = [set() for _ in range(n)]
         for (i, j) in pairs:
@@ -66,10 +66,13 @@ class ExtDomains:
                 self.paos.append(np.unique(np.concatenate([lmo_paos[i] for i in self.lmos[a]])))
             else:
                 self.paos.append(np.zeros(0, np.int64))
-        # dense position lookups, -1 when absent
-        self.pao_pos = -np.ones((natm, nbf), dtype=np.int64)
-        for a in range(natm):
-            self.pao_pos[a, self.paos[a]] = np.arange(len(self.paos[a]))
+        if sparse_positions:
+            from .screening import SparsePositions
+            self.pao_pos = SparsePositions(self.paos, nbf)
+        else:
+            self.pao_pos = -np.ones((natm, nbf), dtype=np.int64)
+            for a in range(natm):
+                self.pao_pos[a, self.paos[a]] = np.arange(len(self.paos[a]))
 
 
 class DFInts:
@@ -95,6 +98,24 @@ class DFInts:
         # memory behind a device cache (``qab_get``)
         nab = sum(8. * len(atom_ribfs[a]) * len(ext.paos[a]) ** 2 for a in range(natm)) if need_ab else 0.
         self.qab_host = _decide_qab_host(nab)
+        # several GPUs: rather than pinned host memory, shard the blocks over
+        # the other devices (served by peer copies over NVLink)
+        self._shard = None
+        if ((self.qab_host and os.environ.get('DLPNO_QAB_HOST', 'auto') == 'auto')
+                or os.environ.get('DLPNO_QAB_SHARD') == '1'):
+            from electrolites.dlpno import mgpu
+            devs = mgpu.devices()
+            home = cp.cuda.Device().id
+            others = [d for d in devs if d != home]
+            if others:
+                cap = 0.
+                for d in others:
+                    with cp.cuda.Device(d):
+                        cap += cp.cuda.runtime.memGetInfo()[0]
+                if nab < 0.35 * cap:
+                    mgpu.enable_peer(devs)
+                    self.qab_host = False
+                    self._shard = dict(devs=others, load=np.zeros(len(others)))
         self._cache = {}               # device -> OrderedDict(atom -> block)
         self._cache_bytes = {}
         self.cache_stats = dict(hit=0, miss=0, bytes=0.)
@@ -139,7 +160,16 @@ class DFInts:
                     m = mask_uv[cp.asarray(pa)[:, None], cp.asarray(pa)[None, :]]
                     u *= m[None]
                     del m
-                    self.qab[a] = to_pinned(u) if self.qab_host else u
+                    if self.qab_host:
+                        self.qab[a] = to_pinned(u)
+                    elif self._shard is not None:
+                        sh = self._shard
+                        r = int(np.argmin(sh['load']))
+                        sh['load'][r] += u.nbytes
+                        with cp.cuda.Device(sh['devs'][r]):
+                            self.qab[a] = cp.asarray(u)
+                    else:
+                        self.qab[a] = u
                     del u
                     off += na
             del j3c
@@ -202,7 +232,27 @@ class DFInts:
         env = os.environ.get('DLPNO_QAB_CACHE_GB')
         if env is not None:
             return float(env) * 1e9
-        return 0.25 * cp.cuda.Device().mem_info[1]
+        # grow while a quarter of the device stays free (whole tensor resident
+        # when it fits), never below a quarter of the device
+        free, tot = cp.cuda.runtime.memGetInfo()
+        free += cp.get_default_memory_pool().free_bytes()
+        mine = self._cache_bytes.get(cp.cuda.Device().id, 0)
+        return max(0.2 * tot, min(0.55 * tot, free + mine - 0.35 * tot))
+
+    def spatial_order(self, atom_sets):
+        """order of items (given by their aux-atom sets) along a Morton curve
+        of their centres: consecutive chunks then share most aux atoms (and
+        their cached (Q|uv) blocks)."""
+        xyz = np.asarray(self.mol.atom_coords())
+        c = np.array([xyz[np.asarray(a, np.int64)].mean(axis=0) if len(a) else np.zeros(3)
+                      for a in atom_sets])
+        lo, hi = c.min(axis=0), c.max(axis=0)
+        q = ((c - lo) / np.maximum(hi - lo, 1e-9) * 1023).astype(np.int64)
+        code = np.zeros(len(c), np.int64)
+        for bit in range(10):
+            for d in range(3):
+                code |= ((q[:, d] >> bit) & 1) << (3 * bit + d)
+        return np.argsort(code, kind='stable')
 
     def cache_clear(self):
         self._cache.clear()
