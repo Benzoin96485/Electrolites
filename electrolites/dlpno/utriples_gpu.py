@@ -22,7 +22,7 @@ import itertools
 
 import numpy as np
 import cupy as cp
-from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno.gather import blocks as gather_blocks, xtbx
 from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx
 
@@ -149,6 +149,13 @@ class UTriplesGPU:
         pt = self._pt
         bidx = cp.asarray(bidx)
         pidx = cp.asarray(pidx)
+        n = len(pidx)
+        V_ = Z[s].shape[2]
+        step = max(1, int((1 << 28) // (8 * (pt['PP'] + self.ns) * (max(pt['VA'], pt['VB']) + V_))))
+        if n > step:
+            # bounded temporaries: the gathered PAO rows are (couples, PP, VP + V)
+            parts = [self._proj(Z, s, bidx[c0:c0 + step], pidx[c0:c0 + step]) for c0 in range(0, n, step)]
+            return cp.concatenate(parts, axis=0)
         dom, dmk = pt['dom'][pidx], pt['dmk'][pidx]
         if s == 0:
             Zg = Z[0][bidx[:, None], dom] * dmk[:, :, None]
@@ -275,7 +282,7 @@ class UTriplesGPU:
         items = []
         for Pv in np.unique(P):
             sel = np.where(P == Pv)[0]
-            sel = sel[np.argsort(self._naux_t[sel], kind='stable')]
+            sel = sel[self.dfi.spatial_order([self.t_riatoms[t] for t in sel])]
             Pv = int(Pv)
             per = 8 * (12 * Pv * Pv + 2 * nbf * Pv)
             step = max(1, int(self._chunk_bytes() // per))
@@ -385,11 +392,11 @@ class UTriplesGPU:
                 sl = slice(r0, r0 + step)
                 g_ = gr[sl]
                 nr = len(rows[sl])
-                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl])
+                blk = gather_blocks(qa_, gpos[sl], gpos[sl], mrow[sl], mrow[sl], ru=True)
                 oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                 for s_, Xs in ((0, Xa), (1, Xbp)):
                     xr = Xs[g_]
-                    q_ = cp.matmul(cp.matmul(tr(xr)[:, None], blk), xr[:, None])      # (nr, na, V, V)
+                    q_ = xtbx(blk, xr, xr)                                            # (nr, na, V, V)
                     q_ = q_.reshape(nr, na, -1).transpose(0, 2, 1)                     # (nr, V*V, na)
                     for (r, s2, t), K in K3.items():
                         if s2 != s_:

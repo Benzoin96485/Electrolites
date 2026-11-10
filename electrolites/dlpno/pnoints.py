@@ -40,7 +40,9 @@ class PNOIntsGPU:
         for Pv in np.unique(P):
             sel = [p for p, pv in zip(canon, P) if pv == Pv]
             # neighbouring pairs share aux atoms: order by the fitting domain
-            sel.sort(key=lambda p: (int(self.strong[p]), tuple(self.riatoms[p][:3])))
+            # neighbouring pairs (Morton order of their fitting domains) share aux atoms
+            o_ = self.dfi.spatial_order([self.riatoms[p] for p in sel])
+            sel = [sel[k] for k in o_]
             ch, tot = [], 0
             for p in sel:
                 A = -(-sum(len(self.dfi.atom_ribfs[a]) for a in self.riatoms[p]) // 32) * 32
@@ -73,9 +75,12 @@ class PNOIntsGPU:
         def work(w, it):
             out = w._pno_chunk(*it)
             if cp.cuda.Device().id != home:
-                # the CC driver reads the integrals on the home device
+                # the CC driver reads the pair integrals on the home device; the
+                # strong pairs' DF tensors stay here (their DF groups are spread
+                # over the devices anyway)
                 with cp.cuda.Device(home):
-                    out = mgpu.replicate(out)
+                    out = {k: (v if k in ('iQk', 'iQa', 'Qma', 'Qab') else mgpu.replicate(v))
+                           for k, v in out.items()}
             for name, d in out.items():
                 lst = getattr(self, name)
                 for p, v in d.items():
@@ -88,7 +93,7 @@ class PNOIntsGPU:
                 c._prof.report()
         self._ext = None
         if getattr(self, 'verbose', 0) >= 2:
-            if getattr(self.dfi, 'qab_host', False):
+            if getattr(self.dfi, 'qab_host', False) or getattr(self.dfi, '_shard', None):
                 print('[mem] (Q|uv) cache', self.dfi.cache_stats, flush=True)
             sz = {}
             for name in ('K_mibj', 'J_ijmb', 'K_ivvv', 'J_ikac', 'K_iakc', 'iQk', 'iQa', 'Qma', 'Qab'):
@@ -202,11 +207,16 @@ class PNOIntsGPU:
             for r0 in range(0, len(rows), step):
                 sl = slice(r0, r0 + step)
                 g_ = gr[sl]
-                blk = gather_blocks(qa, gpos[sl], gpos[sl], gpm[g_], gpm[g_])
+                # (b, u, q, v) layout: both contractions are single large GEMMs
+                blk = gather_blocks(qa, gpos[sl], gpos[sl], gpm[g_], gpm[g_], ru=True)
+                b_ = blk.shape[0]
                 xr = X[g_]
-                oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
-                q_vv[g_[:, None], oo] = cp.matmul(cp.matmul(_tr(xr)[:, None], blk), xr[:, None])
+                Y = cp.matmul(_tr(xr), blk.reshape(b_, P, na * P))                  # (b, V, na*P)
                 del blk
+                Y = cp.matmul(Y.reshape(b_, V * na, P), xr).reshape(b_, V, na, V)    # (b, V, na, V)
+                oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
+                q_vv[g_[:, None], oo] = Y.transpose(0, 2, 1, 3)
+                del Y
             srows = rows[st[rows]]
             if not len(srows):
                 continue
@@ -223,10 +233,11 @@ class PNOIntsGPU:
             for r0 in range(0, len(srows), step):
                 sl = slice(r0, r0 + step)
                 g_, s_ = gsr[sl], gsr2[sl]
-                blk = gather_blocks(qa, gpp[sl], gep[sl], gpm[g_], gem[s_])      # (b, na, P, E)
+                blk = gather_blocks(qa, gpp[sl], gep[sl], gpm[g_], gem[s_], ru=True)   # (b, P, na, E)
                 b_ = blk.shape[0]
-                ve = cp.matmul(_tr(X[g_])[:, None], blk).reshape(b_, na, V * E)        # (b, na, V E)
+                ve = cp.matmul(_tr(X[g_]), blk.reshape(b_, P, na * E))                # (b, V, na*E)
                 del blk
+                ve = cp.ascontiguousarray(ve.reshape(b_, V, na, E).transpose(0, 2, 1, 3)).reshape(b_, na, V * E)
                 oo = cp.asarray(soff[sl])[:, None] + cp.arange(na)[None, :]
                 Kio[s_] += cp.matmul(_tr(q_io_c[g_[:, None], oo]), ve).reshape(b_, L, V, E)
                 Kjo[s_] += cp.matmul(_tr(q_jo_c[g_[:, None], oo]), ve).reshape(b_, L, V, E)
@@ -253,6 +264,7 @@ class PNOIntsGPU:
         K_ivvv = cp.matmul(_tr(q_iv), q_vv.reshape(B, A, V * V)).reshape(B, V, V, V)
         K_jvvv = cp.matmul(_tr(q_jv), q_vv.reshape(B, A, V * V)).reshape(B, V, V, V)
         prof('out')
+        proj = self._proj_chunk(ch, st, srank, nla, nva, Kio, Koviv, Kjo, Kovjv) if ns else {}
         names = ('K_mibj', 'J_ijmb', 'K_ivvv', 'J_ikac', 'K_iakc', 'iQk', 'iQa', 'Qma', 'Qab')
         out = {k: {} for k in names}
         cc = cp.ascontiguousarray
@@ -269,18 +281,9 @@ class PNOIntsGPU:
                 out['K_ivvv'][q] = cc(K_jvvv[s, :nv, :nv, :nv]).reshape(nv, nv * nv)
             if not st[s]:
                 continue
-            r = srank[s]
-            e_ = self._ext[p]
-            ne = len(e_)
-            pos = -np.ones(self.orb.nbf, dtype=np.int64)
-            pos[e_] = np.arange(ne)
-            lm_a = np.asarray(self.lmos[p], np.int64)
-            kjs, iks = pl.ij[lm_a, j], pl.ij[i, lm_a]
-            Jp, Kp = self._proj_batch(Kio[r, :nl, :nv, :ne], Koviv[r, :nl, :ne, :nv], kjs, pos)
-            out['J_ikac'][p], out['K_iakc'][p] = Jp, Kp
+            out['J_ikac'][p], out['K_iakc'][p] = proj[(p, 0)]
             if q != p:
-                Jq, Kq = self._proj_batch(Kjo[r, :nl, :nv, :ne], Kovjv[r, :nl, :ne, :nv], iks, pos)
-                out['J_ikac'][q], out['K_iakc'][q] = Jq, Kq
+                out['J_ikac'][q], out['K_iakc'][q] = proj[(p, 1)]
             vals = [cc(q_io[s, :na_, :nl]), cc(q_iv[s, :na_, :nv]), cc(q_ov[s, :na_, :nl, :nv]),
                     cc(q_vv[s, :na_, :nv, :nv])]
             vq = [cc(q_jo[s, :na_, :nl]), cc(q_jv[s, :na_, :nv])]
@@ -293,4 +296,98 @@ class PNOIntsGPU:
                 out['iQk'][q], out['iQa'][q] = vq
                 out['Qma'][q], out['Qab'][q] = vals[2], vals[3]
         prof(None)
+        return out
+
+    def _xcompact(self):
+        """device store of every canonical pair's PNO coefficients in its PAO
+        domain (one Ragged), and an item -> pointer table (per device)."""
+        dev = cp.cuda.Device().id
+        c = self.__dict__.setdefault('_xc_dev', {})
+        if dev not in c:
+            from electrolites.dlpno.ragged import Layout, Ragged
+            pl = self.pl
+            npair = len(pl)
+            canon = np.array([p if pl.pairs[p][0] <= pl.pairs[p][1] else pl.ji[p] for p in range(npair)])
+            lay = Layout(np.array([len(self.pao[p]) for p in range(npair)]),
+                         np.array([self.X[p].shape[1] for p in range(npair)]))
+            R = Ragged(lay)
+            for g, m in enumerate(lay.members):
+                pr, pc = lay.shapes[g]
+                buf = np.zeros((len(m), pr, pc))
+                for s_, p in enumerate(m):
+                    x = self.X[canon[p]]
+                    buf[s_, :x.shape[0], :x.shape[1]] = x
+                R.data[g] = cp.asarray(buf)
+            shp = np.array(lay.shapes, np.int64).reshape(-1, 2)
+            base = np.array([d.data.ptr for d in R.data], np.int64)
+            ptr = base[lay.group] + 8 * lay.slot * shp[lay.group, 0] * shp[lay.group, 1]
+            c[dev] = (R, ptr, shp[lay.group, 1].astype(np.int32))
+        return c[dev]
+
+    def _proj_chunk(self, ch, st, srank, nla, nva, Kio, Koviv, Kjo, Kovjv):
+        """(J_ikac, K_iakc) item lists of every strong pair of the chunk: the
+        (k a | i e') / (k e' | i a) blocks projected onto the PNOs of the
+        (k, j) / (i, k) pairs, all items of the chunk in a few batches."""
+        from electrolites.dlpno.gather import gather2d
+        pl = self.pl
+        Xs, xptr, xld = self._xcompact()
+        items = []                      # (key, pair p, side, rank r, row kk, target pair t, ext pos)
+        for s_, p in enumerate(ch):
+            if not st[s_]:
+                continue
+            i, j = pl.pairs[p]
+            q = pl.ji[p]
+            e_ = self._ext[p]
+            lm_a = np.asarray(self.lmos[p], np.int64)
+            for side, tg in ((0, pl.ij[lm_a, j]), (1, pl.ij[i, lm_a])):
+                if side == 1 and q == p:
+                    continue
+                for kk, t in enumerate(tg):
+                    items.append((p, side, srank[s_], kk, int(t), e_, nva[s_]))
+        out = {}
+        if not items:
+            return out
+        n_t = np.array([len(self.pao[it[4]]) for it in items])
+        v_t = np.array([self.X[it[4]].shape[1] for it in items])
+        E = Kio.shape[3]
+        V = Kio.shape[2]
+        Pq, Vq = int(n_t.max()), int(v_t.max())
+        step = max(1, int((1 << 29) // (8 * (V * E + 2 * Pq * (V + Vq) + E * V))))
+        res = [None] * len(items)
+        for c0 in range(0, len(items), step):
+            its = items[c0:c0 + step]
+            m = len(its)
+            cols = np.zeros((m, Pq), np.int64)
+            msk = np.zeros((m, Pq))
+            for r_, it in enumerate(its):
+                # Extended domains are sorted local unions. Avoid one
+                # full-molecule position array for every strong pair.
+                target = self.pao[it[4]]
+                c_ = np.searchsorted(it[5], target)
+                if np.any(c_ >= len(it[5])) or np.any(it[5][c_] != target):
+                    raise ValueError('Target PNO support is outside the extended pair domain')
+                cols[r_, :len(c_)] = c_
+                msk[r_, :len(c_)] = 1.
+            gc, gm = cp.asarray(cols), cp.asarray(msk)
+            tt = np.array([it[4] for it in its], np.int64)
+            X = gather2d(cp.asarray(xptr[tt]), cp.asarray(xld[tt]), cp.asarray(n_t[c0:c0 + m].astype(np.int32)),
+                         cp.asarray(v_t[c0:c0 + m].astype(np.int32)), Pq, Vq)        # (m, Pq, Vq)
+            rr = cp.asarray(np.array([it[2] for it in its], np.int64))
+            kk = cp.asarray(np.array([it[3] for it in its], np.int64))
+            sd = np.array([it[1] for it in its])
+            s1 = cp.asarray(sd == 1)
+            Ka = cp.where(s1[:, None, None], Kjo[rr, kk], Kio[rr, kk])                   # (m, V, E)
+            Kb = cp.where(s1[:, None, None], Kovjv[rr, kk], Koviv[rr, kk])               # (m, E, V)
+            A = cp.take_along_axis(Ka, gc[:, None, :], axis=2) * gm[:, None, :]         # (m, V, Pq)
+            J = cp.matmul(A, X)                                                          # (m, V, Vq)
+            B = cp.take_along_axis(Kb, gc[:, :, None], axis=1) * gm[:, :, None]         # (m, Pq, V)
+            K = cp.matmul(X.transpose(0, 2, 1), B).transpose(0, 2, 1)                    # (m, V, Vq)
+            for r_, it in enumerate(its):
+                res[c0 + r_] = (J[r_, :it[6], :v_t[c0 + r_]], K[r_, :it[6], :v_t[c0 + r_]])
+        for it, (Jm, Km) in zip(items, res):
+            key = (it[0], it[1])
+            if key not in out:
+                out[key] = ([], [])
+            out[key][0].append(Jm)
+            out[key][1].append(Km)
         return out

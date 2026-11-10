@@ -59,7 +59,8 @@ class _ChunkedPlan:
     MAX_BYTES = 1 << 29
 
     def __init__(self, gens, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=None, left=None,
-                 devs=None, budget=None):
+                 devs=None, budget=None, store=None):
+        self.store = store
         n = len(out_idx) if left is None else len(left[0].idx)
         self.n = self.nterms = n
         self.gens = gens if callable(gens) else (lambda d, g=gens: g)
@@ -75,18 +76,25 @@ class _ChunkedPlan:
         cid = np.stack([np.asarray(operands[i].idx, np.int64) for i in s_ops], 1)
         byt = 8 * nv[cp_] * nv[cq_]
         order = (np.argsort(np.asarray(out_idx), kind='stable') if out_idx is not None else np.arange(n))
-        bounds, cur, tot, start = [], set(), 0, 0
-        for pos, t in enumerate(order):
-            new = {int(c) for c in cid[t]} - cur
-            add = int(sum(byt[c] for c in new))
-            if cur and tot + add > self.MAX_BYTES:
-                bounds.append((start, pos, tot))
-                start, cur, tot = pos, set(), 0
-                new = {int(c) for c in cid[t]}
-                add = int(sum(byt[c] for c in new))
-            cur |= new
-            tot += add
-        bounds.append((start, n, tot))
+        # greedy chunks of terms whose distinct overlaps stay within MAX_BYTES
+        # (vectorised: first uses counted within a window from the chunk start)
+        bounds, start = [], 0
+        k = cid.shape[1]
+        W0 = 4096
+        while start < n:
+            W = min(n - start, W0)
+            ids = cid[order[start:start + W]].ravel()
+            _, first = np.unique(ids, return_index=True)
+            add = np.zeros(W * k)
+            add[first] = byt[ids[first]]
+            cum = np.cumsum(add.reshape(W, k).sum(axis=1))
+            over = np.flatnonzero(cum > self.MAX_BYTES)
+            if not len(over) and W < n - start:
+                W0 *= 2
+                continue
+            L = max(1, int(over[0])) if len(over) else W
+            bounds.append((start, start + L, float(cum[L - 1])))
+            start += L
         load = np.zeros(len(devs))
         for a, b, nb in bounds:
             r = int(np.argmin(load))
@@ -100,8 +108,13 @@ class _ChunkedPlan:
         s_ops = self.s_ops
         uni = np.unique(cid[sel])
         LSc = Layout(nv[cp_[uni]], nv[cq_[uni]])
-        gen = self.gens(cp.cuda.Device().id)
-        preps = gen.prepare(cp_[uni], cq_[uni], out_layout=LSc, out_idx=np.arange(len(uni)))
+        if self.store is not None:
+            # overlaps computed once into a store spread over the GPUs: this
+            # chunk gathers its blocks by pointer (peer reads over NVLink)
+            gen, preps = None, self.store.tables(LSc, uni)
+        else:
+            gen = self.gens(cp.cuda.Device().id)
+            preps = gen.prepare(cp_[uni], cq_[uni], out_layout=LSc, out_idx=np.arange(len(uni)))
         ops = []
         for i, o in enumerate(operands):
             row = None if o.row is None else o.row[sel]
@@ -121,6 +134,8 @@ class _ChunkedPlan:
         S = ch.get('S')
         if S is not None:
             return S
+        if self.store is not None:
+            return self.store.gather(ch['LS'], ch['preps'])
         S = Ragged(ch['LS'])
         for P in ch['preps']:
             ch['gen'].run(P, S)
@@ -190,6 +205,66 @@ class _ChunkedPlan:
         return out
 
 
+
+class _SStore:
+    """PNO overlaps of all registered couples, computed once and spread over
+    the GPUs (contiguous couple ranges); ``tables`` / ``gather`` assemble a
+    chunk's overlaps from (possibly remote) blocks by pointer."""
+
+    def __init__(self, S_pao, pao, X, cp_, cq_, nv, devs):
+        from electrolites.dlpno.ovgen import OverlapGen
+        n = len(cp_)
+        byt = 8. * nv[cp_] * nv[cq_]
+        cum = np.cumsum(byt)
+        cuts = np.searchsorted(cum, cum[-1] * np.arange(1, len(devs)) / len(devs)) if n else []
+        bounds = np.concatenate([[0], cuts, [n]]).astype(np.int64)
+        self.ptr = np.zeros(n, np.int64)
+        self.ld = np.zeros(n, np.int32)
+        self.nr = nv[cp_].astype(np.int32)
+        self.nc = nv[cq_].astype(np.int32)
+        self.rags = []
+        rng = {d: (a, b) for d, a, b in zip(devs, bounds[:-1], bounds[1:]) if b > a}
+
+        def build(d):                      # every device generates its range concurrently
+            a, b = rng[d]
+            gen = OverlapGen(cp.asarray(S_pao), pao, X, max_bytes=1 << 31)
+            idx = np.arange(a, b)
+            lay = Layout(nv[cp_[idx]], nv[cq_[idx]])
+            R = Ragged(lay)
+            for P_ in gen.prepare(cp_[idx], cq_[idx], out_layout=lay, out_idx=np.arange(len(idx))):
+                gen.run(P_, R)
+            del gen
+            shp = np.array(lay.shapes, np.int64).reshape(-1, 2)
+            base = np.array([x.data.ptr for x in R.data], np.int64)
+            self.ptr[idx] = base[lay.group] + 8 * lay.slot * shp[lay.group, 0] * shp[lay.group, 1]
+            self.ld[idx] = shp[lay.group, 1]
+            self.rags.append(R)
+        from electrolites.dlpno import mgpu
+        mgpu.run_per_device(build, sorted(rng))
+        self.nbytes = float(np.sum(byt))
+
+    def tables(self, LSc, uni):
+        """per layout group of the chunk: device pointer tables of its items."""
+        out = []
+        for g, m in enumerate(LSc.members):
+            if not len(m):
+                out.append(None)
+                continue
+            c = uni[m]
+            out.append((cp.asarray(self.ptr[c]), cp.asarray(self.ld[c]), cp.asarray(self.nr[c]),
+                        cp.asarray(self.nc[c])) + tuple(LSc.shapes[g]))
+        return out
+
+    @staticmethod
+    def gather(LSc, tabs):
+        from electrolites.dlpno.gather import gather2d
+        S = Ragged(LSc)
+        for g, t in enumerate(tabs):
+            if t is not None:
+                ptr, ld, nr, nc, pr, pc = t
+                gather2d(ptr, ld, nr, nc, pr, pc, out=S.data[g])
+        return S
+
 class _SBudget:
     """bytes of generated overlaps each device may keep (thread safe)."""
 
@@ -254,6 +329,53 @@ def _partner_slots(layout, partner):
     return out
 
 
+
+class _VCouples:
+    """Registry of PNO-overlap couples (p, q), vectorised: ``C(p_array,
+    q_array)`` returns provisional codes; ``finalize`` renumbers every
+    registered code list to dense couple indices (couples in first-use
+    order is not needed: sorted by code)."""
+
+    def __init__(self, npair):
+        self.npair = npair
+        self._codes = []
+
+    def __call__(self, p, q):
+        c = np.asarray(p, np.int64) * self.npair + np.asarray(q, np.int64)
+        return _Code(c)
+
+    def finalize(self, terms):
+        cols = [(t, k) for t in terms for k, v in t.cols.items() if isinstance(v, _Code)]
+        allc = np.concatenate([t.cols[k].c for t, k in cols]) if cols else np.zeros(0, np.int64)
+        uni = np.unique(allc)
+        for t, k in cols:
+            t.cols[k] = np.searchsorted(uni, t.cols[k].c).astype(np.int64)
+        self.p = (uni // self.npair).tolist()
+        self.q = (uni % self.npair).tolist()
+
+
+class _Code:
+    __slots__ = ('c',)
+
+    def __init__(self, c):
+        self.c = c
+
+
+class _VTerms:
+    """columns of one term list (numpy arrays)."""
+
+    def __init__(self, **cols):
+        self.cols = dict(cols)
+
+    def __getitem__(self, k):
+        v = self.cols[k]
+        return v if isinstance(v, np.ndarray) else np.asarray(v, dtype=np.int64)
+
+    def __len__(self):
+        v = next(iter(self.cols.values()))
+        return len(v.c) if isinstance(v, _Code) else len(v)
+
+
 class CCSDGPU:
     """Device data and plans for one set of CC PNOs (built from a RefDLPNO
     object after ``recompute_pnos`` and ``pno_integrals``)."""
@@ -291,100 +413,77 @@ class CCSDGPU:
         L11 = self.L11 = Layout(np.ones(npair, np.int64), 1)
         self.pslot = {id(L): _partner_slots(L, ji) for L in (LP, LV, LN, LL)}
 
-        C = self.C = _Couples()
         pos = ref.lmo_pos
         lmos = ref.lmos
 
-        # ---- term lists ----------------------------------------------------
+        # ---- term lists (vectorised over pairs x domain LMOs) -------------------
+        C = self.C = _VCouples(npair)
+        cnt = nl
+        Pl = np.repeat(np.arange(npair), cnt)                     # pair of each (p, l)
+        Ll = np.concatenate([np.asarray(l, np.int64) for l in lmos]) if npair else np.zeros(0, np.int64)
+        Rl = np.concatenate([np.arange(c) for c in cnt]) if npair else np.zeros(0, np.int64)
+        Il, Jl = pi[Pl], pj[Pl]
+        T = _VTerms
         # T_n and S(p,ii) T1[i]
-        tn = _Terms('p', 'row', 's', 'n')
-        for p in range(npair):
-            for r, m in enumerate(lmos[p]):
-                tn.add(p=p, row=r, s=C(p, dii[m]), n=m)
-        ti = _Terms('p', 's', 'i')
-        tj = _Terms('p', 's', 'j')
-        for p in range(npair):
-            ti.add(p=p, s=C(p, dii[pi[p]]), i=pi[p])
-            tj.add(p=p, s=C(p, dii[pj[p]]), j=pj[p])
+        tn = T(p=Pl, row=Rl, s=C(Pl, dii[Ll]), n=Ll)
+        allp = np.arange(npair)
+        ti = T(p=allp, s=C(allp, dii[pi]), i=pi)
+        tj = T(p=allp, s=C(allp, dii[pj]), j=pj)
         # Fkc (all pairs)
-        fkc = _Terms('p', 's1', 'ik', 's2', 'k')
-        for p in range(npair):
-            i = pi[p]
-            for k in lmos[p]:
-                ik, kk = ij[i, k], dii[k]
-                fkc.add(p=p, s1=C(p, ik), ik=ik, s2=C(ik, kk), k=k)
-        # Fkj += Fkc_bar[jj] row i . T1[j]
-        # gamma (all pairs p = (k, i))
-        g3 = _Terms('p', 's1', 'l', 'i', 's2', 'kl', 's3')
-        g4 = _Terms('p', 's1', 'li', 's2', 'kl', 's3')
-        for p in range(npair):
-            k, i = pi[p], pj[p]
-            ii = dii[i]
-            for l in lmos[p]:
-                kl, ll, li = ij[k, l], dii[l], ij[l, i]
-                g3.add(p=p, s1=C(p, ll), l=l, i=i, s2=C(kl, ii), kl=kl, s3=C(p, kl))
-                g4.add(p=p, s1=C(p, li), li=li, s2=C(li, kl), kl=kl, s3=C(kl, p))
+        ik_ = ij[Il, Ll]
+        fkc = T(p=Pl, s1=C(Pl, ik_), ik=ik_, s2=C(ik_, dii[Ll]), k=Ll)
+        # gamma (all pairs p = (k, i)): k = pi, i = pj
+        kl_, ll_, li_ = ij[Il, Ll], dii[Ll], ij[Ll, Jl]
+        g3 = T(p=Pl, s1=C(Pl, ll_), l=Ll, i=Jl, s2=C(kl_, dii[Jl]), kl=kl_, s3=C(Pl, kl_))
+        g4 = T(p=Pl, s1=C(Pl, li_), li=li_, s2=C(li_, kl_), kl=kl_, s3=C(kl_, Pl))
         # delta (all pairs p = (i, k))
-        d3 = _Terms('p', 's1', 'l', 'i', 's2', 'lk', 's3')
-        d4 = _Terms('p', 's1', 'il', 's2', 'lk', 's3')
-        for p in range(npair):
-            i, k = pi[p], pj[p]
-            ii = dii[i]
-            for l in lmos[p]:
-                ll, lk, il = dii[l], ij[l, k], ij[i, l]
-                d3.add(p=p, s1=C(p, ll), l=l, i=i, s2=C(lk, ii), lk=lk, s3=C(lk, p))
-                d4.add(p=p, s1=C(p, il), il=il, s2=C(il, lk), lk=lk, s3=C(lk, p))
+        lk_, il_ = ij[Ll, Jl], ij[Il, Ll]
+        d3 = T(p=Pl, s1=C(Pl, ll_), l=Ll, i=Il, s2=C(lk_, dii[Il]), lk=lk_, s3=C(lk_, Pl))
+        d4 = T(p=Pl, s1=C(Pl, il_), il=il_, s2=C(il_, lk_), lk=lk_, s3=C(lk_, Pl))
         # Fkj double tilde
-        fdd = _Terms('p', 'li', 's1', 'lj', 's2', 'flat')
-        for p in range(npair):
-            i, j = pi[p], pj[p]
-            for l in lmos[p]:
-                li, lj = ij[l, i], ij[l, j]
-                if li < 0 or lj < 0:
-                    continue
-                fdd.add(p=p, li=li, s1=C(li, lj), lj=lj, s2=C(lj, li), flat=i * n + j)
+        li2, lj2 = ij[Ll, Il], ij[Ll, Jl]
+        m_ = (li2 >= 0) & (lj2 >= 0)
+        fdd = T(p=Pl[m_], li=li2[m_], s1=C(li2[m_], lj2[m_]), lj=lj2[m_], s2=C(lj2[m_], li2[m_]),
+                flat=Il[m_] * n + Jl[m_])
         # R1
-        r1a = _Terms('i', 's', 'q')
-        r1b = _Terms('i', 's', 'l', 'kl', 'q', 'sa', 'sb')
-        r1c = _Terms('i', 's', 'p', 'q')
-        for p in range(npair):
-            i, k = pi[p], pj[p]
-            q = ji[p]
-            ii = dii[i]
-            r1a.add(i=i, s=C(q, ii), q=q)
-            for l in lmos[p]:
-                kl, ll = ij[k, l], dii[l]
-                r1b.add(i=i, s=C(ii, ll), l=l, kl=kl, q=q, sa=C(kl, q), sb=C(q, kl))
-            r1c.add(i=i, s=C(p, ii), p=p, q=q)
-        r1d = _Terms('i', 's', 'p', 'row')
-        for p in range(npair):
-            for r, i in enumerate(lmos[p]):
-                r1d.add(i=i, s=C(p, dii[i]), p=p, row=r)
-        # R2: B and Fbc over (k, l) in the pair's LMO domain
-        rb = _Terms('p', 's', 'kl', 'bflat')
-        for p in np.where(strong & canon)[0]:
-            lm = lmos[p]
+        qq = ji[allp]
+        r1a = T(i=pi, s=C(qq, dii[pi]), q=qq)
+        klb = ij[Jl, Ll]
+        r1b = T(i=Il, s=C(dii[Il], dii[Ll]), l=Ll, kl=klb, q=ji[Pl], sa=C(klb, ji[Pl]), sb=C(ji[Pl], klb))
+        r1c = T(i=pi, s=C(allp, dii[pi]), p=allp, q=qq)
+        r1d = T(i=Ll, s=C(Pl, dii[Ll]), p=Pl, row=Rl)
+        # R2: B and Fbc over (k, l) in the pair's LMO domain (strong canonical pairs)
+        sc_ = np.where(strong & canon)[0]
+        pa, ka, la, fa = [], [], [], []
+        for p in sc_:
+            lm = np.asarray(lmos[p], np.int64)
             L = len(lm)
-            for a, k in enumerate(lm):
-                for b, l in enumerate(lm):
-                    kl = ij[k, l]
-                    if kl < 0:
-                        continue
-                    rb.add(p=p, s=C(kl, p), kl=kl, bflat=a * L + b)
-        rc = _Terms('p', 'jk_cpl', 'kj', 's1', 'ki', 's2', 's3')
-        rd = _Terms('p', 'jk_cpl', 'jk', 's1', 'ik', 's2', 's3')
-        rg = _Terms('p', 's', 'ik', 'fflat')
-        for p in np.where(strong)[0]:
-            i, j = pi[p], pj[p]
-            for kk, k in enumerate(lmos[p]):
-                ki, kj, ik, jk = ij[k, i], ij[k, j], ij[i, k], ij[j, k]
-                rc.add(p=p, jk_cpl=-1, kj=kj, s1=C(p, ki), ki=ki, s2=C(ki, kj), s3=C(kj, p))
-                rd.add(p=p, jk_cpl=-1, jk=jk, s1=C(p, ik), ik=ik, s2=C(ik, jk), s3=C(jk, p))
-            for k in range(n):
-                ik = ij[i, k]
-                if ik < 0:
-                    continue
-                rg.add(p=p, s=C(p, ik), ik=ik, fflat=k * n + j)
+            kk, ll2 = np.meshgrid(lm, lm, indexing='ij')
+            pa.append(np.full(L * L, p))
+            ka.append(kk.ravel())
+            la.append(ll2.ravel())
+            fa.append(np.arange(L * L))
+        if pa:
+            pa, ka, la, fa = (np.concatenate(x) for x in (pa, ka, la, fa))
+        else:
+            pa = ka = la = fa = np.zeros(0, np.int64)
+        klr = ij[ka, la]
+        m_ = klr >= 0
+        rb = T(p=pa[m_], s=C(klr[m_], pa[m_]), kl=klr[m_], bflat=fa[m_])
+        ms = strong[Pl]
+        Ps, Ks, Is, Js = Pl[ms], Ll[ms], Il[ms], Jl[ms]
+        ki_, kj_, ik2, jk_ = ij[Ks, Is], ij[Ks, Js], ij[Is, Ks], ij[Js, Ks]
+        neg = np.full(len(Ps), -1)
+        rc = T(p=Ps, jk_cpl=neg, kj=kj_, s1=C(Ps, ki_), ki=ki_, s2=C(ki_, kj_), s3=C(kj_, Ps))
+        rd = T(p=Ps, jk_cpl=neg, jk=jk_, s1=C(Ps, ik2), ik=ik2, s2=C(ik2, jk_), s3=C(jk_, Ps))
+        sp_ = np.where(strong)[0]
+        adjacent = [np.asarray(pl.neighbors(pi[p]), dtype=np.int64) for p in sp_]
+        Pg = np.repeat(sp_, [len(row) for row in adjacent])
+        Kg = np.concatenate(adjacent) if adjacent else np.zeros(0, np.int64)
+        ikg = ij[pi[Pg], Kg]
+        m_ = ikg >= 0
+        rg = T(p=Pg[m_], s=C(Pg[m_], ikg[m_]), ik=ikg[m_], fflat=Kg[m_] * n + pj[Pg[m_]])
+        C.finalize([tn, ti, tj, fkc, g3, g4, d3, d4, fdd, r1a, r1b, r1c, r1d, rb, rc, rd, rg])
         # energy
         self.t_build['terms'] = time.perf_counter() - t0
         t0 = time.perf_counter()
@@ -424,6 +523,15 @@ class CCSDGPU:
             per[home] = min(per[home], frac * free)
             sbud = _SBudget(per) if mode != '1' else None
             self.S = None
+            store = None
+            need = float(np.sum(8. * nv[cp_] * nv[cq_]))
+            if len(devs) > 1 and mode != '1' and need < sum(per.values()):
+                store = _SStore(ref.orb.S_pao, ref.pao, ref.X, cp_, cq_, nv, devs)
+                sbud = None
+                cp.cuda.Device(home).use()
+            if getattr(ref, 'verbose', 0) >= 2:
+                print(f'[mem] PNO overlaps {need / 1e9:.1f} GB:',
+                      'stored over the GPUs' if store is not None else 'regenerated per chunk', flush=True)
         else:
             self.S = self._overlaps(cp_, cq_)
         self.t_build['overlaps'] = time.perf_counter() - t0
@@ -433,12 +541,13 @@ class CCSDGPU:
         def P(out_layout, out_idx, operands, out_row=None):
             if onfly and any(o.layout is LS for o in operands):
                 return _ChunkedPlan(gen, LS, cp_, cq_, nv, out_layout, out_idx, operands, out_row=out_row,
-                                    devs=devs, budget=sbud)
+                                    devs=devs, budget=sbud, store=store)
             return ChainPlan(out_layout, out_idx, operands, out_row=out_row)
 
         def DotPlan_(left, right):
             if onfly and any(o.layout is LS for o in right):
-                return _ChunkedPlan(gen, LS, cp_, cq_, nv, None, None, right, left=left, devs=devs, budget=sbud)
+                return _ChunkedPlan(gen, LS, cp_, cq_, nv, None, None, right, left=left, devs=devs, budget=sbud,
+                                    store=store)
             return DotPlan(left, right)
         self._P = P
         self.p_tn = P(LN, tn['p'], [op(LS, tn['s']), op(LT1, tn['n'])], out_row=tn['row'])

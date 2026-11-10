@@ -148,6 +148,11 @@ class _Op:
 
 
 _BASE = {}
+# Address tables outlive the Ragged operands that created them. Allocating
+# these small persistent arrays from the caller's temporary pool can pin
+# much larger split blocks after the operands have been released. Keep the
+# cache's storage in its own pool; CuPy maintains separate arenas per device.
+_BASE_POOL = cp.cuda.MemoryPool()
 
 
 def _base(rag):
@@ -158,7 +163,9 @@ def _base(rag):
     if b is None:
         if len(_BASE) > 4096:
             _BASE.clear()
-        b = _BASE[key] = cp.asarray(np.array(key, np.int64))
+        with cp.cuda.using_allocator(_BASE_POOL.malloc):
+            b = cp.asarray(np.array(key, np.int64))
+        _BASE[key] = b
     return b
 
 

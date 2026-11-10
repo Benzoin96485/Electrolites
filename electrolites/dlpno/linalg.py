@@ -73,8 +73,24 @@ extern "C" __global__ void pivchol(const double* __restrict__ A, double* __restr
             }
             __syncthreads();
         }
+        // Roundoff in normalized unit diagonals must not change the
+        // retained PAO subspace between neighboring geometries.
+        const double tie = 16. * 2.220446049250313e-16 * fmax(1., fabs(best[0]));
+        bi = -1;
+        for (int i = threadIdx.x; i < nb; i += blockDim.x)
+            if (d[i] >= best[0] - tie && (bi < 0 || TIEBREAK(i, bi))) bi = i;
+        bidx[threadIdx.x] = bi;
+        __syncthreads();
+        for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+            if (threadIdx.x < w) {
+                int oi = bidx[threadIdx.x + w];
+                if (oi >= 0 && (bidx[threadIdx.x] < 0 || TIEBREAK(oi, bidx[threadIdx.x])))
+                    bidx[threadIdx.x] = oi;
+            }
+            __syncthreads();
+        }
         const int p = bidx[0];
-        const double dp = best[0];
+        const double dp = d[p];
         __syncthreads();
         if (dp < tol) break;
         const double s = 1. / sqrt(dp);
@@ -146,6 +162,17 @@ def orthonormal_domain(S, nn, s_cut, method='pivchol'):
         Ss = cp.where(sm, Sn, 0.)
         w, U = eigh_batched(Ss)
         keep = w > 1e-12
+        # The padded zero block is a null eigenspace. Roundoff can mix
+        # its rows into an eigenvector with a small positive eigenvalue;
+        # division by sqrt(w) then amplifies those forbidden PAO rows.
+        # Enforce the selected support exactly, as the compact CPU
+        # eigensolve followed by a zero scatter does.
+        U *= sel[:, :, None]
+        from .setup import orthogonalization_trace
+        trace = orthogonalization_trace.get()
+        if trace is not None:
+            for size, selected, rank in zip(np.asarray(nn), cp.asnumpy(sel), cp.asnumpy(keep.sum(axis=1))):
+                trace.append([int(size), np.flatnonzero(selected[:int(size)]).tolist(), int(rank)])
     else:
         w, U = eigh_batched(Sn)
         keep = w > s_cut
@@ -199,6 +226,9 @@ def eigh_batched(a, overwrite=False):
         ctypes.c_void_p(info.data.ptr), ctypes.c_int64(b))
     if st != 0:
         raise RuntimeError(f'cusolverDnXsyevBatched failed ({st})')
+    if bool(cp.any(info)):
+        raise np.linalg.LinAlgError(
+            f'cusolverDnXsyevBatched did not converge: info={info.get().tolist()}')
     # A now holds eigenvectors column-major: A[b] (row-major view) = V^T
     return W, A.transpose(0, 2, 1)
 

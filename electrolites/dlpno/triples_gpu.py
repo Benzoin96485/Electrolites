@@ -12,7 +12,8 @@ largest pair (PP PAOs, VP PNOs).
 """
 import numpy as np
 import cupy as cp
-from electrolites.dlpno.gather import blocks as gather_blocks
+from electrolites.dlpno import setup as su
+from electrolites.dlpno.gather import blocks as gather_blocks, xtbx
 from electrolites.dlpno.linalg import chol_inv_batched
 import cupyx
 
@@ -162,12 +163,27 @@ class TriplesGPU:
         self._pt = dict(VP=VP, PP=PP, X=cp.asarray(Xp), dom=cp.asarray(dom),
                         dmk=cp.asarray(dmk), T=Tp_d, D=Dp, T1=cp.asarray(T1))
 
+    def _projection_source(self, metric, indices, mask, coefficients):
+        """Reference full-AO projection; the local driver overrides this."""
+        return cp.matmul(metric[:, indices].transpose(1, 0, 2)*mask[:, None, :], coefficients)
+
     def _project(self, Z, bidx, pidx):
         """S(a_t, a_p)^T = X_p^T S_pao[d_p, d_t] X_t for couples (b, p),
         from Z[b] = S_pao[:, d_t] X_t.  -> (C, VP, V)."""
         pt = self._pt
-        Zg = Z[bidx[:, None], pt['dom'][pidx]] * pt['dmk'][pidx][:, :, None]
-        return cp.matmul(pt['X'][pidx].transpose(0, 2, 1), Zg)
+        n = len(pidx)
+        PP, VP, V = pt['PP'], pt['VP'], Z.shape[2]
+        step = max(1, int((1 << 28) // (8 * PP * (VP + V))))
+        if n <= step:
+            Zg = Z[bidx[:, None], pt['dom'][pidx]] * pt['dmk'][pidx][:, :, None]
+            return cp.matmul(pt['X'][pidx].transpose(0, 2, 1), Zg)
+        # bounded temporaries: the gathered PAO rows are (couples, PP, VP + V)
+        out = cp.empty((n, VP, V))
+        for c0 in range(0, n, step):
+            b_, p_ = bidx[c0:c0 + step], pidx[c0:c0 + step]
+            Zg = Z[b_[:, None], pt['dom'][p_]] * pt['dmk'][p_][:, :, None]
+            out[c0:c0 + step] = cp.matmul(pt['X'][p_].transpose(0, 2, 1), Zg)
+        return out
 
     # ---- TNOs ------------------------------------------------------------
     def tno_transform(self, t_cut):
@@ -197,7 +213,7 @@ class TriplesGPU:
         St = S_d[gi[:, :, None], gi[:, None, :]] * mm
         Ft = F_d[gi[:, :, None], gi[:, None, :]] * mm
         X, keep = orthonormal_domain(St, npao, opt['S_CUT'], getattr(self, 'PAO_ORTHO', 'pivchol'))
-        Z = cp.matmul(S_d[:, gi].transpose(1, 0, 2) * m[:, None, :], X)   # (b, nbf, Pv)
+        Z = self._projection_source(S_d, gi, m, X)
         Dt = cp.zeros((b, Pv, Pv))
         tr = trip[ch]
         ar = cp.arange(b)
@@ -230,7 +246,7 @@ class TriplesGPU:
     def _trip_riatoms(self, prescreen):
         opt = self.opt
         mkn = opt['T_CUT_MKN_TRIPLES_PRE'] if prescreen else opt['T_CUT_MKN_TRIPLES']
-        ria = [np.where(np.abs(self.mkn[:, i]) > mkn)[0] for i in range(self.n)]
+        ria = [su.column_above(self.mkn, i, mkn) for i in range(self.n)]
         return [np.unique(np.concatenate([ria[i], ria[j], ria[k]])) for (i, j, k) in self.trip]
 
     def triples_sparsity(self, prescreen):
@@ -261,7 +277,7 @@ class TriplesGPU:
         items = []
         for Pv in np.unique(P):
             sel = np.where(P == Pv)[0]
-            sel = sel[np.argsort(self._naux_t[sel], kind='stable')]
+            sel = sel[self.dfi.spatial_order([self.t_riatoms[t] for t in sel])]
             Pv = int(Pv)
             per = 8 * (10 * Pv * Pv + 2 * nbf * Pv + 3 * PP * Pv)
             step = max(1, int(self._chunk_bytes() // per))
@@ -377,9 +393,9 @@ class TriplesGPU:
                 step = max(1, int((1 << 28) // (8 * na * P * P)))
                 for r0 in range(0, len(rows), step):
                     sl = slice(r0, r0 + step)
-                    blk = gather_blocks(qa, gpos[sl], gpos[sl], mrow[sl], mrow[sl])   # (b, na, P, P)
+                    blk = gather_blocks(qa, gpos[sl], gpos[sl], mrow[sl], mrow[sl], ru=True)   # (b, P, na, P)
                     xr = Xr[sl]
-                    tq = cp.matmul(cp.matmul(xr.transpose(0, 2, 1)[:, None], blk), xr[:, None])
+                    tq = xtbx(blk, xr, xr)
                     oo = cp.asarray(off[sl])[:, None] + cp.arange(na)[None, :]
                     qvv[gr[sl][:, None], oo] = tq
             qvv = cp.matmul(Linv, qvv.reshape(B, A, V * V)).reshape(B, A, V, V)
@@ -390,23 +406,31 @@ class TriplesGPU:
             Kov = {(a, c): cp.matmul(qo[a].transpose(0, 2, 1), qv[c])
                    for a in range(3) for c in range(3) if a != c}
             # ---- projected pair amplitudes --------------------------------
-            Z = cp.matmul(S_d[:, gp].transpose(1, 0, 2) * gpm[:, None, :], X)   # (B, nbf, V)
+            Z = self._projection_source(S_d, gp, gpm, X)
             ar = cp.arange(B)
             W = cp.zeros((B, V, V, V))
+            # projected amplitudes, shared by the permutations: T_kj (T_jk = T_kj^T,
+            # same PNO space) and the domain amplitudes t_il of each position I
+            Tc, Tl = {}, {}
             for r, (I, J_, K) in enumerate(_PERMS):
-                pkj = cp.asarray(pl.ij[ijk[:, K], ijk[:, J_]])
-                s = self._project(Z, ar, pkj)                           # (B, VP, V)
-                Tkj = cp.matmul(s.transpose(0, 2, 1), cp.matmul(pt['T'][pkj], s))
+                key = (min(J_, K), max(J_, K))
+                if key not in Tc:
+                    pkj = cp.asarray(pl.ij[ijk[:, key[1]], ijk[:, key[0]]])
+                    s = self._project(Z, ar, pkj)                       # (B, VP, V)
+                    Tc[key] = cp.matmul(s.transpose(0, 2, 1), cp.matmul(pt['T'][pkj], s))
+                Tkj = Tc[key] if (K, J_) == (key[1], key[0]) else Tc[key].transpose(0, 2, 1)
                 w = cp.matmul(Kvvv[I].reshape(B, V * V, V), Tkj.transpose(0, 2, 1))
                 # t_il^{ab} (jl|kc) over the triplet's LMO domain
-                pil = pl.ij[ijk[:, I][:, None], lidx]                   # (B, L)
-                pil = np.where(lmk > 0, pil, 0)
-                bb = cp.asarray(np.repeat(np.arange(B), L))
-                gpil = cp.asarray(pil.reshape(-1))
-                s = self._project(Z, bb, gpil)                          # (B*L, VP, V)
-                Til = cp.matmul(s.transpose(0, 2, 1), cp.matmul(pt['T'][gpil], s))
-                Til = Til.reshape(B, L, V * V) * glm[:, :, None]
-                w -= cp.matmul(Til.transpose(0, 2, 1), Kov[(J_, K)])
+                if I not in Tl:
+                    pil = pl.ij[ijk[:, I][:, None], lidx]               # (B, L)
+                    pil = np.where(lmk > 0, pil, 0)
+                    bb = cp.asarray(np.repeat(np.arange(B), L))
+                    gpil = cp.asarray(pil.reshape(-1))
+                    s = self._project(Z, bb, gpil)                      # (B*L, VP, V)
+                    Til = cp.matmul(s.transpose(0, 2, 1), cp.matmul(pt['T'][gpil], s))
+                    Tl[I] = Til.reshape(B, L, V * V) * glm[:, :, None]
+                    del s
+                w -= cp.matmul(Tl[I].transpose(0, 2, 1), Kov[(J_, K)])
                 W += w.reshape(B, V, V, V).transpose((0,) + tuple(a + 1 for a in _BACK[r]))
             # ---- V, T3, energy -------------------------------------------
             t1 = []
@@ -436,12 +460,14 @@ class TriplesGPU:
         return float(self.e_ijk.sum())
 
     # ---- iterative (T) --------------------------------------------------
-    def lccsd_t_iterations(self):
+    def lccsd_t_iterations(self, return_amplitudes=False):
         """Iterative (T) (Jiang Eq. 111-112), batched: triplets live in
         padded buckets of equal TNO count; every coupling t <- u of a bucket
         pair and permutation case is one batched 3-mode transformation."""
         opt, f, n = self.opt, self.orb.F_lmo, self.n
         ntrip = len(self.trip)
+        if ntrip == 0:
+            return 0.
         S_d = self.S_pao_d
         nv = np.array([x.shape[1] for x in self.X_tno], dtype=np.int64)
         Vp = padded(nv)
@@ -454,7 +480,7 @@ class TriplesGPU:
             out = cp.full((len(mem), v, v, v), fill)
             for s, t in enumerate(mem):
                 m = nv[t]
-                out[s, :m, :m, :m] = lst[t]
+                out[s, :m, :m, :m] = cp.asarray(lst[t])
             return out
         W = {v: pack(self.W3, v, m) for v, m in buckets.items()}
         Vv = {v: pack(self.V3, v, m) for v, m in buckets.items()}
@@ -474,28 +500,19 @@ class TriplesGPU:
         self.W3 = self.V3 = self.T3 = None
         # couplings t <- u (one LMO of t replaced by l), vectorised over triplets
         tri = self._trip_arr
-        ts = np.sort(tri, axis=1)
-        code = lambda M: (M[:, 0] * n + M[:, 1]) * n + M[:, 2]
-        cs = code(ts)
-        corder = np.argsort(cs)
-        csorted = cs[corder]
+        connections = self._triples_couplings()
         CT, CU, CF, CC = [], [], [], []
         for r in (2, 1, 0):
-            x = tri[:, r]
-            fm = f[:, x].T                                   # (ntrip, n): f[l, x_t]
-            ok = (np.abs(fm) >= opt['F_CUT_T']) & (np.arange(n)[None, :] != x[:, None])
-            ti, li = np.nonzero(ok)
-            key = tri[ti].copy()
-            key[:, r] = li
-            c_ = code(np.sort(key, axis=1))
-            pos = np.minimum(np.searchsorted(csorted, c_), len(csorted) - 1)
-            hit = csorted[pos] == c_
-            a1, a2, a3 = key[hit, 0], key[hit, 1], key[hit, 2]
+            selected = [(t, u, key, f[occ, old])
+                        for t, row in enumerate(connections) for key, u, occ, old in row
+                        if key[r] != tri[t, r] and abs(f[occ, old]) >= opt['F_CUT_T']]
+            key = np.asarray([item[2] for item in selected], dtype=int).reshape(-1, 3)
+            a1, a2, a3 = key[:, 0], key[:, 1], key[:, 2]
             case = np.select([(a1 <= a2) & (a2 <= a3), (a1 <= a3) & (a3 <= a2), (a2 <= a1) & (a1 <= a3),
                               (a2 <= a3) & (a3 <= a1), (a3 <= a1) & (a1 <= a2)], [0, 1, 2, 3, 4], 5)
-            CT.append(ti[hit])
-            CU.append(corder[pos[hit]])
-            CF.append(fm[ti[hit], li[hit]])
+            CT.append(np.asarray([item[0] for item in selected], dtype=int))
+            CU.append(np.asarray([item[1] for item in selected], dtype=int))
+            CF.append(np.asarray([item[3] for item in selected]))
             CC.append(case)
         CT, CU = np.concatenate(CT), np.concatenate(CU)
         CF, CC = np.concatenate(CF), np.concatenate(CC)
@@ -523,8 +540,13 @@ class TriplesGPU:
             order = np.argsort(gk, kind='stable')
             ukeys, starts = np.unique(gk[order], return_index=True)
             ends = np.append(starts[1:], len(order))
+            pieces = []
             for k0, k1 in zip(starts, ends):
-                mem = order[k0:k1]
+                m0 = order[k0:k1]
+                vmax = int(max(Vp[CT[m0[0]]], Vp[CU[m0[0]]]))
+                step = max(1, int((1 << 28) // (8 * 4 * vmax ** 3)))      # bounded sweep temporaries
+                pieces += [m0[i0:i0 + step] for i0 in range(0, len(m0), step)]
+            for mem in pieces:
                 tt, uu = CT[mem], CU[mem]
                 vt, vu, case = int(Vp[tt[0]]), int(Vp[uu[0]]), int(CC[mem[0]])
                 ids = sid[mem]
@@ -534,6 +556,9 @@ class TriplesGPU:
                              cp.asarray(nv[tt].astype(np.int32)), cp.asarray(nv[uu].astype(np.int32)), vt, vu)
                 plan.append(dict(vt=vt, vu=vu, case=case, S=S,
                                  st=cp.asarray(bslot[tt]), su=cp.asarray(bslot[uu]), w=cp.asarray(CF[mem])))
+        # Every plan overlap owns its gathered array; release the original
+        # ragged overlaps before allocating iterative residuals.
+        del SU
         e_old = np.zeros(ntrip)
         e_prev = 0.
         ax = lambda c: (0,) + tuple(a + 1 for a in _CASES[c])
@@ -552,10 +577,23 @@ class TriplesGPU:
             # energy changed by less than T_CUT_ITER, which saves nothing in a
             # batched sweep and, with Jacobi updates, stops ~1e-7 Eh short
             for v, mem in buckets.items():
-                T[v] = T[v] - R[v] / D[v]
-                cnt = cp.asarray(np.maximum(nv[mem], 1) ** 3, dtype=cp.float64)
-                r = cp.sqrt(cp.sum(R[v] ** 2, axis=(1, 2, 3)) / cnt)
-                rms = max(rms, float(r.max()))
+                # All residuals were formed from the previous Jacobi state.
+                # Bound the squared-norm workspace, then reuse each residual
+                # slice for R/D after its original residual norm is consumed.
+                step = max(1, (128 << 20) // (8 * v ** 3))
+                for first in range(0, len(mem), step):
+                    sl = slice(first, first + step)
+                    residual = R[v][sl]
+                    cnt = cp.asarray(np.maximum(nv[mem[sl]], 1) ** 3, dtype=cp.float64)
+                    r = cp.sqrt(cp.sum(residual ** 2, axis=(1, 2, 3)) / cnt)
+                    rms = max(rms, float(r.max()))
+                    residual /= D[v][sl]
+                    T[v][sl] -= residual
+                    del residual
+                del R[v]
+            # Residuals are no longer needed for the energy or next sweep.
+            # Do not retain the old dictionary while constructing the next.
+            del R
             e_old = self.e_ijk.copy()
             for v, mem in buckets.items():
                 self.e_ijk[mem] = _batched_energy(Vv[v], T[v], coef[v]).get()
@@ -566,4 +604,7 @@ class TriplesGPU:
             e_prev = E
         else:
             raise RuntimeError('(T) iterations did not converge')
+        if return_amplitudes:
+            self.T3 = [cp.asnumpy(T[int(Vp[t])][bslot[t], :nv[t], :nv[t], :nv[t]])
+                       for t in range(ntrip)]
         return E

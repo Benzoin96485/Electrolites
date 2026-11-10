@@ -17,6 +17,51 @@ Direct drivers: `electrolites.dlpno.rhf.DLPNO` (closed shell),
 `electrolites.dlpno.uhf.UDLPNO` (open shell); any threshold can be passed by
 keyword (`T_CUT_PNO=1e-8`, ...).
 
+Closed-shell analytic nuclear gradients are available through
+`dl.nuc_grad_method(backend='cupy').kernel()` (or `backend='numpy'`).  The first
+implementation includes MP2/CCSD/T0/iterative-T response, both PNO
+generations, TNOs and continuous screening corrections.  It requires
+tightly converged RHF and stationary Boys orbitals.  See the
+[derivation, preparation example and validation](DLPNO_ANALYTIC_GRADIENT.md)
+for the supported scope and the current dense, per-coordinate response
+cost.  Open-shell energy support does not extend to gradients yet.
+
+For the shared local-integral energy and coordinate-independent adjoint,
+use `mf.DLPNO_CCSD_T(integral_backend='local', triples='t1')`, then
+`dl.nuc_grad_method(backend='cupy').kernel()`.  The
+[local adjoint derivation and scaling audit](DLPNO_LOCAL_ADJOINT.md) describe
+the matching coefficient screens, single MP2/CCSD/T adjoint solves and
+auxiliary-atom integral derivatives.  Exact distant-pair corrections and
+global orbital work remain separately accounted costs. To enable the
+complete hierarchical far tail and spatial DOI preparation as well, pass
+`dipole_tail_options={}` and `local_screening_options={}` to the same
+local driver. Set `lmo_cut` and `pao_cut` explicitly and refine them for
+the force accuracy required by the application; energy agreement alone
+does not certify force accuracy. The scaling claim concerns bounded local
+pair/triplet and RI-derivative work. Full Boys/CPHF and orbital
+backtransforms retain their reference-state scaling.
+
+The local driver additionally accepts `ri_backend='gpu'` to evaluate
+compact three-center integrals on the GPU. Its gradient accepts
+`response_backend='gpu'` for RHF potential actions, relaxed two-electron
+contractions and the reference HF gradient. These choices are independent
+of `backend='numpy'|'cupy'`, which controls the correlation tensor graph.
+The local gradient defaults to `checkpoint_triples=True`: each triplet's
+inner graph is recomputed during its analytic reverse pass, reducing
+storage without freezing TNOs or changing the derivative. Small-system
+tests do not establish a maximum supported molecular size; consult the
+saved phase timings, memory observations and accuracy evidence for the
+actual basis and thresholds.
+
+The local implementation has now completed the full 312-component
+CCSD(T1) gradient of asymmetric C34H70/def2-SVP (104 atoms, 826 AOs) on
+one A100 40 GB. The installed source170 passed 137 small-system tests;
+the full104 run passed sampled independent finite differences and
+comparison of every gradient component with source165. See the
+[current validation and reproducible GPU configuration](DLPNO_LOCAL_ADJOINT.md#current-hundred-atom-validation-2026-10-26)
+for the hybrid CPU/GPU settings, approximately 323-minute gradient time,
+209 GiB host requirement, sampled FD scope, and remaining global costs.
+
 ## Algorithm
 
 * **Closed shell** -- Psi4 1.11's DLPNO-CCSD(T) (Jiang, Sylvetsky,
