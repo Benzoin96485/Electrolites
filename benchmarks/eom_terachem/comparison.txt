@@ -1,0 +1,74 @@
+
+== Ir/ACRHCO02_comp_0  nao 211  o_act 38 v 162  (TC: 1757 Cholesky vecs, RR rank 585)
+  E_SCF   ours -672.59473515  TC -672.59472895  diff -0.0062 mEh
+  E_corr  ours -1.885245 (CCSD)  TC -1.888572 (RR-CCSD)  diff +3.326 mEh
+  roots eV  ours   3.9848  4.3985  4.4790  4.6812  4.9573
+            TC     3.9744  4.3730  4.4623  4.6750  4.9559
+            diff  +0.0104 +0.0255 +0.0166 +0.0062 +0.0014
+  time  ours: SCF 3s CCSD 16s EOM 58s total 78s [NVIDIA A100-SXM4-80GB]   TC: Cholesky 68s RR-CC(+Λ+EOM) 3074s total 3153s [H200]  speedup 40.6x
+
+== Ir/PEXRAL_comp_0  nao 154  o_act 31 v 109  (TC: 1258 Cholesky vecs, RR rank 389)
+  E_SCF   ours -1326.86644947  TC -1326.86644330  diff -0.0062 mEh
+  E_corr  ours -1.285549 (CCSD)  TC -1.289883 (RR-CCSD)  diff +4.334 mEh
+  roots eV  ours   2.9112  3.0136  3.0308  3.6474  3.7268
+            TC     2.8991  3.0061  3.0219  3.6424  3.7197
+            diff  +0.0122 +0.0075 +0.0089 +0.0051 +0.0071
+  time  ours: SCF 3s CCSD 11s EOM 14s total 29s [NVIDIA A100-SXM4-80GB]   TC: Cholesky 48s RR-CC(+Λ+EOM) 651s total 708s [H200]  speedup 24.6x
+
+== Pt/AFAPOM_comp_0  nao 276  o_act 50 v 204  (TC: 2248 Cholesky vecs, RR rank 744)
+  E_SCF   ours -1678.70338353  TC -1678.70338157  diff -0.0020 mEh
+  E_corr  ours -2.432920 (CCSD)  TC -2.438744 (RR-CCSD)  diff +5.824 mEh
+  roots eV  ours   3.2162  3.2776  3.2792  3.7279  3.8062
+            TC     3.2157  3.2750  3.2762  3.7337  3.8001
+            diff  +0.0005 +0.0026 +0.0029 -0.0058 +0.0062
+  time  ours: SCF 4s CCSD 137s EOM 700s total 842s [NVIDIA A100-SXM4-80GB]   TC: Cholesky 123s RR-CC(+Λ+EOM) 3867s total 4009s [H200]  speedup 4.8x
+
+== Pt/BERDEI_comp_0  nao 192  o_act 34 v 142  (TC: 1548 Cholesky vecs, RR rank 496)
+  E_SCF   ours -1303.54812327  TC -1303.54812127  diff -0.0020 mEh
+  E_corr  ours -1.397248 (CCSD)  TC -1.400224 (RR-CCSD)  diff +2.976 mEh
+  roots eV  ours   3.3585  3.4686  3.7439  3.7719  5.2528
+            TC     3.3415  3.4541  3.7287  3.7573  5.2598
+            diff  +0.0170 +0.0145 +0.0153 +0.0146 -0.0070
+  time  ours: SCF 4s CCSD 16s EOM 27s total 47s [NVIDIA A100-SXM4-80GB]   TC: Cholesky 60s RR-CC(+Λ+EOM) 1479s total 1550s [H200]  speedup 33.1x
+
+== Rh/EDOYAZ_comp_0  nao 291  o_act 49 v 226  (TC: 2382 Cholesky vecs, RR rank 788)
+  E_SCF   ours -867.92532477  TC -867.92531716  diff -0.0076 mEh
+  E_corr  ours -2.521315 (CCSD)  TC -2.523163 (RR-CCSD)  diff +1.848 mEh
+  roots eV  ours   3.7133  3.7463  4.2137  4.4681  4.4975
+            TC     3.6798  3.6990  4.2018  4.4061  4.4241
+            diff  +0.0335 +0.0473 +0.0119 +0.0620 +0.0734
+  time  ours: SCF 5s CCSD 121s EOM 1374s total 1499s [NVIDIA A100-SXM4-80GB]   TC: Cholesky 125s RR-CC(+Λ+EOM) 5846s total 5991s [H200]  speedup 4.0x
+
+== Rh/QUNBAC_comp_0  nao 243  o_act 47 v 182  (TC: 2006 Cholesky vecs, RR rank 671)
+  E_SCF   ours -954.15070455  TC -954.15069692  diff -0.0076 mEh
+  E_corr  ours -2.401461 (CCSD)  TC -2.406690 (RR-CCSD)  diff +5.229 mEh
+  roots eV  ours   3.6854  3.8989  4.3272  4.4829  4.6497
+            TC     3.6722  3.8477  4.3193  4.4304  4.6114
+            diff  +0.0131 +0.0513 +0.0080 +0.0525 +0.0383
+  time  ours: SCF 4s CCSD 42s EOM 124s total 171s [NVIDIA A100-SXM4-80GB]   TC: Cholesky 73s RR-CC(+Λ+EOM) 5443s total 5531s [H200]  speedup 32.4x
+
+== Rh/SOXYIN01_comp_0  nao 259  o_act 45 v 198  (TC: 2153 Cholesky vecs, RR rank 682)
+  E_SCF   ours -1127.98033765  TC -1127.98033001  diff -0.0076 mEh
+  E_corr  ours -2.214499 (CCSD)  TC -2.219370 (RR-CCSD)  diff +4.871 mEh
+  roots eV  ours   3.1087  3.3076  3.4754  3.5037  4.4071
+            TC     3.0786  3.2838  3.4470  3.4751  4.3940
+            diff  +0.0301 +0.0238 +0.0284 +0.0286 +0.0131
+  time  ours: SCF 5s CCSD 92s EOM 370s total 467s [NVIDIA A100-SXM4-80GB]   TC: Cholesky 115s RR-CC(+Λ+EOM) 2756s total 2891s [H200]  speedup 6.2x
+
+== Ru/LUNXIB01_comp_0  nao 282  o_act 53 v 211  (TC: 2359 Cholesky vecs, RR rank 757)
+  E_SCF   ours -1388.83815414  TC -1388.83815864  diff +0.0045 mEh
+  E_corr  ours -2.710372 (CCSD)  TC -2.717492 (RR-CCSD)  diff +7.121 mEh
+  roots eV  ours   3.2192  3.3276  3.4234  3.5345  3.7612
+            TC     3.1943  3.3054  3.3961  3.4869  3.6889
+            diff  +0.0249 +0.0222 +0.0272 +0.0476 +0.0723
+  time  ours: SCF 5s CCSD 158s EOM 1209s total 1372s [NVIDIA A100-SXM4-80GB]   TC: Cholesky 135s RR-CC(+Λ+EOM) 7668s total 7826s [H200]  speedup 5.7x
+
+== Ru/ZEQHOS_comp_0  nao 232  o_act 43 v 165  (TC: 1856 Cholesky vecs, RR rank 591)
+  E_SCF   ours -1902.06232216  TC -1902.06232670  diff +0.0045 mEh
+  E_corr  ours -2.090012 (CCSD)  TC -2.091850 (RR-CCSD)  diff +1.838 mEh
+  roots eV  ours   4.2662  4.3906  4.4328  4.5384  4.9275
+            TC     4.2166  4.3377  4.3884  4.4892  4.8901
+            diff  +0.0496 +0.0529 +0.0444 +0.0492 +0.0374
+  time  ours: SCF 3s CCSD 34s EOM 77s total 115s [NVIDIA A100-SXM4-80GB]   TC: Cholesky 89s RR-CC(+Λ+EOM) 2812s total 2922s [H200]  speedup 25.4x
+
+ALL 9 cases, 45 roots: mean signed +0.0245 eV, MAE 0.0251 eV, max |d| 0.0734 eV

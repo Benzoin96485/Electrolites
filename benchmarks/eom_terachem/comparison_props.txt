@@ -1,0 +1,57 @@
+case                    nao  root   E ours    E TC    f ours     f TC
+Ir/ACRHCO02_comp_0      211     1   3.9848  3.9766   0.07785  0.07890
+Ir/ACRHCO02_comp_0      211     2   4.3985  4.3719   0.00213  0.00342
+Ir/ACRHCO02_comp_0      211     3   4.4790  4.4633   0.04286  0.03869
+Ir/ACRHCO02_comp_0      211     4   4.6812  4.6749   0.00002  0.00001
+Ir/ACRHCO02_comp_0      211     5   4.9573  4.9565   0.16621  0.16057
+   times: SCF 4 CCSD 16 EOM-R 58 Λ 8 EOM-L 112 props 10 total 208 s  |  TC total 3153 s  (15.1x)   max|eL-eR| 3.5e-08 Eh
+Ir/PEXRAL_comp_0        154     1   2.9112  2.8985   0.00000  0.00000
+Ir/PEXRAL_comp_0        154     2   3.0136  3.0062   0.00000  0.00000
+Ir/PEXRAL_comp_0        154     3   3.0308  3.0224   0.00000  0.00000
+Ir/PEXRAL_comp_0        154     4   3.6474  3.6407   0.00000  0.00000
+Ir/PEXRAL_comp_0        154     5   3.7268  3.7202   0.00000  0.00000
+   times: SCF 5 CCSD 12 EOM-R 15 Λ 7 EOM-L 20 props 2 total 61 s  |  TC total 708 s  (11.6x)   max|eL-eR| 3.2e-08 Eh
+Pt/AFAPOM_comp_0        276     1   3.2162  3.2147   0.00320  0.00343
+Pt/AFAPOM_comp_0        276     2   3.2776  3.2737   0.00103  0.00128
+Pt/AFAPOM_comp_0        276     3   3.2792  3.2763   0.00412  0.00425
+Pt/AFAPOM_comp_0        276     4   3.7279  3.7343   0.00252  0.00243
+Pt/AFAPOM_comp_0        276     5   3.8062  3.8004   0.01068  0.01105
+   times: SCF 5 CCSD 114 EOM-R 405 Λ 30 EOM-L 416 props 32 total 1002 s  |  TC total 4009 s  (4.0x)   max|eL-eR| 2.2e-07 Eh
+Pt/BERDEI_comp_0        192     1   3.3585  3.3429   0.00252  0.00254
+Pt/BERDEI_comp_0        192     2   3.4686  3.4559   0.00020  0.00017
+Pt/BERDEI_comp_0        192     3   3.7439  3.7298   0.00045  0.00049
+Pt/BERDEI_comp_0        192     4   3.7719  3.7559   0.00161  0.00152
+Pt/BERDEI_comp_0        192     5   5.2528  5.2567   0.01304  0.01328
+   times: SCF 6 CCSD 17 EOM-R 30 Λ 9 EOM-L 51 props 5 total 119 s  |  TC total 1550 s  (13.1x)   max|eL-eR| 1.1e-07 Eh
+Rh/EDOYAZ_comp_0        291     1   3.7133  3.6793   0.05904  0.01953
+Rh/EDOYAZ_comp_0        291     2   3.7463  3.6992   0.01756  0.05619
+Rh/EDOYAZ_comp_0        291     3   4.2137  4.2010   0.15562  0.14519
+Rh/EDOYAZ_comp_0        291     4   4.4681  4.4017   0.00187  0.00302
+Rh/EDOYAZ_comp_0        291     5   4.4975  4.4217   0.00348  0.00377
+   times: SCF 4 CCSD 149 EOM-R 1558 Λ 97 EOM-L 1186 props 36 total 3030 s  |  TC total 5991 s  (2.0x)   max|eL-eR| 1.1e-06 Eh
+Rh/QUNBAC_comp_0        243     1   3.6854  3.6754   0.05942  0.06003
+Rh/QUNBAC_comp_0        243     2   3.8989  3.8467   0.01503  0.01440
+Rh/QUNBAC_comp_0        243     3   4.3272  4.3161   0.04920  0.04512
+Rh/QUNBAC_comp_0        243     4   4.4829  4.4299   0.00018  0.00026
+Rh/QUNBAC_comp_0        243     5   4.6497  4.6102   0.03204  0.00245
+   times: SCF 6 CCSD 41 EOM-R 122 Λ 17 EOM-L 257 props 18 total 461 s  |  TC total 5531 s  (12.0x)   max|eL-eR| 3.1e-07 Eh
+Rh/SOXYIN01_comp_0      259     1   3.1087  3.0787   0.00062  0.00060
+Rh/SOXYIN01_comp_0      259     2   3.3076  3.2826   0.00475  0.00435
+Rh/SOXYIN01_comp_0      259     3   3.4754  3.4484   0.00340  0.00329
+Rh/SOXYIN01_comp_0      259     4   3.5037  3.4783   0.00006  0.00017
+Rh/SOXYIN01_comp_0      259     5   4.4071  4.3925   0.00009  0.00000
+   times: SCF 5 CCSD 114 EOM-R 155 Λ 26 EOM-L 173 props 22 total 496 s  |  TC total 2891 s  (5.8x)   max|eL-eR| 8.9e-07 Eh
+Ru/LUNXIB01_comp_0      282     1   3.2192  3.1934   0.00079  0.00087
+Ru/LUNXIB01_comp_0      282     2   3.3276  3.3050   0.00068  0.00070
+Ru/LUNXIB01_comp_0      282     3   3.4234  3.3951   0.00075  0.00074
+Ru/LUNXIB01_comp_0      282     4   3.5345  3.4868   0.00075  0.00049
+Ru/LUNXIB01_comp_0      282     5   3.7612  3.6897   0.00331  0.00164
+   times: SCF 5 CCSD 162 EOM-R 471 Λ 39 EOM-L 486 props 33 total 1196 s  |  TC total 7826 s  (6.5x)   max|eL-eR| 2.6e-07 Eh
+Ru/ZEQHOS_comp_0        232     1   4.2662  4.2149   0.00411  0.00421
+Ru/ZEQHOS_comp_0        232     2   4.3906  4.3344   0.01403  0.01425
+Ru/ZEQHOS_comp_0        232     3   4.4328  4.3849   0.00306  0.00346
+Ru/ZEQHOS_comp_0        232     4   4.5384  4.4912   0.00749  0.00707
+Ru/ZEQHOS_comp_0        232     5   4.9275  4.8871   0.00136  0.00128
+   times: SCF 5 CCSD 37 EOM-R 77 Λ 16 EOM-L 152 props 12 total 299 s  |  TC total 2922 s  (9.8x)   max|eL-eR| 3.1e-07 Eh
+
+45 roots: |f - f_TC| mean 0.00317, max 0.03951; for f_TC > 0.01 (12 roots) median rel. diff 3.9 %

@@ -338,7 +338,7 @@ def _ladder(mycc, x2):
 
 def _vvvv_mo(mycc, nv):
     """(ac|bd) as a (v^2, v^2) matrix [(a,b), (c,d)] on the device, or None
-    when it would take more than a third of the free device memory."""
+    when it would take more than 45 % of the free device memory."""
     from electrolites import fastmp2
     from electrolites.fastccsd import _avail
     key = getattr(mycc, '_eom_vvvv', None)
@@ -346,21 +346,32 @@ def _vvvv_mo(mycc, nv):
         return key[1]
     if getattr(mycc, '_eom_ao_ladder', False):
         return None
-    # the array, its transposed build copy and the integral workspace; the
-    # rest of the device stays for the sigma intermediates and the Davidson
-    if nv ** 4 * 8 * 3 > _avail() / 2:
+    # the v^4 array is built in slices of its first index straight into
+    # its final [(a,b), (c,d)] layout, so the peak is v^4 plus one slice
+    # (a full (ac|bd) build and its transposed copy, 3 v^4 with the
+    # workspace, sent v >= 198 -- 4-6 of 9 TM complexes at cc-pVDZ -- to
+    # the AO-direct ladder, 75-78 % of their EOM time on an A100-80GB)
+    need = nv ** 4 * 8
+    avail = _avail()
+    if need > .45 * avail:
         mycc._eom_ao_ladder = True
         return None
     mask = mycc.get_frozen_mask()
     mo = cp.asarray(mycc.mo_coeff)[:, cp.asarray(mask)]
     orbv = mo[:, mo.shape[1] - nv:]
+    na = max(1, min(nv, int(.25 * (avail - need) // (nv ** 3 * 8))))
     try:
-        v = cp.asarray(fastmp2.get_int4c2e_ovpq(mycc.mol, orbv, orbv, orbv,
-                                                orbv))        # (ac|bd)[acbd]
-        W = cp.ascontiguousarray(v.transpose(0, 2, 1, 3)).reshape(nv * nv,
-                                                                  -1)
+        W = cp.empty((nv * nv, nv * nv))
+        Wv = W.reshape(nv, nv, nv, nv)
+        for a0 in range(0, nv, na):
+            a1 = min(nv, a0 + na)
+            v = cp.asarray(fastmp2.get_int4c2e_ovpq(
+                mycc.mol, orbv[:, a0:a1], orbv, orbv, orbv))  # [a,c,b,d]
+            Wv[a0:a1] = v.transpose(0, 2, 1, 3)
+            v = None
+        Wv = None
     except (cp.cuda.memory.OutOfMemoryError, RuntimeError):
-        v = W = None
+        v = W = Wv = None
         cp.get_default_memory_pool().free_all_blocks()
         mycc._eom_ao_ladder = True
         return None
@@ -831,56 +842,82 @@ def _davidson_nosym(matvec, x0, diag, nroots, tol, tol_residual, max_cycle,
                 out.append(v / nrm)
         return out
 
-    nwant = len(x0)
+    nwant, dim = x0.shape
     from electrolites.fastccsd import _avail
-    room = int(.4 * _avail() // (2 * 8 * x0.shape[1]))
+    V0 = cp.stack(orth(list(x0), None))
+    # the first sigma batch builds the persistent pieces (MO vvvv or the AO
+    # integral cache) before the subspace is sized against the free memory
+    AV0 = matvec(V0)
+    vbytes = 8 * dim
+    # V and AV buffers, X and AX (= R) of nwant rows; half the free memory,
+    # the rest for the sigma intermediates
+    room = int((.5 * _avail() - 2 * nwant * vbytes) // (2 * vbytes))
     if room < max_space:
         log.warn('EOM Davidson: subspace capped at %d vectors (memory)', room)
         max_space = max(room, 2 * nwant)
-    V = cp.stack(orth(list(x0), None))
-    AV = matvec(V)
+    Vb = cp.empty((max_space, dim))
+    AVb = cp.empty((max_space, dim))
+    k = len(V0)
+    Vb[:k] = V0
+    AVb[:k] = AV0
+    V0 = AV0 = None
     e_last = None
     conv = np.zeros(nwant, dtype=bool)
     for it in range(max_cycle):
+        V, AV = Vb[:k], AVb[:k]
         H = cp.asnumpy(V @ AV.T)
         w, c = np.linalg.eig(H)
-        real = np.where(abs(w.imag) < 1e-3)[0]
+        # real roots only; of a nearly real complex pair keep one member --
+        # both have the same real part of the eigenvector, and keeping the
+        # two put identical rows in X
+        real = np.where((abs(w.imag) < 1e-3) & (w.imag >= 0))[0]
         w, c = w[real].real, c[:, real].real
         order = np.argsort(w)[:nwant]
-        w, c = w[order], cp.asarray(c[:, order])
-        X = c.T @ V
-        AX = c.T @ AV
+        w, c = w[order], c[:, order]
+        cd = cp.asarray(c)
+        X = cd.T @ V
+        R = cd.T @ AV
         nrm = cp.linalg.norm(X, axis=1)
         X /= nrm[:, None]
-        AX /= nrm[:, None]
+        R /= nrm[:, None]
         wd = cp.asarray(w)
-        R = AX - wd[:, None] * X
+        R -= wd[:, None] * X
         rnorm = cp.asnumpy(cp.linalg.norm(R, axis=1))
         if e_last is not None and len(e_last) == len(w):
             de = abs(w - e_last)
         else:
             de = np.ones(len(w))
         conv = (de < tol) & (rnorm < tol_residual)
-        log.debug('EOM Davidson %d  space %d  |r| %s  dE %s', it, len(V),
+        log.debug('EOM Davidson %d  space %d  |r| %s  dE %s', it, k,
                   rnorm[:nroots], de[:nroots])
         e_last = w
         if conv[:nroots].all():
             break
         new = []
-        for k in np.where(~conv[:nroots])[0]:
-            d = wd[k] - diag
+        for j in np.where(~conv[:nroots])[0]:
+            d = wd[j] - diag
             d = cp.where(abs(d) < 1e-8, 1e-8, d)
-            new.append(R[k] / d)
-        if len(V) + len(new) > max_space:
-            q, r_ = cp.linalg.qr(X.T)
-            V = q.T
-            AV = cp.linalg.solve(r_.T, AX)
-        new = orth(new, V)
+            new.append(R[j] / d)
+        R = None
+        if k + len(new) > max_space:
+            # collapse onto span(X) through an orthonormal basis of the
+            # Ritz coefficients: rank-deficient X (near-equal Ritz vectors)
+            # made a QR + solve(r^T, AX) collapse give rows with V != 0 and
+            # AV == 0, i.e. a spurious exact zero root
+            u, sv, _ = np.linalg.svd(c, full_matrices=False)
+            U = cp.asarray(u[:, sv > 1e-8 * sv[0]])
+            m = U.shape[1]
+            Vb[:m] = U.T @ V
+            AVb[:m] = U.T @ AV
+            k = m
+        new = orth(new, Vb[:k])
         if not new:
             break
-        Vn = cp.stack(new)
-        V = cp.vstack([V, Vn])
-        AV = cp.vstack([AV, matvec(Vn)])
+        n = min(len(new), max_space - k)
+        Vb[k:k + n] = cp.stack(new[:n])
+        new = None
+        AVb[k:k + n] = matvec(Vb[k:k + n])
+        k += n
     return conv[:nroots], e_last[:nroots], X[:nroots]
 
 
@@ -926,6 +963,12 @@ class EOMEESinglet(eom_rccsd.EOMEESinglet):
     @_on_pool
     def kernel(self, nroots=1, koopmans=False, guess=None, eris=None,
                imds=None, diag=None):
+        if imds is not None:
+            return self._kernel(nroots, koopmans, guess, imds)
+        return _drop_vvvv_on_oom(self._cc, logger.new_logger(self),
+                                 self._kernel, nroots, koopmans, guess, None)
+
+    def _kernel(self, nroots, koopmans, guess, imds):
         log = logger.new_logger(self)
         if imds is None:
             imds = self.make_imds()
@@ -934,6 +977,7 @@ class EOMEESinglet(eom_rccsd.EOMEESinglet):
         h1, h2 = _ee_diag(imds, mycc)
         d = _pack_singlet(h1[None], h2[None])[0]
         h1 = h2 = None
+        self._diag = cp.asnumpy(d)       # for the left solve (same diagonal)
         nwant = min(len(d), nroots + max(3, nroots // 2))
         if guess is not None:
             x0 = cp.asarray(np.asarray(guess)).reshape(len(guess), -1)
@@ -944,12 +988,16 @@ class EOMEESinglet(eom_rccsd.EOMEESinglet):
             x0[cp.arange(nwant), idx] = 1.
 
         def matvec(V):
-            out = []
-            for p0 in range(0, len(V), _EE_BLK):
-                r1, r2 = _unpack_singlet(V[p0:p0 + _EE_BLK], no, nv)
+            out = cp.empty_like(V)
+            blk = _ee_blk(no, nv)
+            for p0 in range(0, len(V), blk):
+                r1, r2 = _unpack_singlet(V[p0:p0 + blk], no, nv)
                 h1, h2 = _ee_sigma(imds, mycc, r1, r2)
-                out.append(_pack_singlet(h1, h2))
-            return cp.vstack(out)
+                r1 = r2 = None
+                out[p0:p0 + blk] = _pack_singlet(h1, h2)
+                h1 = h2 = None
+                blk = _ee_blk(no, nv)
+            return out
 
         conv, e, X = _davidson_nosym(
             matvec, x0, d, nroots, self.conv_tol,
@@ -965,8 +1013,224 @@ class EOMEESinglet(eom_rccsd.EOMEESinglet):
         return e, self.v
 
 
-#: trial vectors per EE sigma batch
+# ------------------------------- left singlet EOM-EE, transition properties
+#
+# PySCF has neither for RCCSD.  The left operator is the λ-linear part of
+# the Λ equations (``ccsd_lambda_gpu.lambda_rhs``): lambda_rhs(λ) - D λ =
+# η + λ (H̄ - E_CC), so L (H̄ - E_CC) = lambda_rhs(L) - lambda_rhs(0) - D L,
+# with L in the same (spin-adapted) representation as Λ.  The pairing of a
+# Λ-like bra with a T-like ket is
+#     <L|R> = 2 sum l1 r1 + sum (2 l2[ijab] - l2[ijba]) r2[ijab].
+# Transition densities come from the CCSD 1-RDM functional
+# γ(λ; T) = <0|(1+λ) e^-T E_pq e^T|0> (``ccsd_rdm_gpu``):
+#   left   <0|L_k Ē|0>          = γ(L_k; T) - γ(0; T)
+#   right  <0|(1+Λ) Ē (r0+R)|0> = r0 [γ(Λ;T) - γ(0;T)]
+#                                 + d/de γ(Λ; T + e R)|e=0
+#                                 + γ(ζ, 0; T) - γ(0; T)
+# where the derivative is the commutator <0|(1+Λ)[Ē, R]|0>, the last term
+# is <0|Λ R Ē|0> with <0|Λ2 R1 = sum ζ_jb <S_jb|,
+# ζ_jb = sum_ia (2 l2[ijab] - l2[ijba]) r1[ia], and r0 = -<Λ|R> makes the
+# state biorthogonal to the ground state.  γ is a polynomial of degree 3 in
+# T, so a 5-point central difference gives the derivative exactly.  PySCF's
+# dm1 is the symmetrised density, which is all a symmetric operator (the
+# dipole) sees.
+
+
+def _pair(l1, l2, r1, r2):
+    """<L|R> for a Λ-like (l1, l2) and a T-like (r1, r2)."""
+    return float(2 * cp.vdot(l1, r1) + 2 * cp.vdot(l2, r2)
+                 - cp.vdot(l2.transpose(0, 1, 3, 2), r2))
+
+
+def _gamma(mycc, t1, t2, l1, l2):
+    """Active-space spin-traced 1-RDM functional γ(λ; T) without the
+    reference occupations (PySCF ``ccsd_rdm``, device)."""
+    from electrolites import ccsd_rdm_gpu
+    m = ccsd_rdm_gpu._mod()
+    d1 = m._gamma1_intermediates(mycc, t1, t2, l1, l2)
+    return m._make_rdm1(mycc, d1, with_frozen=False, with_mf=False)
+
+
+def _drop_vvvv_on_oom(mycc, log, fn, *args):
+    """Run ``fn``; if the device runs out of memory while the MO (ac|bd)
+    (v^4 doubles) is held, drop it and run ``fn`` again with the AO-direct
+    ladder (Rh EDOYAZ, v = 226 on an 80 GB A100: (ac|bd) 21 GB + the EE
+    intermediates left room for 6 Davidson vectors and the sigma failed)."""
+    try:
+        return fn(*args)
+    except cp.cuda.memory.OutOfMemoryError:
+        if getattr(mycc, '_eom_vvvv', None) is None:
+            raise
+    log.warn('EOM-EE: out of device memory with the MO vvvv held; '
+             'repeating with the AO-direct ladder')
+    del mycc._eom_vvvv
+    mycc._eom_ao_ladder = True
+    cp.get_default_memory_pool().free_all_blocks()
+    return fn(*args)
+
+
+def _left_kernel(eom, nroots, guess=None):
+    """Left singlet EOM-EE-CCSD eigenvectors (Λ-like representation),
+    packed as the right ones; ``guess`` (e.g. the right vectors) seeds the
+    Davidson.  If the device runs out of memory with the MO (ac|bd) held,
+    it is dropped and the solve repeated with the AO-direct ladder."""
+    log = logger.new_logger(eom)
+    return _drop_vvvv_on_oom(eom._cc, log, _left_solve, eom, nroots, guess,
+                             log)
+
+
+def _left_solve(eom, nroots, guess, log):
+    from electrolites import ccsd_lambda_gpu as LG
+    mycc = eom._cc
+    d = getattr(eom, '_diag', None)
+    if d is None:
+        imds = _make_ee(_Imds(mycc), mycc)
+        h1, h2 = _ee_diag(imds, mycc)
+        d = _pack_singlet(h1[None], h2[None])[0]
+        h1 = h2 = imds = None
+    d = cp.asarray(d)
+    imds = LG.make_intermediates(_Imds(mycc))
+    no, nv = imds.nocc, imds.nvir
+    e = cp.diag(imds.fock)
+    eia = e[:no, None] - (e[None, no:] + mycc.level_shift)
+    d2 = eia[:, None, :, None] + eia[None, :, None, :]
+    z1, z2 = LG.lambda_rhs(imds, mycc, cp.zeros((no, nv)),
+                           cp.zeros((no, no, nv, nv)))
+
+    def matvec(V):
+        out = cp.empty_like(V)
+        for k in range(len(V)):
+            l1, l2 = _unpack_singlet(V[k:k + 1], no, nv)
+            l1, l2 = l1[0], l2[0]
+            s1, s2 = LG.lambda_rhs(imds, mycc, l1, l2)
+            s1 -= z1
+            s1 -= eia * l1
+            s2 -= z2
+            s2 -= d2 * l2
+            l1 = l2 = None
+            out[k] = _pack_singlet(s1[None], s2[None])[0]
+            s1 = s2 = None
+        return out
+
+    nspare = max(3, nroots // 2)
+    ng = len(guess) if guess is not None else 0
+    idx = cp.asnumpy(cp.argsort(d)[:nroots + nspare])
+    x0 = cp.zeros((ng + (nspare if ng else nroots + nspare), len(d)))
+    if ng:
+        x0[:ng] = cp.asarray(np.asarray(guess)).reshape(ng, -1)
+        idx = idx[:nspare]
+    x0[cp.arange(ng, len(x0)), cp.asarray(idx)] = 1.
+    conv, ev, X = _davidson_nosym(matvec, x0, d, nroots, eom.conv_tol,
+                                  eom.conv_tol ** .5, eom.max_cycle,
+                                  eom.max_space + len(x0), log)
+    for n in range(nroots):
+        log.info('left EOM-EE-CCSD singlet root %d E = %.16g  conv = %s', n,
+                 ev[n], conv[n])
+    return conv, ev, list(cp.asnumpy(X))
+
+
+def _dipole_mo(mycc):
+    mol = mycc.mol
+    mask = mycc.get_frozen_mask()
+    mo = np.asarray(mycc.mo_coeff.get() if hasattr(mycc.mo_coeff, 'get')
+                    else mycc.mo_coeff)[:, mask]
+    charges = mol.atom_charges()
+    origin = charges @ mol.atom_coords() / charges.sum()
+    with mol.with_common_orig(origin):
+        dip = mol.intor_symmetric('int1e_r', comp=3)
+    return cp.asarray(np.einsum('xpq,pi,qj->xij', dip, mo, mo))
+
+
+def transition_properties(mycc, e, rvecs, lvecs, l1=None, l2=None):
+    """Transition dipoles <0|mu|k> (right), <k|mu|0> (left) and oscillator
+    strengths f = 2/3 w sum_x <0|mu_x|k><k|mu_x|0> for singlet EOM-EE-CCSD
+    states (packed right/left vectors as from ``EOMEESinglet``)."""
+    from electrolites import ccsd_lambda_gpu
+    t1, t2 = cp.asarray(mycc.t1), cp.asarray(mycc.t2)
+    if l1 is None or l2 is None:
+        if getattr(mycc, 'l1', None) is None:
+            ccsd_lambda_gpu.kernel(mycc, tol=mycc.conv_tol_normt)
+        l1, l2 = mycc.l1, mycc.l2
+    l1, l2 = cp.asarray(l1), cp.asarray(l2)
+    no, nv = t1.shape
+    dip = _dipole_mo(mycc)
+    z1, z2 = cp.zeros_like(t1), cp.zeros_like(t2)
+    g0 = _gamma(mycc, t1, t2, z1, z2)
+    gl = _gamma(mycc, t1, t2, l1, l2) - g0
+    out = dict(e=np.asarray(e, dtype=float), mu_0k=[], mu_k0=[], f=[], r0=[])
+    for w, rv, lv in zip(e, rvecs, lvecs):
+        r1, r2 = _unpack_singlet(cp.asarray(rv)[None], no, nv)
+        x1, x2 = _unpack_singlet(cp.asarray(lv)[None], no, nv)
+        r1, r2, x1, x2 = r1[0], r2[0], x1[0], x2[0]
+        s = _pair(x1, x2, r1, r2)
+        x1 /= s
+        x2 /= s
+        r0 = -_pair(l1, l2, r1, r2)
+        zeta = (2 * _ein('ijab,ia->jb', l2, r1)
+                - _ein('ijba,ia->jb', l2, r1))
+        h = 1e-2
+        gs = [_gamma(mycc, t1 + c * h * r1, t2 + c * h * r2, l1, l2)
+              for c in (-2, -1, 1, 2)]
+        dg = (gs[0] - 8 * gs[1] + 8 * gs[2] - gs[3]) / (12 * h)
+        gs = None
+        g_r = r0 * gl + dg + (_gamma(mycc, t1, t2, zeta, z2) - g0)
+        g_l = _gamma(mycc, t1, t2, x1, x2) - g0
+        m0k = cp.asnumpy(_ein('xpq,pq->x', dip, g_r))
+        mk0 = cp.asnumpy(_ein('xpq,pq->x', dip, g_l))
+        out['mu_0k'].append(m0k)
+        out['mu_k0'].append(mk0)
+        out['f'].append(2. / 3 * float(w) * float(m0k @ mk0))
+        out['r0'].append(r0)
+    for k in ('mu_0k', 'mu_k0', 'f', 'r0'):
+        out[k] = np.asarray(out[k])
+    return out
+
+
+@_on_pool
+def eomee_singlet_properties(mycc, nroots=1, conv_tol=1e-7, eom=None):
+    """Right and left singlet EOM-EE-CCSD roots, the CCSD Λ and the
+    transition properties: returns (eom, props) with props as from
+    ``transition_properties`` plus 'e_left' and 'converged'."""
+    from electrolites import ccsd_lambda_gpu
+    if eom is None:
+        eom = EOMEESinglet(mycc)
+        eom.conv_tol = conv_tol
+    e, rv = eom.kernel(nroots=nroots)
+    e = np.atleast_1d(e)
+    rv = rv if nroots > 1 else [rv]
+    if getattr(mycc, 'l1', None) is None:
+        ccsd_lambda_gpu.kernel(mycc, tol=mycc.conv_tol_normt)
+    convl, el, lv = _left_kernel(eom, nroots, guess=rv)
+    # pair each right root with the left root of the same energy
+    order = [int(np.argmin(abs(el - x))) for x in e]
+    el = el[order]
+    lv = [lv[i] for i in order]
+    log = logger.new_logger(eom)
+    dmax = float(abs(el - e).max())
+    if dmax > 10 * eom.conv_tol ** .5:
+        log.warn('left/right EOM-EE roots differ by up to %.2e Eh', dmax)
+    props = transition_properties(mycc, e, rv, lv)
+    props['e_left'] = el
+    props['converged'] = np.asarray(eom.converged) & np.asarray(convl)[order]
+    for n in range(nroots):
+        log.info('EOM-EE-CCSD singlet %d  %.6f eV  f = %.6f  r0 = %.4f', n,
+                 e[n] * 27.211386245988, props['f'][n], props['r0'][n])
+    return eom, props
+
+
+#: trial vectors per EE sigma batch (at most)
 _EE_BLK = 8
+
+
+def _ee_blk(no, nv):
+    """Trial vectors per singlet sigma batch that fit the free memory: the
+    sigma holds ~16 o^2 v^2 arrays per vector at its peak (r2, tau2, Hr2,
+    theta, the ladder's pair halves and output, einsum and transpose copies,
+    the packing indices).  At o = 47, v = 182 one vector is ~9 GB, and a
+    fixed batch of 8 ran an 80 GB device out of memory."""
+    from electrolites.fastccsd import _avail
+    per = 16 * 8 * (no * nv) ** 2
+    return max(1, min(_EE_BLK, int(.8 * _avail() // per)))
 
 
 def _ipccsd(self, nroots=1, left=False, koopmans=False, guess=None,

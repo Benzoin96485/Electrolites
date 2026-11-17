@@ -2754,3 +2754,74 @@ triplet: the first try of the MO path ran out of memory there).
 All CC/EOM/ADC tests pass unchanged.  Note that the MO (ac|bd) stays on
 the CCSD object (`mycc._eom_vvvv`, v⁴ doubles) for later EOM/Λ calls;
 `del mycc._eom_vvvv` frees it.
+
+### 17.11 Singlet EOM-EE-CCSD on TM complexes: fixes, left vectors, oscillator strengths
+
+Driver: TeraChem RR-EOM-CCSD reference set (Ir/Pt/Rh/Ru singlet complexes,
+15–30 atoms, cc-pVDZ + LANL2DZ/ECP, frozen core as in the inputs, 5 roots);
+9 of them (nao 154–291) were run here on one A100-80GB.
+
+**Two bugs in the singlet EOM-EE path** `[V]`:
+
+* *Spurious exact-zero root.*  The Davidson collapse orthonormalised the
+  Ritz vectors with QR + `solve(r^T, AX)`.  A nearly real complex pair
+  (|Im w| < 1e-3) kept both members, whose real parts are the same vector;
+  X was rank-deficient and the collapse produced rows with V ≠ 0, AV = 0:
+  a root at 0 with residual 1e-15 (Ir PEXRAL, nao 154).  Now one member of
+  such a pair is kept, and the collapse uses an SVD of the Ritz
+  coefficients (V ← Uᵀ V, AV ← Uᵀ AV).
+* *Out of memory at nao ≥ 243.*  The sigma ran 8 trial vectors per batch
+  (~16 o²v² arrays each: 9 GB per vector at o = 47, v = 182).  The batch is
+  now sized from free memory (`_ee_blk`), the subspace is preallocated and
+  sized after the first sigma (which builds the MO vvvv), without `vstack`
+  copies.
+
+**Profile of the v ≥ 198 slowdown** (5 roots, A100-80GB, times in s):
+
+| case (o, v) | EOM before | AO-direct ladder share | EOM after | path after |
+|---|---|---|---|---|
+| Rh QUNBAC (47, 182) | 121 | — (MO vvvv) | 120 | MO |
+| Rh SOXYIN01 (45, 198) | 407 | 298 (73 %) | **153** | MO |
+| Pt AFAPOM (50, 204) | 554 | 404 (73 %) | **398** | MO |
+
+`_vvvv_mo` asked for 3 v⁴ doubles (array, transposed copy, workspace) in
+half the free memory; v ≥ 198 fell back to the AO-direct ladder.  It now
+fills the [(a,b),(c,d)] matrix in slices of a straight from
+`get_int4c2e_ovpq` (peak v⁴ + one slice) and is used up to 45 % of the
+free memory.  After the fix the sigma's three o³v³ contractions
+(`mbej,nimea->njiab`, `meaf,nijef->nmaij`, `mbej,nimae->nijab`) run at
+~17.6 TFLOP/s, ~90 % of the A100's FP64 tensor-core peak; AFAPOM's
+remaining cost is more Davidson vectors (subspace capped by memory). If the
+device runs out of memory with the MO vvvv held (Rh EDOYAZ, v = 226: 21 GB
+of vvvv + 17 GB of intermediates), `_drop_vvvv_on_oom` frees it and
+repeats the solve on the AO-direct ladder.
+
+**Left vectors and transition properties** (PySCF has neither for RCCSD).
+The left operator is the λ-linear part of the Λ equations:
+`ccsd_lambda_gpu.lambda_rhs` (the update before the division by D) gives
+L (H̄ − E) = rhs(L) − rhs(0) − D L, in Λ's representation; pairing
+⟨L|R⟩ = 2 Σ l1 r1 + Σ (2 l2[ijab] − l2[ijba]) r2[ijab].  Transition
+densities come from the CCSD 1-RDM functional γ(λ; T) (`ccsd_rdm`):
+
+* left ⟨0|L_k Ē|0⟩ = γ(L_k; T) − γ(0; T);
+* right ⟨0|(1+Λ) Ē (r0 + R_k)|0⟩ = r0 [γ(Λ;T) − γ(0;T)] + ∂_ε γ(Λ; T+εR_k)
+  + γ(ζ, 0; T) − γ(0; T), with ζ_jb = Σ_ia (2 l2[ijab] − l2[ijba]) r1[ia]
+  (⟨0|Λ₂R₁) and r0 = −⟨Λ|R_k⟩.  γ is cubic in T, so a 5-point central
+  difference gives the derivative exactly.
+
+f = ⅔ ω Σ_x ⟨0|μ_x|k⟩⟨k|μ_x|0⟩.  API: `eom_gpu.eomee_singlet_properties(mycc,
+nroots)` (or `_left_kernel` + `transition_properties`).
+`tests/test_eomee_props_gpu.py` checks it against a brute-force
+determinant-space reference (H̄ = e^-T H e^T and μ̄ as dense matrices from
+the converged T, no spin adaptation, no Λ code): H2O (with and without
+frozen core), NH3 (both distorted), LiH/6-31G — energies to ≤ 2e-9 Eh,
+f to ≤ 1e-8, left roots = right roots to ≤ 2e-9 Eh.  Dropping the ζ term
+changes f by ~7 %, dropping r0 by ~4e-5 relative; the test catches both.
+Λ-update GEMMs written out (`jibc,ca->jiba` took 0.2 s in cupy.einsum):
+1.44 → 0.83 s per left sigma vector at QUNBAC.
+
+Against TeraChem RR-EOM-CCSD (same basis/ECP/frozen core): excitation
+energies +0.025 eV mean, ≤ 0.073 eV (canonical − rank-reduced, mostly a
+per-molecule shift correlating with D1); oscillator strengths |Δf| ≤ 0.006
+apart from one near-degenerate pair whose states swap order, ~3 % median
+for f > 0.01.  Scripts, results and profiles: `benchmarks/eom_terachem/`.

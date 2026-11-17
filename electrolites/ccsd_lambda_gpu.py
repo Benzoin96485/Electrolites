@@ -109,7 +109,7 @@ def make_intermediates(imds):
     w3 -= _ein('kj,kb->bj', w2, t1)
     imds.w1, imds.w2, imds.w3, imds.w4 = w1, w2, w3, w4
     imds.woooo, imds.wvooo, imds.wVOov = woooo, wvooo, wVOov
-    imds.wvOOv, imds.wvvov = wvOOv, wvvov
+    imds.wvOOv, imds.wvvov = wvOOv, cp.ascontiguousarray(wvvov)
     return imds
 
 
@@ -127,6 +127,22 @@ def _ladder_oovv(imds, mycc, x):
 
 def update_lambda(imds, mycc, l1, l2):
     """PySCF ``ccsd_lambda.update_lambda``, unblocked, on the device."""
+    l1new, l2new = lambda_rhs(imds, mycc, l1, l2)
+    e = cp.diag(imds.fock)
+    no = imds.nocc
+    eia = e[:no, None] - (e[None, no:] + mycc.level_shift)
+    l1new /= eia
+    l2new /= eia[:, None, :, None] + eia[None, :, None, :]
+    return l1new, l2new
+
+
+def lambda_rhs(imds, mycc, l1, l2):
+    """The Λ update before its division by the orbital-energy differences
+    (λ2 part symmetrised): the Λ equations are lambda_rhs(λ) = D λ with
+    D = e_i - e_a (e_i + e_j - e_a - e_b), so the λ-linear part
+    lambda_rhs(λ) - lambda_rhs(0) - D λ is λ (H̄ - E_CC) on the singles
+    and doubles -- the left EOM-EE operator (``eom_gpu.EOMEESinglet``
+    ``left=True``)."""
     t1, t2 = imds.t1, imds.t2
     ovvv, ovoo, ovvo, oovv = imds.ovvv, imds.ovoo, imds.ovvo, imds.oovv
     no = imds.nocc
@@ -162,12 +178,14 @@ def update_lambda(imds, mycc, l1, l2):
     l1new += _ein('ijab,bj->ia', l2, imds.w3) * 2
     l1new -= _ein('ijba,bj->ia', l2, imds.w3)
     l2new += _ein('ia,jb->ijab', l1, imds.w4)
-    l2new += _ein('jibc,ca->jiba', l2, w1)
-    l2new -= _ein('jk,kiba->jiba', w2, l2)
+    # GEMMs written out: cupy.einsum took 0.2 s for this o^2 v^3 term
+    # (permuted copies), 15 % of a QUNBAC (o 47, v 182) Λ/left-EOM update
+    l2new += l2 @ w1                                 # jibc,ca->jiba
+    l2new -= (w2 @ l2.reshape(no, -1)).reshape(l2.shape)  # jk,kiba->jiba
 
     l1new -= _ein('iajk,kj->ia', ovoo, mij1) * 2
     l1new += _ein('jaik,kj->ia', ovoo, mij1)
-    l2new -= _ein('jbki,ka->jiba', ovoo, l1)
+    l2new -= ovoo.transpose(0, 3, 1, 2) @ l1       # jbki,ka->jiba
 
     tau = t2 + _ein('ia,jb->ijab', t1, t1)
     l2tau = _ein('ijcd,klcd->ijkl', l2, tau)
@@ -200,7 +218,9 @@ def update_lambda(imds, mycc, l1, l2):
     m4 = None
 
     l1new -= _ein('ckij,jkca->ia', imds.wvooo, l2)
-    l1new += _ein('abkc,kibc->ia', imds.wvvov, l2)
+    nv_ = l2.shape[2]
+    l1new += (l2.transpose(1, 2, 0, 3).reshape(no, -1)       # abkc,kibc->ia
+              @ imds.wvvov.reshape(nv_, -1).T)
     tmp_voov = imds.wVOov * 2 + imds.wvOOv
     tmp = l2.transpose(0, 2, 1, 3) - l2.transpose(0, 3, 1, 2) * .5
     l2new += _ein('iakc,bjkc->jiba', tmp, tmp_voov)
@@ -216,10 +236,7 @@ def update_lambda(imds, mycc, l1, l2):
     l1new -= _ein('ijba,jb->ia', m3, t1)
     m3 = None
 
-    eia = mo_e_o[:, None] - mo_e_v[None, :]
-    l1new /= eia
     l2new = l2new + l2new.transpose(1, 0, 3, 2)
-    l2new /= eia[:, None, :, None] + eia[None, :, None, :]
     return l1new, l2new
 
 
