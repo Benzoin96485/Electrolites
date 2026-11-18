@@ -137,6 +137,24 @@ for name, atom, basis, frozen in cases:
     nroots = 4
     eom, props = eom_gpu.eomee_singlet_properties(mycc, nroots, conv_tol=1e-10)
     resid, ref = reference(mol, mf, mycc, nroots)
+    # the batched λ-linear operator: a batch equals its vectors one by one,
+    # and λ (H̄ - E) + D λ + η equals the Λ update before the division
+    import cupy as cp
+    from electrolites import ccsd_lambda_gpu as LG
+    imds = LG.make_intermediates(eom_gpu._Imds(mycc))
+    no, nv = imds.nocc, imds.nvir
+    rng = np.random.default_rng(3)
+    L1 = cp.asarray(rng.standard_normal((3, no, nv)))
+    L2 = cp.asarray(rng.standard_normal((3, no, no, nv, nv)))
+    L2 = L2 + L2.transpose(0, 2, 1, 4, 3)
+    S1, S2 = LG.lambda_linear(imds, mycc, L1, L2)
+    d = 0.
+    for k in range(3):
+        s1, s2 = LG.lambda_linear(imds, mycc, L1[k:k + 1], L2[k:k + 1])
+        d = max(d, float(abs(s1[0] - S1[k]).max()), float(abs(s2[0] - S2[k]).max()))
+    scale = float(abs(S2).max())
+    report(f'{name}: batched λ-linear == one vector at a time', d < 1e-12 * scale,
+           f'{d / scale:.1e} rel')
     report(f'{name}: CCSD equations hold in the SD space', resid < 1e-8,
            f'max |<mu|H̄|0>| {resid:.1e}')
     e = props['e']

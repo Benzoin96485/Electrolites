@@ -2825,3 +2825,38 @@ energies +0.025 eV mean, ≤ 0.073 eV (canonical − rank-reduced, mostly a
 per-molecule shift correlating with D1); oscillator strengths |Δf| ≤ 0.006
 apart from one near-degenerate pair whose states swap order, ~3 % median
 for f > 0.01.  Scripts, results and profiles: `benchmarks/eom_terachem/`.
+
+### 17.12 Left EOM-EE: batched λ-linear operator, and the missing pool
+
+Profile of the left solve (5 roots, one A100-80GB, alone on the GPU):
+
+| QUNBAC (o 47, v 182) | left | λ update | per vector | pack/unpack | Davidson rest |
+|---|---|---|---|---|---|
+| e2fd034 (per-vector `lambda_rhs`) | 251 s | 192 s (151 calls) | 1.27 s | 17.5 s | 29 s |
+| batched `lambda_linear` | 187 s | 144 s (61 calls) | 0.96 s | 8.8 s | 25 s |
+| batched + CuPy pool | **102 s** | 84 s | 0.56 s | 1.5 s | 7 s |
+
+| AFAPOM (o 50, v 204) | left | λ update | Davidson rest |
+|---|---|---|---|
+| e2fd034 | 378 s | 281 s | 53 s |
+| batched + pool | **182 s** | 154 s | 9 s |
+
+Two changes:
+
+* `ccsd_lambda_gpu.lambda_linear(imds, mycc, L1, L2)`: λ (H̄ − E_CC) on a batch
+  (leading index on every λ-dependent array), PySCF's update without its
+  three constant terms and without the orbital-energy diagonal (raw w1, w2).
+  `lambda_rhs` is now assembled from it (+ D λ + η, `_lambda_const`), so the
+  Λ tests check it against PySCF; the left Davidson sends all trial vectors
+  of a step through it in memory-sized blocks (`_ee_blk`).
+* `_left_kernel` and `transition_properties` were not on CuPy's memory pool
+  (`_on_pool`): called directly (as a campaign script does), every >100 MB
+  temporary went through GPU4PySCF's cudaMalloc/cudaFree path, which
+  synchronises — about 85 s of QUNBAC's λ updates and most of the Davidson
+  overhead.  The 0.83 s/vector measured earlier for one `lambda_rhs` had
+  been on the pool, which is why the in-situ 257 s did not add up.
+
+Left/right EOM time: QUNBAC 2.1 → 0.84, AFAPOM 0.96 → 0.46.  The Λ solver
+(one vector per iteration, already on the pool) is unchanged (17 s / 30 s).
+Tests: 66 checks pass, plus "batched λ-linear == one vector at a time"
+(≤ 2e-16 relative) in `test_eomee_props_gpu.py`.

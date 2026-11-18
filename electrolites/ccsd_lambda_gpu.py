@@ -116,7 +116,7 @@ def make_intermediates(imds):
 def _ladder_oovv(imds, mycc, x):
     """sum_cd (ac|bd) x[i,j,c,d] AO-direct (PySCF ``_add_vvvv``)."""
     from electrolites.eom_gpu import _ladder_setup
-    no, _, nv, _ = x.shape
+    no = x.shape[-4]                 # x may carry leading batch indices
     if not hasattr(imds, 'orbv_s'):
         mask = mycc.get_frozen_mask()
         mo = cp.asarray(mycc.mo_coeff)[:, cp.asarray(mask)]
@@ -139,105 +139,143 @@ def update_lambda(imds, mycc, l1, l2):
 def lambda_rhs(imds, mycc, l1, l2):
     """The Λ update before its division by the orbital-energy differences
     (λ2 part symmetrised): the Λ equations are lambda_rhs(λ) = D λ with
-    D = e_i - e_a (e_i + e_j - e_a - e_b), so the λ-linear part
-    lambda_rhs(λ) - lambda_rhs(0) - D λ is λ (H̄ - E_CC) on the singles
-    and doubles -- the left EOM-EE operator (``eom_gpu.EOMEESinglet``
-    ``left=True``)."""
+    D = e_i - e_a (e_i + e_j - e_a - e_b).  Assembled from its λ-linear
+    part (``lambda_linear``, which is λ (H̄ - E_CC) on the singles and
+    doubles -- the left EOM-EE operator), the diagonal D λ and the
+    λ-independent part (η, ``_lambda_const``)."""
+    c1, c2 = _lambda_const(imds, mycc)
+    s1, s2 = lambda_linear(imds, mycc, l1[None], l2[None])
+    d1 = _lambda_diag(imds, mycc)
+    s1, s2 = s1[0], s2[0]
+    s1 += c1
+    s1 += d1 * l1
+    s2 += c2
+    s2 += (d1[:, None, :, None] + d1[None, :, None, :]) * l2
+    return s1, s2
+
+
+def _lambda_diag(imds, mycc):
+    e = cp.diag(imds.fock)
+    no = imds.nocc
+    return e[:no, None] - (e[None, no:] + mycc.level_shift)
+
+
+def _lambda_const(imds, mycc):
+    """The λ-independent part of the Λ update (η): f_ov, the t1 piece of
+    mia1 through voov, and voov itself (symmetrised as the λ2 update)."""
+    c = getattr(imds, '_lambda_const', None)
+    if c is not None:
+        return c
+    t1 = imds.t1
+    no = imds.nocc
+    voov = imds.ovvo.transpose(1, 0, 3, 2)
+    c1 = imds.fock[:no, no:].copy()
+    c1 += _ein('aijb,jb->ia', voov, t1) * 2
+    c1 -= _ein('bija,jb->ia', voov, t1)
+    c2 = voov.transpose(1, 2, 0, 3) * .5
+    c2 = c2 + c2.transpose(1, 0, 3, 2)
+    imds._lambda_const = (c1, c2)
+    return c1, c2
+
+
+def lambda_linear(imds, mycc, L1, L2):
+    """λ (H̄ - E_CC) on the singles and doubles for a batch of λ:
+    L1 (n, o, v), L2 (n, o, o, v, v) with L2[n,j,i,b,a] = L2[n,i,j,a,b].
+    PySCF's ``update_lambda`` without its constant terms and without the
+    orbital-energy diagonal (w1, w2 are used as they are, the D λ of the
+    Λ update cancelling the diag(e) taken off them there), with a leading
+    batch index on every λ-dependent array: the left EOM-EE Davidson runs
+    all its trial vectors of a step through here at once."""
     t1, t2 = imds.t1, imds.t2
     ovvv, ovoo, ovvo, oovv = imds.ovvv, imds.ovoo, imds.ovvo, imds.oovv
-    no = imds.nocc
-    fov = imds.fock[:no, no:]
-    e = cp.diag(imds.fock)
-    mo_e_o = e[:no]
-    mo_e_v = e[no:] + mycc.level_shift
+    n, no, nv = L1.shape
+    w1, w2 = imds.w1, imds.w2
 
     theta = t2 * 2 - t2.transpose(0, 1, 3, 2)
-    mba = _ein('klca,klcb->ba', l2, theta)
-    mij = _ein('ikcd,jkcd->ij', l2, theta)
+    mba = _ein('nklca,klcb->nba', L2, theta)
+    mij = _ein('nikcd,jkcd->nij', L2, theta)
     theta = None
-    mba1 = _ein('jc,jb->bc', l1, t1) + mba
-    mij1 = _ein('kb,jb->kj', l1, t1) + mij
-    mia1 = t1 + _ein('kc,jkbc->jb', l1, t2) * 2
-    mia1 -= _ein('kc,jkcb->jb', l1, t2)
-    mia1 -= t1 @ l1.T @ t1
-    mia1 -= _ein('bd,jd->jb', mba, t1)
-    mia1 -= _ein('lj,lb->jb', mij, t1)
+    mba1 = _ein('njc,jb->nbc', L1, t1) + mba
+    mij1 = _ein('nkb,jb->nkj', L1, t1) + mij
+    mia1 = _ein('nkc,jkbc->njb', L1, t2) * 2
+    mia1 -= _ein('nkc,jkcb->njb', L1, t2)
+    mia1 -= _ein('ja,nka,kb->njb', t1, L1, t1)
+    mia1 -= _ein('nbd,jd->njb', mba, t1)
+    mia1 -= _ein('nlj,lb->njb', mij, t1)
 
-    l2new = _ladder_oovv(imds, mycc, l2)
-    l1new = _ein('ijab,jb->ia', l2new, t1) * 2
-    l1new -= _ein('jiab,jb->ia', l2new, t1)
-    l2new *= .5
+    L2new = _ladder_oovv(imds, mycc, L2)
+    L1new = _ein('nijab,jb->nia', L2new, t1) * 2
+    L1new -= _ein('njiab,jb->nia', L2new, t1)
+    L2new *= .5
 
-    w1 = imds.w1 - cp.diag(mo_e_v)
-    w2 = imds.w2 - cp.diag(mo_e_o)
-    l1new += fov
-    l1new += _ein('ib,ba->ia', l1, w1)
-    l1new -= _ein('ja,ij->ia', l1, w2)
-    l1new -= _ein('ik,ka->ia', mij, imds.w4)
-    l1new -= _ein('ca,ic->ia', mba, imds.w4)
-    l1new += _ein('ijab,bj->ia', l2, imds.w3) * 2
-    l1new -= _ein('ijba,bj->ia', l2, imds.w3)
-    l2new += _ein('ia,jb->ijab', l1, imds.w4)
-    # GEMMs written out: cupy.einsum took 0.2 s for this o^2 v^3 term
-    # (permuted copies), 15 % of a QUNBAC (o 47, v 182) Λ/left-EOM update
-    l2new += l2 @ w1                                 # jibc,ca->jiba
-    l2new -= (w2 @ l2.reshape(no, -1)).reshape(l2.shape)  # jk,kiba->jiba
+    L1new += L1 @ w1                                      # nib,ba->nia
+    L1new -= _ein('nja,ij->nia', L1, w2)
+    L1new -= _ein('nik,ka->nia', mij, imds.w4)
+    L1new -= _ein('nca,ic->nia', mba, imds.w4)
+    L1new += _ein('nijab,bj->nia', L2, imds.w3) * 2
+    L1new -= _ein('nijba,bj->nia', L2, imds.w3)
+    L2new += _ein('nia,jb->nijab', L1, imds.w4)
+    L2new += L2 @ w1                                      # njibc,ca->njiba
+    L2new -= cp.matmul(w2, L2.reshape(n, no, -1)).reshape(L2.shape)
 
-    l1new -= _ein('iajk,kj->ia', ovoo, mij1) * 2
-    l1new += _ein('jaik,kj->ia', ovoo, mij1)
-    l2new -= ovoo.transpose(0, 3, 1, 2) @ l1       # jbki,ka->jiba
+    L1new -= _ein('iajk,nkj->nia', ovoo, mij1) * 2
+    L1new += _ein('jaik,nkj->nia', ovoo, mij1)
+    ov_t = ovoo.transpose(0, 3, 1, 2).reshape(-1, no)      # (jib, k)
+    L2new -= cp.matmul(ov_t, L1).reshape(L2.shape)       # jbki,nka->njiba
+    ov_t = None
 
     tau = t2 + _ein('ia,jb->ijab', t1, t1)
-    l2tau = _ein('ijcd,klcd->ijkl', l2, tau)
+    l2tau = _ein('nijcd,klcd->nijkl', L2, tau)
     tau = None
-    l2t1 = _ein('jidc,kc->ijkd', l2, t1)
+    l2t1 = _ein('njidc,kc->nijkd', L2, t1)
 
-    l1new -= _ein('jb,jiab->ia', l1, oovv)
-    l1new += _ein('iabc,bc->ia', ovvv, mba1) * 2
-    l1new -= _ein('ibca,bc->ia', ovvv, mba1)
-    l2new += _ein('jbac,ic->jiba', ovvv, l1)
-    m4 = _ein('ijkd,kadb->ijab', l2t1, ovvv)
-    l2new -= m4
-    l1new -= _ein('ijab,jb->ia', m4, t1) * 2
-    l1new -= _ein('ijab,ia->jb', m4, t1) * 2
-    l1new += _ein('jiab,jb->ia', m4, t1)
-    l1new += _ein('jiab,ia->jb', m4, t1)
+    L1new -= _ein('njb,jiab->nia', L1, oovv)
+    L1new += _ein('iabc,nbc->nia', ovvv, mba1) * 2
+    L1new -= _ein('ibca,nbc->nia', ovvv, mba1)
+    L2new += _ein('jbac,nic->njiba', ovvv, L1)
+    m4 = _ein('nijkd,kadb->nijab', l2t1, ovvv)
+    l2t1 = None
+    L2new -= m4
+    L1new -= _ein('nijab,jb->nia', m4, t1) * 2
+    L1new -= _ein('nijab,ia->njb', m4, t1) * 2
+    L1new += _ein('njiab,jb->nia', m4, t1)
+    L1new += _ein('njiab,ia->njb', m4, t1)
     m4 = None
 
     voov = ovvo.transpose(1, 0, 3, 2)
-    l1new += _ein('jb,aijb->ia', l1, voov) * 2
-    l2new += voov.transpose(1, 2, 0, 3) * .5
-    l2new -= _ein('bjic,ca->jiba', voov, mba1)
-    l2new -= _ein('bjka,ik->jiba', voov, mij1)
-    l1new += _ein('aijb,jb->ia', voov, mia1) * 2
-    l1new -= _ein('bija,jb->ia', voov, mia1)
-    m4 = _ein('ijkl,aklb->ijab', l2tau, voov)
-    l2new += m4 * .5
-    l1new += _ein('ijab,jb->ia', m4, t1) * 2
-    l1new -= _ein('ijba,jb->ia', m4, t1)
+    L1new += _ein('njb,aijb->nia', L1, voov) * 2
+    L2new -= _ein('bjic,nca->njiba', voov, mba1)
+    L2new -= _ein('bjka,nik->njiba', voov, mij1)
+    L1new += _ein('aijb,njb->nia', voov, mia1) * 2
+    L1new -= _ein('bija,njb->nia', voov, mia1)
+    m4 = _ein('nijkl,aklb->nijab', l2tau, voov)
+    l2tau = None
+    L2new += m4 * .5
+    L1new += _ein('nijab,jb->nia', m4, t1) * 2
+    L1new -= _ein('nijba,jb->nia', m4, t1)
     m4 = None
 
-    l1new -= _ein('ckij,jkca->ia', imds.wvooo, l2)
-    nv_ = l2.shape[2]
-    l1new += (l2.transpose(1, 2, 0, 3).reshape(no, -1)       # abkc,kibc->ia
-              @ imds.wvvov.reshape(nv_, -1).T)
-    tmp_voov = imds.wVOov * 2 + imds.wvOOv
-    tmp = l2.transpose(0, 2, 1, 3) - l2.transpose(0, 3, 1, 2) * .5
-    l2new += _ein('iakc,bjkc->jiba', tmp, tmp_voov)
-    tmp = tmp_voov = None
-    tmp = _ein('jkca,bikc->jiba', l2, imds.wvOOv)
-    l2new += tmp
-    l2new += tmp.transpose(1, 0, 2, 3) * .5
+    L1new -= _ein('ckij,njkca->nia', imds.wvooo, L2)
+    L1new += cp.matmul(L2.transpose(0, 2, 3, 1, 4).reshape(n, no, -1),
+                       imds.wvvov.reshape(nv, -1).T)      # abkc,nkibc->nia
+    tmp_voov = getattr(imds, '_tmp_voov', None)
+    if tmp_voov is None:
+        tmp_voov = imds._tmp_voov = imds.wVOov * 2 + imds.wvOOv
+    tmp = L2.transpose(0, 1, 3, 2, 4) - L2.transpose(0, 1, 4, 2, 3) * .5
+    L2new += _ein('niakc,bjkc->njiba', tmp, tmp_voov)
+    tmp = _ein('njkca,bikc->njiba', L2, imds.wvOOv)
+    L2new += tmp
+    L2new += tmp.transpose(0, 2, 1, 3, 4) * .5
     tmp = None
 
-    m3 = _ein('ijkl,klab->ijab', imds.woooo, l2)
-    l2new += m3 * .5
-    l1new += _ein('ijab,jb->ia', m3, t1) * 2
-    l1new -= _ein('ijba,jb->ia', m3, t1)
+    m3 = _ein('ijkl,nklab->nijab', imds.woooo, L2)
+    L2new += m3 * .5
+    L1new += _ein('nijab,jb->nia', m3, t1) * 2
+    L1new -= _ein('nijba,jb->nia', m3, t1)
     m3 = None
 
-    l2new = l2new + l2new.transpose(1, 0, 3, 2)
-    return l1new, l2new
+    L2new = L2new + L2new.transpose(0, 2, 1, 4, 3)
+    return L1new, L2new
 
 
 def _kernel_on_pool(*args, **kwargs):

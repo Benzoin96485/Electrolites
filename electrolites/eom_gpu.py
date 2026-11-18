@@ -1069,6 +1069,7 @@ def _drop_vvvv_on_oom(mycc, log, fn, *args):
     return fn(*args)
 
 
+@_on_pool
 def _left_kernel(eom, nroots, guess=None):
     """Left singlet EOM-EE-CCSD eigenvectors (Λ-like representation),
     packed as the right ones; ``guess`` (e.g. the right vectors) seeds the
@@ -1091,25 +1092,20 @@ def _left_solve(eom, nroots, guess, log):
     d = cp.asarray(d)
     imds = LG.make_intermediates(_Imds(mycc))
     no, nv = imds.nocc, imds.nvir
-    e = cp.diag(imds.fock)
-    eia = e[:no, None] - (e[None, no:] + mycc.level_shift)
-    d2 = eia[:, None, :, None] + eia[None, :, None, :]
-    z1, z2 = LG.lambda_rhs(imds, mycc, cp.zeros((no, nv)),
-                           cp.zeros((no, no, nv, nv)))
 
     def matvec(V):
+        # all trial vectors of the step through one batched λ-linear
+        # update (the per-vector loop was 2x the right sigma's time per
+        # vector: o^3 v^3 contractions at one vector each)
         out = cp.empty_like(V)
-        for k in range(len(V)):
-            l1, l2 = _unpack_singlet(V[k:k + 1], no, nv)
-            l1, l2 = l1[0], l2[0]
-            s1, s2 = LG.lambda_rhs(imds, mycc, l1, l2)
-            s1 -= z1
-            s1 -= eia * l1
-            s2 -= z2
-            s2 -= d2 * l2
+        blk = _ee_blk(no, nv)
+        for p0 in range(0, len(V), blk):
+            l1, l2 = _unpack_singlet(V[p0:p0 + blk], no, nv)
+            s1, s2 = LG.lambda_linear(imds, mycc, l1, l2)
             l1 = l2 = None
-            out[k] = _pack_singlet(s1[None], s2[None])[0]
+            out[p0:p0 + blk] = _pack_singlet(s1, s2)
             s1 = s2 = None
+            blk = _ee_blk(no, nv)
         return out
 
     nspare = max(3, nroots // 2)
@@ -1141,6 +1137,7 @@ def _dipole_mo(mycc):
     return cp.asarray(np.einsum('xpq,pi,qj->xij', dip, mo, mo))
 
 
+@_on_pool
 def transition_properties(mycc, e, rvecs, lvecs, l1=None, l2=None):
     """Transition dipoles <0|mu|k> (right), <k|mu|0> (left) and oscillator
     strengths f = 2/3 w sum_x <0|mu_x|k><k|mu_x|0> for singlet EOM-EE-CCSD
