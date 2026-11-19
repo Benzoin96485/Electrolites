@@ -34,26 +34,45 @@ def make_intermediates(imds):
     w3 += t1.T @ fov @ t1.T                       # 'kc,kb,jc->bj'
     w4 = fov.copy()
 
-    vvov = ovvv.transpose(2, 3, 0, 1)
-    w1 += _ein('jcba,jc->ba', ovvv, t1 * 2)
-    w1 -= _ein('jabc,jc->ba', ovvv, t1)
+    # every o v^3 term in slices (``eom_gpu._ein_o`` or explicit loops):
+    # the unsliced build held five o v^3 arrays at once (ovvv, its
+    # transposed copies, g2vovv, g2vvov, vackb) and ran an 80 GB device out
+    # of memory at o 66, v 288
+    from electrolites.eom_gpu import _ein_o, _vslice
+    no, nv = t1.shape
+    w1 += _ein_o('jcba,jc->ba', ovvv, t1 * 2, 0)
+    w1 -= _ein_o('jabc,jc->ba', ovvv, t1, 0)
     theta = t2 * 2 - t2.transpose(1, 0, 2, 3)
-    w3 += _ein('jkcd,kdcb->bj', theta, ovvv)
-    wVOov = _ein('jbcd,kd->bjkc', ovvv, t1)
-    wvOOv = _ein('cbjd,kd->cjkb', vvov, -t1)
-    g2vovv = vvov.transpose(0, 2, 1, 3) * 2 - vvov.transpose(0, 2, 3, 1)
+    w3 += _ein_o('jkcd,kdcb->bj', theta, ovvv, 1, big=1)
+    wVOov = _ein_o('jbcd,kd->bjkc', ovvv, t1, None, out_axis=1)
+    # vvov[c,b,j,d] = ovvv[j,d,c,b]
+    wvOOv = _ein_o('jdcb,kd->cjkb', ovvv, -t1, None, out_axis=1)
     tau = t2 + _ein('ia,jb->ijab', t1, t1)
-    wvooo = _ein('cibd,jkbd->ckij', g2vovv, tau)
-    g2vovv = None
-    wvvov = _ein('jabd,jkcd->abkc', ovvv, t2) * -1.5
-    wvvov += vvov.transpose(0, 3, 2, 1) * 2
-    wvvov -= vvov
-    g2vvov = vvov * 2 - ovvv.transpose(1, 2, 0, 3)
+    # wvooo[c,k,i,j] = sum_bd (2 ovvv[i,d,c,b] - ovvv[i,b,c,d]) tau[j,k,b,d]
+    wvooo = cp.empty((nv, no, no, no))
+    for i0, i1 in _vslice(no, nv ** 3 * 8 * 4):
+        ov = ovvv[i0:i1]
+        g = ov.transpose(0, 2, 3, 1) * 2 - ov.transpose(0, 2, 1, 3)  # icbd
+        wvooo[:, :, i0:i1] = _ein('icbd,jkbd->ckij', g, tau)
+        g = ov = None
+    # wvvov[a,b,k,c] = -1.5 sum_jd ovvv[j,a,b,d] t2[j,k,c,d]
+    #   + 2 vvov[a,c,k,b] - vvov[a,b,k,c] + vackb[a,c,k,b] - vackb[a,b,k,c]/2
+    # vvov[a,b,k,c] = ovvv[k,c,a,b]; vackb[a,c,k,b] = sum_jd g2vvov[a,c,j,d]
+    # theta2[k,j,b,d], g2vvov[a,c,j,d] = 2 ovvv[j,d,a,c] - ovvv[j,a,c,d]
     theta2 = t2 * 2 - t2.transpose(0, 1, 3, 2)
-    vackb = _ein('acjd,kjbd->ackb', g2vvov, theta2)
-    wvvov += vackb.transpose(0, 3, 2, 1)
-    wvvov -= vackb * .5
-    vackb = g2vvov = None
+    wvvov = cp.empty((nv, nv, no, nv))
+    for a0, a1 in _vslice(nv, no * nv * nv * 8 * 5):
+        out = wvvov[a0:a1]
+        out[...] = _ein('jabd,jkcd->abkc', ovvv[:, a0:a1], t2) * -1.5
+        out += ovvv[:, :, a0:a1].transpose(2, 1, 0, 3) * 2     # vvov[a,c,k,b]
+        out -= ovvv[:, :, a0:a1].transpose(2, 3, 0, 1)         # vvov[a,b,k,c]
+        g = (ovvv[:, :, a0:a1].transpose(2, 3, 0, 1) * 2
+             - ovvv[:, a0:a1].transpose(1, 2, 0, 3))           # g2vvov[a,c,j,d]
+        v = _ein('acjd,kjbd->ackb', g, theta2)
+        g = None
+        out += v.transpose(0, 3, 2, 1)
+        out -= v * .5
+        v = out = None
 
     w2 += _ein('kbij,kb->ij', ovoo, t1) * 2
     w2 -= _ein('ibkj,kb->ij', ovoo, t1)
@@ -100,16 +119,17 @@ def make_intermediates(imds):
     wvooo -= _ein('jb,bikc->ckij', t1, ov1)
     wvooo += _ein('kb,bijc->ckij', t1, ov2)
     w3 += _ein('ckjb,kc->bj', ov2, t1)
-    wvvov += _ein('ajkc,jb->abkc', ov1, t1)
-    wvvov -= _ein('ajkb,jc->abkc', ov2, t1)
-    wvvov += _ein('laki,klbc->abic', g2ovoo, tau)
+    for a0, a1 in _vslice(nv, no * nv * nv * 8 * 3):
+        wvvov[a0:a1] += _ein('ajkc,jb->abkc', ov1[a0:a1], t1)
+        wvvov[a0:a1] -= _ein('ajkb,jc->abkc', ov2[a0:a1], t1)
+        wvvov[a0:a1] += _ein('laki,klbc->abic', g2ovoo[:, a0:a1], tau)
     ov1 = ov2 = g2ovoo = None
     woooo += oooo.transpose(0, 2, 1, 3)
     w3 += _ein('bc,jc->bj', w1, t1)
     w3 -= _ein('kj,kb->bj', w2, t1)
     imds.w1, imds.w2, imds.w3, imds.w4 = w1, w2, w3, w4
     imds.woooo, imds.wvooo, imds.wVOov = woooo, wvooo, wVOov
-    imds.wvOOv, imds.wvvov = wvOOv, cp.ascontiguousarray(wvvov)
+    imds.wvOOv, imds.wvvov = wvOOv, wvvov
     return imds
 
 
@@ -186,6 +206,7 @@ def lambda_linear(imds, mycc, L1, L2):
     Λ update cancelling the diag(e) taken off them there), with a leading
     batch index on every λ-dependent array: the left EOM-EE Davidson runs
     all its trial vectors of a step through here at once."""
+    from electrolites.eom_gpu import _ein_o
     t1, t2 = imds.t1, imds.t2
     ovvv, ovoo, ovvo, oovv = imds.ovvv, imds.ovoo, imds.ovvo, imds.oovv
     n, no, nv = L1.shape
@@ -230,10 +251,10 @@ def lambda_linear(imds, mycc, L1, L2):
     l2t1 = _ein('njidc,kc->nijkd', L2, t1)
 
     L1new -= _ein('njb,jiab->nia', L1, oovv)
-    L1new += _ein('iabc,nbc->nia', ovvv, mba1) * 2
-    L1new -= _ein('ibca,nbc->nia', ovvv, mba1)
-    L2new += _ein('jbac,nic->njiba', ovvv, L1)
-    m4 = _ein('nijkd,kadb->nijab', l2t1, ovvv)
+    L1new += _ein_o('iabc,nbc->nia', ovvv, mba1, None, out_axis=1) * 2
+    L1new -= _ein_o('ibca,nbc->nia', ovvv, mba1, None, out_axis=1)
+    L2new += _ein_o('jbac,nic->njiba', ovvv, L1, None, out_axis=1)
+    m4 = _ein_o('nijkd,kadb->nijab', l2t1, ovvv, 3, big=1)
     l2t1 = None
     L2new -= m4
     L1new -= _ein('nijab,jb->nia', m4, t1) * 2
@@ -305,16 +326,26 @@ def _kernel(mycc, t1=None, t2=None, l1=None, l2=None, max_cycle=50,
     l1 = imds.t1.copy() if l1 is None else cp.asarray(l1)
     l2 = imds.t2.copy() if l2 is None else cp.asarray(l2)
     no, nv = l1.shape
-    adiis = DIIS()
-    adiis.space = getattr(mycc, 'diis_space', 6)
+    from electrolites.fastccsd import _avail
+    space = getattr(mycc, 'diis_space', 6)
+    from electrolites.eom_gpu import _pack_singlet, _unpack_singlet
+    nov = no * nv
+    vec = (nov + nov * (nov + 1) // 2) * 8
+    # DIIS vectors in host memory when they would be a large share of the
+    # device (o 66, v 288: 12 x 2.9 GB)
+    adiis = DIIS(incore=2 * space * vec < 0.2 * _avail())
+    adiis.space = space
     conv = False
     for it in range(max_cycle):
         l1new, l2new = update_lambda(imds, mycc, l1, l2)
         normt = float(cp.sqrt(cp.linalg.norm(l1new - l1) ** 2
                               + cp.linalg.norm(l2new - l2) ** 2))
-        vec = adiis.update(cp.hstack([l1new.ravel(), l2new.ravel()]))
-        l1 = vec[:no * nv].reshape(no, nv)
-        l2 = vec[no * nv:].reshape(no, no, nv, nv)
+        l1 = l2 = None
+        # λ2 is pair-symmetric: DIIS on the packed (λ1, λ2[ia>=jb]) vector
+        vec = adiis.update(_pack_singlet(l1new[None], l2new[None])[0])
+        l1new = l2new = None
+        l1, l2 = _unpack_singlet(vec[None], no, nv)
+        l1, l2 = l1[0].copy(), l2[0]
         log.info('lambda cycle = %d  norm(lambda1,lambda2) = %.6g', it + 1,
                  normt)
         if normt < tol:

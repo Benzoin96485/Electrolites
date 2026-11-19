@@ -2860,3 +2860,70 @@ Left/right EOM time: QUNBAC 2.1 → 0.84, AFAPOM 0.96 → 0.46.  The Λ solver
 (one vector per iteration, already on the pool) is unchanged (17 s / 30 s).
 Tests: 66 checks pass, plus "batched λ-linear == one vector at a time"
 (≤ 2e-16 relative) in `test_eomee_props_gpu.py`.
+
+### 17.13 The largest TM complex on one A100-80GB (Pt EWANIZ, o 66, v 288)
+
+Pt/EWANIZ_comp_0 (29 atoms, nao 394, 40 frozen, o 66, v 288; one singlet
+vector 1.45 GB, o²v² 2.9 GB, ov³ 12.6 GB) now runs end to end on one
+A100-80GB: CCSD, 5 right roots, Λ, 5 left roots, oscillator strengths.
+
+| stage | time | notes |
+|---|---|---|
+| SCF | 12 s | |
+| CCSD | 548 s | fastccsd, host DIIS |
+| right EOM | 8725 s | host-subspace Davidson, 50 iterations from diagonal guesses |
+| Λ | 760 s | 17 iterations, host DIIS |
+| left EOM | 4120 s | 23 iterations from the right vectors, max \|E_L − E_R\| 2.4e-7 Eh |
+| properties | 82 s | |
+| total | 14247 s | TeraChem RR-EOM-CCSD, H200: 13286 s |
+
+| root | ω (eV) | TeraChem | f | TeraChem f |
+|---|---|---|---|---|
+| 1 | 2.6725 | 2.6677 | 9.1e-7 | 9.4e-7 |
+| 2 | 2.9179 | 2.8888 | 5.5e-4 | 1.2e-6 |
+| 3 | 2.9202 | 2.8958 | 0.1067 | 0.1053 |
+| 4 | 3.2842 | 3.2578 | 0.1450 | 0.1369 |
+| 5 | 3.2984 | 3.2699 | 3.0e-5 | 4.4e-5 |
+
+Roots 2/3 are 2.3 meV apart and mix differently in the two codes; their
+summed f agrees (0.1073 vs 0.1053).  E_corr −3.38401 vs TeraChem −3.38600.
+Excitation energies 5–29 meV above TeraChem, the sign and size of the
+rank-reduction offset seen across the campaign (§17.11).
+
+Memory fixes, in the order they were hit:
+
+* `fastccsd._fits` counted the nao²o² half-transformed block four times
+  instead of two, so EWANIZ fell back to GPU4PySCF's CCSD, which fails with
+  a frozen core ("Axis dimension mismatch").  DIIS vectors (packed, lower
+  triangle of t2) go to the host when two spaces would exceed 20 % of the
+  free device memory; same for the Λ DIIS.
+* `_pack_singlet`/`_unpack_singlet`: elementwise kernels with the
+  triangular index computed in place, no tril index arrays (2.9 GB at this
+  size) and no transposed copies.
+* `_davidson_nosym_host`: V and AV in pinned host memory as column blocks;
+  the device holds the integrals, one sigma sub-block and one column chunk.
+  Chosen automatically when fewer than 2·nwant+4 vectors fit on the device
+  (`EOM_DAVIDSON_HOST=1` forces it).  Ritz vectors are written every three
+  iterations to `eom.davidson_checkpoint(_left)`, so a run killed by the
+  wall clock restarts from them.
+* EE intermediates: wvOvV built in slices over its first index (peak one
+  ov³ instead of three), the ov³ contractions of the sigma through
+  `_ein_o` (slices of the ov³ operand; cupy.einsum otherwise made a full
+  12.6 GB transposed copy), tau2 consumed and dropped before the
+  end-of-sigma terms, and oovv/oooo/ovoo freed after the singlet build.
+* AO ladder: integral group size from the free memory (a fixed nao/4 group
+  was a 15.6 GB block here).
+* `_on_pool` lifts the CuPy pool limit to 100 % for the EOM/Λ calls, as
+  the CCSD does.
+* Λ: all ov³ terms of `make_intermediates` and of `lambda_linear` sliced.
+
+Measured left-solve memory (one vector per λ-linear call): Λ intermediates
+44.2 GB, pool peak 55 GB per call, 4.9 GB driver local memory for the
+(dd|dd) integral launches.  All EOM/Λ/property tests pass both normally and
+with `EOM_DAVIDSON_HOST=1 EOM_EIN_SLICE=2 EOM_WVOVV_CHUNK=3`.
+
+The right solve dominates: 50 iterations at ~3 min (one 1.45 GB vector per
+sigma, ~35 s each), most of them spent in the 1e-5 → 1e-7 tail of the
+energy test.  Starting it from better guesses (e.g. CIS/CC2) or loosening
+the energy tolerance for the roots whose residual is already converged
+is the obvious next saving.

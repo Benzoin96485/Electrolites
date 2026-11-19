@@ -74,23 +74,17 @@ def _tril_index(nov):
     return i * nov + j
 
 
-def _to_vector(t1, t2, idx):
-    nocc, nvir = t1.shape
-    nov = nocc * nvir
-    m = t2.transpose(0, 2, 1, 3).reshape(nov * nov)
-    return cp.concatenate([t1.ravel(), m[idx]])
+def _to_vector(t1, t2, idx=None):
+    """t1 + lower triangle of t2[ia,jb] (packed by a kernel: no index
+    array, no transposed copy of t2)."""
+    from electrolites.eom_gpu import _pack_singlet
+    return _pack_singlet(t1[None], t2[None])[0]
 
 
-def _from_vector(vec, nocc, nvir, idx):
-    nov = nocc * nvir
-    t1 = vec[:nov].reshape(nocc, nvir).copy()
-    m = cp.zeros(nov * nov)
-    m[idx] = vec[nov:]
-    m = m.reshape(nov, nov)
-    m = m + m.T - cp.diag(cp.diag(m))
-    t2 = cp.ascontiguousarray(
-        m.reshape(nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3))
-    return t1, t2
+def _from_vector(vec, nocc, nvir, idx=None):
+    from electrolites.eom_gpu import _unpack_singlet
+    r1, r2 = _unpack_singlet(vec[None], nocc, nvir)
+    return r1[0].copy(), r2[0]
 
 
 def energy(t1, t2, E):
@@ -535,18 +529,27 @@ def _avail():
     return cp.cuda.runtime.memGetInfo()[0] + pool.free_bytes()
 
 
+def _diis_incore(mycc):
+    nov = mycc.nocc * (mycc.nmo - mycc.nocc)
+    vec = (nov + nov * (nov + 1) // 2) * 8
+    return 2 * mycc.diis_space * vec < 0.2 * _avail()
+
+
 def _fits(mycc):
     """Device footprint estimate: ~14 o²v² arrays (amplitudes, integrals,
-    intermediates), 2·space packed DIIS vectors, the AO-direct step's
-    Ht2ao/x2 and wVVoo/wVvoO, and one AO integral block."""
+    intermediates), 2·space packed DIIS vectors when they are kept on the
+    device, the AO-direct step's Ht2ao/x2 and wVVoo/wVvoO (two nao² o²
+    arrays; counted four times before, which sent Pt EWANIZ -- o 66,
+    v 288, which runs in 69 GB -- to GPU4PySCF's CCSD, whose frozen-core
+    path fails), and one AO integral block."""
     from gpu4pyscf.scf import int4c2e
     nocc = mycc.nocc
     nvir = mycc.nmo - nocc
     nao = mycc.mol.nao_nr(cart=True)
     o2v2 = nocc**2 * nvir**2
-    space = mycc.diis_space if mycc.diis else 0
+    space = mycc.diis_space if mycc.diis and _diis_incore(mycc) else 0
     need = (14 * o2v2 + 2 * space * (o2v2 // 2 + nocc * nvir)
-            + 3 * nocc * (nocc + 1) // 2 * nao**2 + 4 * nao**2 * nocc**2
+            + 3 * nocc * (nocc + 1) // 2 * nao**2 + 2 * nao**2 * nocc**2
             + 4 * nao**3) * 8
     lmax = max(mycc.mol._bas[:, 1]) if mycc.mol.nbas else 0
     return need < 0.8 * _avail() and lmax <= int4c2e.LMAX_ON_GPU
@@ -586,10 +589,13 @@ def kernel(mycc, eris, t1=None, t2=None, max_cycle=50, tol=1e-8,
     eccsd = energy(t1, t2, E)
     log.info('Init E_corr(%s) = %.15g', name, eccsd)
 
-    idx = _tril_index(nocc * nvir)
+    idx = None
     adiis = None
     if mycc.diis:
-        adiis = DIIS(mycc, incore=True)
+        # DIIS vectors on the device only when they are a small share of it
+        # (o 66, v 288: 2 x 6 x 1.45 GB; the CCSD ran out of memory at the
+        # first DIIS step with them on the device)
+        adiis = DIIS(mycc, incore=_diis_incore(mycc))
         adiis.space = mycc.diis_space
 
     converged = False

@@ -45,8 +45,16 @@ def _on_pool(fn):
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
-        with cp.cuda.using_allocator(cp.get_default_memory_pool().malloc):
-            return fn(*args, **kwargs)
+        # the whole device for the pool, as fastccsd's CCSD (GPU4PySCF caps
+        # it at 90 %: 8.5 GB of an A100-80GB the largest EE cases need)
+        pool = cp.get_default_memory_pool()
+        lim = pool.get_limit()
+        pool.set_limit(fraction=1.0)
+        try:
+            with cp.cuda.using_allocator(pool.malloc):
+                return fn(*args, **kwargs)
+        finally:
+            pool.set_limit(size=lim)
     return wrapped
 
 
@@ -237,15 +245,24 @@ def _make_ea(imds, mycc):
 
 
 def _ladder_setup(mycc):
-    """vhfopt (as ``fastccsd``'s) and the AO-block cache on mycc."""
+    """vhfopt (as ``fastccsd``'s) and the AO-block cache on mycc.  The AO
+    shell groups are sized so that one integral block [i, nao, j, nao]
+    takes at most ~8 % of the free device memory: the fixed nao/4 grouping
+    made 15.6 GB blocks at nao 420 (cartesian) and ran the AO-direct ladder
+    out of memory beside the EE intermediates."""
     from gpu4pyscf.scf import int4c2e
+    from electrolites.fastccsd import _avail
+    nao = mycc.mol.nao_nr(cart=True)
+    gmax = max(4, (nao + 3) // 4)
+    g = int(max(4, min(gmax, (.08 * _avail() / (8 * nao * nao)) ** .5)))
     vhfopt = getattr(mycc, '_fastccsd_vhfopt', None)
+    if vhfopt is not None and vhfopt._fastccsd_blk is not None and \
+            vhfopt._fastccsd_blk > g and getattr(mycc, '_fastccsd_eri', None) is None:
+        vhfopt = None                   # CCSD's grouping, too big here
     if vhfopt is None:
-        nao = mycc.mol.nao_nr(cart=True)
         vhfopt = int4c2e._VHFOpt(mycc.mol, 'int2e')
-        vhfopt.build(group_size=max(4, (nao + 3) // 4),
-                     diag_block_with_triu=True)
-        vhfopt._fastccsd_blk = None
+        vhfopt.build(group_size=g, diag_block_with_triu=True)
+        vhfopt._fastccsd_blk = g
         mycc._fastccsd_vhfopt = vhfopt
         mycc._fastccsd_eri = None
     return vhfopt
@@ -608,7 +625,7 @@ def _virtual_coulomb_diag(mycc, orbv):
     return _ein('apq,pb,qb->ab', vj, orbv, orbv)
 
 
-def _make_ee(imds, mycc):
+def _make_ee(imds, mycc, keep_eris=False):
     """PySCF's ``_IMDS.make_ee`` (singlet EOM-EE intermediates), unblocked,
     on the device."""
     t1, t2 = imds.t1, imds.t2
@@ -673,18 +690,37 @@ def _make_ee(imds, mycc):
     woVoO += _ein('mjbe,ie->mbji', oovv, t1)
     woVoO += _ein('me,ijeb->mbij', Fov, t2)
 
-    ebmf = ovvv.transpose(1, 2, 0, 3)                      # (me|bf) -> ebmf
-    w = _ein('ebmf,miaf->eiab', ebmf, t2)
-    wvOvV = -.5 * w.transpose(0, 1, 3, 2) - w
-    w = None
-    wvOvV += ebmf.transpose(1, 2, 3, 0)
-    tmp = -.5 * ebmf + ebmf.transpose(1, 0, 2, 3)
-    wvOvV += _ein('efmb,mifa->eiba', tmp, theta)
-    tmp = None
-    wvOvV += _ein('meni,mnab->eiab', ovoo, tau)
-    wvOvV -= _ein('me,miab->eiab', Fov, t2)
-    wvOvV += _ein('ma,eimb->eiab', t1, tmpovvo)
-    wvOvV += _ein('ma,eimb->eiba', t1, tmpoovv)
+    # wvOvV (v^3 o) built in slices of its first index e: the unsliced build
+    # held three more v^3 o arrays (w, its transposed copy, ebmf terms) and
+    # ran an 80 GB device out of memory at o 66, v 288
+    from electrolites.fastccsd import _avail
+    nv = ovvv.shape[1]
+    wvOvV = cp.empty((nv, no, nv, nv))
+    ce = max(1, min(nv, int(.03 * _avail() // (8 * no * nv * nv))))
+    import os
+    ce = int(os.environ.get('EOM_WVOVV_CHUNK', 0)) or ce     # tests: force slices
+    for e0 in range(0, nv, ce):
+        e1 = min(nv, e0 + ce)
+        # ebmf[e,b,m,f] = ovvv[m,e,b,f]
+        eb = ovvv[:, e0:e1].transpose(1, 2, 0, 3)          # [e,b,m,f]
+        w = _ein('ebmf,miaf->eiab', eb, t2)
+        out = wvOvV[e0:e1]
+        out[...] = -.5 * w.transpose(0, 1, 3, 2)
+        out -= w
+        w = None
+        # + ebmf.transpose(1,2,3,0): [e,i,a,b] = ebmf[b,e,i,a] = ovvv[i,b,e,a]
+        out += ovvv[:, :, e0:e1].transpose(2, 0, 3, 1)
+        # tmp[e,f,m,b] = -.5 ebmf[e,f,m,b] + ebmf[f,e,m,b]
+        tmp = -.5 * eb + ovvv[:, :, e0:e1].transpose(2, 1, 0, 3)
+        eb = None
+        out += _ein('efmb,mifa->eiba', tmp, theta)
+        tmp = None
+        out += _ein('meni,mnab->eiab', ovoo[:, e0:e1], tau)
+        out -= _ein('me,miab->eiab', Fov[:, e0:e1], t2)
+        out += _ein('ma,eimb->eiab', t1, tmpovvo[e0:e1])
+        out += _ein('ma,eimb->eiba', t1, tmpoovv[e0:e1])
+        out = None
+    tmpovvo = tmpoovv = None
 
     imds.Foo, imds.Fov, imds.Fvv = Foo, Fov, Fvv
     imds.woOoO, imds.woVoO, imds.woOoV = woOoO, woVoO, woOoV
@@ -695,6 +731,8 @@ def _make_ee(imds, mycc):
     imds.orbv = mo[:, no:]
     imds.orbv_s = _ladder_setup(mycc).coeff @ imds.orbv
     _vvvv_mo(mycc, imds.nvir)
+    if not keep_eris:   # the singlet sigma and diagonal do not read these
+        imds.oovv = imds.oooo = imds.ovoo = None
     return imds
 
 
@@ -720,6 +758,62 @@ def _ee_ladder(imds, mycc, x):
     return _ladder_pairsym(mycc, imds.orbv_s, x)
 
 
+def _vslice(n, per_bytes, frac=.04):
+    """(i0, i1) slices of range(n) with about frac of the free memory per
+    slice, per_bytes being the temporary bytes per index"""
+    import os
+    from electrolites.fastccsd import _avail
+    step = max(1, min(n, int(frac * _avail() // max(per_bytes, 1))))
+    step = int(os.environ.get('EOM_EIN_SLICE', 0)) or step      # tests
+    return [(i0, min(n, i0 + step)) for i0 in range(0, n, step)]
+
+
+def _ein_o(sub, A, B, b_axis, out_axis=None, big=0):
+    """einsum(sub, A, B) (or (B, A) when ``big=1``) in slices of the first
+    index of the v^3 o operand (``A`` / ``B``): cupy.einsum copies an
+    operand it has to transpose, and a whole ovvv / wvOvV copy (12.6 GB at
+    o 66, v 288) did not fit beside the EE intermediates.  The sliced index
+    is summed over (the slices accumulate) unless ``out_axis`` gives its
+    position in the output (the slices are written there).  ``b_axis`` is
+    the position of the same index in the other operand (None: absent)."""
+    from electrolites.fastccsd import _avail
+    W = B if big else A
+    n0 = W.shape[0]
+    per = W[0].size * 8 * 3
+    step = max(1, min(n0, int(.04 * _avail() // per)))
+    import os
+    step = int(os.environ.get('EOM_EIN_SLICE', 0)) or step      # tests
+    if step >= n0:
+        return _ein(sub, A, B)
+    lhs, rhs = sub.split('->')
+    sa, sb = lhs.split(',')
+    out = None
+    for i0 in range(0, n0, step):
+        i1 = min(n0, i0 + step)
+        Wi = W[i0:i1]
+        if b_axis is None:
+            Oi = B if not big else A
+        else:
+            sl = [slice(None)] * (B.ndim if not big else A.ndim)
+            sl[b_axis] = slice(i0, i1)
+            Oi = (B if not big else A)[tuple(sl)]
+        r = _ein(sub, Wi, Oi) if not big else _ein(sub, Oi, Wi)
+        if out_axis is None:
+            if out is None:
+                out = r
+            else:
+                out += r
+        else:
+            if out is None:
+                shape = list(r.shape)
+                shape[out_axis] = n0
+                out = cp.empty(shape)
+            sl = [slice(None)] * out.ndim
+            sl[out_axis] = slice(i0, i1)
+            out[tuple(sl)] = r
+    return out
+
+
 def _ee_sigma(imds, mycc, r1, r2):
     """eeccsd_matvec_singlet for a batch: r1 (n, o, v), r2 (n, o, o, v, v)."""
     t1, t2 = imds.t1, imds.t2
@@ -733,20 +827,24 @@ def _ee_sigma(imds, mycc, r1, r2):
     tau2 = r2 + rt + rt.transpose(0, 2, 1, 4, 3)
     rt = None
     Hr2 = _ee_ladder(imds, mycc, tau2)
+    # the two other tau2 terms now, so that tau2 (o^2 v^2) can go
+    tmp_t = _ein_o('meaf,nijef->nmaij', ovvv, tau2, None, out_axis=1)
+    tmp_end = _ein('menf,kijef->kmnij', ovov, tau2)
+    tau2 = None
     Hr2 += _ein('mnij,kmnab->kijab', imds.woOoO, r2)
     Hr2 *= .5
     Hr2 += _ein('be,nijae->nijab', imds.Fvv, r2)
     Hr2 -= _ein('mj,nimab->nijab', imds.Foo, r2)
 
     theta = r2 * 2 - r2.transpose(0, 1, 2, 4, 3)
-    Hr1 += _ein('mfae,nmife->nia', ovvv, theta)
-    tmp = _ein('meaf,nijef->nmaij', ovvv, tau2)
-    Hr2 -= _ein('ma,nmbij->nijab', t1, tmp)
-    tmp = _ein('meaf,nme->naf', ovvv, r1) * 2
-    tmp -= _ein('mfae,nme->naf', ovvv, r1)
+    Hr1 += _ein_o('mfae,nmife->nia', ovvv, theta, 1)
+    Hr2 -= _ein('ma,nmbij->nijab', t1, tmp_t)
+    tmp_t = None
+    tmp = _ein_o('meaf,nme->naf', ovvv, r1, 1) * 2
+    tmp -= _ein_o('mfae,nme->naf', ovvv, r1, 1)
     Hr2 += _ein('naf,ijfb->nijab', tmp, t2)
     Hr2 -= _ein('mbij,nma->nijab', imds.woVoO, r1)
-    Hr2 += _ein('ejab,nie->nijab', imds.wvOvV, r1)
+    Hr2 += _ein_o('ejab,nie->nijab', imds.wvOvV, r1, 2)
 
     tmp = _ein('mbej,nimea->njiab', imds.woVVo, r2)
     Hr2 += tmp
@@ -772,10 +870,9 @@ def _ee_sigma(imds, mycc, r1, r2):
     Hr2 -= _ein('kmj,miab->kijba', tmp, t2)
     theta = None
 
-    tmp = _ein('menf,kijef->kmnij', ovov, tau2)
-    tau2 = None
-    Hr2 += _ein('kmnij,mnab->kijab', tmp, imds.tau_half)
-    Hr2 = Hr2 + Hr2.transpose(0, 2, 1, 4, 3)
+    Hr2 += _ein('kmnij,mnab->kijab', tmp_end, imds.tau_half)
+    tmp_end = None
+    Hr2 += Hr2.transpose(0, 2, 1, 4, 3).copy()
     return Hr1, Hr2
 
 
@@ -796,35 +893,65 @@ def _ee_diag(imds, mycc):
     Hr2 = Hr2 + Wovaa[None, :, None, :] + Wovab[:, None, None, :]
     Hr2 = Hr2 + Hr2.transpose(1, 0, 3, 2)
     Hr2 = Hr2 + _ein('ijij->ij', imds.woOoO)[:, :, None, None]
-    tmp = _ein('mb,mbaa->ab', t1, ovvv)
+    tmp = _ein_o('mb,mbaa->ab', t1, ovvv, 0, big=1)
     Wvvab = Wvvab - tmp - tmp.T + _virtual_coulomb_diag(mycc, imds.orbv)
     Hr2 = Hr2 + Wvvab[None, None]
     return Hr1, Hr2
 
 
-def _pack_singlet(r1, r2):
+# packed singlet layout without index arrays or transposed copies: element
+# k of the triangle is (r, c), r >= c, row-major (cupy.tril_indices order),
+# r = (i, a), c = (j, b), value t2[i, j, a, b].  The index arrays of
+# tril_indices(nov) alone were 2.9 GB at o 66, v 288.
+_TRI_RC = r"""
+    long long r = (long long)((sqrt(8.0 * (double)k + 1.0) - 1.0) * 0.5);
+    while (r * (r + 1) / 2 > k) r--;
+    while ((r + 1) * (r + 2) / 2 <= k) r++;
+    long long c = k - r * (r + 1) / 2;
+    long long oi = r / nv, va = r % nv, oj = c / nv, vb = c % nv;
+    long long t = (((m * no + oi) * no + oj) * nv + va) * nv + vb;
+    long long u = (((m * no + oj) * no + oi) * nv + vb) * nv + va;
+"""
+_PACK = cp.ElementwiseKernel(
+    'raw float64 t2, int64 no, int64 nv, int64 npk, int64 dim, int64 nov',
+    'raw float64 out',
+    """long long m = i / npk, k = i % npk;""" + _TRI_RC +
+    """out[m * dim + nov + k] = t2[t];""",
+    'eom_pack_t2_tril')
+_UNPACK = cp.ElementwiseKernel(
+    'raw float64 v, int64 no, int64 nv, int64 npk, int64 dim, int64 nov',
+    'raw float64 t2',
+    """long long m = i / npk, k = i % npk;""" + _TRI_RC +
+    """double x = v[m * dim + nov + k]; t2[t] = x; t2[u] = x;""",
+    'eom_unpack_t2_tril')
+
+
+def _pack_singlet(r1, r2, out=None):
     """ccsd.amplitudes_to_vector for a batch: t1 + lower triangle of
     t2[ia,jb]."""
     n, no, nv = r1.shape
     nov = no * nv
-    i, j = cp.tril_indices(nov)
-    m = r2.transpose(0, 1, 3, 2, 4).reshape(n, nov, nov)
-    return cp.hstack([r1.reshape(n, -1), m[:, i, j]])
+    npk = nov * (nov + 1) // 2
+    dim = nov + npk
+    if out is None:
+        out = cp.empty((n, dim))
+    out[:, :nov] = r1.reshape(n, nov)
+    _PACK(cp.ascontiguousarray(r2), no, nv, npk, dim, nov, out, size=n * npk)
+    return out
 
 
 def _unpack_singlet(v, no, nv):
+    v = cp.ascontiguousarray(v)
     n = len(v)
     nov = no * nv
-    i, j = cp.tril_indices(nov)
-    m = cp.zeros((n, nov, nov), dtype=v.dtype)
-    m[:, i, j] = v[:, nov:]
-    m[:, j, i] = v[:, nov:]
-    r2 = m.reshape(n, no, nv, no, nv).transpose(0, 1, 3, 2, 4)
-    return v[:, :nov].reshape(n, no, nv), cp.ascontiguousarray(r2)
+    npk = nov * (nov + 1) // 2
+    r2 = cp.empty((n, no, no, nv, nv))
+    _UNPACK(v, no, nv, npk, v.shape[1], nov, r2, size=n * npk)
+    return v[:, :nov].reshape(n, no, nv), r2
 
 
 def _davidson_nosym(matvec, x0, diag, nroots, tol, tol_residual, max_cycle,
-                    max_space, log):
+                    max_space, log, ckpt=None):
     """Block Davidson for the lowest roots of a non-symmetric operator on
     the device, with a batched ``matvec`` ((n, dim) -> (n, dim)); PySCF's
     convergence test (energy change < tol, residual < tol_residual), real
@@ -842,13 +969,22 @@ def _davidson_nosym(matvec, x0, diag, nroots, tol, tol_residual, max_cycle,
                 out.append(v / nrm)
         return out
 
+    import os
     nwant, dim = x0.shape
     from electrolites.fastccsd import _avail
+    vbytes = 8 * dim
+    room = (.5 * _avail() - 4 * nwant * vbytes) // (2 * vbytes)
+    if room < 2 * nwant + 4 or os.environ.get('EOM_DAVIDSON_HOST'):
+        log.info('EOM Davidson: subspace in pinned host memory (device room '
+                 'for %d vectors of %.2f GB)', max(room, 0), vbytes / 1e9)
+        return _davidson_nosym_host(matvec, x0, diag, nroots, tol,
+                                    tol_residual, max_cycle, max_space, log,
+                                    ckpt)
+    x0 = cp.asarray(x0)
     V0 = cp.stack(orth(list(x0), None))
     # the first sigma batch builds the persistent pieces (MO vvvv or the AO
     # integral cache) before the subspace is sized against the free memory
     AV0 = matvec(V0)
-    vbytes = 8 * dim
     # V and AV buffers, X and AX (= R) of nwant rows; half the free memory,
     # the rest for the sigma intermediates
     room = int((.5 * _avail() - 2 * nwant * vbytes) // (2 * vbytes))
@@ -921,6 +1057,194 @@ def _davidson_nosym(matvec, x0, diag, nroots, tol, tol_residual, max_cycle,
     return conv[:nroots], e_last[:nroots], X[:nroots]
 
 
+class _HostRows:
+    """(nrow, dim) float64 in pinned host memory, stored as column blocks
+    (each block (nrow, cs) contiguous), so that a column chunk of the
+    leading rows is one contiguous H2D copy."""
+
+    def __init__(self, nrow, dim, cs):
+        import cupyx
+        self.dim, self.cs = dim, cs
+        self.cols = [(c0, min(dim, c0 + cs)) for c0 in range(0, dim, cs)]
+        self.blk = [cupyx.empty_pinned((nrow, c1 - c0)) for c0, c1 in self.cols]
+
+    def chunk(self, b, r0, r1):
+        """rows r0:r1 of column block b, on the device"""
+        return cp.asarray(self.blk[b][r0:r1])
+
+    def put_chunk(self, b, r0, r1, x):
+        x.get(out=self.blk[b][r0:r1]) if x.flags.c_contiguous else \
+            cp.ascontiguousarray(x).get(out=self.blk[b][r0:r1])
+
+    def set_rows(self, r0, x):
+        for b, (c0, c1) in enumerate(self.cols):
+            self.put_chunk(b, r0, r0 + len(x), x[:, c0:c1])
+
+    def rows(self, r0, r1):
+        out = cp.empty((r1 - r0, self.dim))
+        for b, (c0, c1) in enumerate(self.cols):
+            out[:, c0:c1] = self.chunk(b, r0, r1)
+        return out
+
+    def host_row(self, r):
+        return np.concatenate([blk[r] for blk in self.blk])
+
+
+def _davidson_nosym_host(matvec, x0, diag, nroots, tol, tol_residual,
+                         max_cycle, max_space, log, ckpt=None):
+    """``_davidson_nosym`` with the subspace (V, AV) in pinned host memory,
+    for vectors too long to keep a subspace on the device (Pt EWANIZ,
+    o 66, v 288: 1.45 GB per singlet vector).  The device holds the
+    integrals, the diagonal, the new block (or one sigma sub-block) and one
+    column chunk of V/AV at a time:
+
+    * H = V AV^T is kept and extended by the new rows/columns;
+    * Ritz vectors and the residuals of the first nroots roots come from one
+      streamed pass over V and AV (both kept on the host);
+    * new vectors: two streamed classical Gram-Schmidt passes against V,
+      then among themselves on the device;
+    * a collapse is U^T V and U^T AV chunk by chunk, H -> U^T H U.
+    Same convergence test and root selection as the device version."""
+    import os
+    from electrolites.fastccsd import _avail
+    nwant, dim = x0.shape
+    max_space = max(max_space, 2 * nwant)
+    cs = int(max(1 << 20, min(dim, 1e9 // (8 * max_space))))
+    V = _HostRows(max_space, dim, cs)
+    AV = _HostRows(max_space, dim, cs)
+    X = _HostRows(nwant, dim, cs)
+    R = _HostRows(nroots, dim, cs)
+    nb = len(V.cols)
+    H = np.zeros((max_space, max_space))
+    diag = cp.asarray(diag)
+    k = 0
+
+    def project_out(B):
+        """B (n, dim) on the device: two classical Gram-Schmidt passes
+        against V[:k], then among the rows of B; drops dependent rows."""
+        for _ in range(2):
+            if k:
+                P = cp.zeros((k, len(B)))
+                for b, (c0, c1) in enumerate(V.cols):
+                    P += V.chunk(b, 0, k) @ B[:, c0:c1].T
+                for b, (c0, c1) in enumerate(V.cols):
+                    B[:, c0:c1] -= P.T @ V.chunk(b, 0, k)
+        keep = []
+        for i in range(len(B)):
+            for _ in range(2):
+                for j in keep:
+                    B[i] -= B[j] * (B[j] @ B[i])
+            nrm = float(cp.linalg.norm(B[i]))
+            if nrm > 1e-7:
+                B[i] /= nrm
+                keep.append(i)
+        return B[keep] if len(keep) < len(B) else B
+
+    def add(n):
+        """append the n orthonormal rows already written to V[k:k+n] and
+        their sigma to V, AV, H; the rows come back from the host one sigma
+        block at a time, so the device holds one block and its sigma
+        intermediates beside the integrals (the caller drops its device
+        copy of the rows before calling)"""
+        nonlocal k
+        sb = max(1, min(n, int(.05 * _avail() // (8 * dim))))
+        for j0 in range(0, n, sb):
+            j1 = min(n, j0 + sb)
+            AV.set_rows(k + j0, matvec(V.rows(k + j0, k + j1)))
+        kn = k + n
+        Hc = np.zeros((kn, n))          # V[:kn] . AV[k:kn]^T
+        Hr = np.zeros((n, k))           # V[k:kn] . AV[:k]^T
+        for b in range(nb):
+            Vc = V.chunk(b, 0, kn)
+            Ac = AV.chunk(b, 0, kn)
+            Hc += cp.asnumpy(Vc @ Ac[k:].T)
+            if k:
+                Hr += cp.asnumpy(Vc[k:] @ Ac[:k].T)
+            Vc = Ac = None
+        H[:kn, k:kn] = Hc
+        H[k:kn, :k] = Hr
+        k = kn
+
+    x0 = np.asarray(x0.get() if isinstance(x0, cp.ndarray) else x0)
+    step = max(1, nroots)
+    for p0 in range(0, nwant, step):
+        B = project_out(cp.asarray(x0[p0:p0 + step]))
+        n = len(B)
+        if n:
+            V.set_rows(k, B)
+            B = None
+            add(n)
+        B = None
+    e_last = None
+    conv = np.zeros(nwant, dtype=bool)
+    xnrm = np.ones(nwant)
+    for it in range(max_cycle):
+        w, c = np.linalg.eig(H[:k, :k])
+        real = np.where((abs(w.imag) < 1e-3) & (w.imag >= 0))[0]
+        w, c = w[real].real, c[:, real].real
+        order = np.argsort(w)[:nwant]
+        w, c = w[order], c[:, order]
+        nw = len(w)
+        nr = min(nroots, nw)
+        cd = cp.asarray(c)
+        wd = cp.asarray(w)
+        xn2 = np.zeros(nw)
+        rn2 = np.zeros(nw)
+        for b in range(nb):
+            Xc = cd.T @ V.chunk(b, 0, k)
+            Rc = cd.T @ AV.chunk(b, 0, k)
+            Rc -= wd[:, None] * Xc
+            xn2 += cp.asnumpy((Xc * Xc).sum(1))
+            rn2 += cp.asnumpy((Rc * Rc).sum(1))
+            X.put_chunk(b, 0, nw, Xc)
+            R.put_chunk(b, 0, nr, Rc[:nr])
+            Xc = Rc = None
+        xnrm = np.sqrt(xn2)
+        rnorm = np.sqrt(rn2) / xnrm
+        if e_last is not None and len(e_last) == len(w):
+            de = abs(w - e_last)
+        else:
+            de = np.ones(len(w))
+        conv = (de < tol) & (rnorm < tol_residual)
+        log.debug('EOM Davidson (host) %d  space %d  |r| %s  dE %s', it, k,
+                  rnorm[:nroots], de[:nroots])
+        e_last = w
+        if ckpt and it % 3 == 2:
+            # the current Ritz vectors: a restart passes them as guess
+            np.save(ckpt + '.tmp.npy', np.asarray(
+                [X.host_row(i) / xnrm[i] for i in range(nw)]))
+            os.replace(ckpt + '.tmp.npy', ckpt)
+        if conv[:nroots].all():
+            break
+        todo = np.where(~conv[:nr])[0]
+        B = cp.empty((len(todo), dim))
+        for i, j in enumerate(todo):
+            B[i] = R.rows(j, j + 1)[0]
+            dd = wd[j] - diag
+            dd = cp.where(abs(dd) < 1e-8, 1e-8, dd)
+            B[i] /= dd * xnrm[j]
+            dd = None
+        if k + len(B) > max_space:
+            u, sv, _ = np.linalg.svd(c, full_matrices=False)
+            U = u[:, sv > 1e-8 * sv[0]]
+            m = U.shape[1]
+            Ud = cp.asarray(U)
+            for b in range(nb):
+                V.put_chunk(b, 0, m, Ud.T @ V.chunk(b, 0, k))
+                AV.put_chunk(b, 0, m, Ud.T @ AV.chunk(b, 0, k))
+            H[:m, :m] = U.T @ H[:k, :k] @ U
+            k = m
+        B = project_out(B)
+        n = min(len(B), max_space - k)
+        if not n:
+            break
+        V.set_rows(k, B[:n])
+        B = None
+        add(n)
+    Xr = np.asarray([X.host_row(i) / xnrm[i] for i in range(nroots)])
+    return conv[:nroots], e_last[:nroots], Xr
+
+
 class EOMEESinglet(eom_rccsd.EOMEESinglet):
     """PySCF's singlet EOM-EE-CCSD (same vector layout and equations) with
     the intermediates, the sigma vectors (the (ae|bf) ladder AO-direct,
@@ -980,12 +1304,12 @@ class EOMEESinglet(eom_rccsd.EOMEESinglet):
         self._diag = cp.asnumpy(d)       # for the left solve (same diagonal)
         nwant = min(len(d), nroots + max(3, nroots // 2))
         if guess is not None:
-            x0 = cp.asarray(np.asarray(guess)).reshape(len(guess), -1)
+            x0 = np.asarray(guess).reshape(len(guess), -1)
             nwant = len(x0)
         else:
             idx = cp.argsort(d[:no * nv] if koopmans else d)[:nwant]
-            x0 = cp.zeros((nwant, len(d)))
-            x0[cp.arange(nwant), idx] = 1.
+            x0 = np.zeros((nwant, len(d)))
+            x0[np.arange(nwant), cp.asnumpy(idx)] = 1.
 
         def matvec(V):
             out = cp.empty_like(V)
@@ -1002,7 +1326,8 @@ class EOMEESinglet(eom_rccsd.EOMEESinglet):
         conv, e, X = _davidson_nosym(
             matvec, x0, d, nroots, self.conv_tol,
             self.conv_tol ** .5, self.max_cycle,
-            self.max_space + nwant, log)
+            self.max_space + nwant, log,
+            getattr(self, 'davidson_checkpoint', None))
         self.converged, self.e = conv, e
         self.v = list(cp.asnumpy(X))
         for n in range(nroots):
@@ -1111,14 +1436,16 @@ def _left_solve(eom, nroots, guess, log):
     nspare = max(3, nroots // 2)
     ng = len(guess) if guess is not None else 0
     idx = cp.asnumpy(cp.argsort(d)[:nroots + nspare])
-    x0 = cp.zeros((ng + (nspare if ng else nroots + nspare), len(d)))
+    x0 = np.zeros((ng + (nspare if ng else nroots + nspare), len(d)))
     if ng:
-        x0[:ng] = cp.asarray(np.asarray(guess)).reshape(ng, -1)
+        x0[:ng] = np.asarray(guess).reshape(ng, -1)
         idx = idx[:nspare]
-    x0[cp.arange(ng, len(x0)), cp.asarray(idx)] = 1.
+    x0[np.arange(ng, len(x0)), idx] = 1.
     conv, ev, X = _davidson_nosym(matvec, x0, d, nroots, eom.conv_tol,
                                   eom.conv_tol ** .5, eom.max_cycle,
-                                  eom.max_space + len(x0), log)
+                                  eom.max_space + len(x0), log,
+                                  getattr(eom, 'davidson_checkpoint_left',
+                                          None))
     for n in range(nroots):
         log.info('left EOM-EE-CCSD singlet root %d E = %.16g  conv = %s', n,
                  ev[n], conv[n])
@@ -1476,7 +1803,7 @@ class _EEOtherBase:
     _kind = None
 
     def make_imds(self, eris=None):
-        imds = _make_ee(_Imds(self._cc), self._cc)
+        imds = _make_ee(_Imds(self._cc), self._cc, keep_eris=True)
         imds.eris = _ERIShim(imds)
         return imds
 
@@ -1550,11 +1877,11 @@ class _EEOtherBase:
             d = cp.where(mask > 0, d, 1e9)
         nwant = min(len(d), nroots + max(3, nroots // 2))
         if guess is not None:
-            x0 = cp.asarray(np.asarray(guess)).reshape(len(guess), -1)
+            x0 = np.asarray(guess).reshape(len(guess), -1)
         else:
             idx = cp.argsort(d[:no * nv] if koopmans else d)[:nwant]
-            x0 = cp.zeros((nwant, len(d)))
-            x0[cp.arange(nwant), idx] = 1.
+            x0 = np.zeros((nwant, len(d)))
+            x0[np.arange(nwant), cp.asnumpy(idx)] = 1.
         sigma = self._sigma_fn(imds)
         if mask is not None:
             raw = sigma
