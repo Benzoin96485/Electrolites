@@ -315,6 +315,50 @@ def _mdm_names(s):
     return frozenset(names)
 
 
+# CUDA limits the second launch dimension to 65535 thread blocks.
+_MAX_GRID_Y = 65535
+
+
+def _launch_pair_tiles(kern, entry, prefix, ij, kl, ij_loc, kl_loc,
+                       ij_max, kl_max, suffix):
+    """Launch screened pair tiles, preserving diagonal quartet symmetry.
+
+    The kernels compare the two mapping pointers to decide whether to apply
+    triangular screening and the diagonal half weight. For identical lists,
+    partition both axes identically and visit only the lower triangle of
+    chunks. Only its diagonal chunks then have identical device pointers.
+    Locations are absolute Hermite offsets and must not be rebased.
+    """
+    bx, by = entry['bsizex'], entry['bsizey']
+    tx, ty = entry.get('threadsx', 16), entry.get('threadsy', 16)
+    block = tuple(entry.get('block', (16, 16)))
+    shm = entry['shm'] * 8
+
+    def launch(i, k, iloc, kloc, imax, kmax):
+        grid = ((i.size + bx - 1) // bx, (k.size + by - 1) // by)
+        kern(grid, block, (*prefix, np.int32(i.size), np.int32(k.size),
+                           i, k, iloc, kloc, imax, kmax, *suffix),
+             shared_mem=shm)
+
+    if kl.size <= _MAX_GRID_Y * by:
+        launch(ij, kl, ij_loc, kl_loc, ij_max, kl_max)
+        return
+
+    diagonal = ij.data.ptr == kl.data.ptr
+    # Every chunk starts on a boundary of the original tile-max arrays.
+    align = math.lcm(tx, ty) if diagonal else ty
+    span = (_MAX_GRID_Y * by // align) * align
+    for k0 in range(0, kl.size, span):
+        k1 = min(kl.size, k0 + span)
+        k = kl[k0:k1]
+        if not diagonal:
+            launch(ij, k, ij_loc, kl_loc[k0:], ij_max, kl_max[k0 // ty:])
+            continue
+        for i0 in range(k0, ij.size, span):
+            launch(ij[i0:i0+span], k, ij_loc[i0:], kl_loc[k0:],
+                   ij_max[i0 // tx:], kl_max[k0 // ty:])
+
+
 def _launch_task(s, task, vj_xyz, force=None, override=None):
     """Run one (i,j,k,l) task into ``vj_xyz``.
 
@@ -377,20 +421,16 @@ def _launch_task(s, task, vj_xyz, force=None, override=None):
     elif force == 'ours' and entry is None:
         raise KeyError(f'no fastj kernel for class {tag}')
     if entry is not None:
-        bx, by = entry['bsizex'], entry['bsizey']
         tx, ty = entry.get('threadsx', 16), entry.get('threadsy', 16)
         off_ij = _qd_offset_for_threads(npairs_ij, tx)
         off_kl = _qd_offset_for_threads(npairs_kl, ty)
-        grid = ((npairs_ij + bx - 1) // bx, (npairs_kl + by - 1) // by)
         if kern is None:
             kern = _function('j_' + tag, s.lmax)
-        kern(grid, tuple(entry.get('block', (16, 16))),
-             (vj_xyz, s.dm_xyz, s.d_bas, s.d_env, np.int32(mol.nbas),
-              np.int32(npairs_ij), np.int32(npairs_kl),
-              pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
-              qd_ij[off_ij:], qd_kl[off_kl:], s.q_cond,
-              np.float32(s.log_cutoff)),
-             shared_mem=entry['shm'] * 8)
+        _launch_pair_tiles(kern, entry,
+                           (vj_xyz, s.dm_xyz, s.d_bas, s.d_env, np.int32(mol.nbas)),
+                           pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
+                           qd_ij[off_ij:], qd_kl[off_kl:],
+                           (s.q_cond, np.float32(s.log_cutoff)))
         return tag
     _run_ref(s, task, vj_xyz, 0, s.n_dm, shls_slice, npairs_ij, npairs_kl,
              pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
@@ -442,20 +482,17 @@ def _run_mdm(s, tag, nblk, dm_off, vj_xyz, npairs_ij, npairs_kl,
     name = f'dm{nblk}_{tag}'
     if entry is None:
         entry = _MDM[name]
-    bx, by = entry['bsizex'], entry['bsizey']
     tx, ty = entry['threadsx'], entry['threadsy']
     off_ij = _qd_offset_for_threads(npairs_ij, tx)
     off_kl = _qd_offset_for_threads(npairs_kl, ty)
-    grid = ((npairs_ij + bx - 1) // bx, (npairs_kl + by - 1) // by)
     if kern is None:
         kern = _function('j_' + name, s.lmax, 'mdm', s.mdm_names)
-    kern(grid, tuple(entry['block']),
-         (vj_xyz[dm_off:], s.dm_xyz[dm_off:], s.d_bas, s.d_env,
-          np.int32(s.mol.nbas), np.int32(npairs_ij), np.int32(npairs_kl),
-          pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
-          qd_ij[off_ij:], qd_kl[off_kl:], s.q_cond,
-          np.float32(s.log_cutoff), np.int32(s.dm_xyz_size)),
-         shared_mem=entry['shm'] * 8)
+    _launch_pair_tiles(kern, entry,
+                       (vj_xyz[dm_off:], s.dm_xyz[dm_off:], s.d_bas, s.d_env,
+                        np.int32(s.mol.nbas)),
+                       pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
+                       qd_ij[off_ij:], qd_kl[off_kl:],
+                       (s.q_cond, np.float32(s.log_cutoff), np.int32(s.dm_xyz_size)))
 
 
 def get_j_181(self, dms, verbose=None):
@@ -590,20 +627,13 @@ def get_j(self, dms, verbose=None):
         tag = f'{i+j}_{k+l}'
         entry = LAUNCH.get(tag) if use_ours else None
         if entry is not None:
-            bx, by = entry['bsizex'], entry['bsizey']
-            # GPU4PySCF's kernels all use a 16x16 thread block, and the
-            # tile-max hierarchy is indexed at that granularity.
-            off_ij = _qd_offset_for_threads(npairs_ij, 16)
-            off_kl = _qd_offset_for_threads(npairs_kl, 16)
-            grid = ((npairs_ij + bx - 1) // bx, (npairs_kl + by - 1) // by)
+            off_ij = _qd_offset_for_threads(npairs_ij, entry.get('threadsx', 16))
+            off_kl = _qd_offset_for_threads(npairs_kl, entry.get('threadsy', 16))
             kern = _function('j_' + tag, lmax)
-            kern(grid, (16, 16),
-                 (vj_xyz, dm_xyz, d_bas, d_env, np.int32(prim_mol.nbas),
-                  np.int32(npairs_ij), np.int32(npairs_kl),
-                  pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
-                  qd_ij[off_ij:], qd_kl[off_kl:], q_cond,
-                  np.float32(log_cutoff)),
-                 shared_mem=entry['shm'] * 8)
+            _launch_pair_tiles(kern, entry,
+                               (vj_xyz, dm_xyz, d_bas, d_env, np.int32(prim_mol.nbas)),
+                               pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
+                               qd_ij[off_ij:], qd_kl[off_kl:], (q_cond, np.float32(log_cutoff)))
             continue
         err = kern_ref(
             ctypes.cast(vj_xyz.data.ptr, ctypes.c_void_p),
