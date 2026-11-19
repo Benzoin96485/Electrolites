@@ -2,9 +2,12 @@
 
 On an A100-40GB, B3LYP/6-31G\* on these clusters spends about 30 % of the SCF
 inside GPU4PySCF's McMurchie–Davidson J engine (`md_j_*`), once the exchange
-build has been sped up by `fastk`.  `fastj` rewrites those kernels and leaves
-the rest of the J engine — the Hermite density transform, the screening, the
-tile decomposition, the symmetry factors — exactly as it is.
+build has been sped up by `fastk`.  `fastj` rewrites those kernels and uses GPU4PySCF’s Hermite density transform,
+symmetry factors and screening threshold. The kernels read Schwarz bounds in
+sorted shell-pair order. Before loading integral data, each CUDA block checks
+the maximum density-weighted bound in each contraction direction. Both must
+fall below the cutoff to discard the block on density grounds. These maxima
+are computed for the current densities on each J build.
 
 ```python
 import sys; sys.path.insert(0, '.../side_test/HF/src')

@@ -5,15 +5,15 @@ Coulomb (J) engine.
 Importing this module monkey-patches
 ``gpu4pyscf.scf.j_engine._VHFOpt.get_j`` so that the angular-momentum classes
 built by ``gen_j_kernels.py`` are handled by our kernels; every other class or
-option falls through to GPU4PySCF's own ``MD_build_j``.  The screening, the
-task/tile decomposition, the Hermite density transformation and the symmetry
-factors are GPU4PySCF's own and are untouched, and the integral arithmetic is
+option falls through to GPU4PySCF's own ``MD_build_j``. The screening cutoff,
+Hermite density transformation and symmetry factors follow GPU4PySCF. Compact
+pair bounds reject empty blocks before loading integral data. The arithmetic is
 lifted verbatim out of its generated kernels, so the J matrix agrees with
 GPU4PySCF's to round-off.
 
 See README_fastj.md for what the kernels change and why.
 """
-import os, json, math, ctypes, functools
+import os, json, math, ctypes, functools, re
 import numpy as np
 import cupy as cp
 from pyscf import lib
@@ -198,6 +198,48 @@ def _qd_offset_for_threads(npairs, threads):
     return address
 
 
+class _PairScreen:
+    """Sorted Schwarz bounds and one build's density-weighted upper bounds."""
+
+    def __init__(self, q, qd):
+        self.q = q
+        self.qd = qd
+        self._blocks = {}
+
+    def batch_max(self, threads):
+        return self.qd[_qd_offset_for_threads(self.q.size, threads):]
+
+    def block_max(self, width, start):
+        # When a diagonal launch is split, its bra and ket block widths can
+        # differ. A chunk can start partway through an original bra block.
+        shift = start % width
+        key = (width, shift)
+        if key not in self._blocks:
+            # Reduce an already available level of GPU4PySCF's QD hierarchy.
+            # The chosen level divides the width and the first pair index.
+            stride = math.gcd(32, width, shift)
+            count = (self.q.size - shift + stride - 1) // stride
+            offset = shift // stride
+            values = self.batch_max(stride)[offset:offset + count]
+            batches = width // stride
+            pad = -count % batches
+            if pad:
+                values = cp.pad(values, (0, pad), constant_values=-np.inf)
+            if batches > 1:
+                values = values.reshape(-1, batches).max(axis=1)
+            self._blocks[key] = values
+        return self._blocks[key][start // width:]
+
+
+@functools.lru_cache(maxsize=256)
+def _legacy_bounds(kern):
+    """Recognize pre-generated override kernels that take the dense table."""
+    if kern.code is None:
+        return True
+    compact = rf'\b{re.escape(kern.name)}\s*\(\s*J_SCREEN_ARGS\b'
+    return re.search(compact, kern.code) is None
+
+
 class _JSetup:
     """Everything ``MD_build_j`` (or our kernels) needs, built once.
 
@@ -207,9 +249,14 @@ class _JSetup:
     """
     __slots__ = ('opt', 'mol', 'n_dm', 'dm_xyz', 'dm_xyz_size', 'pair_lst',
                  'pair_loc', 'task_offsets', 'pair_mappings', 'tasks',
-                 'schemes', 'q_cond', 'l_ctr_bas_loc', 'log_cutoff', '_env',
+                 'schemes', 'screens', 'l_ctr_bas_loc', 'log_cutoff', '_env',
                  'd_bas', 'd_env', 'use_ours', 'lmax', '_scheme_cache',
                  'mdm_names')
+
+    @property
+    def q_cond(self):
+        """Dense compatibility view for older profiling tools."""
+        return _dense_q_cond(self.opt)
 
     def scheme(self, task, n_dm):
         """GPU4PySCF's shared-memory scheme for this task at this ``n_dm``.
@@ -283,7 +330,7 @@ def _setup_181(self, dms):
     s.tasks = tasks
     s.schemes = {t: JE._md_j_engine_quartets_scheme(t, n_dm=n_dm) for t in tasks}
     s._scheme_cache = {(t, n_dm): s.schemes[t] for t in tasks}
-    s.q_cond = _dense_q_cond(self)
+    s.screens = {key: _PairScreen(q, qd) for key, (_, q, qd) in pair_mappings.items()}
     s.l_ctr_bas_loc = l_ctr_bas_loc
     s.log_cutoff = log_cutoff
     s._env = _env
@@ -320,43 +367,44 @@ _MAX_GRID_Y = 65535
 
 
 def _launch_pair_tiles(kern, entry, prefix, ij, kl, ij_loc, kl_loc,
-                       ij_max, kl_max, suffix):
-    """Launch screened pair tiles, preserving diagonal quartet symmetry.
-
-    The kernels compare the two mapping pointers to decide whether to apply
-    triangular screening and the diagonal half weight. For identical lists,
-    partition both axes identically and visit only the lower triangle of
-    chunks. Only its diagonal chunks then have identical device pointers.
-    Locations are absolute Hermite offsets and must not be rebased.
-    """
+                       ij_screen, kl_screen, suffix, opt):
+    """Launch screened tiles, preserving absolute Hermite offsets and symmetry."""
     bx, by = entry['bsizex'], entry['bsizey']
     tx, ty = entry.get('threadsx', 16), entry.get('threadsy', 16)
     block = tuple(entry.get('block', (16, 16)))
     shm = entry['shm'] * 8
+    ij_max, kl_max = ij_screen.batch_max(tx), kl_screen.batch_max(ty)
+    legacy = _legacy_bounds(kern)
 
-    def launch(i, k, iloc, kloc, imax, kmax):
-        grid = ((i.size + bx - 1) // bx, (k.size + by - 1) // by)
-        kern(grid, block, (*prefix, np.int32(i.size), np.int32(k.size),
-                           i, k, iloc, kloc, imax, kmax, *suffix),
+    def launch(i0, i1, k0, k1):
+        ni, nk = i1 - i0, k1 - k0
+        grid = ((ni + bx - 1) // bx, (nk + by - 1) // by)
+        if legacy:
+            bounds = (_dense_q_cond(opt),)
+        else:
+            bounds = (ij_screen.q[i0:], kl_screen.q[k0:],
+                      ij_screen.block_max(bx, i0), kl_screen.block_max(by, k0))
+        kern(grid, block, (*prefix, np.int32(ni), np.int32(nk),
+                           ij[i0:i1], kl[k0:k1], ij_loc[i0:], kl_loc[k0:],
+                           ij_max[i0 // tx:], kl_max[k0 // ty:], *bounds, *suffix),
              shared_mem=shm)
 
     if kl.size <= _MAX_GRID_Y * by:
-        launch(ij, kl, ij_loc, kl_loc, ij_max, kl_max)
+        launch(0, ij.size, 0, kl.size)
         return
 
     diagonal = ij.data.ptr == kl.data.ptr
-    # Every chunk starts on a boundary of the original tile-max arrays.
+    # Identical mapping pointers select the triangular kernel and diagonal
+    # half weight. Keep only the lower triangle of chunks for an identical list.
     align = math.lcm(tx, ty) if diagonal else ty
     span = (_MAX_GRID_Y * by // align) * align
     for k0 in range(0, kl.size, span):
         k1 = min(kl.size, k0 + span)
-        k = kl[k0:k1]
-        if not diagonal:
-            launch(ij, k, ij_loc, kl_loc[k0:], ij_max, kl_max[k0 // ty:])
-            continue
-        for i0 in range(k0, ij.size, span):
-            launch(ij[i0:i0+span], k, ij_loc[i0:], kl_loc[k0:],
-                   ij_max[i0 // tx:], kl_max[k0 // ty:])
+        if diagonal:
+            for i0 in range(k0, ij.size, span):
+                launch(i0, min(ij.size, i0 + span), k0, k1)
+        else:
+            launch(0, ij.size, k0, k1)
 
 
 def _launch_task(s, task, vj_xyz, force=None, override=None):
@@ -402,9 +450,9 @@ def _launch_task(s, task, vj_xyz, force=None, override=None):
             raise KeyError(f'no fastj multi-density kernel covers the last '
                            f'{rem} of {s.n_dm} densities for class {tag}')
         for nblk, off in plan:
-            _run_mdm(s, tag, nblk, off, vj_xyz, npairs_ij, npairs_kl,
+            _run_mdm(s, tag, nblk, off, vj_xyz,
                      pair_ij_mapping, pair_kl_mapping, pair_ij_loc,
-                     pair_kl_loc, qd_ij, qd_kl, kern, entry)
+                     pair_kl_loc, s.screens[i, j], s.screens[k, l], kern, entry)
         if rem:
             _run_ref(s, task, vj_xyz, s.n_dm - rem, rem, shls_slice,
                      npairs_ij, npairs_kl, pair_ij_mapping, pair_kl_mapping,
@@ -421,16 +469,13 @@ def _launch_task(s, task, vj_xyz, force=None, override=None):
     elif force == 'ours' and entry is None:
         raise KeyError(f'no fastj kernel for class {tag}')
     if entry is not None:
-        tx, ty = entry.get('threadsx', 16), entry.get('threadsy', 16)
-        off_ij = _qd_offset_for_threads(npairs_ij, tx)
-        off_kl = _qd_offset_for_threads(npairs_kl, ty)
         if kern is None:
             kern = _function('j_' + tag, s.lmax)
         _launch_pair_tiles(kern, entry,
                            (vj_xyz, s.dm_xyz, s.d_bas, s.d_env, np.int32(mol.nbas)),
                            pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
-                           qd_ij[off_ij:], qd_kl[off_kl:],
-                           (s.q_cond, np.float32(s.log_cutoff)))
+                           s.screens[i, j], s.screens[k, l],
+                           (np.float32(s.log_cutoff),), self)
         return tag
     _run_ref(s, task, vj_xyz, 0, s.n_dm, shls_slice, npairs_ij, npairs_kl,
              pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
@@ -475,24 +520,21 @@ def _run_ref(s, task, vj_xyz, dm_off, n_dm, shls_slice, npairs_ij, npairs_kl,
         raise RuntimeError(f'MD_build_j kernel for {llll} failed')
 
 
-def _run_mdm(s, tag, nblk, dm_off, vj_xyz, npairs_ij, npairs_kl,
+def _run_mdm(s, tag, nblk, dm_off, vj_xyz,
              pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
-             qd_ij, qd_kl, kern=None, entry=None):
+             ij_screen, kl_screen, kern=None, entry=None):
     """One multi-density kernel over ``nblk`` densities from ``dm_off``."""
     name = f'dm{nblk}_{tag}'
     if entry is None:
         entry = _MDM[name]
-    tx, ty = entry['threadsx'], entry['threadsy']
-    off_ij = _qd_offset_for_threads(npairs_ij, tx)
-    off_kl = _qd_offset_for_threads(npairs_kl, ty)
     if kern is None:
         kern = _function('j_' + name, s.lmax, 'mdm', s.mdm_names)
     _launch_pair_tiles(kern, entry,
                        (vj_xyz[dm_off:], s.dm_xyz[dm_off:], s.d_bas, s.d_env,
                         np.int32(s.mol.nbas)),
                        pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
-                       qd_ij[off_ij:], qd_kl[off_kl:],
-                       (s.q_cond, np.float32(s.log_cutoff), np.int32(s.dm_xyz_size)))
+                       ij_screen, kl_screen,
+                       (np.float32(s.log_cutoff), np.int32(s.dm_xyz_size)), s.opt)
 
 
 def get_j_181(self, dms, verbose=None):
@@ -507,10 +549,8 @@ def get_j_181(self, dms, verbose=None):
     -- and made ``MD_build_j`` take the per-group compact ``q_cond_ij`` /
     ``q_cond_kl`` rather than one global matrix.
 
-    Our kernels are unchanged: they index a dense ``nbas x nbas`` q_cond,
-    which ``g4pcompat.dense_q_cond`` rebuilds from the per-group cache, and
-    the tile-max hierarchy ``_make_tile_max_hierarchy`` writes has the same
-    layout ``_qd_offset_for_threads`` assumes.
+    The kernels read the sorted Schwarz bounds directly. Per-block density
+    maxima are derived from this call's batch hierarchy before integral work.
     """
     assert num_devices == 1, 'fastj currently supports a single device'
     log = logger.new_logger(self.mol, verbose)
@@ -613,6 +653,11 @@ def get_j(self, dms, verbose=None):
                            rys_envs._env_ref_holder[2])
     kern_ref = JE.libvhf_md.MD_build_j
     use_ours = (n_dm == 1 and float(_env[PTR_RANGE_OMEGA]) == 0.)
+    if use_ours:
+        # 1.7 supplies a dense Schwarz table and density-dependent pair lists.
+        # Gather in their sorted order once for this build.
+        screens = {key: _PairScreen(q_cond.ravel()[pairs], qd)
+                   for key, (pairs, qd) in pair_mappings.items()}
 
     for i, j, k, l in tasks:
         shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
@@ -627,13 +672,11 @@ def get_j(self, dms, verbose=None):
         tag = f'{i+j}_{k+l}'
         entry = LAUNCH.get(tag) if use_ours else None
         if entry is not None:
-            off_ij = _qd_offset_for_threads(npairs_ij, entry.get('threadsx', 16))
-            off_kl = _qd_offset_for_threads(npairs_kl, entry.get('threadsy', 16))
             kern = _function('j_' + tag, lmax)
             _launch_pair_tiles(kern, entry,
                                (vj_xyz, dm_xyz, d_bas, d_env, np.int32(prim_mol.nbas)),
                                pair_ij_mapping, pair_kl_mapping, pair_ij_loc, pair_kl_loc,
-                               qd_ij[off_ij:], qd_kl[off_kl:], (q_cond, np.float32(log_cutoff)))
+                               screens[i, j], screens[k, l], (np.float32(log_cutoff),), self)
             continue
         err = kern_ref(
             ctypes.cast(vj_xyz.data.ptr, ctypes.c_void_p),

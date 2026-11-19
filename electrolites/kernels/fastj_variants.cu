@@ -1,21 +1,12 @@
-
-#define JARGS double *vj, double *dm_all, int *bas, double *env,       \
-              int nbas, int npairs_ij, int npairs_kl,                  \
-              int *pair_ij_mapping, int *pair_kl_mapping,              \
-              int *pair_ij_loc, int *pair_kl_loc,                      \
-              float *qd_ij_max, float *qd_kl_max,                      \
-              float *q_cond, float cutoff
-
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_0_0_mb1(JARGS)
+j_0_0_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[480];
     int task_ij0 = blockIdx.x * 480;
     int task_kl0 = blockIdx.y * 480;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+480 <= task_kl0) {
@@ -130,10 +121,8 @@ j_0_0_mb1(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*30] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*30] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*30] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*30] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -206,15 +195,14 @@ j_0_0_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_0_0_mb2(JARGS)
+j_0_0_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[480];
     int task_ij0 = blockIdx.x * 480;
     int task_kl0 = blockIdx.y * 480;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+480 <= task_kl0) {
@@ -329,10 +317,8 @@ j_0_0_mb2(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*30] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*30] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*30] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*30] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -405,15 +391,14 @@ j_0_0_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_0_0_mb3(JARGS)
+j_0_0_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[480];
     int task_ij0 = blockIdx.x * 480;
     int task_kl0 = blockIdx.y * 480;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+480 <= task_kl0) {
@@ -528,10 +513,8 @@ j_0_0_mb3(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*30] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*30] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*30] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*30] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -604,15 +587,14 @@ j_0_0_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_0_0_mb4(JARGS)
+j_0_0_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[480];
     int task_ij0 = blockIdx.x * 480;
     int task_kl0 = blockIdx.y * 480;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+480 <= task_kl0) {
@@ -727,10 +709,8 @@ j_0_0_mb4(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*30] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*30] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*30] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*30] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -803,15 +783,14 @@ j_0_0_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_1_0_mb1(JARGS)
+j_1_0_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[368];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 368;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -920,10 +899,8 @@ j_1_0_mb1(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*23] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*23] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -1001,15 +978,14 @@ j_1_0_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_1_0_mb2(JARGS)
+j_1_0_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[368];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 368;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -1118,10 +1094,8 @@ j_1_0_mb2(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*23] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*23] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -1199,15 +1173,14 @@ j_1_0_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_1_0_mb3(JARGS)
+j_1_0_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[368];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 368;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -1316,10 +1289,8 @@ j_1_0_mb3(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*23] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*23] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -1397,15 +1368,14 @@ j_1_0_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_1_0_mb4(JARGS)
+j_1_0_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[368];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 368;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -1514,10 +1484,8 @@ j_1_0_mb4(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*23] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*23] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -1595,15 +1563,14 @@ j_1_0_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_1_1_mb1(JARGS)
+j_1_1_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[160];
     int task_ij0 = blockIdx.x * 160;
     int task_kl0 = blockIdx.y * 160;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+160 <= task_kl0) {
@@ -1718,10 +1685,8 @@ j_1_1_mb1(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*10] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*10] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*10] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*10] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -1854,15 +1819,14 @@ j_1_1_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_1_1_mb2(JARGS)
+j_1_1_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[160];
     int task_ij0 = blockIdx.x * 160;
     int task_kl0 = blockIdx.y * 160;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+160 <= task_kl0) {
@@ -1977,10 +1941,8 @@ j_1_1_mb2(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*10] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*10] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*10] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*10] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -2113,15 +2075,14 @@ j_1_1_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_1_1_mb3(JARGS)
+j_1_1_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[160];
     int task_ij0 = blockIdx.x * 160;
     int task_kl0 = blockIdx.y * 160;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+160 <= task_kl0) {
@@ -2236,10 +2197,8 @@ j_1_1_mb3(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*10] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*10] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*10] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*10] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -2372,15 +2331,14 @@ j_1_1_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_1_1_mb4(JARGS)
+j_1_1_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[160];
     int task_ij0 = blockIdx.x * 160;
     int task_kl0 = blockIdx.y * 160;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+160 <= task_kl0) {
@@ -2495,10 +2453,8 @@ j_1_1_mb4(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*10] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*10] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*10] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*10] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -2631,15 +2587,14 @@ j_1_1_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_2_0_mb1(JARGS)
+j_2_0_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[256];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 256;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -2748,10 +2703,8 @@ j_2_0_mb1(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*16] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*16] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -2850,15 +2803,14 @@ j_2_0_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_2_0_mb2(JARGS)
+j_2_0_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[256];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 256;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -2967,10 +2919,8 @@ j_2_0_mb2(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*16] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*16] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -3069,15 +3019,14 @@ j_2_0_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_2_0_mb3(JARGS)
+j_2_0_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[256];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 256;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -3186,10 +3135,8 @@ j_2_0_mb3(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*16] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*16] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -3288,15 +3235,14 @@ j_2_0_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_2_0_mb4(JARGS)
+j_2_0_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[256];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 256;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -3405,10 +3351,8 @@ j_2_0_mb4(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*16] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*16] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -3507,15 +3451,14 @@ j_2_0_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_2_1_mb1(JARGS)
+j_2_1_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[480];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 480;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -3624,10 +3567,8 @@ j_2_1_mb1(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*30] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*30] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -3823,15 +3764,14 @@ j_2_1_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_2_1_mb2(JARGS)
+j_2_1_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[480];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 480;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -3940,10 +3880,8 @@ j_2_1_mb2(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*30] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*30] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -4139,15 +4077,14 @@ j_2_1_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_2_1_mb3(JARGS)
+j_2_1_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[480];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 480;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -4256,10 +4193,8 @@ j_2_1_mb3(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*30] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*30] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -4455,15 +4390,14 @@ j_2_1_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_2_1_mb4(JARGS)
+j_2_1_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[480];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 480;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -4572,10 +4506,8 @@ j_2_1_mb4(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*30] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*30] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -4771,15 +4703,14 @@ j_2_1_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_2_2_mb1(JARGS)
+j_2_2_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[224];
     int task_ij0 = blockIdx.x * 224;
     int task_kl0 = blockIdx.y * 224;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+224 <= task_kl0) {
@@ -4894,10 +4825,8 @@ j_2_2_mb1(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*14] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*14] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*14] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*14] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -5287,15 +5216,14 @@ j_2_2_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_2_2_mb2(JARGS)
+j_2_2_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[224];
     int task_ij0 = blockIdx.x * 224;
     int task_kl0 = blockIdx.y * 224;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+224 <= task_kl0) {
@@ -5410,10 +5338,8 @@ j_2_2_mb2(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*14] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*14] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*14] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*14] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -5803,15 +5729,14 @@ j_2_2_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_2_2_mb3(JARGS)
+j_2_2_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[224];
     int task_ij0 = blockIdx.x * 224;
     int task_kl0 = blockIdx.y * 224;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+224 <= task_kl0) {
@@ -5926,10 +5851,8 @@ j_2_2_mb3(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*14] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*14] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*14] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*14] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -6319,15 +6242,14 @@ j_2_2_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_2_2_mb4(JARGS)
+j_2_2_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[224];
     int task_ij0 = blockIdx.x * 224;
     int task_kl0 = blockIdx.y * 224;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     if (pair_ij_mapping == pair_kl_mapping && task_ij0+224 <= task_kl0) {
@@ -6442,10 +6364,8 @@ j_2_2_mb4(JARGS)
             if (pair_ij_mapping == pair_kl_mapping && task_ij0+16 <= task_kl0) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*14] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*14] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*14] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*14] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -6835,15 +6755,14 @@ j_2_2_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_3_0_mb1(JARGS)
+j_3_0_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[736];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 736;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -6952,10 +6871,8 @@ j_3_0_mb1(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*46] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*46] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -7093,15 +7010,14 @@ j_3_0_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_3_0_mb2(JARGS)
+j_3_0_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[736];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 736;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -7210,10 +7126,8 @@ j_3_0_mb2(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*46] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*46] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -7351,15 +7265,14 @@ j_3_0_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_3_0_mb3(JARGS)
+j_3_0_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[736];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 736;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -7468,10 +7381,8 @@ j_3_0_mb3(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*46] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*46] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -7609,15 +7520,14 @@ j_3_0_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_3_0_mb4(JARGS)
+j_3_0_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[736];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 736;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -7726,10 +7636,8 @@ j_3_0_mb4(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*46] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*46] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -7867,15 +7775,14 @@ j_3_0_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_3_1_mb1(JARGS)
+j_3_1_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[384];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 384;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -7984,10 +7891,8 @@ j_3_1_mb1(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*24] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*24] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -8297,15 +8202,14 @@ j_3_1_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_3_1_mb2(JARGS)
+j_3_1_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[384];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 384;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -8414,10 +8318,8 @@ j_3_1_mb2(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*24] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*24] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -8727,15 +8629,14 @@ j_3_1_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_3_1_mb3(JARGS)
+j_3_1_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[384];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 384;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -8844,10 +8745,8 @@ j_3_1_mb3(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*24] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*24] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -9157,15 +9056,14 @@ j_3_1_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_3_1_mb4(JARGS)
+j_3_1_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[384];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 384;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -9274,10 +9172,8 @@ j_3_1_mb4(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*24] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*24] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -9587,15 +9483,14 @@ j_3_1_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_3_2_mb1(JARGS)
+j_3_2_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[176];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 176;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -9704,10 +9599,8 @@ j_3_2_mb1(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*11] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*11] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -10348,15 +10241,14 @@ j_3_2_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_3_2_mb2(JARGS)
+j_3_2_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[176];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 176;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -10465,10 +10357,8 @@ j_3_2_mb2(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*11] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*11] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -11109,15 +10999,14 @@ j_3_2_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_3_2_mb3(JARGS)
+j_3_2_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[176];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 176;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -11226,10 +11115,8 @@ j_3_2_mb3(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*11] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*11] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -11870,15 +11757,14 @@ j_3_2_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_3_2_mb4(JARGS)
+j_3_2_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[176];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 176;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -11987,10 +11873,8 @@ j_3_2_mb4(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*11] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*11] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -12631,15 +12515,14 @@ j_3_2_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_4_0_mb1(JARGS)
+j_4_0_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[576];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 576;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -12748,10 +12631,8 @@ j_4_0_mb1(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*36] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*36] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -12953,15 +12834,14 @@ j_4_0_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_4_0_mb2(JARGS)
+j_4_0_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[576];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 576;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -13070,10 +12950,8 @@ j_4_0_mb2(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*36] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*36] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -13275,15 +13153,14 @@ j_4_0_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_4_0_mb3(JARGS)
+j_4_0_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[576];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 576;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -13392,10 +13269,8 @@ j_4_0_mb3(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*36] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*36] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -13597,15 +13472,14 @@ j_4_0_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_4_0_mb4(JARGS)
+j_4_0_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[576];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 576;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -13714,10 +13588,8 @@ j_4_0_mb4(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*36] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*36] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -13919,15 +13791,14 @@ j_4_0_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_4_1_mb1(JARGS)
+j_4_1_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[288];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 288;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -14036,10 +13907,8 @@ j_4_1_mb1(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*18] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*18] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -14524,15 +14393,14 @@ j_4_1_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_4_1_mb2(JARGS)
+j_4_1_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[288];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 288;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -14641,10 +14509,8 @@ j_4_1_mb2(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*18] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*18] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -15129,15 +14995,14 @@ j_4_1_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_4_1_mb3(JARGS)
+j_4_1_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[288];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 288;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -15246,10 +15111,8 @@ j_4_1_mb3(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*18] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*18] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -15734,15 +15597,14 @@ j_4_1_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_4_1_mb4(JARGS)
+j_4_1_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[288];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 288;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -15851,10 +15713,8 @@ j_4_1_mb4(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*18] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*18] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -16339,15 +16199,14 @@ j_4_1_mb4(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
-j_5_0_mb1(JARGS)
+j_5_0_mb1(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[416];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 416;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -16456,10 +16315,8 @@ j_5_0_mb1(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*26] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*26] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -16881,15 +16738,14 @@ j_5_0_mb1(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
-j_5_0_mb2(JARGS)
+j_5_0_mb2(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[416];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 416;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -16998,10 +16854,8 @@ j_5_0_mb2(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*26] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*26] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -17423,15 +17277,14 @@ j_5_0_mb2(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3)
-j_5_0_mb3(JARGS)
+j_5_0_mb3(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[416];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 416;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -17540,10 +17393,8 @@ j_5_0_mb3(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*26] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*26] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 
@@ -17965,15 +17816,14 @@ j_5_0_mb3(JARGS)
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-j_5_0_mb4(JARGS)
+j_5_0_mb4(J_SCREEN_ARGS)
 {
     __shared__ double s_iaij[16];
     __shared__ double s_iakl[416];
     int task_ij0 = blockIdx.x * 768;
     int task_kl0 = blockIdx.y * 416;
-    int pair_ij0 = pair_ij_mapping[task_ij0];
-    int pair_kl0 = pair_kl_mapping[task_kl0];
-    if (q_cond[pair_ij0] + q_cond[pair_kl0] < cutoff) {
+    if (j_skip_block(q_ij[task_ij0], q_kl[task_kl0],
+                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)) {
         return;
     }
     int tx = threadIdx.x;
@@ -18082,10 +17932,8 @@ j_5_0_mb4(JARGS)
             if (task_kl0 >= npairs_kl) {
                 break;
             }
-            int pair_ij0 = pair_ij_mapping[task_ij0];
-            int pair_kl0 = pair_kl_mapping[task_kl0];
-            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_cond[pair_kl0] < cutoff &&
-                qd_kl_max[batch_kl+blockIdx.y*26] + q_cond[pair_ij0] < cutoff) {
+            if (qd_ij_max[batch_ij+blockIdx.x*48] + q_kl[task_kl0] < cutoff &&
+                qd_kl_max[batch_kl+blockIdx.y*26] + q_ij[task_ij0] < cutoff) {
                 continue;
             }
 

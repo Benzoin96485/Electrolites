@@ -55,15 +55,6 @@ DROP_LINES = [
     r'double omega = jk\.omega;',
 ]
 
-HEAD = r'''
-#define JARGS double *vj, double *dm_all, int *bas, double *env,       \
-              int nbas, int npairs_ij, int npairs_kl,                  \
-              int *pair_ij_mapping, int *pair_kl_mapping,              \
-              int *pair_ij_loc, int *pair_kl_loc,                      \
-              float *qd_ij_max, float *qd_kl_max,                      \
-              float *q_cond, float cutoff
-'''
-
 
 def _body_of(src, name):
     m = re.search(r'\nvoid ' + name + r'\(RysIntEnvVars envs, JKMatrix jk, '
@@ -93,6 +84,16 @@ def transform(body, name, order):
         body, n = re.subn(r'[ \t]*' + pat + r'\n', '', body)
         assert n >= 1, (name, pat)
     body = body.replace('bounds.cutoff', 'cutoff')
+    # Both the coarse Schwarz test and the original inner tests index the
+    # compact, sorted pair lists directly. Discard their old gather indices.
+    for side in ('ij', 'kl'):
+        body = re.sub(rf'^[ \t]*int pair_{side}0 = pair_{side}_mapping\[task_{side}0\];\n',
+                      '', body, flags=re.M)
+        body = body.replace(f'q_cond[pair_{side}0]', f'q_{side}[task_{side}0]')
+    coarse = 'q_ij[task_ij0] + q_kl[task_kl0] < cutoff'
+    assert body.count(coarse) == 1 and 'q_cond[' not in body, name
+    body = body.replace(coarse, 'j_skip_block(q_ij[task_ij0], q_kl[task_kl0],\n'
+                        '                     block_qd_ij[blockIdx.x], block_qd_kl[blockIdx.y], cutoff)')
     body = body.replace('double *dm = jk.dm', 'double *dm = dm_all')
 
     # no reference to the structs may survive
@@ -203,7 +204,7 @@ def generate(path, variants=False):
     classes = sorted(
         {(int(m.group(1)), int(m.group(2)))
          for m in re.finditer(r'void md_j_(\d+)_(\d+)\(RysIntEnvVars', src)})
-    out = [HEAD]
+    out = []
     table = {}
     for lij, lkl in classes:
         name = f'md_j_{lij}_{lkl}'
@@ -220,7 +221,7 @@ def generate(path, variants=False):
         for m in mbs:
             suffix = f'_mb{m}' if variants else ''
             out.append(f'extern "C" __global__ void __launch_bounds__({NTHREADS}, {m})\n'
-                       f'j_{tag}{suffix}(JARGS)\n{{\n{body}\n}}\n')
+                       f'j_{tag}{suffix}(J_SCREEN_ARGS)\n{{\n{body}\n}}\n')
         table[tag] = dict(order=order, shm=shm, bsizex=bsizex, bsizey=bsizey,
                           nf3ij=nf3ij, minblocks=mb)
         sys.stderr.write(f'generated j_{tag}: order={order} shm={shm*8/1024:.1f}KB '

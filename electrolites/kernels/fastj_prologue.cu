@@ -31,6 +31,22 @@
 // All arithmetic is double precision.
 // ---------------------------------------------------------------------------
 
+#define J_SCREEN_ARGS double *vj, double *dm_all, int *bas, double *env, \
+                      int nbas, int npairs_ij, int npairs_kl,           \
+                      int *pair_ij_mapping, int *pair_kl_mapping,       \
+                      int *pair_ij_loc, int *pair_kl_loc,               \
+                      const float *qd_ij_max, const float *qd_kl_max,   \
+                      const float *q_ij, const float *q_kl,             \
+                      const float *block_qd_ij, const float *block_qd_kl, float cutoff
+
+// The first Schwarz bound is the largest in its sorted block. The block QD
+// maxima bound the original batch screen in both contraction directions.
+__device__ __forceinline__ bool j_skip_block(float qij, float qkl,
+                                              float qdij, float qdkl, float cutoff)
+{
+    return qij + qkl < cutoff || (qdij + qkl < cutoff && qdkl + qij < cutoff);
+}
+
 #define BAS_SLOTS       8
 #define ATOM_OF         0
 #define ANG_OF          1
