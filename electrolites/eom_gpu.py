@@ -814,8 +814,11 @@ def _ein_o(sub, A, B, b_axis, out_axis=None, big=0):
     return out
 
 
-def _ee_sigma(imds, mycc, r1, r2):
-    """eeccsd_matvec_singlet for a batch: r1 (n, o, v), r2 (n, o, o, v, v)."""
+def _ee_sigma(imds, mycc, r1, r2, ladder=True):
+    """eeccsd_matvec_singlet for a batch: r1 (n, o, v), r2 (n, o, o, v, v).
+    ``ladder=False`` leaves out sum_ef (ae|bf) tau2[ijef] (tau2 = r2 + r1 t1
+    + t1 r1), whose whole contribution to Hr2 is that term itself (the
+    rank-reduced EOM adds it factorised)."""
     t1, t2 = imds.t1, imds.t2
     ovvv, ovov = imds.ovvv, imds.ovov
     Hr1 = _ein('ae,nie->nia', imds.Fvv, r1)
@@ -826,7 +829,7 @@ def _ee_sigma(imds, mycc, r1, r2):
     rt = _ein('nia,jb->nijab', r1, t1)
     tau2 = r2 + rt + rt.transpose(0, 2, 1, 4, 3)
     rt = None
-    Hr2 = _ee_ladder(imds, mycc, tau2)
+    Hr2 = _ee_ladder(imds, mycc, tau2) if ladder else cp.zeros_like(r2)
     # the two other tau2 terms now, so that tau2 (o^2 v^2) can go
     tmp_t = _ein_o('meaf,nijef->nmaij', ovvv, tau2, None, out_axis=1)
     tmp_end = _ein('menf,kijef->kmnij', ovov, tau2)

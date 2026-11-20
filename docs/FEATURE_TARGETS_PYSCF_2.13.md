@@ -2927,3 +2927,202 @@ sigma, ~35 s each), most of them spent in the 1e-5 → 1e-7 tail of the
 energy test.  Starting it from better guesses (e.g. CIS/CC2) or loosening
 the energy tolerance for the roots whose residual is already converged
 is the obvious next saving.
+
+### 17.14 Rank-reduced CCSD / EOM-CCSD (TeraChem's RR-EOM-CCSD)
+
+`electrolites/rreom_gpu.py` reproduces the method behind the reference
+dataset (TeraChem `ccbox_rrccsd` + `ccbox_rreomccsd`, papers in
+`papers/RR-CC`: Parrish 2019, Hohenstein 2019, Hohenstein & Martinez 2021):
+every doubles quantity — t2, λ2, the right and left EOM doubles — is
+U R U^T with an orthonormal hole-particle projector U (ov x N), the
+singles are full, and the working equations are the canonical ones
+projected on U (x) U.  The residuals and sigma vectors are the existing GPU
+kernels (`fastccsd.update_amps`, `eom_gpu._ee_sigma`,
+`ccsd_lambda_gpu.lambda_linear`) applied to the reconstructed doubles and
+projected back; U is rotated once so that U^T diag(e_a - e_i) U is
+diagonal, which turns the papers' Lyapunov update into a division.
+
+Conventions that matter for the projection: PySCF's t2/r2 and its
+doubles residual / sigma are the αβ-determinant amplitudes and
+projections, i.e. Koch's biorthonormal ones, so the right problem is
+U^T σ(U R U^T) U with the identity metric.  PySCF's λ is not: <L|R> =
+2 l1.r1 + Σ (2 l2 - l2[..ba]).r2, so the compressed left/Λ doubles are
+U L U^T in the biorthonormal convention, l2 = (2X + X[..ba])/3, and the
+left operator is P(G λ-linear(G^-1 E(L))) — the adjoint of the right
+one in that pairing (checked to 1e-11 against the dense matrices).
+
+Projectors, calibrated against the ranks TeraChem prints:
+
+| | rule | Ir PEXRAL ranks (ours / TC) |
+|---|---|---|
+| ground (MP2) | eigenvalues of -(ia\|jb)/(Δ_ia+Δ_jb) above 1e-4, (ia\|jb) from the AO pivoted Cholesky truncated at 1e-2, denominator Cholesky 1e-2 | 377 / 389 |
+| state-specific | paper II eq. 33 generator from the state's r1 and ω, same thresholds | 332-361 / 329-362 |
+| state-averaged | eigenvalues of Σ_n U_n U_n^T above 1e-2 | 747 / 754 |
+
+(An ov-pair Cholesky of the same threshold gave rank 192 and 36 mEh of
+correlation energy too little; TeraChem's "Cholesky integral threshold"
+is on the AO pair diagonal.  For the union, an SVD threshold of 1e-2 on
+the stacked U gave 1144.)
+
+Workflow (TeraChem's): RR-CCSD → RR-Λ → CIS seeds → state-specific
+RR-EOM (one state at a time, its projector rebuilt from its singles
+until ω moves < 1e-6, earlier states deflated, lowest root of the deflated
+problem) → state-averaged right and left in the union space →
+transition properties (`eom_gpu.transition_properties` on the
+reconstructed vectors).  Two departures, both for robustness: a
+state-averaged pre-pass in the union of the CIS-based projectors seeds the
+state-specific solves with EOM-like singles in energy order (following
+the CIS states lost near-degenerate partners when CIS and EOM order the
+states differently: Pt CCENPT01 state 4 was +1.5 eV off), and the final
+state-averaged solve is converged to |r| < 1e-5 (TeraChem: 1e-4).
+
+The ladder: for compressed doubles its projection factorises with DF
+(all auxiliary functions) as Σ_A y_A R y_A, y_A = Σ_i U_i^T B_A U_i
+(naux N^2, built once per projector, device or pinned host), and the
+r1 t1 pieces as (U^T ρ)(U^T θ)^T; the left singles' t1 contraction of
+the ladder is done with the same factors.  It is used where an estimate
+(4 naux N^3 per vector against one timed AO-direct ladder) says it is
+cheaper: Pt EWANIZ AO ladder 27.7 s per vector, factorised ~0.5 s at
+N ≈ 900 (the whole sigma ~6 s instead of 30 s); on small cases the AO
+ladder is kept.  DF error on the excitation energies 0.1-0.3 meV
+(PEXRAL, CCENPT01, DOVBEV).  Λ with the factorised ladder: EWANIZ 140 s
+(canonical Λ 760 s).
+
+Memory at o 66, v 288: expand/project go occupied block by block (no
+(ov x ov) or transposed copies), finished states' doubles wait on the
+host, the Cholesky factors are offloaded during the Λ intermediates, the
+fastccsd integral cache is dropped after RR-CCSD, and a whole-ov v^3
+transposed copy in `lambda_linear` (abkc,nkibc->nia) is gone (cp.dot
+with an F-ordered view).  Every stage checkpoints (RR-CCSD, Λ, pre-pass,
+each state, the state-averaged right solution).
+
+Tests: `tests/test_rreom_gpu.py` (16 checks: U = 1 reproduces canonical
+CCSD, Λ, EOM roots, f; truncated U: projected residual zero, Davidson ==
+dense compressed matrix, left == right roots, left == adjoint of right;
+projectors reproduce their generators; factorised DF ladder == direct).
+
+Results against TeraChem (22 dataset complexes, nao 154-394, 5 singlet
+roots each; one A100-80GB, nodes shared by four jobs; scripts and data in
+`$PSCRATCH/eomcc_bench`: `run_rr.py`, `compare_rr.py`,
+`summarize_rr.py`, `rr/`, `rr_figs/`):
+
+| | Electrolites RR vs TeraChem RR | canonical EOM-CCSD vs TeraChem RR |
+|---|---|---|
+| excitation energies, MAE per case | median 3.1 meV | median +12.6 meV (mean of 5 roots) |
+| max \|ΔE\| per case | median 4.7 meV | |
+| E_corr | -0.36 … +0.72 mEh | +0.5 … +7.2 mEh |
+| ranks (ground / union) | 3-10 % below TeraChem's | |
+| wall time | median 6.7x faster (1.3-16.7x) | |
+
+Pt EWANIZ (o 66, v 288, the largest): ΔE -0.8, +0.3, -0.6, -0.3,
+-2.1 meV, f 0.1047 / 0.1395 against 0.1053 / 0.1369, E_corr -0.19 mEh;
+10,500 s against TeraChem's 13,286 s (canonical: 14,247 s).  Its stages:
+RR-CCSD 347 s, Λ 140 s, pre-pass 2870 s (rank 3132, y streamed from
+the host), state-specific 3380 s, state-averaged right 1293 s / left
+2280 s (union rank 2382), properties 102 s.
+
+The outliers are state selection, not the equations: Pt GAWTUU (-212 meV
+on root 5) — TeraChem's fifth state is the sixth, it missed one at
+3.78 eV that our RR and the canonical run (+207 meV in the campaign) both
+find; Ru ZICVAI01 (-59 meV) the same kind; Ir ACRHCO02 (+19/-25 meV on
+roots 4-5) and Pt AHIGOP (f of a 4 meV-split pair 0.021 vs 0.041) are the
+state-specific stage converging to a different member of a near-degenerate
+pair, which changes the union space.  Ir IMIXOR is excluded (our SCF
+lands 231 mEh below TeraChem's, as in the canonical campaign).
+
+Where the time goes: against our canonical EOM-CCSD (with left vectors
+and properties) the RR run is 1.2-1.9x slower below nao ≈ 290 (the
+state-specific stage alone is ~300 sigma vectors at near full-rank cost;
+the advantage over TeraChem there is the GPU code, not the compression)
+and 0.3-0.9x of it from nao ≈ 290 up (AFAPEC, AHIGOP, EWANIZ), where
+the factorised ladder and the factorised Λ pay off.  At EWANIZ the factorised ladder makes the
+compressed sigma ~6 s (state-specific spaces, N ≈ 900) to ~15-20 s (union
+space, y streamed), against 30 s full rank.  The pre-pass over seven CIS
+projectors (rank 3132) is now the largest single stage there; its y
+(149 GB) should be built in single precision or the pre-pass run with the
+AO ladder.
+
+**The canonical-vs-TeraChem differences are TeraChem's RR error.**  Use
+canonical EOM-CCSD as the common reference: the §17.11 campaign, plus
+EWANIZ from §17.13.  The comparison covers 22 complexes, with IMIXOR
+excluded, and 106 states whose state matches:
+
+| per state | mean | rms | range |
+|---|---|---|---|
+| TeraChem RR − canonical | −23.9 meV | 33.3 meV | −130 … +13 meV |
+| our RR − canonical | −26.0 meV | 35.2 meV | −135 … +12 meV |
+| TeraChem RR − our RR | +2.1 meV | 3.6 meV | −4.6 … +15 meV |
+
+- Our RR error tracks TeraChem's (correlation 0.993, slope 0.97). It
+  accounts for 98.9 % of Σ(TeraChem − canonical)². RR lowers ~90 % of
+  the excitation energies.
+- E_corr, TeraChem − canonical: −7.2 … −0.5 mEh. Ours: −7.0 … +0.1 mEh.
+  TeraChem − ours: −0.7 … +0.4 mEh (again 98.9 %).
+- Bright-state f, median |canonical − TeraChem| / TeraChem: 1.6 %. For
+  our RR it is 0.6 %.
+
+So the campaign's +12.6 meV, and its −50 … −130 meV states (KANQAS,
+WIYBIR, LUNXAT03, NIYPUG, KEWDOG01), are the truncation error of
+TeraChem's RR thresholds. They are not a difference in the canonical
+code, SCF, ECP or integrals. The residual +2 meV fits our ranks being
+3-10 % smaller, plus TeraChem's Cholesky integrals.
+
+Four states do not match; in each, one code took a different state:
+- **GAWTUU r5, ZICVAI01 r5:** TeraChem's state-specific stage took
+  another state. Our RR and canonical agree.
+- **ACRHCO02 r4/r5:** TeraChem agrees with canonical; ours took the other
+  member of the pair.
+
+Figure: `rr_figs/rr_error_decomp.png`.
+
+**Why RR is slower than canonical below nao ≈ 290.**  Measured with
+`prof_rr_can.py` (`prof_rrcan/`, one A100 per case), against canonical
+sigma with the MO vvvv ladder:
+
+| | PEXRAL (nao 154) | DOVBEV (nao 226) |
+|---|---|---|
+| canonical sigma, s/vector (single / block of 5) | 0.053 / 0.042 | 0.449 / 0.397 |
+| share outside the ladder | 84 % | 82 % |
+| RR sigma, state-specific space (N 336 / 474) | 0.055 / 0.044 | 0.410 / 0.383 |
+| RR sigma, union space (N 747 / 1146) | 0.056 / 0.045 | 0.467 / 0.440 |
+| sigma vectors, canonical (right + left) | 97 + 68 = 165 | 133 + 76 = 209 |
+| sigma vectors, our RR (pre + SS + SA right + left) | 71+261+81+134 = 547 | 78+250+93+131 = 552 |
+| sigma vectors, TeraChem (SS + SA right + left) | 140+21+36 = 197 | 138+28+41 = 207 |
+
+The compressed sigma reconstructs the doubles, runs the canonical
+contractions, and projects. Only the ladder is factorised, and at this
+size it is 16-18 % of the sigma. So an RR sigma costs the same as a
+canonical one.
+
+The RR workflow needs 2.6-3.3x more sigma vectors. Five single-root
+solves restart Davidson at every projector rebuild (~24 macroiterations).
+That cost belongs to the method: TeraChem's counts run 181-812 over the
+set, median ~380. Ours are larger still, for two reasons:
+- the pre-pass (70-140 vectors);
+- state-averaged convergence to residual 1e-5 / energy 1e-7, against
+  TeraChem's 1e-4. That is ~215 vectors against TeraChem's ~60.
+
+Fixed extras at PEXRAL:
+- the CIS guess, 8 s;
+- the factors, 1.3 s;
+- a separate EE-intermediate build, 9 s;
+- projector rebuilds, plus a one-off 15 s stall in the first deflated
+  solve (not yet diagnosed).
+
+Above nao ≈ 290 the canonical o²v⁴ ladder dominates. Once MO vvvv no
+longer fits, the canonical code switches to the AO-direct ladder:
+AFAPEC and AHIGOP canonical right take 2460 and 3090 s. The factorised
+DF ladder needs no vvvv, so RR/canonical drops to 0.3-0.6. KEWDOG01
+(nao 292, still the MO ladder) gives 0.87.
+
+This matches the papers. The GPU RR-CCSD paper (JCP 155, 184110), with
+every term factorised, reports RR-CCSD faster than CCSD "for all but the
+smallest molecules". The RR-EOM paper (JCP 151, 164121) used a prototype
+and left the O(N⁵) factorised EOM for future work.
+
+To make RR pay off at small sizes:
+1. Factorise the remaining doubles-doubles terms in the compressed basis
+   (U^T W U per space; the oooo ladder and exchange-type rings via DF, as
+   for the vvvv ladder).
+2. Test the TeraChem state-averaged tolerance (1e-4). It would cut ~150
+   vectors per case.

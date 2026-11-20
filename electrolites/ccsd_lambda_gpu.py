@@ -113,8 +113,12 @@ def make_intermediates(imds):
     vOOv -= oovv.transpose(2, 1, 0, 3)
     wVOov += VOov
     wvOOv += vOOv
-    ov1 = vOOv * 2 + VOov
-    ov2 = VOov * 2 + vOOv
+    # in place (two o^2 v^2 temporaries fewer at the peak of the build)
+    ov2 = VOov * 2
+    ov2 += vOOv
+    ov1 = vOOv
+    ov1 *= 2
+    ov1 += VOov
     vOOv = VOov = None
     wvooo -= _ein('jb,bikc->ckij', t1, ov1)
     wvooo += _ein('kb,bijc->ckij', t1, ov2)
@@ -198,7 +202,7 @@ def _lambda_const(imds, mycc):
     return c1, c2
 
 
-def lambda_linear(imds, mycc, L1, L2):
+def lambda_linear(imds, mycc, L1, L2, ladder_l1=None):
     """λ (H̄ - E_CC) on the singles and doubles for a batch of λ:
     L1 (n, o, v), L2 (n, o, o, v, v) with L2[n,j,i,b,a] = L2[n,i,j,a,b].
     PySCF's ``update_lambda`` without its constant terms and without the
@@ -224,9 +228,16 @@ def lambda_linear(imds, mycc, L1, L2):
     mia1 -= _ein('nbd,jd->njb', mba, t1)
     mia1 -= _ein('nlj,lb->njb', mij, t1)
 
-    L2new = _ladder_oovv(imds, mycc, L2)
-    L1new = _ein('nijab,jb->nia', L2new, t1) * 2
-    L1new -= _ein('njiab,jb->nia', L2new, t1)
+    if ladder_l1 is None:
+        L2new = _ladder_oovv(imds, mycc, L2)
+        L1new = _ein('nijab,jb->nia', L2new, t1) * 2
+        L1new -= _ein('njiab,jb->nia', L2new, t1)
+    else:
+        # the ladder left out of the doubles (its whole contribution to
+        # them is sum_cd (ac|bd) L2[ijcd]); its t1 contraction into the
+        # singles from the caller
+        L1new = ladder_l1(L2)
+        L2new = cp.zeros_like(L2)
     L2new *= .5
 
     L1new += L1 @ w1                                      # nib,ba->nia
@@ -277,8 +288,12 @@ def lambda_linear(imds, mycc, L1, L2):
     m4 = None
 
     L1new -= _ein('ckij,njkca->nia', imds.wvooo, L2)
-    L1new += cp.matmul(L2.transpose(0, 2, 3, 1, 4).reshape(n, no, -1),
-                       imds.wvvov.reshape(nv, -1).T)      # abkc,nkibc->nia
+    # abkc,nkibc->nia as wvvov (a, bkc) . X^T: X^T is an F-ordered view
+    # that cuBLAS takes as it is (matmul with wvvov.T copied the whole
+    # o v^3 array, 12.6 GB at o 66, v 288)
+    X = L2.transpose(0, 2, 3, 1, 4).reshape(n * no, -1)
+    L1new += cp.dot(imds.wvvov.reshape(nv, -1), X.T).T.reshape(n, no, nv)
+    X = None
     tmp_voov = getattr(imds, '_tmp_voov', None)
     if tmp_voov is None:
         tmp_voov = imds._tmp_voov = imds.wVOov * 2 + imds.wvOOv
