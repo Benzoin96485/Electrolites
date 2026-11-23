@@ -188,5 +188,111 @@ a, b = opsd.left(sp, V), ops.left(sp, V)
 report('left sigma with the DF ladder ~ AO ladder (DF error)',
        float(abs(a - b).max()) < 3e-3 * float(abs(b).max()),
        f'{float(abs(a - b).max() / abs(b).max()):.1e} rel')
+
+# ------------------------------------------------ factorised rings
+opsc = RR.Ops(mycc, imds_ee=ops.ee, rings=False)
+a, b = ops.right(sp, V), opsc.right(sp, V)
+report('right sigma: factorised rings == canonical',
+       float(abs(a - b).max()) < 1e-11 * float(abs(b).max()),
+       f'{float(abs(a - b).max() / abs(b).max()):.1e} rel')
+opsc.imds_l = ops.imds_l
+a, b = ops.left(sp, V), opsc.left(sp, V)
+report('left sigma: factorised rings == canonical',
+       float(abs(a - b).max()) < 1e-11 * float(abs(b).max()),
+       f'{float(abs(a - b).max() / abs(b).max()):.1e} rel')
+
+# ------------------------------------------------ T1-dressed ladder
+from pyscf import ao2mo                                          # noqa: E402
+ee = ops.ee
+cv = cp.asnumpy(mo[:, no:])
+vvvv = cp.asarray(ao2mo.kernel(mol, (cv,) * 4, compact=False)).reshape(
+    (nv,) * 4)
+ovvv, ovov = ee.ovvv, ee.ovov
+Vd = (vvvv - cp.einsum('ma,mebf->aebf', t1c, ovvv)
+      - cp.einsum('nb,nfae->aebf', t1c, ovvv)
+      + cp.einsum('ma,nb,menf->aebf', t1c, t1c, ovov))
+r2r = RR.expand(sp.U, Rr, no, nv)
+h1f, h2f = G._ee_sigma(ee, mycc, r1r, r2r)
+h1s, h2s = G._ee_sigma(ee, mycc, r1r, r2r, ladder=False, skip=('dress',))
+rt = cp.einsum('nia,jb->nijab', r1r, t1c)
+tau2 = r2r + rt + rt.transpose(0, 2, 1, 4, 3)
+ref = cp.einsum('aebf,nijef->nijab', Vd, tau2)
+err = float(abs(h2f - h2s - ref).max()) / float(abs(ref).max())
+report('right: ladder + dressing terms == T1-transformed ladder',
+       err < 1e-11 and float(abs(h1f - h1s).max()) == 0., f'{err:.1e} rel')
+from electrolites import ccsd_lambda_gpu as LG                   # noqa: E402
+L2r = RR.g_inv(r2r)
+DT = cp.einsum('cadb,nijcd->nijab', Vd, L2r)
+l1x = 2 * cp.einsum('nijab,jb->nia', DT, t1c) - \
+    cp.einsum('njiab,jb->nia', DT, t1c)
+s1f, s2f = LG.lambda_linear(ops.imds_l, mycc, r1r, L2r)
+s1s, s2s = LG.lambda_linear(ops.imds_l, mycc, r1r, L2r,
+                            ladder_l1=lambda x: l1x, skip=('dress',))
+err = float(abs(s2f - s2s - DT).max()) / float(abs(DT).max())
+err1 = float(abs(s1f - s1s).max()) / float(abs(s1f).max())
+report('left: ladder + dressing terms == transposed T1 ladder',
+       err < 1e-11 and err1 < 1e-11, f'{err:.1e}, singles {err1:.1e} rel')
+Bh = RR.dressed_vv(Bvv, F.Bov, t1c)
+VdDF = cp.einsum('aeA,bfA->aebf', Bh, Bh)
+ladh = RR.DFLadder(Bh, sp, t1c, dressed=True)
+ref = RR.project(sp.U, cp.einsum('aebf,nijef->nijab', VdDF, tau2))
+got = ladh.project(Rr, r1r)
+report('dressed DF ladder: factorised projection == direct',
+       float(abs(got - ref).max()) < 1e-10 * float(abs(ref).max()),
+       f'{float(abs(got - ref).max()):.1e}')
+DTd = cp.einsum('cadb,nijcd->nijab', VdDF, L2r)
+ref = RR.project(sp.U, RR.g_fwd(DTd))
+got = ladh.project(Rr, trans=True)
+report('dressed DF ladder: transposed, Koch metric == direct',
+       float(abs(got - ref).max()) < 1e-10 * float(abs(ref).max()),
+       f'{float(abs(got - ref).max()):.1e}')
+ref1 = 2 * cp.einsum('nijab,jb->nia', DTd, t1c) - \
+    cp.einsum('njiab,jb->nia', DTd, t1c)
+got1 = ladh.l1_part(L2r, t1c)
+report('dressed DF ladder: singles contraction == direct',
+       float(abs(got1 - ref1).max()) < 1e-10 * float(abs(ref1).max()),
+       f'{float(abs(got1 - ref1).max()):.1e}')
+opsh = RR.Ops(mycc, imds_ee=ee, Bvv=Bvv, Bov=F.Bov)
+opsh.imds_l = ops.imds_l
+report('dressed DF ladder chosen by the cost model',
+       opsh.ladder(sp) is not None and opsh.ladder(sp).dressed)
+Mh = cp.asnumpy(opsh.right(sp, cp.eye(sp.dim))).T
+MLh = cp.asnumpy(opsh.left(sp, cp.eye(sp.dim))).T
+adj = Mh.T * W[None, :] / W[:, None]
+report('dressed DF ladder + rings: left == adjoint of right',
+       abs(MLh - adj).max() < 1e-9 * abs(Mh).max(),
+       f'{abs(MLh - adj).max():.1e}')
+report('dressed DF ladder: sigma ~ AO ladder (DF error)',
+       abs(Mh - Mm).max() < 3e-3 * abs(Mm).max(),
+       f'{abs(Mh - Mm).max() / abs(Mm).max():.1e} rel')
+
+# ------------------------------------------------ T1-dressed canonical ladder
+ref_r = cp.einsum('aebf,nijef->nijab', Vd, tau2)
+for mode in ('MO', 'AO'):
+    if mode == 'AO':
+        mycc._eom_vvvv = None
+        mycc._eom_ao_ladder = True
+    tl = RR.T1Ladder(mycc, ee)
+    report(f'{mode} path taken', (tl.W is not None) == (mode == 'MO'))
+    got = tl.right(tau2)
+    err = float(abs(got - ref_r).max()) / float(abs(ref_r).max())
+    report(f'{mode} T1 ladder (right) == direct', err < 1e-11, f'{err:.1e}')
+    got = tl.left(L2r)
+    err = float(abs(got - DT).max()) / float(abs(DT).max())
+    report(f'{mode} T1 ladder (left) == direct', err < 1e-11, f'{err:.1e}')
+    tl = None
+    opsc = RR.Ops(mycc, imds_ee=ee, rings=False)
+    opsc.imds_l = ops.imds_l
+    opst = RR.Ops(mycc, imds_ee=ee, dress=True)
+    opst.imds_l = ops.imds_l
+    a, b = opst.right(sp, V), opsc.right(sp, V)
+    report(f'{mode} right sigma: rings + T1 ladder == canonical',
+           float(abs(a - b).max()) < 1e-11 * float(abs(b).max()),
+           f'{float(abs(a - b).max() / abs(b).max()):.1e} rel')
+    a, b = opst.left(sp, V), opsc.left(sp, V)
+    report(f'{mode} left sigma: rings + T1 ladder == canonical',
+           float(abs(a - b).max()) < 1e-11 * float(abs(b).max()),
+           f'{float(abs(a - b).max() / abs(b).max()):.1e} rel')
+mycc._eom_ao_ladder = False
 print('FAILED: ' + ', '.join(fails) if fails else 'all passed')
 sys.exit(1 if fails else 0)

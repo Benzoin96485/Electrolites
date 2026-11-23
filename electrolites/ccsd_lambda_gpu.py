@@ -202,15 +202,28 @@ def _lambda_const(imds, mycc):
     return c1, c2
 
 
-def lambda_linear(imds, mycc, L1, L2, ladder_l1=None):
+def lambda_linear(imds, mycc, L1, L2, ladder_l1=None, skip=(), ladder=None):
     """λ (H̄ - E_CC) on the singles and doubles for a batch of λ:
     L1 (n, o, v), L2 (n, o, o, v, v) with L2[n,j,i,b,a] = L2[n,i,j,a,b].
     PySCF's ``update_lambda`` without its constant terms and without the
     orbital-energy diagonal (w1, w2 are used as they are, the D λ of the
     Λ update cancelling the diag(e) taken off them there), with a leading
     batch index on every λ-dependent array: the left EOM-EE Davidson runs
-    all its trial vectors of a step through here at once."""
+    all its trial vectors of a step through here at once.
+
+    ``skip`` leaves out doubles terms for ``rreom_gpu`` to add factorised
+    (with L2new = X + X^T):
+
+    * 'ring': X[ia,jb] += sum_kc (L2[i,k,a,c] - L2[i,k,c,a]/2) Wv[kc,jb],
+      Wv[kc,jb] = (2 wVOov + wvOOv)[b,j,k,c] (the crossed wvOOv ring
+      stays);
+    * 'dress': the T1 dressing of the ladder (m4 = l2t1.ovvv and the t1 t1
+      part of l2tau), doubles and singles; the ladder must then be the
+      dressed one: ``ladder`` (L2 -> sum_cd (ca^|db^) L2[ijcd]) or, with the
+      ladder left out of the doubles, ``ladder_l1`` for its singles."""
     from electrolites.eom_gpu import _ein_o
+    ring, dress = 'ring' in skip, 'dress' in skip
+    assert not dress or ladder_l1 is not None or ladder is not None
     t1, t2 = imds.t1, imds.t2
     ovvv, ovoo, ovvo, oovv = imds.ovvv, imds.ovoo, imds.ovvo, imds.oovv
     n, no, nv = L1.shape
@@ -229,7 +242,8 @@ def lambda_linear(imds, mycc, L1, L2, ladder_l1=None):
     mia1 -= _ein('nlj,lb->njb', mij, t1)
 
     if ladder_l1 is None:
-        L2new = _ladder_oovv(imds, mycc, L2)
+        L2new = ladder(L2) if ladder is not None else \
+            _ladder_oovv(imds, mycc, L2)
         L1new = _ein('nijab,jb->nia', L2new, t1) * 2
         L1new -= _ein('njiab,jb->nia', L2new, t1)
     else:
@@ -256,23 +270,24 @@ def lambda_linear(imds, mycc, L1, L2, ladder_l1=None):
     L2new -= cp.matmul(ov_t, L1).reshape(L2.shape)       # jbki,nka->njiba
     ov_t = None
 
-    tau = t2 + _ein('ia,jb->ijab', t1, t1)
+    tau = t2 if dress else t2 + _ein('ia,jb->ijab', t1, t1)
     l2tau = _ein('nijcd,klcd->nijkl', L2, tau)
     tau = None
-    l2t1 = _ein('njidc,kc->nijkd', L2, t1)
+    l2t1 = None if dress else _ein('njidc,kc->nijkd', L2, t1)
 
     L1new -= _ein('njb,jiab->nia', L1, oovv)
     L1new += _ein_o('iabc,nbc->nia', ovvv, mba1, None, out_axis=1) * 2
     L1new -= _ein_o('ibca,nbc->nia', ovvv, mba1, None, out_axis=1)
     L2new += _ein_o('jbac,nic->njiba', ovvv, L1, None, out_axis=1)
-    m4 = _ein_o('nijkd,kadb->nijab', l2t1, ovvv, 3, big=1)
-    l2t1 = None
-    L2new -= m4
-    L1new -= _ein('nijab,jb->nia', m4, t1) * 2
-    L1new -= _ein('nijab,ia->njb', m4, t1) * 2
-    L1new += _ein('njiab,jb->nia', m4, t1)
-    L1new += _ein('njiab,ia->njb', m4, t1)
-    m4 = None
+    if l2t1 is not None:
+        m4 = _ein_o('nijkd,kadb->nijab', l2t1, ovvv, 3, big=1)
+        l2t1 = None
+        L2new -= m4
+        L1new -= _ein('nijab,jb->nia', m4, t1) * 2
+        L1new -= _ein('nijab,ia->njb', m4, t1) * 2
+        L1new += _ein('njiab,jb->nia', m4, t1)
+        L1new += _ein('njiab,ia->njb', m4, t1)
+        m4 = None
 
     voov = ovvo.transpose(1, 0, 3, 2)
     L1new += _ein('njb,aijb->nia', L1, voov) * 2
@@ -297,8 +312,9 @@ def lambda_linear(imds, mycc, L1, L2, ladder_l1=None):
     tmp_voov = getattr(imds, '_tmp_voov', None)
     if tmp_voov is None:
         tmp_voov = imds._tmp_voov = imds.wVOov * 2 + imds.wvOOv
-    tmp = L2.transpose(0, 1, 3, 2, 4) - L2.transpose(0, 1, 4, 2, 3) * .5
-    L2new += _ein('niakc,bjkc->njiba', tmp, tmp_voov)
+    if not ring:
+        tmp = L2.transpose(0, 1, 3, 2, 4) - L2.transpose(0, 1, 4, 2, 3) * .5
+        L2new += _ein('niakc,bjkc->njiba', tmp, tmp_voov)
     tmp = _ein('njkca,bikc->njiba', L2, imds.wvOOv)
     L2new += tmp
     L2new += tmp.transpose(0, 2, 1, 3, 4) * .5

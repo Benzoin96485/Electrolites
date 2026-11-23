@@ -814,13 +814,24 @@ def _ein_o(sub, A, B, b_axis, out_axis=None, big=0):
     return out
 
 
-def _ee_sigma(imds, mycc, r1, r2, ladder=True):
+def _ee_sigma(imds, mycc, r1, r2, ladder=True, skip=()):
     """eeccsd_matvec_singlet for a batch: r1 (n, o, v), r2 (n, o, o, v, v).
     ``ladder=False`` leaves out sum_ef (ae|bf) tau2[ijef] (tau2 = r2 + r1 t1
     + t1 r1), whose whole contribution to Hr2 is that term itself (the
-    rank-reduced EOM adds it factorised)."""
+    rank-reduced EOM adds it factorised); a callable is used as the ladder
+    (tau2 -> its ladder).  ``skip`` leaves out more of the doubles, for
+    ``rreom_gpu`` to add in factorised form (Hr2 = X + X^T, X[ia,jb] =
+    X[i,j,a,b] as an ov x ov matrix, M the same for r2):
+
+    * 'ring': the uncrossed rings, X = 2 M Wc + P Wx with Wc[me,jb] =
+      (woVvO + woVVo/2)[m,b,e,j], Wx[me,jb] = -woVvO[m,b,e,j],
+      P[ia,me] = r2[i,m,e,a] (the crossed woVVo ring stays);
+    * 'dress': the T1 dressing of the ladder, -t1[m,a] (me|bf) tau2[ijef]
+      and its t1 t1 (me|nf) part (in tau_half), which with the ladder make
+      sum_ef (ae^|bf^) tau2[ijef] in the T1-transformed integrals."""
     t1, t2 = imds.t1, imds.t2
     ovvv, ovov = imds.ovvv, imds.ovov
+    ring, dress = 'ring' in skip, 'dress' in skip
     Hr1 = _ein('ae,nie->nia', imds.Fvv, r1)
     Hr1 -= _ein('mi,nma->nia', imds.Foo, r1)
     Hr1 += _ein('me,nimae->nia', imds.Fov, r2) * 2
@@ -829,9 +840,14 @@ def _ee_sigma(imds, mycc, r1, r2, ladder=True):
     rt = _ein('nia,jb->nijab', r1, t1)
     tau2 = r2 + rt + rt.transpose(0, 2, 1, 4, 3)
     rt = None
-    Hr2 = _ee_ladder(imds, mycc, tau2) if ladder else cp.zeros_like(r2)
+    assert not dress or ladder is not True
+    if callable(ladder):          # e.g. the T1-dressed one ('dress')
+        Hr2 = ladder(tau2)
+    else:
+        Hr2 = _ee_ladder(imds, mycc, tau2) if ladder else cp.zeros_like(r2)
     # the two other tau2 terms now, so that tau2 (o^2 v^2) can go
-    tmp_t = _ein_o('meaf,nijef->nmaij', ovvv, tau2, None, out_axis=1)
+    tmp_t = None if dress else \
+        _ein_o('meaf,nijef->nmaij', ovvv, tau2, None, out_axis=1)
     tmp_end = _ein('menf,kijef->kmnij', ovov, tau2)
     tau2 = None
     Hr2 += _ein('mnij,kmnab->kijab', imds.woOoO, r2)
@@ -841,7 +857,8 @@ def _ee_sigma(imds, mycc, r1, r2, ladder=True):
 
     theta = r2 * 2 - r2.transpose(0, 1, 2, 4, 3)
     Hr1 += _ein_o('mfae,nmife->nia', ovvv, theta, 1)
-    Hr2 -= _ein('ma,nmbij->nijab', t1, tmp_t)
+    if tmp_t is not None:
+        Hr2 -= _ein('ma,nmbij->nijab', t1, tmp_t)
     tmp_t = None
     tmp = _ein_o('meaf,nme->naf', ovvv, r1, 1) * 2
     tmp -= _ein_o('mfae,nme->naf', ovvv, r1, 1)
@@ -851,11 +868,13 @@ def _ee_sigma(imds, mycc, r1, r2, ladder=True):
 
     tmp = _ein('mbej,nimea->njiab', imds.woVVo, r2)
     Hr2 += tmp
-    Hr2 += tmp.transpose(0, 1, 2, 4, 3) * .5
+    if not ring:
+        Hr2 += tmp.transpose(0, 1, 2, 4, 3) * .5
     tmp = None
     woVvO = imds.woVVo * .5 + imds.woVvO
     Hr1 += _ein('maei,nme->nia', woVvO, r1) * 2
-    Hr2 += _ein('mbej,nimae->nijab', woVvO, theta)
+    if not ring:
+        Hr2 += _ein('mbej,nimae->nijab', woVvO, theta)
     woVvO = None
 
     Hr1 -= _ein('mnie,kmnae->kia', imds.woOoV, theta)
@@ -873,7 +892,8 @@ def _ee_sigma(imds, mycc, r1, r2, ladder=True):
     Hr2 -= _ein('kmj,miab->kijba', tmp, t2)
     theta = None
 
-    Hr2 += _ein('kmnij,mnab->kijab', tmp_end, imds.tau_half)
+    Hr2 += _ein('kmnij,mnab->kijab', tmp_end,
+                t2 * .5 if dress else imds.tau_half)
     tmp_end = None
     Hr2 += Hr2.transpose(0, 2, 1, 4, 3).copy()
     return Hr1, Hr2

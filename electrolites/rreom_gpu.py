@@ -453,24 +453,37 @@ def rr_lambda(mycc, sp, max_cycle=50, tol=1e-6, log=None, Bvv=None):
 
 
 # ------------------------------------------------------------------ EOM
+def dressed_vv(Bvv, Bov, t1):
+    """T1-dressed DF factors B^[a,e,A] = B[a,e,A] - sum_m t1[m,a] B[m,e,A]
+    (the particle index of the T1-transformed (ae|bf))."""
+    no, nv = t1.shape
+    Bo = cp.asarray(Bov).reshape(no, nv, -1)
+    return Bvv - _ein('ma,meA->aeA', cp.asarray(t1), Bo)
+
+
 class DFLadder:
     """The particle-particle ladder sum_ef (ae|bf) x[ij,ef] with DF
     integrals (ae|bf) = sum_A B[a,e,A] B[b,f,A] (all auxiliary functions),
     for compressed doubles: for x = U R U^T its projection is
 
-        U^T Lad(x) U = sum_A y_A R y_A,   y_A = sum_i U_i^T B_A U_i,
+        U^T Lad(x) U = sum_A y_A R y_A^T,   y_A = sum_i U_i^T B_A U_i,
 
-    (U_i: the (v x N) rows of U for occupied i; y_A symmetric), and for the
-    rank-one pieces r1 t1 + t1 r1 of tau2 it is (U^T rho)(U^T theta)^T + t.,
-    rho[ia,A] = sum_e B[a,e,A] r[i,e].  y (naux N^2) is built once per
-    projector, on the device if it fits, else in pinned host memory and
-    streamed per call."""
+    (U_i: the (v x N) rows of U for occupied i), and for the rank-one
+    pieces r1 t1 + t1 r1 of tau2 it is (U^T rho)(U^T theta)^T + t.,
+    rho[ia,A] = sum_e B[a,e,A] r[i,e].  With the bare B, y_A is symmetric;
+    with the T1-dressed B^ (``dressed_vv``) the same formulas give the
+    T1-transformed ladder sum_ef (ae^|bf^) x[ij,ef], which also carries the
+    -t1 (me|bf) and t1 t1 (me|nf) terms of the sigma (``dressed=True``;
+    the left operator takes the transpose, sum_A y_A^T L y_A).  y
+    (naux N^2) is built once per projector, on the device if it fits,
+    else in pinned host memory and streamed per call."""
 
-    def __init__(self, Bvv, sp, t1, log=None, dev_frac=.25):
+    def __init__(self, Bvv, sp, t1, log=None, dev_frac=.25, dressed=False):
         from electrolites.fastccsd import _avail
         no, nv, N = sp.no, sp.nv, sp.N
         naux = Bvv.shape[2]
         self.sp, self.naux = sp, naux
+        self.dressed = dressed
         self.Bvv = Bvv
         self.theta = _ein('bfA,jf->jbA', Bvv, t1).reshape(no * nv, naux)
         self.Ut = sp.U.T @ self.theta                    # (N, naux)
@@ -503,19 +516,23 @@ class DFLadder:
                      nbytes / 1e9, 'device' if self.on_dev else 'host',
                      time.perf_counter() - t0)
 
-    def project(self, R, r1=None):
-        """U^T Lad(U R U^T + r1 t1 + t1 r1) U for R (n, N, N)."""
+    def project(self, R, r1=None, trans=False):
+        """U^T Lad(U R U^T + r1 t1 + t1 r1) U for R (n, N, N); ``trans``:
+        the transposed ladder (left operator, no r1)."""
         n, N = len(R), self.sp.N
         out = cp.zeros_like(R)
         nb = max(1, min(self.naux, int(1e9 // (N * N * 8))))
         for a0 in range(0, self.naux, nb):
             a1 = min(self.naux, a0 + nb)
             y = self.y[a0:a1] if self.on_dev else cp.asarray(self.y[a0:a1])
+            yt = y.transpose(0, 2, 1)
+            if trans:
+                y, yt = yt, y
             for k in range(n):
                 T = cp.matmul(y, R[k])                       # (nb, N, N)
-                out[k] += cp.matmul(T, y).sum(axis=0)
+                out[k] += cp.matmul(T, yt).sum(axis=0)
                 T = None
-            y = None
+            y = yt = None
         if r1 is not None:
             nv = self.sp.nv
             rho = _ein('aeA,nie->niaA', self.Bvv, r1).reshape(
@@ -528,15 +545,170 @@ class DFLadder:
 
     def l1_part(self, L2, t1):
         """2 sum_jb Lad(L2)[ijab] t[jb] - sum_jb Lad(L2)[jiab] t[jb] for
-        full L2 (n, o, o, v, v) (the singles of ``lambda_linear``)."""
+        full L2 (n, o, o, v, v) (the singles of ``lambda_linear``), Lad the
+        transposed ladder sum_cd (ca^|db^) L2[ijcd]."""
         no, nv = self.sp.no, self.sp.nv
         th = self.theta.reshape(no, nv, self.naux)
-        # sum_jb Lad[i,j,a,b] t[j,b] = sum_A,e B[a,e,A] sum_jf L2[ijef] th[jfA]
-        W1 = _ein('nijef,jfA->nieA', L2, th)
-        W2 = _ein('nijfe,jfA->nieA', L2, th)
+        # sum_jb Lad[i,j,a,b] t[j,b] = sum_A,c B[c,a,A] sum_jd L2[ijcd] th[jdA]
+        W1 = _ein('nijcd,jdA->nicA', L2, th)
+        W2 = _ein('nijdc,jdA->nicA', L2, th)
         W = 2 * W1 - W2
         W1 = W2 = None
-        return _ein('aeA,nieA->nia', self.Bvv, W)
+        return _ein('caA,nicA->nia', self.Bvv, W)
+
+
+class T1Ladder:
+    """The canonical ladder with the T1-transformed particle index,
+
+        right:  y[ij,ab] = sum_cd (ac^|bd^) x[ij,cd],
+        left:   y[ij,ab] = sum_cd (ca^|db^) x[ij,cd]  (the transpose),
+
+    (a^ = a - sum_m t1[m,a] m), which carries the -t1 (mc|bd) and
+    t1 t1 (mc|nd) terms of the sigma vectors (``_ee_sigma`` /
+    ``lambda_linear`` with skip 'dress') at the cost of the bare ladder:
+    with the MO (ac|bd) on the device (``eom_gpu._vvvv_mo``) that matrix is
+    dressed in place once (o v^4; ``mycc._eom_vvvv`` is handed over, so
+    the bare one is rebuilt if a canonical EOM needs it later), else the
+    AO-direct ladder runs with the T1-transformed virtual coefficients on
+    the output (right) or input (left) side.  Both keep the pair symmetry
+    (the ladder of X^T is the transpose of that of X)."""
+
+    def __init__(self, mycc, ee):
+        from electrolites import eom_gpu as G
+        t1 = cp.asarray(ee.t1)
+        no, nv = t1.shape
+        self.mycc = mycc
+        W = G._vvvv_mo(mycc, nv)
+        self.W = None
+        if W is not None:
+            mycc._eom_vvvv = None
+            Wv = W.reshape(nv, nv, nv, nv)                     # [c,d,a,b]
+            ovvv, ovov = ee.ovvv, ee.ovov
+            from electrolites.fastccsd import _avail
+            nc = max(1, min(nv, int(.04 * _avail() //
+                                    (8 * (no * nv * nv + 2 * nv ** 3)))))
+            for c0 in range(0, nv, nc):
+                c1 = min(nv, c0 + nc)
+                # Z[m,c,b,d] = (mc|bd) - sum_n t[n,b] (mc|nd)
+                Z = ovvv[:, c0:c1] - _ein('nb,mcnd->mcbd', t1, ovov[:, c0:c1])
+                Wv[c0:c1] -= _ein('ma,mcbd->cdab', t1, Z)
+                Z = None
+                # - sum_n t[n,b] (nd|ac) = - t[n,b] ovvv[n,d,a,c]
+                Wv[c0:c1] -= _ein('nb,ndac->cdab', t1, ovvv[:, :, :, c0:c1])
+            self.W = W
+        else:
+            # AO coefficients; taken to vhfopt's basis per call (the vhfopt
+            # is rebuilt when the AO-block cache is dropped)
+            mask = mycc.get_frozen_mask()
+            mo = cp.asarray(mycc.mo_coeff)[:, cp.asarray(mask)]
+            self.cv = mo[:, no:]
+            self.cvh = self.cv - mo[:, :no] @ t1
+
+    def _pairs(self, x, f):
+        lead = x.shape[:-4]
+        no, nv = x.shape[-4], x.shape[-1]
+        x = x.reshape((-1, no, no, nv, nv))
+        i, j = cp.tril_indices(no)
+        xt = x[:, i, j]                                   # (n, npair, v, v)
+        y = f(xt.reshape(-1, nv, nv)).reshape(xt.shape)
+        xt = None
+        out = cp.empty_like(x)
+        out[:, i, j] = y
+        out[:, j, i] = y.transpose(0, 1, 3, 2)
+        return out.reshape(lead + (no, no, nv, nv))
+
+    def _ao(self, x, cin, cout):
+        from electrolites import eom_gpu as G
+        c = G._ladder_setup(self.mycc).coeff
+        cin, cout = c @ cin, c @ cout
+        X = _ein('pe,mef,qf->mpq', cin, x, cin)
+        Y = G._ladder(self.mycc, X)
+        X = None
+        return _ein('pa,mpq,qb->mab', cout, Y, cout)
+
+    def right(self, x):
+        if self.W is not None:
+            return self._pairs(x, lambda m: (m.reshape(len(m), -1) @ self.W)
+                               .reshape(m.shape))
+        return self._pairs(x, lambda m: self._ao(m, self.cv, self.cvh))
+
+    def left(self, x):
+        if self.W is not None:
+            return self._pairs(x, lambda m: (m.reshape(len(m), -1) @ self.W.T)
+                               .reshape(m.shape))
+        return self._pairs(x, lambda m: self._ao(m, self.cvh, self.cv))
+
+
+class Rings:
+    """The uncrossed ring terms of the sigma vectors in a compressed space
+    (``_ee_sigma`` / ``lambda_linear`` with skip 'ring'), from ov x N and
+    N x N factors built once per space.  As ov x ov matrices (M = U R U^T,
+    X the doubles before Hr2 = X + X^T, P[ia,me] = r2[i,m,e,a], E the
+    exchange (E Y)[ia,jb] = Y[ib,ja]):
+
+    * right: X = 2 M Wc + P Wx, so U^T X U = 2 R C + U^T (P Vx), with
+      C = U^T Wc U and Vx = Wx U; P Vx costs (ov)^2 N per vector instead
+      of the o^3 v^3 of the canonical contraction;
+    * left (Koch metric G = 2 - E on the output, G^-1 on the input): the
+      ring sum_kc (L2[ikac] - L2[ikca]/2) Wv[kc,jb] is M Wv / 2 for
+      L2 = G^-1 M, so U^T G(X) U = L C - U^T E(U L K) U / 2 with
+      K = U^T Wv, C = K U."""
+
+    def __init__(self, sp, ee=None, imds_l=None):
+        no, nv, N, ov = sp.no, sp.nv, sp.N, sp.ov
+        U = sp.U
+        self.sp = sp
+        if ee is not None:
+            W = (ee.woVVo * .5 + ee.woVvO).transpose(0, 2, 3, 1)  # m,e,j,b
+            W = W.reshape(ov, ov)
+            self.C = U.T @ (W @ U)
+            W = None
+            W = ee.woVvO.transpose(0, 2, 3, 1).reshape(ov, ov)
+            self.Vx = -(W @ U)
+            W = None
+        if imds_l is not None:
+            tv = getattr(imds_l, '_tmp_voov', None)
+            if tv is None:
+                tv = imds_l._tmp_voov = imds_l.wVOov * 2 + imds_l.wvOOv
+            W = tv.transpose(2, 3, 1, 0).reshape(ov, ov)          # k,c,j,b
+            self.K = (W.T @ U).T                                 # (N, ov)
+            W = None
+            self.Cl = self.K @ U
+
+    def right(self, R, r2):
+        """U^T X U (before symmetrisation) for R (n, N, N), r2 = U R U^T
+        (n, o, o, v, v)."""
+        sp = self.sp
+        no, nv, N = sp.no, sp.nv, sp.N
+        out = 2 * cp.matmul(R, self.C)
+        for k in range(len(R)):
+            # K[i,a,Q] = sum_me r2[i,m,e,a] Vx[me,Q]
+            Kx = cp.matmul(r2[k].reshape(no, no * nv, nv).transpose(0, 2, 1),
+                           self.Vx)
+            out[k] += sp.U.T @ Kx.reshape(-1, N)
+            Kx = None
+        return out
+
+    def left(self, L):
+        """U^T G(X) U (before symmetrisation) for L (n, N, N)."""
+        sp = self.sp
+        no, nv, N = sp.no, sp.nv, sp.N
+        U3 = sp.U.reshape(no, nv, N)
+        out = cp.matmul(L, self.Cl)
+        for k in range(len(L)):
+            H = L[k] @ self.K                                   # (N, ov)
+            for i0, i1 in _ichunks(no, no * nv * nv * 8 * 3):
+                # Y[i,b,j,a] = (U H)[ib, ja]; G[i,a,Q] = sum_jb Y[ibja] U[jbQ]
+                Y = (U3[i0:i1].reshape(-1, N) @ H).reshape(i1 - i0, nv, no, nv)
+                Y = cp.ascontiguousarray(Y.transpose(0, 2, 1, 3)).reshape(
+                    i1 - i0, no * nv, nv)                       # [i,(j,b),a]
+                Gx = cp.matmul(Y.transpose(0, 2, 1), sp.U)        # (i, a, Q)
+                Y = None
+                out[k] -= .5 * (U3[i0:i1].reshape(-1, N).T @
+                                Gx.reshape(-1, N))
+                Gx = None
+            H = None
+        return out
 
 
 def cupyx_empty_pinned(shape):
@@ -545,11 +717,18 @@ def cupyx_empty_pinned(shape):
 
 
 class Ops:
-    """Right and left sigma in a compressed space.  With ``Bvv`` (DF
-    (ae|bf) factors) the ladder is applied factorised (``DFLadder``, built
-    once per space) instead of AO-direct on the reconstructed doubles."""
+    """Right and left sigma in a compressed space: the canonical kernels on
+    the reconstructed doubles for what does not factorise, projected, plus
+    the factorised terms: the uncrossed rings (``Rings``, built once per
+    space; ``rings=False`` keeps them canonical) and, with ``Bvv`` (DF
+    (ae|bf) factors), the ladder (``DFLadder``, built once per space)
+    when the cost model prefers it to the AO-direct one; with ``Bov`` too,
+    that ladder is the T1-dressed one and replaces the o^3 v^3 dressing
+    terms of the sigma.  ``dress``: the canonical ladder is the T1-dressed
+    one too (``T1Ladder``), so those terms leave every space."""
 
-    def __init__(self, mycc, imds_ee=None, imds_l=None, Bvv=None, log=None):
+    def __init__(self, mycc, imds_ee=None, imds_l=None, Bvv=None, log=None,
+                 Bov=None, rings=True, dress=False):
         from electrolites import eom_gpu as G
         self.mycc = mycc
         self.ee = imds_ee if imds_ee is not None else \
@@ -558,10 +737,17 @@ class Ops:
         self.h1 = h1
         self.imds_l = imds_l
         self.nsig = 0
-        self.Bvv = Bvv
+        self.dressed = Bvv is not None and Bov is not None
+        self.Bvv = dressed_vv(Bvv, Bov, mycc.t1) if self.dressed else Bvv
+        # the canonical ladder T1-dressed as well (the dressing terms then
+        # leave the sigma whichever ladder a space gets)
+        self.t1lad = T1Ladder(mycc, self.ee) if dress else None
         self.log = log
         self._lad = (None, None)
         self.t_ladder = 0.
+        self.use_rings = rings
+        self._rings = (None, None, None)
+        self.t_rings = 0.
 
     def _costs(self, sp):
         """(AO-direct ladder seconds per vector, flop rate): one timed AO
@@ -571,7 +757,9 @@ class Ops:
             sync = cp.cuda.Device().synchronize
             x = cp.random.random((1, sp.no, sp.no, sp.nv, sp.nv))
             x = x + x.transpose(0, 2, 1, 4, 3)
-            if self.ee is not None:
+            if self.t1lad is not None:
+                lad = self.t1lad.right
+            elif self.ee is not None:
                 lad = lambda y: G._ee_ladder(self.ee, self.mycc, y)
             else:                     # left only (right from a checkpoint)
                 from electrolites import ccsd_lambda_gpu as LG
@@ -599,7 +787,8 @@ class Ops:
     def ladder(self, sp):
         """The factorised DF ladder for this space when it is estimated
         cheaper than the AO-direct one (per vector 4 naux N^3 flops plus the
-        y build spread over ~10 calls), else None."""
+        y build spread over ~10 calls, against the AO ladder and, when
+        dressed, the o^3 v^3 dressing contraction it replaces), else None."""
         if self.Bvv is None:
             return None
         if self._lad[0] is sp:
@@ -607,7 +796,9 @@ class Ops:
         t_ao, rate = self._costs(sp)
         naux, N = self.Bvv.shape[2], sp.N
         t_df = (4 * naux * N ** 3 + 2 * naux * N * N * sp.ov / 10) / rate
-        if t_df > .7 * t_ao:
+        t_dress = 2. * sp.no ** 3 * sp.nv ** 3 / rate \
+            if self.dressed and self.t1lad is None else 0.
+        if t_df > .7 * t_ao + t_dress:
             self._lad = (sp, None)
             return None
         # factorised: the AO integral cache the timing filled is not needed
@@ -617,30 +808,66 @@ class Ops:
             self._lad = (None, None)
             t0 = time.perf_counter()
             self._lad = (sp, DFLadder(self.Bvv, sp, cp.asarray(self.mycc.t1),
-                                      self.log))
+                                      self.log, dressed=self.dressed))
             self.t_ladder += time.perf_counter() - t0
         return self._lad[1]
+
+    def rings(self, sp, side):
+        """``Rings`` of this space for 'right' / 'left' (None: canonical)."""
+        if not self.use_rings:
+            return None
+        if self._rings[0] is not sp or self._rings[1] != side:
+            self._rings = (None, None, None)
+            t0 = time.perf_counter()
+            rg = Rings(sp, ee=self.ee if side == 'right' else None,
+                       imds_l=self.imds_l if side == 'left' else None)
+            cp.cuda.Device().synchronize()
+            self.t_rings += time.perf_counter() - t0
+            self._rings = (sp, side, rg)
+        return self._rings[2]
+
+    def _skip(self, lad, rg):
+        dress = self.t1lad is not None if lad is None else lad.dressed
+        return (('ring',) if rg is not None else ()) + \
+            (('dress',) if dress else ())
 
     def right(self, sp, V):
         from electrolites import eom_gpu as G
         lad = self.ladder(sp)
+        rg = self.rings(sp, 'right')
+        skip = self._skip(lad, rg)
         r1, R = sp.unpack(V)
         out = cp.empty_like(V)
         blk = max(1, G._ee_blk(sp.no, sp.nv))
         for p0 in range(0, len(V), blk):
             r2 = expand(sp.U, R[p0:p0 + blk], sp.no, sp.nv)
-            h1, h2 = G._ee_sigma(self.ee, self.mycc, r1[p0:p0 + blk], r2,
-                                 ladder=lad is None)
-            r2 = None
+            h1, h2 = G._ee_sigma(
+                self.ee, self.mycc, r1[p0:p0 + blk], r2, skip=skip,
+                ladder=False if lad is not None else
+                (self.t1lad.right if self.t1lad is not None else True))
             hc = project(sp.U, h2)
             h2 = None
-            if lad is not None:
-                t0 = time.perf_counter()
-                hc += lad.project(R[p0:p0 + blk], r1[p0:p0 + blk])
+            if rg is not None:
                 cp.cuda.Device().synchronize()
-                self.t_ladder += time.perf_counter() - t0
+                t0 = time.perf_counter()
+                zx = rg.right(R[p0:p0 + blk], r2)
+                hc += zx + zx.transpose(0, 2, 1)
+                zx = None
+                cp.cuda.Device().synchronize()
+                self.t_rings += time.perf_counter() - t0
+            r2 = None
             out[p0:p0 + blk] = sp.pack(h1, hc)
             h1 = hc = None
+        if lad is not None:
+            # all vectors in one pass over y (streamed from the host for
+            # large spaces: 73 GB per pass at Pt EWANIZ's union space)
+            cp.cuda.Device().synchronize()
+            t0 = time.perf_counter()
+            Z = lad.project(R, r1)
+            out[:, sp.ov:] += Z[:, sp.tri[0], sp.tri[1]]
+            Z = None
+            cp.cuda.Device().synchronize()
+            self.t_ladder += time.perf_counter() - t0
         self.nsig += len(V)
         return out
 
@@ -655,11 +882,14 @@ class Ops:
                 self.Bvv = cp.asnumpy(Bvv)
                 Bvv = None
             self._lad = (None, None)
+            self._rings = (None, None, None)
             cp.get_default_memory_pool().free_all_blocks()
             self.imds_l = LG.make_intermediates(G._Imds(self.mycc))
             if self.Bvv is not None:
                 self.Bvv = cp.asarray(self.Bvv)
         lad = self.ladder(sp)
+        rg = self.rings(sp, 'left')
+        skip = self._skip(lad, rg)
         t1 = cp.asarray(self.mycc.t1)
         l1, Lc = sp.unpack(V)
         out = cp.empty_like(V)
@@ -669,18 +899,32 @@ class Ops:
             s1, s2 = LG.lambda_linear(
                 self.imds_l, self.mycc, l1[p0:p0 + blk], l2,
                 ladder_l1=None if lad is None else
-                (lambda L2: lad.l1_part(L2, t1)))
+                (lambda L2: lad.l1_part(L2, t1)), skip=skip,
+                ladder=self.t1lad.left if lad is None and self.t1lad is not
+                None else None)
             l2 = None
             sc = project(sp.U, g_fwd(s2))
             s2 = None
-            if lad is not None:
-                # G commutes with the ladder: P(G Lad(G^-1 X)) = P(Lad X)
-                t0 = time.perf_counter()
-                sc += lad.project(Lc[p0:p0 + blk])
+            if rg is not None:
                 cp.cuda.Device().synchronize()
-                self.t_ladder += time.perf_counter() - t0
+                t0 = time.perf_counter()
+                zx = rg.left(Lc[p0:p0 + blk])
+                sc += zx + zx.transpose(0, 2, 1)
+                zx = None
+                cp.cuda.Device().synchronize()
+                self.t_rings += time.perf_counter() - t0
             out[p0:p0 + blk] = sp.pack(s1, sc)
             s1 = sc = None
+        if lad is not None:
+            # G commutes with the (dressed, transposed) ladder:
+            # P(G Lad(G^-1 X)) = P(Lad X); all vectors in one pass over y
+            cp.cuda.Device().synchronize()
+            t0 = time.perf_counter()
+            Z = lad.project(Lc, trans=True)
+            out[:, sp.ov:] += Z[:, sp.tri[0], sp.tri[1]]
+            Z = None
+            cp.cuda.Device().synchronize()
+            self.t_ladder += time.perf_counter() - t0
         self.nsig += len(V)
         return out
 
@@ -883,11 +1127,12 @@ def cis_guess(mycc, nroots, mf=None):
 def run(mycc, nroots=5, thresh=1e-4, den_thresh=1e-2, int_thresh=1e-2,
         union_thresh=1e-2, auxbasis=None, cc_tol=1e-6, tol_e=1e-7,
         tol_r=1e-5, props=True, verbose=None, mf=None, pre_guess=True,
-        df_ladder=True, chk=None, n_extra=2):
+        df_ladder=True, chk=None, n_extra=2, rings=True, dress=True):
     """The TeraChem RR-EOM-CCSD workflow on a GPU4PySCF CCSD object whose
     SCF is done: RR-CCSD, RR-Λ, state-specific RR-EOM, state-averaged right
     and left RR-EOM, transition properties.  Returns a dict of results and
-    timings."""
+    timings.  ``rings`` / ``dress``: factorised ring terms / T1-dressed DF
+    ladder in the EOM sigma vectors (``Ops``)."""
     from electrolites import eom_gpu as G
     from electrolites import ccsd_lambda_gpu as LG
     log = logger.new_logger(mycc, verbose)
@@ -969,7 +1214,9 @@ def run(mycc, nroots=5, thresh=1e-4, den_thresh=1e-2, int_thresh=1e-2,
         res['cis'] = [w for _, w in guesses]
         stamp('cis', t0)
         t0 = time.perf_counter()
-        ops = Ops(mycc, Bvv=Bvv, log=log)
+        ops = Ops(mycc, Bvv=Bvv, log=log, rings=rings,
+                  Bov=F.Bov if dress else None, dress=dress)
+        Bvv = None
         stamp('ee_imds', t0)
         all_ss = bool(ck) and all(os.path.exists(ck(f'rr_ss{n}.npz'))
                                   for n in range(nroots))
@@ -1101,5 +1348,6 @@ def run(mycc, nroots=5, thresh=1e-4, den_thresh=1e-2, int_thresh=1e-2,
             res['props'] = p
             stamp('props', t0)
         res['t_ladder'] = ops.t_ladder
+        res['t_rings'] = ops.t_rings
     return res
 

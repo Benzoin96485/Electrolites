@@ -3123,6 +3123,174 @@ and left the O(N⁵) factorised EOM for future work.
 To make RR pay off at small sizes:
 1. Factorise the remaining doubles-doubles terms in the compressed basis
    (U^T W U per space; the oooo ladder and exchange-type rings via DF, as
-   for the vvvv ladder).
+   for the vvvv ladder).  Done for the terms where it pays, §17.15; the
+   oooo ladder and the crossed ring do not factorise profitably.
 2. Test the TeraChem state-averaged tolerance (1e-4). It would cut ~150
    vectors per case.
+
+### 17.15 RR sigma: factorised rings and the T1-dressed ladder
+
+Follow-up to §17.14: put the doubles-doubles terms of the compressed
+sigma in the compressed basis where that is cheaper than the canonical
+contraction on the reconstructed doubles.
+
+**Where the canonical sigma spends its time** (`rrfac/prof_terms.py`,
+5 vectors, one A100; shares of the whole sigma):
+
+| | o, v | ladder | three o³v³ contractions | three o⁴v² |
+|---|---|---|---|---|
+| PEXRAL right / left | 31, 109 | 19 / 17 % | 34 / 31 % | 10 / 9 % |
+| DOVBEV right / left | 49, 155 | 21 / 20 % | 41 / 41 % | 14 / 13 % |
+| CARXAU right / left | 45, 183 | 26 / 24 % | 40 / 42 % | 11 / 10 % |
+| KANQAS right / left | 48, 201 | 29 / 27 % | 40 / 44 % | 10 / 9 % |
+
+The three o³v³ contractions per side are the T1 dressing of the ladder
+(right `meaf,nijef` + `ma,nmbij`; left `l2t1 · ovvv`) and two ring
+contractions.
+
+**What factorises.**  Write doubles as ov x ov matrices, M = U R U^T,
+X the doubles before the final Hr2 = X + X^T, and E the exchange
+(E Y)[ia,jb] = Y[ib,ja].  The output is only needed as U^T X U.
+
+- *Uncrossed rings, Coulomb type* (X = M W): U^T X U = R (U^T W U).
+  The N x N matrix is built once per space, then N³ per vector.
+- *Uncrossed rings, exchange type* (X = E(M) W): U^T X U = U^T (E(M) V)
+  with V = W U (ov x N) built once per space.  That is (ov)²N per vector
+  instead of o³v³, a factor ov/N (≈ 7 in the union space).
+- *Crossed ring* (X = E(E(M) W)): needs the full o²v² product, so it
+  stays o³v³.  TeraChem's RR-CCSD keeps the same term canonical (the "C
+  term" of JCP 155, 184110).
+- *T1 dressing*: the ladder plus its dressing terms is the ladder in
+  T1-transformed integrals, Σ_ef (ae^|bf^) tau2[ijef] with
+  a^ = a − Σ_m t1[m,a] m (left: the transpose).  So the dressing costs
+  nothing extra inside whichever ladder a space uses:
+  - DF: B^ = B − t1·B_ov in the factorised ladder (y_A then
+    non-symmetric; left uses Σ y_A^T L y_A);
+  - MO (ac|bd): dressed in place once per run (o v⁴);
+  - AO-direct: T1-transformed virtual coefficients on the output (right)
+    or input (left) side.
+
+  Pair symmetry (ladder of X^T = transpose) still holds, so the i ≥ j
+  trick stays.
+
+Per side, three o³v³ contractions become one.
+
+**The left operator in the Koch metric.**  The sigma is
+U^T G(σ(G^-1 M)) U with G = 2 − E, which mixes Coulomb and exchange.
+- The `lambda_linear` ring (L2[ikac] − L2[ikca]/2)·Wv is exactly M Wv / 2
+  for L2 = G^-1 M. After G it is M Wv − E(M Wv)/2: N³ plus (ov)²N, the
+  second through Y = U (L K), K = U^T Wv, built block by block.
+- The other ring, E(L2)·Wo, after G is 1.5 E(E(G^-1 M) Wo). It contains
+  the crossed E(E(M) Wo), so it stays canonical.
+- G commutes with the dressed transposed ladder, as it did with the bare
+  one.
+
+**What does not pay** (estimated, not implemented):
+- The oooo ladder and the o⁴v² tau2·ovov → tau term: in the compressed
+  basis they become o²N² storage or naux(o²N² + o⁴N) work, against o⁴v²
+  canonical.
+- The DF vvvv ladder in the union space: 4 naux N³ per vector, with
+  naux ≈ 1000 and N 1150-1580, is about twice o²v⁴/2. The cost model
+  keeps the MO/AO ladder there, now dressed.
+
+**Code.**
+- `eom_gpu._ee_sigma(..., skip=('ring', 'dress'))`; `ladder` may be a
+  callable.
+- `ccsd_lambda_gpu.lambda_linear(..., skip=..., ladder=...)`.
+- In `rreom_gpu`: `Rings` (per-space factors), `T1Ladder` (dressed
+  canonical ladder, MO or AO), `dressed_vv` + `DFLadder(...,
+  dressed=True)` with `project(..., trans=True)`.
+- `Ops(rings=True, dress=...)`; `run(rings=True, dress=True)` is the
+  default.
+- The DF/AO cost model counts the dressing as free on both sides.
+- `Ops.right/left` apply the DF ladder to all vectors of a call in one
+  pass over y. Before, it was once per sigma block, and that is one
+  vector at o 66, v 288. Where y does not fit on the device, every pass
+  streams it from pinned host memory: 73 GB in Pt EWANIZ's union space.
+
+**Tests.** `tests/test_rreom_gpu.py` now has 36 checks. The 20 new ones:
+- right/left sigma with factorised rings == canonical (≤ 1e-15
+  relative);
+- ladder + dressing terms of `_ee_sigma` / `lambda_linear` == the T1
+  ladder built from exact (ac|bd), ovvv, ovov (3e-12; singles 3e-14);
+- the dressed DF ladder: projection, transposed projection under the Koch
+  metric, and singles, against direct contraction (≤ 3e-15);
+- left == adjoint of right with the dressed DF ladder + rings (1.5e-11);
+- the T1 ladder on both the MO and the AO-direct path == direct, and the
+  full right/left sigma with rings + T1 ladder == canonical (≤ 1.5e-15).
+
+`test_eomee_props_gpu.py`, `test_eomee_lambda_gpu.py` and
+`test_eom_gpu.py` (canonical paths, defaults unchanged) still pass.
+
+**Per-sigma cost** (`rrfac/prof_sig.py`, s per vector in blocks of 5,
+in the stored spaces of each case's RR run; ss0 = first state-specific
+space, union = state-averaged space):
+
+| | ss0 N | right | left | union N | right | left |
+|---|---|---|---|---|---|---|
+| PEXRAL (154) | 336 | 0.041 → 0.031 | 0.046 → 0.035 | 747 | 0.042 → 0.033 | 0.047 → 0.038 |
+| DOVBEV (226) | 474 | 0.321 → 0.219 | 0.357 → 0.244 | 1146 | 0.373 → 0.276 | 0.397 → 0.302 |
+| CARXAU (252) | 455 | 0.387 → 0.256 | 0.426 → 0.276 | 1336 | 0.492 → 0.371 | 0.528 → 0.401 |
+| KANQAS (275) | 462 | 0.610 → 0.400 | 0.658 → 0.410 | 1583 | 0.816 → 0.623 | 0.847 → 0.643 |
+
+That is 0.62-0.77x in the state-specific spaces and 0.74-0.81x in the
+union space.
+
+Where the same ladder runs, before and after agree to 1e-13. The
+DF-dressed vs canonically dressed ss0 differ by DF error, ~1e-5
+relative. Per-space factors are cheap: the union `Rings` take
+0.02-0.04 s, and dressing the MO (ac|bd) and the DF factors takes
+0.7-3.2 s once.
+
+**End to end** (EOM stages re-run from the same RR-CCSD/Λ checkpoints,
+old and new configuration on the same node, `rrfac/e2e.sh`,
+`rrfac/cmp_e2e.py`):
+
+| | EOM stages, s (before → after) | sigma vectors | ΔE (state-avg / state-specific) | total RR / canonical, before → after |
+|---|---|---|---|---|
+| PEXRAL (154) | 58.9 → 53.9 (0.92) | 547, unchanged | 0 / 0 | 2.10 → 1.99 |
+| DOVBEV (226) | 284.5 → 228.3 (0.80) | 552, unchanged | 0 / ≤ 0.001 meV | 1.39 → 1.16 |
+| CARXAU (252) | 454.0 → 369.7 (0.81) | 676, unchanged | 0 / ≤ 0.001 meV | 1.52 → 1.27 |
+| KANQAS (275) | 616.5 → 492.1 (0.80) | 628, unchanged | 0 / ≤ 0.006 meV | 1.16 → 0.97 |
+
+Oscillator strengths agree to 2e-8. "Total RR" is the earlier full run
+(§17.14) minus the measured EOM saving; "canonical" is the campaign's
+CCSD + right + Λ + left + properties.
+
+So the crossover against canonical moves from nao ≈ 290 to ≈ 275.
+
+**Pt EWANIZ** (o 66, v 288, union N 2382; the DF ladder streams 73 GB
+of y from the host per pass):
+- Controlled benchmark, one GPU, 5 right vectors (`rrfac/prof_big*.py`):
+  - the non-ladder part goes 4.96 → 3.48 s per vector;
+  - the whole sigma goes 12.5 → 8.9 s per vector. The rest of the gain
+    is the one-pass ladder.
+- The state-averaged stages, re-run from the stored state-specific
+  checkpoints, alone on the node (`rr/Pt__EWANIZ_comp_0/fac2.json`):
+  - right 1293 → 1090 s;
+  - left 2280 → 1367 s;
+  - properties 102 → 83 s.
+
+  Sigma counts are the same (100 / 155). ΔE ≤ 0.003 meV, |Δf| ≤ 4e-7.
+  The DF ladder is now 64 % of these stages: `t_ladder` is 1574 s of
+  2457 s, and the rings take 56 s.
+
+  An earlier run of the same stages, sharing the node with other GPU
+  jobs and still streaming y once per vector, gave right 1310 s and
+  left 1692 s. The likely cause is that the other jobs competed for
+  host-to-device bandwidth, which hid the right side's gain. Time large
+  cases alone.
+
+The pre-pass (rank 3132) and the state-specific stage (2870 + 3380 s in
+§17.14) run the same sigma and were not re-run, which would take ~2 h.
+
+Below nao ≈ 275, RR still loses, now only on the sigma count (≈ 3x, §17.14).
+At PEXRAL the sigma is no longer even the main cost: the state-specific
+stage spends ~8-10 s of its 21 s in sigma vectors, and the rest in projector
+builds, CIS and the Davidson. The remaining levers are the sigma count
+(TeraChem's state-averaged tolerance 1e-4, a cheaper pre-pass) and that
+fixed overhead.
+
+The T1-dressed ladder is not specific to RR. The canonical EOM-EE and Λ
+code could drop its dressing contraction the same way: one o³v³ per
+sigma, 10-19 % of it at these sizes. Not done here.
