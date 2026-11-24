@@ -3,7 +3,8 @@
 D1 the device vSAP matrix against PySCF's on the same grid, and the vSAP
 guess converging RKS/UKS/ROKS to the minao energies; D2 ROHF's Newton solver
 against its plain SCF; D3 ``CCSD.to_cpu()`` carrying the amplitudes;
-D4 a clear error for an open-shell CCSD; D7 frozen-core DF-(U)MP2 with
+D4 a clear error for an open-shell CCSD; D15 one in-core CCSD amplitude
+update on two distant waters against PySCF; D7 frozen-core DF-(U)MP2 with
 ``with_t2`` against the unfrozen-free reference (PySCF DF-MP2 on the CPU).
 
     python tests/test_fixes.py
@@ -73,6 +74,48 @@ try:
     report('CCSD(UHF) raises NotImplementedError', False, 'did not raise')
 except NotImplementedError:
     report('CCSD(UHF) raises NotImplementedError', True)
+
+print('D15 in-core CCSD vvvv blocks (1.9.x)')
+# two waters 8 A apart: distant shell pairs are screened out, which is where
+# the stray write leaves wrong values (a lone water shows nothing)
+from electrolites import fixes                              # noqa: E402
+from pyscf import cc as ccc                                 # noqa: E402
+w2 = gto.M(atom=water.atom + '; O 0 0 8.117; H 0 0.757 7.533; '
+           'H 0 -0.757 7.533', basis='6-31g', verbose=0)
+mf2 = scf.RHF(w2).run(conv_tol=1e-11)
+cpu_cc = ccc.CCSD(mf2.to_cpu())
+nocc = w2.nelectron // 2
+nvir = mf2.mo_coeff.shape[1] - nocc
+rng = np.random.default_rng(7)
+t1 = rng.standard_normal((nocc, nvir)) * 1e-2
+t2 = rng.standard_normal((nocc, nocc, nvir, nvir)) * 1e-2
+t2 = t2 + t2.transpose(1, 0, 3, 2)
+r1, r2 = cpu_cc.update_amps(t1, t2, cpu_cc.ao2mo())
+gcc = ccsd_incore.CCSD(mf2)
+geris = gcc.ao2mo()
+
+
+def _amps_err(fn):
+    saved = ccsd_incore._direct_ovvv_vvvv
+    ccsd_incore._direct_ovvv_vvvv = fn
+    try:
+        a1, a2 = gcc.update_amps(t1, t2, geris)
+    finally:
+        ccsd_incore._direct_ovvv_vvvv = saved
+    a1, a2 = (np.asarray(cupy.asnumpy(cupy.asarray(a))) for a in (a1, a2))
+    return max(abs(a1 - r1).max() / abs(r1).max(),
+               abs(a2 - r2).max() / abs(r2).max())
+
+
+err = _amps_err(ccsd_incore._direct_ovvv_vvvv)
+detail = f'{err:.1e}'
+if fixes.D15_APPLIED:
+    stock = _amps_err(ccsd_incore._direct_ovvv_vvvv.__wrapped__)
+    detail += f' (stock {stock:.1e})'
+else:
+    detail += ' (fix not needed on this release)'
+report('one CCSD amplitude update == PySCF, water dimer 8 A', err < 1e-9,
+       detail)
 
 print('D7 frozen DF-MP2 with t2')
 mf = scf.RHF(water).run(conv_tol=1e-11)

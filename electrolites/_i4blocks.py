@@ -27,8 +27,8 @@ repository's post-HF modules were built on -- ``int4c2e._VHFOpt(mol,
 
 The kernel call and the scatter are GPU4PySCF 1.9.2's own
 (``cc/ccsd_incore.py:_direct_ovvv_vvvv``, ``fint``), reached by group-pair
-id -- except one line of the off-diagonal scatter, which does not survive
-split groups (see :meth:`BlockOpt.block`).
+id -- except one line of the off-diagonal scatter, which is wrong (see
+:meth:`BlockOpt.block`; `fixes` D15 repairs upstream's own copy).
 """
 import ctypes
 import math
@@ -176,11 +176,13 @@ class BlockOpt:
             # (i in the first group, j in the second) only.  Upstream's own
             # `fint` (1.9.2 cc/ccsd_incore.py) first also writes
             # `eri[j, :, i]`, indexing the first group's axis with the second
-            # group's offsets.  In upstream's use -- one group per (l, nprim),
-            # never split -- its CCSD still matches PySCF (glycine/def2-SVP,
-            # 8e-9 Eh, measured); with the groups split by `group_size` as
-            # here, that write left entries the second one does not
-            # overwrite, and glycine's (ia|jb) came out 1e-3 off
+            # group's offsets, and entries the second write does not cover
+            # keep wrong values.  With the groups split by `group_size` as
+            # here, glycine's (ia|jb) came out 1e-3 off.  In upstream's own
+            # CCSD (groups never split) it bites wherever shell pairs are
+            # screened out: two waters 8 A apart end 53 mEh off PySCF,
+            # glycine/def2-SVP 4.5e-9 Eh, neither converged; with the line
+            # removed, 1e-14 and 5.8e-10.  `fixes` D15 repairs upstream's copy
             eri[i, :, j] = eri_tmp.transpose(2, 0, 1)
         return eri
 

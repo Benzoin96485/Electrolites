@@ -41,6 +41,19 @@ _off = len(_names) - len(_d)
 _d[_names.index('lindep') - _off] = 1e-22
 _d[_names.index('max_cycle') - _off] = 300
 CH.krylov.__defaults__ = tuple(_d)
+# GPU4PySCF >= 1.9 (#951) passes ``lindep=max(tol**2, eps)`` from
+# ``cphf.solve`` explicitly, which a default does not reach -- the floor is
+# then 2.2e-16 and the two paths differ by up to 1e-5 again.  Lower it there too
+from gpu4pyscf.scf import cphf as _cphf                       # noqa: E402
+_krylov = _cphf.krylov
+
+
+def _krylov_low_floor(*args, **kwargs):
+    kwargs['lindep'] = 1e-22
+    return _krylov(*args, **kwargs)
+
+
+_cphf.krylov = _krylov_low_floor
 
 H2O = 'O 0. 0. 0.1174; H -0.757 0. -0.4696; H 0.757 0. -0.4696'
 HCHO = 'C 0 0 0; O 0 0 1.21; H 0 0.94 -0.54; H 0 -0.94 -0.54'

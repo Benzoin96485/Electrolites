@@ -39,6 +39,13 @@ performance change; each is checked in `tests/test_fixes.py`.
   point-charge kernel for Gaussian ones.  All three now use PySCF's
   erf-screened nucleus-MM interaction (``qmmm/itrf.py``); point charges are
   unchanged.
+* **D15 GPU4PySCF 1.9.x in-core CCSD.**  ``_direct_ovvv_vvvv``'s block
+  builder writes a stray block for off-diagonal shell-group pairs, which
+  survives wherever shell pairs are screened out: on two waters 8 A apart
+  (def2-SVP) the stock CCSD does not converge and ends 53 mEh off PySCF; on
+  glycine it does not converge and ends 4.5e-9 Eh off.  Rebuilt from
+  upstream's source without that one line (1e-14 and 5.8e-10).  Still on
+  upstream master as of 2026-11-24.
 * **D14 sfX2C1e SCF.**  The X2C one-electron Hamiltonian's generalised
   eigensolver raises a ``LinAlgError`` class its own fallback does not
   catch, so no sfX2C1e SCF ran; it now falls back to a Cholesky reduction
@@ -398,3 +405,51 @@ if not getattr(_x2c_gpu.eigh, '_electrolites', False):
     _x2c_eigh._electrolites = True
     _x2c_eigh.__wrapped__ = _x2c_gpu.eigh
     _x2c_gpu.eigh = _x2c_eigh
+
+
+# ------------------------------------- D15 1.9.x in-core CCSD's vvvv blocks
+# GPU4PySCF 1.9.0 moved `ccsd_incore._direct_ovvv_vvvv` onto
+# RYS_fill_int4c2e (#936).  Its block builder `fint`, for an off-diagonal
+# pair of shell groups, writes the block twice -- `eri[j,:,i] = eri_tmp`
+# and then `eri[i,:,j] = eri_tmp` -- and the first indexes the first group's
+# axis with the second group's offsets.  Entries the second write does not
+# cover keep wrong values -- those of screened-out shell pairs, so a compact
+# molecule shows nothing.  Two waters 8 A apart (def2-SVP): one amplitude
+# update is 0.3-7.6 relative off PySCF CPU and the CCSD ends 53 mEh off,
+# unconverged; glycine/def2-SVP: never converges (200 cycles, 4.5e-9 Eh
+# off).  With the first write removed -- nothing else -- they match PySCF to
+# 1e-14 and 5.8e-10 (42 cycles), the energies `fastccsd` gives
+# (`electrolites/_i4blocks.py` builds its blocks without it).  The function is rebuilt from upstream's source with that
+# line dropped, on releases that have it; it is what `fastccsd`'s fall-back
+# to the stock driver runs too.
+from gpu4pyscf.cc import ccsd_incore as _ccsd_incore         # noqa: E402
+
+_D15_LINE = '                eri[j,:,i] = eri_tmp\n'
+
+
+def _fix_direct_ovvv_vvvv():
+    import inspect as _inspect
+    import textwrap as _textwrap
+    import types as _types
+    fn = _ccsd_incore._direct_ovvv_vvvv
+    if getattr(fn, '_electrolites', False):
+        return False
+    try:
+        src = _textwrap.dedent(_inspect.getsource(fn))
+    except (OSError, TypeError):
+        return False
+    if src.count(_D15_LINE) != 1:
+        return False
+    ns = {}
+    exec(compile(src.replace(_D15_LINE, ''), _ccsd_incore.__file__, 'exec'),
+         _ccsd_incore.__dict__, ns)
+    new = _types.FunctionType(ns[fn.__name__].__code__, _ccsd_incore.__dict__,
+                              fn.__name__, fn.__defaults__, fn.__closure__)
+    new.__doc__ = fn.__doc__
+    new.__wrapped__ = fn
+    new._electrolites = True
+    _ccsd_incore._direct_ovvv_vvvv = new
+    return True
+
+
+D15_APPLIED = _fix_direct_ovvv_vvvv()

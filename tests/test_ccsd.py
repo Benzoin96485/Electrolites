@@ -28,6 +28,11 @@ from electrolites import fastccsd
 from pyscf import gto
 from gpu4pyscf import scf
 from gpu4pyscf.cc import ccsd_incore
+# The stock driver here is GPU4PySCF's with `fixes` D15 applied (patch_all
+# loads it): on 1.9.x its `_direct_ovvv_vvvv` writes one stray block, and
+# with it the stock CCSD does not converge on glycine/def2-SVP (200 cycles,
+# 4.5e-9 Eh off PySCF CPU); without it, 42 cycles and 5.8e-10.
+from electrolites import fixes as _fixes
 if {nofit!r}:
     fastccsd._fits = lambda mycc: False
 mol = gto.M(atom={atom!r}, basis={basis!r}, verbose=0)
