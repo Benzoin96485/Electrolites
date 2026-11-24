@@ -5,7 +5,9 @@ fits.  Checked in one process against the stock mapped-memory build (the
 patched functions swapped back for the reference): the cderi itself, J and K
 for a k-point density on the 2-atom diamond cell at 2x2x2 and 3x3x3 (bar
 1e-12), that the device path was taken, and that a forced host build
-(``FRACTION = 0``) still works through the patched loop.
+(``FRACTION = 0``) still works through the patched loop.  On GPU4PySCF
+>= 1.9 the same, through the device recontraction of the primitive-pair
+blocks, which must also have handled the diffuse-pair (dd) part.
 
     python tests/test_pbcdf.py
 """
@@ -20,14 +22,14 @@ import cupy as cp
 import electrolites
 electrolites.patch_all()
 from electrolites import fastpbcdf
-if not fastpbcdf._PATCHED and not fastpbcdf._OFF:
-    # GPU4PySCF 1.9's k-point builder (#924) is not ported yet; the module
-    # stands down and upstream's builder runs (docs/UPGRADE_1.9_PLAN.md)
-    import sys
-    print('skip: fastpbcdf stands down on this GPU4PySCF release')
-    sys.exit(0)
 from pyscf.pbc import gto
 from gpu4pyscf.pbc.df import df as gdf, df_jk, rsdf_builder
+import inspect
+
+# GPU4PySCF >= 1.9 (#924) recontracts primitive-pair blocks into the cderi;
+# there the device scatter replaces the host one, for the diffuse pairs too
+V19 = 'store_col_segment' not in inspect.getsource(
+    rsdf_builder._compressed_cderi_kk_orig)
 
 cell = gto.M(atom='C 0 0 0; C 0.8917 0.8917 0.8917',
              a=[[0, 1.7834, 1.7834], [1.7834, 0, 1.7834], [1.7834, 1.7834, 0]],
@@ -61,16 +63,20 @@ for mesh in ([2, 2, 2], [3, 3, 3]):
     c = rng.rand(len(kpts), nao, 4) + 1j * rng.rand(len(kpts), nao, 4)
     dm = cp.asarray(np.einsum('kpi,kqi->kpq', c, c.conj()) * .1)
     n0 = fastpbcdf.STATS['device_builds']
+    dd0 = fastpbcdf.STATS.get('device_dd_calls', 0)
     cd1, vj1, vk1, d1 = jk(kpts, dm)
     on_dev = isinstance(next(iter(d1._cderi.values())), cp.ndarray)
     cd0, vj0, vk0, _ = stock(lambda: jk(kpts, dm))
     dc = max(abs(cd1[k] - cd0[k]).max() for k in cd0)
     dj, dk = abs(vj1 - vj0).max(), abs(vk1 - vk0).max()
+    dd = fastpbcdf.STATS.get('device_dd_calls', 0) - dd0
     good = (dc < 1e-12 and dj < 1e-12 and dk < 1e-12 and on_dev
-            and fastpbcdf.STATS['device_builds'] == n0 + 1)
+            and fastpbcdf.STATS['device_builds'] == n0 + 1
+            and (dd > 0 or not V19))
     ok &= good
     print(f'diamond {mesh}: device cderi {on_dev}, max|d cderi| {dc:.1e} '
-          f'|dJ| {dj:.1e} |dK| {dk:.1e}  {"ok" if good else "FAIL"}')
+          f'|dJ| {dj:.1e} |dK| {dk:.1e}' + (f', dd blocks {dd}' if V19 else '')
+          + f'  {"ok" if good else "FAIL"}')
 
 fastpbcdf.FRACTION = 0.0
 kpts = cell.make_kpts([2, 2, 2])
