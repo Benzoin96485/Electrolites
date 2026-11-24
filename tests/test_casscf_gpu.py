@@ -100,10 +100,14 @@ e = mc.kernel()[0]
 cm = mcscf.CASSCF(mfc.density_fit(auxbasis=aux), 8, 8).state_average_([.25] * 4)
 cm.conv_tol = 1e-10
 ec = cm.kernel(mfc.mo_coeff)[0]
-# the averaged energy is what is converged (1e-10); the individual states of
-# the degenerate Pi pair only to ~1e-8
+# the averaged energy is what is converged (1e-10) and stationary; the
+# individual states are not stationary in the orbitals, so their error is
+# first order in the orbital error that conv_tol_grad leaves.  Measured
+# against PySCF: 3e-9 to 1.2e-7 between runs on the same code (1.8.1 and
+# 1.9.2; RHF's degenerate Pi pair can rotate differently from run to run),
+# and a tighter conv_tol_grad (1e-7) does not take it below ~7e-9.  Bar 1e-6
 dst = abs(np.sort(mc.e_states) - np.sort(cm.e_states)).max()
-report('N2 SA-4 CASSCF, same start', abs(e - ec) < 1e-9 and dst < 1e-7,
+report('N2 SA-4 CASSCF, same start', abs(e - ec) < 1e-9 and dst < 1e-6,
        f'{abs(e - ec):.1e}; states {dst:.1e}; {e!r} {ec!r}')
 o2 = gto.M(atom='O 0 0 0; O 0 0 1.21', basis='6-31g', spin=2, verbose=0)
 mf = scf.ROHF(o2).run(conv_tol=1e-11)

@@ -13,10 +13,12 @@ the far field carries more of it).
 Part 2, end to end: the symbol is swapped back to GPU4PySCF's inside the same
 process and a wB97M-V analytic Hessian -- whose three VV10 terms are the
 kernel's three callers in `hessian/rks.py` -- is computed both ways, closed
-shell and open shell; then a polarizability.  Tolerance 1e-6 relative on the
-Hessian, because GPU4PySCF's own Hessian is not reproducible below that: two
-stock runs in one process differ by up to 5.6e-7 relative on water (the
-test prints that scatter beside the difference); 1e-8 on the polarizability.
+shell and open shell; then a polarizability.  Tolerance on the Hessian 1e-6
+relative or three times GPU4PySCF's own scatter, whichever is larger: on
+1.8.1 the stock Hessian is not reproducible below that -- two stock runs in
+one process have differed by 5.6e-7 and by 2.3e-6 relative on water (the
+test prints that scatter beside the difference; on 1.9.2 it is 1e-13);
+1e-8 on the polarizability.
 
     python tests/test_vv10ft.py [--quick]
 """
@@ -181,7 +183,7 @@ for atom, spin, xc in E2E:
     h0b = with_stock(hess)
     e = np.abs(h1 - h0).max() / np.abs(h0).max()
     e0 = np.abs(h0b - h0).max() / np.abs(h0).max()
-    ok = e < 1e-6 and used >= 3
+    ok = e < max(1e-6, 3 * e0) and used >= 3
     fails += not ok
     print(f'Hessian {"UKS" if spin else "RKS"} {xc:8s} {str(atom)[:14]:14s} '
           f'rel {e:.2e}  (stock against itself {e0:.2e}; {used} calls of '
