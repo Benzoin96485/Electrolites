@@ -660,6 +660,11 @@ def _blocks(cderi_sparse, blksize, on_gpu, resident=None):
     io_stream = cp.cuda.stream.Stream(non_blocking=True)
     io_event = cp.cuda.Event()
 
+    # GPU4PySCF #1031/#1036: `buf_prefetch` can reuse pool memory the compute
+    # stream is still using, and the copy runs on a non-blocking stream; it
+    # must wait for the compute stream before its first write
+    compute_event.record(comput_stream)
+    io_stream.wait_event(compute_event)
     buf_prefetch[:nstream].set(cderi_sparse[start:start + nstream],
                                stream=io_stream)
     io_event.record(io_stream)

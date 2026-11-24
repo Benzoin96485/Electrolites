@@ -126,6 +126,10 @@ def loop(self, blksize=None, unpack=True):
     io_stream = cp.cuda.stream.Stream(non_blocking=True)
     io_event = cp.cuda.Event()
 
+    # GPU4PySCF #1031/#1036: the non-blocking copy must wait for the compute
+    # stream before writing pool memory it may still be using
+    compute_event.record(comput_stream)
+    io_stream.wait_event(compute_event)
     buf_prefetch[:blksize].set(cderi_sparse[:blksize], stream=io_stream)
     io_event.record(io_stream)
 

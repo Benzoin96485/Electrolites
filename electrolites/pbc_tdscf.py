@@ -28,6 +28,24 @@ from pyscf import lib
 from pyscf.lib import logger
 
 
+def _get_j(mf, cell, dms, hermi, *kpts):
+    """``mf.get_j`` of a stack of densities.  GPU4PySCF 1.9's multigrid v3
+    (the default multigrid from 1.9.0) asserts a single density
+    (``multigrid_v3.nr_rks``: ``len(dm_sc) == 1``), so there the stack is
+    built one density at a time; everywhere else in one call, as before."""
+    try:
+        from gpu4pyscf.pbc.dft import multigrid_v3
+    except ImportError:                      # <= 1.8: there is no v3
+        multigrid_v3 = None
+    ni = getattr(mf, '_numint', None)
+    nstack = dms.shape[0] if dms.ndim > 2 + bool(kpts) else 1
+    if (nstack > 1 and multigrid_v3 is not None
+            and isinstance(ni, multigrid_v3.MultiGridNumInt)):
+        return cp.stack([cp.asarray(mf.get_j(cell, d, hermi, *kpts))
+                         for d in dms])
+    return mf.get_j(cell, dms, hermi, *kpts)
+
+
 def _fxc_batch(ni, cell, grids, xctype, fxc, dms, kpts):
     """fxc[D] for a stack of real symmetric Gamma-point densities
     (nz, nao, nao), LDA/GGA: per grid block one GEMM for all the
@@ -105,7 +123,7 @@ def gen_response(mf, singlet=True, hermi=0):
                 cell, mf.grids, mf.xc, dm0, (.5 * ds)[:, None], 1,
                 singlet, fxc, kpts)).reshape(dms.shape)
         if singlet and hermi != 2:
-            v1 += cp.asarray(mf.get_j(cell, ds, 1)).reshape(dms.shape)
+            v1 += cp.asarray(_get_j(mf, cell, ds, 1)).reshape(dms.shape)
         if hyb != 0:
             # FFT exchange holds nao x ngrids complex per density
             for z0 in range(0, len(dms), kblk):
@@ -233,8 +251,9 @@ def gen_response_k(mf, singlet=True):
             dh = dms.conj().transpose(0, 1, 3, 2)
             h1 = .5 * (dms + dh)
             h2 = -.5j * (dms - dh)
-            v1 += cp.asarray(mf.get_j(cell, h1, 1, kpts)).reshape(dms.shape)
-            v1 += 1j * cp.asarray(mf.get_j(cell, h2, 1, kpts)
+            v1 += cp.asarray(_get_j(mf, cell, h1, 1, kpts)
+                             ).reshape(dms.shape)
+            v1 += 1j * cp.asarray(_get_j(mf, cell, h2, 1, kpts)
                                   ).reshape(dms.shape)
         if hyb != 0:
             v1 -= .5 * hyb * cp.asarray(mf.get_k(cell, dms, 0, kpts)

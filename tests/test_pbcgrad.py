@@ -38,12 +38,28 @@ def cell_(pseudo=True, spin=0):
                  basis='sto-3g', spin=spin, verbose=0)
 
 
+#: GPU4PySCF >= 1.9 (#910): the loop J7 replaces is `krhf.get_nuc_fftdf`,
+#: called by all four `grad_elec`; there the patched function is compared
+#: with the replaced one on the converged density (and J5's module is gone)
+NEW = hasattr(krhf, '_get_nuc_fftdf_orig')
+
+
 def run(tag, mf, orig):
     mf.conv_tol = 1e-10
     mf.kernel()
     g = mf.nuc_grad_method()
-    ours = np.asarray(g.grad_elec())
-    ref = np.asarray(orig(g))
+    if NEW:
+        dm0 = mf.make_rdm1()
+        if mf.istype('UHF') or mf.istype('KUHF'):
+            dm0 = dm0[0] + dm0[1]                  # unrestricted: total
+        # what each grad_elec passes: its k-points, or the Gamma point
+        kp = (np.asarray(g.kpts).reshape(-1, 3)
+              if isinstance(g, krhf.GradientsBase) else np.zeros((1, 3)))
+        ours = np.asarray(krhf.get_nuc_fftdf(g, mf.cell, dm0, kp))
+        ref = np.asarray(krhf._get_nuc_fftdf_orig(g, mf.cell, dm0, kp))
+    else:
+        ours = np.asarray(g.grad_elec())
+        ref = np.asarray(orig(g))
     err = np.abs(ours - ref).max()
     ok = err <= TOL
     if not ok:
@@ -53,19 +69,29 @@ def run(tag, mf, orig):
 
 
 kpts = cell_().make_kpts([2, 2, 2])
+def _orig(owner):
+    return getattr(owner, '_grad_elec_orig', None)
+
+
 run('KRKS diamond 2x2x2 (GTH)', dft.KRKS(cell_(), kpts=kpts, xc='pbe'),
-    krhf._grad_elec_orig)
+    _orig(krhf))
 run('KUKS diamond 2x2x2 (GTH)', dft.KUKS(cell_(), kpts=kpts, xc='pbe'),
-    kuhf._grad_elec_orig)
+    _orig(kuhf))
 run('RKS diamond Gamma (GTH)', dft.RKS(cell_(), xc='pbe'),
-    rhf.Gradients._grad_elec_orig)
+    _orig(rhf.Gradients))
 run('UKS diamond Gamma (GTH)', dft.UKS(cell_(), xc='pbe'),
-    uhf.Gradients._grad_elec_orig)
+    _orig(uhf.Gradients))
 ae = cell_(pseudo=False)
 run('KRKS LiH 2x2x2 (all-electron)',
-    dft.KRKS(ae, kpts=ae.make_kpts([2, 2, 2]), xc='pbe'), krhf._grad_elec_orig)
+    dft.KRKS(ae, kpts=ae.make_kpts([2, 2, 2]), xc='pbe'), _orig(krhf))
 run('RKS LiH Gamma (all-electron)', dft.RKS(ae, xc='pbe'),
-    rhf.Gradients._grad_elec_orig)
+    _orig(rhf.Gradients))
+if NEW:
+    if fails:
+        print('\nFAILED:\n  ' + '\n  '.join(fails))
+        sys.exit(1)
+    print('\nall ok (J5 is upstream\'s analytic derivative from 1.9)')
+    sys.exit(0)
 print('## the GTH non-local strain derivative (J5)')
 from gpu4pyscf.pbc.grad import rks_stress as RKSS               # noqa: E402
 from electrolites import fastpbcgrad                            # noqa: E402

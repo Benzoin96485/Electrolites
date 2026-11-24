@@ -20,6 +20,12 @@ import cupy as cp
 import electrolites
 electrolites.patch_all()
 from electrolites import fastpbcdf
+if not fastpbcdf._PATCHED and not fastpbcdf._OFF:
+    # GPU4PySCF 1.9's k-point builder (#924) is not ported yet; the module
+    # stands down and upstream's builder runs (docs/UPGRADE_1.9_PLAN.md)
+    import sys
+    print('skip: fastpbcdf stands down on this GPU4PySCF release')
+    sys.exit(0)
 from pyscf.pbc import gto
 from gpu4pyscf.pbc.df import df as gdf, df_jk, rsdf_builder
 

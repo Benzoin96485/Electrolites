@@ -1195,13 +1195,25 @@ def _get_veff_resp_mo_u(hessobj, mol, dms, mo_coeff, mo_occ, hermi=1):
         v1vo[:, nmoa * nocca:] += vnlcb.reshape(-1, nmob * noccb)
 
     if hybrid:
-        vj, vk = hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ, hermi=1)
-        vk *= hyb
-        if omega > 1e-10:
-            _, vk_lr = hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ,
-                                         hermi, with_j=False, omega=omega)
-            vk_lr *= (alpha - hyb)
-            vk += vk_lr
+        # GPU4PySCF 1.9's own block (`hessian/uks.py:get_veff_resp_mo`): any
+        # omega != 0 -- the 1.8 `omega > 1e-10` skipped a short-range-only
+        # (omega < 0) functional's second term -- and the single fused
+        # exchange call of `range_separated_mode='mix_inside_kernel'`
+        mode = getattr(mf, 'range_separated_mode', 'mix_outside_kernel')
+        if omega != 0 and mode == 'mix_inside_kernel':
+            vj = hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ, hermi=1,
+                                   with_k=False)[0]
+            vk = hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ, hermi=1,
+                                   with_j=False, omega=omega,
+                                   lr_factor=alpha, sr_factor=hyb)[1]
+        else:
+            vj, vk = hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ, hermi=1)
+            vk *= hyb
+            if omega != 0:
+                _, vk_lr = hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ,
+                                             hermi, with_j=False, omega=omega)
+                vk_lr *= (alpha - hyb)
+                vk += vk_lr
         v1vo += vj - vk
     else:
         v1vo += hessobj.get_jk_mo(mol, dms, mo_coeff, mo_occ,

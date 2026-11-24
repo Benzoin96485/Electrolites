@@ -116,8 +116,7 @@ def _direct_ovvv_vvvv(mycc, t1, t2):
 
     vhfopt = getattr(mycc, '_fastccsd_vhfopt', None)
     if vhfopt is None or vhfopt._fastccsd_blk != blksize:
-        vhfopt = int4c2e._VHFOpt(mycc.mol, 'int2e')
-        vhfopt.build(group_size=blksize, diag_block_with_triu=True)
+        vhfopt = _vhfopt(mycc.mol, blksize)
         vhfopt._fastccsd_blk = blksize
         mycc._fastccsd_vhfopt = vhfopt
         mycc._fastccsd_eri = None
@@ -265,12 +264,39 @@ def _direct_ovvv_vvvv(mycc, t1, t2):
     return wpq, t1new, t2new, wVOov, wVooV
 
 
+def _vhfopt(mol, group_size):
+    """The block integral optimiser: 1.8's ``int4c2e._VHFOpt`` built with
+    ``group_size`` and both triangles of the diagonal blocks, or on >= 1.9
+    (where that driver is gone) `_i4blocks.BlockOpt`, the same interface on
+    ``RYS_fill_int4c2e``."""
+    from . import compat as _compat
+    if _compat.INT4C2E_FULL:
+        from ._i4blocks import BlockOpt
+        return BlockOpt(mol, group_size)
+    from gpu4pyscf.scf import int4c2e
+    vhfopt = int4c2e._VHFOpt(mol, 'int2e')
+    vhfopt.build(group_size=group_size, diag_block_with_triu=True)
+    return vhfopt
+
+
+def _lmax_on_gpu():
+    from gpu4pyscf.scf import int4c2e
+    lmax = getattr(int4c2e, 'LMAX_ON_GPU', None)
+    if lmax is None:                       # 1.9: the Rys J/K kernels' bound
+        from gpu4pyscf.scf import jk
+        lmax = jk.LMAX
+    return lmax
+
+
 def _fill(mycc, eri, strides, offsets, vhfopt, group_id):
     """``_fill_eri_block``, retried after handing the pool's free blocks
     back and then after dropping the integral cache: the high-l
     ``GINTfill_int2e`` launches need driver local memory outside the pool,
     which fails as a CUDA error rather than as a pool allocation."""
     from gpu4pyscf.cc import ccsd_incore as ci
+    from ._i4blocks import BlockOpt, fill_into
+    if isinstance(vhfopt, BlockOpt):
+        return fill_into(eri, strides, vhfopt, group_id)
     pool = cp.get_default_memory_pool()
     lmem = getattr(mycc, '_fastccsd_lmem', 0)
     if lmem and cp.cuda.runtime.memGetInfo()[0] < lmem * 1.05:
@@ -354,8 +380,7 @@ def _make_eris(mycc):
     mem_avail = int(_avail() * .3)
     blksize = max(ci.BLKMIN, int(min((nao_cart + 3) / 4,
                                      (mem_avail * .5 / 8 / nao_cart**2)**.5)))
-    vhfopt = int4c2e._VHFOpt(mycc.mol, 'int2e')
-    vhfopt.build(group_size=blksize, diag_block_with_triu=True)
+    vhfopt = _vhfopt(mycc.mol, blksize)
     mol = vhfopt.mol
     mo = vhfopt.coeff.dot(mo_coeff)
     orbo = cp.asarray(mo[:, :nocc])
@@ -552,7 +577,7 @@ def _fits(mycc):
             + 3 * nocc * (nocc + 1) // 2 * nao**2 + 2 * nao**2 * nocc**2
             + 4 * nao**3) * 8
     lmax = max(mycc.mol._bas[:, 1]) if mycc.mol.nbas else 0
-    return need < 0.8 * _avail() and lmax <= int4c2e.LMAX_ON_GPU
+    return need < 0.8 * _avail() and lmax <= _lmax_on_gpu()
 
 
 def kernel(mycc, eris, t1=None, t2=None, max_cycle=50, tol=1e-8,

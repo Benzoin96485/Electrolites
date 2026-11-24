@@ -522,6 +522,13 @@ class _Stages:
               flush=True)
 
 
+try:                                   # GPU4PySCF >= 1.9
+    from gpu4pyscf.df.int3c2e_bdiv import splits_by_blocksize as \
+        _splits_by_blocksize
+except ImportError:
+    _splits_by_blocksize = None
+
+
 def _ip1_evaluator(int3c2e_opt, scheme, batch_size, kern, omega, spmult):
     """``int3c2e_bdiv._int3c2e_ip1_evaluator`` with the aggregation exposed.
 
@@ -550,7 +557,17 @@ def _ip1_evaluator(int3c2e_opt, scheme, batch_size, kern, omega, spmult):
     ksh_offsets_cpu = l_ctr_aux_offsets
     ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu + mol.nbas, dtype=np.int32)
     aux_loc = auxmol.ao_loc
-    aux_offsets = aux_loc[ksh_offsets_cpu]
+    # GPU4PySCF 1.9 (#970) packs several auxiliary (l, nprim) groups into one
+    # batch up to `batch_size` AOs (`splits_by_blocksize`) -- in its
+    # `int3c2e_evaluator` too, whose `aux_offsets` the callers here pair with
+    # these -- where 1.8 made one batch per group.  Follow the installed
+    # rule; within a batch the groups are launched one at a time below, so
+    # the per-lk tiling (item 16) still sees a single lk.
+    if _splits_by_blocksize is not None:
+        aux_splits = _splits_by_blocksize(aux_loc[ksh_offsets_cpu], batch_size)
+    else:
+        aux_splits = np.arange(len(ksh_offsets_cpu))
+    aux_offsets = aux_loc[ksh_offsets_cpu[aux_splits]]
     kernel = getattr(libvhf_rys, kern)
     int3c2e_envs = int3c2e_opt.int3c2e_envs
     npair_batches = len(shl_pair_offsets) - 1
@@ -561,13 +578,19 @@ def _ip1_evaluator(int3c2e_opt, scheme, batch_size, kern, omega, spmult):
         tiled = {}
 
     def evaluate_j3c(batch_id, out=None):
-        ksh0 = ksh_offsets_cpu[batch_id]
-        ksh1 = ksh_offsets_cpu[batch_id + 1]
-        aux_ao_offset = aux_loc[ksh0]
-        naux = aux_loc[ksh1] - aux_ao_offset
+        g0, g1 = int(aux_splits[batch_id]), int(aux_splits[batch_id + 1])
+        aux_ao_offset = aux_loc[ksh_offsets_cpu[g0]]
+        naux = aux_loc[ksh_offsets_cpu[g1]] - aux_ao_offset
         out = ndarray((3, nao_pair, naux), buffer=out)
         if out.size == 0:
             return out
+        for g in range(g0, g1):
+            _fill_group(out, g, aux_ao_offset, naux)
+        return out
+
+    def _fill_group(out, group_id, aux_ao_offset, naux):
+        ksh0 = ksh_offsets_cpu[group_id]
+        ksh1 = ksh_offsets_cpu[group_id + 1]
         spo, nb = shl_pair_offsets, npair_batches
         if fill_tile > 0:
             # The fill kernels walk a block's (pair, auxiliary shell)
@@ -597,7 +620,7 @@ def _ip1_evaluator(int3c2e_opt, scheme, batch_size, kern, omega, spmult):
             ctypes.c_int(1),
             ctypes.cast(spo.data.ptr, ctypes.c_void_p),
             ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
-            ctypes.cast(ksh_offsets_gpu[batch_id:].data.ptr, ctypes.c_void_p),
+            ctypes.cast(ksh_offsets_gpu[group_id:].data.ptr, ctypes.c_void_p),
             ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
             ctypes.cast(ao_pair_loc.data.ptr, ctypes.c_void_p),
             ctypes.c_int(0),
@@ -606,7 +629,6 @@ def _ip1_evaluator(int3c2e_opt, scheme, batch_size, kern, omega, spmult):
             ctypes.c_int(naux))
         if err != 0:
             raise RuntimeError(f'{kern} failed')
-        return out
     return evaluate_j3c, aux_sorting, aux_offsets
 
 

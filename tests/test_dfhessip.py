@@ -199,10 +199,10 @@ def run_terms(mf, tag, factors, switches=SWITCHES, mem=None):
     dm0 = mf.make_rdm1(mo_coeff, mo_occ)
     for jf, kf, omega in factors:
         f = f'j={jf} k={kf}' + ('' if omega is None else f' omega={omega}')
-        ref_h1 = UP_H1(intopt, mo_coeff, mo_occ, jf, kf, omega)
+        ref_h1 = UP_H1(intopt, mo_coeff, mo_occ, jf, kf, omega=omega)
         # k = 0 is a pure functional's ip2 term, which both sides hand to
         # their own `_j_energy_per_atom`
-        ref_ip2 = UP_IP2(intopt, dm0, jf, kf, omega)
+        ref_ip2 = UP_IP2(intopt, dm0, jf, kf, omega=omega)
         for lbl, sw in switches:
             extra = dict(sw)
             if mem is not None:

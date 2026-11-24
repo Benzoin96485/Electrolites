@@ -260,8 +260,8 @@ def _ladder_setup(mycc):
             vhfopt._fastccsd_blk > g and getattr(mycc, '_fastccsd_eri', None) is None:
         vhfopt = None                   # CCSD's grouping, too big here
     if vhfopt is None:
-        vhfopt = int4c2e._VHFOpt(mycc.mol, 'int2e')
-        vhfopt.build(group_size=g, diag_block_with_triu=True)
+        from electrolites.fastccsd import _vhfopt
+        vhfopt = _vhfopt(mycc.mol, g)
         vhfopt._fastccsd_blk = g
         mycc._fastccsd_vhfopt = vhfopt
         mycc._fastccsd_eri = None

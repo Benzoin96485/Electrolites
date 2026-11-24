@@ -218,6 +218,17 @@ def _keep_all(nbytes):
     return True
 
 
+def _lindep_kw(tol):
+    """GPU4PySCF 1.9 (#951) ties the Krylov solver's linear-dependency
+    threshold to the tolerance, ``max(tol**2, eps)``, in both spin cases'
+    ``solve_mo1``; follow whichever rule the installed release applies, so
+    the solve stays the one it replaces."""
+    from . import compat as _compat
+    if _compat._release() >= (1, 9, 0):
+        return {'lindep': max(tol**2, np.finfo(np.float64).eps)}
+    return {}
+
+
 def krylov(aop, b, x0=None, tol=1e-10, max_cycle=30, dot=cp.dot,
            lindep=DSOLVE_LINDEP, callback=None, hermi=False,
            verbose=logger.WARN, keep=None):
@@ -565,7 +576,8 @@ def solve_mo1_u(mf, mo_energy, mo_coeff, mo_occ, h1mo,
         nsets_next[0] = nset
         raw_mo1 = krylov(fvind_vo, mo1.reshape(-1, nmo*nocc),
                          tol=tol, max_cycle=max_cycle, verbose=log,
-                         keep=_keeper(budget, nsets_next))
+                         keep=_keeper(budget, nsets_next),
+                         **_lindep_kw(tol))
         raw_mo1a = mo1[:, :nmo*nocca].reshape(i1-i0, 3, nmo, nocca)
         raw_mo1b = mo1[:, nmo*nocca:].reshape(i1-i0, 3, nmo, noccb)
 
@@ -677,7 +689,8 @@ def solve_mo1_r(mf, mo_energy, mo_coeff, mo_occ, h1mo,
         nsets_next[0] = (i1 - i0) * 3
         raw_mo1 = krylov(fvind_vo, mo1.reshape(-1, nmo*nocc),
                          tol=tol, max_cycle=max_cycle, verbose=log,
-                         keep=_keeper(budget, nsets_next))
+                         keep=_keeper(budget, nsets_next),
+                         **_lindep_kw(tol))
         raw_mo1 = raw_mo1.reshape(i1-i0, 3, nmo, nocc)
         raw_mo1[:, :, occidx] = mo1[:, :, occidx]
 

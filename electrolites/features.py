@@ -124,7 +124,11 @@ def enable(*names, strict=True):
     return tuple(_enabled)
 
 
-def enable_all(strict=True):
+def enable_all(strict=False):
+    """Enable every registered feature.  A feature whose upstream slot
+    GPU4PySCF has since filled (``sap`` from 1.9.1, #997) is skipped with a
+    warning rather than shadowing upstream's; ``strict=True`` raises instead.
+    """
     return enable(list(FEATURES), strict=strict)
 
 
@@ -187,10 +191,9 @@ def not_available(what, reason):
 # FEATURE_TARGETS_PYSCF_2.13.md IDs in brackets.
 
 register('stability', 'stability',
-         absent=[('gpu4pyscf.scf.hf', 'RHF.stability'),
-                 ('gpu4pyscf.scf.uhf', 'UHF.stability'),
-                 ('gpu4pyscf.scf.rohf', 'ROHF.stability')],
-         gpu_modules=['gpu4pyscf.scf.stability'],
+         # ROHF is the slot GPU4PySCF still leaves empty from 1.9.1 (#1005);
+         # the module fills RHF/UHF too where upstream has none (<= 1.9.0)
+         absent=[('gpu4pyscf.scf.rohf', 'ROHF.stability')],
          doc='[S2] RHF/RKS, UHF/UKS internal + external, ROHF/ROKS internal')
 register('rohf_grad', 'rohf_grad',
          absent=[('gpu4pyscf.scf.rohf', 'ROHF.nuc_grad_method'),

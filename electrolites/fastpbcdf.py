@@ -118,6 +118,19 @@ def apply_patch():
     if _PATCHED or _OFF:
         return
     from gpu4pyscf.pbc.df import rsdf_builder, df
+    import inspect as _inspect
+    if 'store_col_segment' not in _inspect.getsource(
+            rsdf_builder.compressed_cderi_kk):
+        # GPU4PySCF 1.9 (#924) rebuilt the k-point store: the integrals are
+        # copied to the host and recontracted there by an OpenMP writer
+        # (`PBCzrecontract_cderi`) instead of `store_col_segment`.  This
+        # module's device-resident store has not been ported onto that
+        # builder yet (docs/UPGRADE_1.9_PLAN.md, fastpbcdf); stand down so
+        # upstream's builder runs, rather than fail the import.
+        import warnings
+        warnings.warn('fastpbcdf: GPU4PySCF\'s 1.9 GDF k-point builder is '
+                      'not ported yet; upstream\'s runs', RuntimeWarning)
+        return
     _patch_builder(rsdf_builder)
     _patch_loop(df)
     _PATCHED = True

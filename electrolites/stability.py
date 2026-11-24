@@ -444,10 +444,21 @@ rhf_stability.__doc__ = stab_cpu.rhf_stability.__doc__
 uhf_stability.__doc__ = stab_cpu.uhf_stability.__doc__
 rohf_stability.__doc__ = stab_cpu.rohf_stability.__doc__
 
-# ROHF is a subclass of RHF in GPU4PySCF, so it gets its own binding
-attach(rohf.ROHF, 'stability', rohf_stability)
-attach(uhf.UHF, 'stability', uhf_stability)
-attach(hf.RHF, 'stability', rhf_stability)
+# ROHF is a subclass of RHF in GPU4PySCF, so it gets its own binding.
+# GPU4PySCF 1.9.1 (#1005) ships RHF/RKS and UHF/UKS stability of its own
+# (and a `gpu4pyscf.scf.stability` module its methods import); there only the
+# slots it leaves empty -- ROHF -- are filled, and upstream's module is not
+# shadowed.  This module's functions stay importable either way
+# (`electrolites.stability.uhf_external` covers UKS, which upstream's does
+# not).
+from electrolites.features import is_absent as _is_absent      # noqa: E402
+for _cls, _fn in ((rohf.ROHF, rohf_stability), (uhf.UHF, uhf_stability),
+                  (hf.RHF, rhf_stability)):
+    if _is_absent(_cls.__dict__.get('stability', getattr(_cls, 'stability',
+                                                        None))):
+        attach(_cls, 'stability', _fn)
 
 import sys as _sys                                         # noqa: E402
-register_gpu_module('gpu4pyscf.scf.stability', _sys.modules[__name__])
+import importlib.util as _ilu                              # noqa: E402
+if _ilu.find_spec('gpu4pyscf.scf.stability') is None:
+    register_gpu_module('gpu4pyscf.scf.stability', _sys.modules[__name__])

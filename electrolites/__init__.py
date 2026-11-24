@@ -224,8 +224,12 @@ _TARGETS = {
     # QM/MM's QM-nucleus--MM-charge energy and forces on the device, cached
     # (F6 / F13)
     # the periodic gradients' local 1e derivative from one density pass (J7)
-    'fastpbcgrad': (('gpu4pyscf.pbc.grad.krhf', 'grad_elec'),
-                    ('gpu4pyscf.pbc.grad.kuhf', 'grad_elec'),
+    # 1.9 (#910) moved the per-atom loop of all four into one function,
+    # `krhf.get_nuc_fftdf`; the module patches whichever form is there
+    'fastpbcgrad': (('gpu4pyscf.pbc.grad.krhf', 'get_hcore'),
+                    ('gpu4pyscf.pbc.grad.krhf', 'get_nuc_fftdf', 'optional'),
+                    ('gpu4pyscf.pbc.grad.krhf', 'grad_elec', 'optional'),
+                    ('gpu4pyscf.pbc.grad.kuhf', 'grad_elec', 'optional'),
                     ('gpu4pyscf.pbc.grad.rhf', 'Gradients.grad_elec'),
                     ('gpu4pyscf.pbc.grad.uhf', 'Gradients.grad_elec')),
     # the multi-collinear XC on one sample per antipodal pair (A21);

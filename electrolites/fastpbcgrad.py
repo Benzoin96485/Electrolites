@@ -270,12 +270,49 @@ def _rebuild(fn, mod):
     return g
 
 
+# --------------------------------------------------------------------------
+# GPU4PySCF >= 1.9: the per-atom loop moved into one function
+# --------------------------------------------------------------------------
+def get_nuc_fftdf(mf_grad, cell, dm0, kpts):
+    """``pbc/grad/krhf.py:get_nuc_fftdf`` (GPU4PySCF >= 1.9) with its
+    per-atom ``hcore_generator`` loop replaced by `dh1e_local`'s single grid
+    pass.  1.9 (#910) unified the gradient and the stress tensor: every
+    ``grad_elec`` -- k-point and Gamma, restricted and unrestricted (the
+    latter on the summed density) -- reaches the electronic part of the local
+    nuclear/pseudopotential derivative through this one function, and the
+    strain rows it returns are upstream's own two lines, unchanged.  Under
+    multigrid v3 upstream does not call it at all."""
+    if getattr(mf_grad.base, 'with_x2c', None):
+        return KRHF._get_nuc_fftdf_orig(mf_grad, cell, dm0, kpts)
+    kpts = np.asarray(kpts).reshape(-1, 3)
+    nkpts = len(kpts)
+    dm0 = cp.asarray(dm0)
+    if dm0.ndim == 2:
+        dm0 = dm0[None, :, :]
+    grad_sigma = np.zeros((cell.natm + 3, 3))
+    grad_sigma[:-3] += dh1e_local(mf_grad, cell, kpts, dm0).get() / nkpts
+    # upstream's strain rows: hcore_generator includes the kinetic gradient
+    # but not the kinetic strain
+    grad_sigma[-3:] += KRHF.int1e.kin_derivatives(cell, dm0, kpts)[-3:]
+    ni = KRHF.multigrid_v3.MultiGridNumInt(cell)
+    grad_sigma[-3:] += ni.energy_strain_gradient(
+        'HF', dm0, kpts, spin=0, with_j=False, with_nuc=True)
+    return grad_sigma
+
+
 _PATCHED = False
 
 
 def apply_patch():
     global _PATCHED
     if _PATCHED or _OFF:
+        return
+    if hasattr(KRHF, 'get_nuc_fftdf'):
+        # 1.9: J7 is one function; J5's finite-difference non-local PP
+        # strain is gone upstream, replaced by analytic derivatives (#912)
+        KRHF._get_nuc_fftdf_orig = KRHF.get_nuc_fftdf
+        KRHF.get_nuc_fftdf = get_nuc_fftdf
+        _PATCHED = True
         return
     import importlib
     from gpu4pyscf.pbc.grad import rks_stress as RKSS

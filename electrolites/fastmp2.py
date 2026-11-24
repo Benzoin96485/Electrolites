@@ -136,8 +136,13 @@ def get_int4c2e_ovpq(mol, orbo, orbv, orbp, orbq, vhfopt=None,
 
 def _ovpq(mol, orbo, orbv, orbp, orbq, vhfopt, direct_scf_tol, omega):
     from gpu4pyscf.scf import int4c2e
+    from . import compat as _compat
     if omega is None:
         omega = 0.0
+    if _compat.INT4C2E_FULL:
+        # GPU4PySCF >= 1.9 (#936): the 1.8 block driver is gone
+        return _ovpq_v19(mol, orbo, orbv, orbp, orbq, vhfopt,
+                         direct_scf_tol, omega)
     if vhfopt is None:
         vhfopt = int4c2e._VHFOpt(mol, 'int2e').build(direct_scf_tol)
     STATS['calls'] += 1
@@ -252,6 +257,104 @@ def _batches(int4c2e, vhfopt, omega, orbo, orbv, ovov, nb, on_device,
         else:
             ovov[i0:i1] = cp.asnumpy(out)
         del out
+
+
+def _ovpq_v19(mol, orbo, orbv, orbp, orbq, vhfopt, direct_scf_tol, omega):
+    """The same blocked half transformation on GPU4PySCF >= 1.9.
+
+    1.9 removed ``loop_int4c2e_general`` (the class-quartet boxes `_batches`
+    consumes); its own ``get_int4c2e_ovov`` is ``_ao2mo_general``, which
+    holds an ``(nao_pairs, kl_block)`` slab per ket group pair and the whole
+    ``nao^2 o v`` half-transformed tensor at once, with no batching and no
+    host result.  Here the blocks are `_i4blocks.BlockOpt`'s -- ``(ij|kl)``
+    for one bra group pair and every ``k, l``, from ``RYS_fill_int4c2e`` --
+    and each one goes into the occupied batch's
+
+        H[l, s, i, a] = sum_{mn} (mn|ls) C_occ[m, i] C_vir[n, a]
+
+    directly (both bra orders of an off-diagonal group pair), so the memory
+    is bounded by the group size and the batch, as before.  A range-separated
+    request is handed to upstream, which serves it."""
+    from gpu4pyscf.scf import int4c2e
+    from ._i4blocks import BlockOpt
+    if omega:
+        if orbp is not None:
+            raise NotImplementedError('fastmp2: (ia|pq) with a '
+                                      'range-separated operator')
+        return int4c2e._get_int4c2e_ovov_orig(mol, orbo, orbv, vhfopt,
+                                              direct_scf_tol, omega=omega)
+    STATS['calls'] += 1
+    nao_c = mol.nao_nr(cart=True)
+    g = int(os.environ.get('FASTMP2_GROUP', 0)) or int(max(4, min(
+        (nao_c + 3) // 4, (.08 * _avail() / (8 * nao_c * nao_c)) ** .5)))
+    opt = BlockOpt(mol, g, direct_scf_tol)
+    coeff = opt.coeff
+    plain = orbp is None
+    orbo = coeff @ cp.asarray(orbo)
+    orbv = coeff @ cp.asarray(orbv)
+    orbp = orbo if plain else coeff @ cp.asarray(orbp)
+    orbq = orbv if plain else coeff @ cp.asarray(orbq)
+    nao, nocc = orbo.shape
+    nvir = orbv.shape[1]
+    npp, nqq = orbp.shape[1], orbq.shape[1]
+
+    ovov_bytes = nocc * nvir * npp * nqq * 8
+    avail = _avail()
+    on_device = (ovov_bytes < 0.45 * avail
+                 and not os.environ.get('FASTMP2_HOST'))
+    if on_device:
+        ovov = cp.empty((nocc, nvir, npp, nqq))
+        avail -= ovov_bytes
+    else:
+        STATS['host_result'] += 1
+        ovov = (np.empty((nocc * nvir, nocc * nvir)) if plain
+                else np.empty((nocc, nvir, npp, nqq)))
+    ao_loc = opt.mol.ao_loc
+    lo = opt.l_ctr_offsets
+    dmax = int(max(ao_loc[lo[1:]] - ao_loc[lo[:-1]]))
+    # one block, its once-transformed copy, and the batch's H and output
+    fixed = (2 * dmax * dmax * nao * nao) * 8 + (2 << 30)
+    per_occ = (nao * nao * nvir + dmax * nao * dmax * nao
+               + npp * nao * nvir + npp * nqq * nvir) * 8
+    nb = int(os.environ.get('FASTMP2_BATCH', 0)) or \
+        int((0.7 * avail - fixed) // per_occ)
+    nb = max(1, min(nocc, nb))
+    ngp = len(opt.log_qs)
+    for i0 in range(0, nocc, nb):
+        i1 = min(nocc, i0 + nb)
+        STATS['batches'] += 1
+        co = orbo[:, i0:i1]
+        ni = i1 - i0
+        H = cp.zeros((nao, nao, ni, nvir))
+        for gid in range(ngp):
+            if opt.log_qs[gid].size == 0:
+                continue
+            ish0, ish1, jsh0, jsh1, a0, a1, b0, b1 = opt.ao_ranges(gid)
+            eri = opt.block(gid)                     # [m, l, n, s]
+            # (mn|ls) with m in the first group, n in the second
+            t = cp.tensordot(co[a0:a1], eri, axes=([0], [0]))   # [I,l,n,s]
+            H += cp.tensordot(t, orbv[b0:b1], axes=([2], [0])
+                              ).transpose(1, 2, 0, 3)          # [l,s,I,a]
+            if ish0 != jsh0:
+                # and the other bra order, (nm|ls) = (mn|ls)
+                t = cp.tensordot(co[b0:b1], eri, axes=([0], [2]))  # [I,m,l,s]
+                H += cp.tensordot(t, orbv[a0:a1], axes=([1], [0])
+                                  ).transpose(1, 2, 0, 3)
+            eri = t = None
+        m = ni * nvir
+        t = (orbp.T @ H.reshape(nao, nao * m)).reshape(npp, nao, m)
+        H = None
+        out = cp.matmul(orbq.T, t)                        # [p, q, ia]
+        t = None
+        out = out.reshape(npp, nqq, ni, nvir).transpose(2, 3, 0, 1)
+        if on_device:
+            ovov[i0:i1] = out
+        elif ovov.ndim == 2:
+            ovov[i0 * nvir:i1 * nvir] = cp.asnumpy(out).reshape(m, npp * nqq)
+        else:
+            ovov[i0:i1] = cp.asnumpy(out)
+        out = None
+    return ovov
 
 
 def apply_patch():

@@ -190,8 +190,8 @@ def run_terms(mf, tag, factors, switches=SWITCHES):
     intopt, mo_coeff, mo_occ, dm0 = terms(mf)
     for jf, kf, omega in factors:
         f = f'j={jf} k={kf}' + ('' if omega is None else f' omega={omega}')
-        ref_h1 = UP_H1(intopt, mo_coeff, mo_occ, jf, kf, omega)
-        ref_ip2 = UP_IP2(intopt, dm0, jf, kf, omega)
+        ref_h1 = UP_H1(intopt, mo_coeff, mo_occ, jf, kf, omega=omega)
+        ref_ip2 = UP_IP2(intopt, dm0, jf, kf, omega=omega)
         for lbl, sw in switches:
             with env(**sw):
                 got = U._get_veff(intopt, mo_coeff, mo_occ, jf, kf, omega)
@@ -347,7 +347,7 @@ for tag, mfu, factors in (
     iu, mcu, mou, _ = terms(mfu)
     for jf, kf, om in factors:
         f = f'j={jf} k={kf}' + ('' if om is None else f' omega={om}')
-        r = UP_H1(iu, mcu, mou, jf, kf, om)
+        r = UP_H1(iu, mcu, mou, jf, kf, omega=om)
         for nb in (8, 5):
             # W41's item 35 is `host` and `host sync`; `A0` is W38's stage
             # A per batch, `B3` stage B's fetch in chunks of 3 orbitals

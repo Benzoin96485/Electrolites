@@ -214,6 +214,7 @@ Ablations, for the tables in ``docs/README_fastdfgrad.md``:
                             (`docs/DF_WORK_LIST.md` W21)
 """
 import ctypes
+import inspect
 import os
 
 import numpy as np
@@ -764,6 +765,24 @@ def _fill_from_j3c(int3c2e_opt, dm_factor, batch_size, blksize, naux,
     return store, aux_sorting
 
 
+class _MetricSolve:
+    """``X -> C solve(J, C^T X)``: the fitting metric applied the way
+    GPU4PySCF 1.9's ``df/grad/rhf.py`` applies it (#1019), as a solve on the
+    right-hand side rather than through the explicit ``C J^-1 C^T``, which
+    loses accuracy as the auxiliary basis nears linear dependence (the
+    explicit product put this module 2.6e-10 off upstream on ethanol)."""
+
+    def __init__(self, coef, solver):
+        self.coef = coef
+        self.solver = solver
+        self.shape = (coef.shape[0], coef.shape[0])
+
+    def apply(self, x, out):
+        t = self.coef.T.dot(x)
+        t = self.solver(t, overwrite=True)
+        cp.dot(self.coef, t, out=out)
+
+
 def _metric_pass(store, coef, naux_in, need_auxvec, need_koo, log):
     """``oo <- coef @ oo``, in slices of the first occupied index, in place.
 
@@ -805,8 +824,12 @@ def _metric_pass(store, coef, naux_in, need_auxvec, need_koo, log):
         src = store.read_cols(c0, c1, naux_in, in_buf)
         dst = ndarray((nset, naux_out, d, nocc), buffer=out_buf)
         for s in range(nset):
-            cp.dot(coef, src[s].reshape(naux_in, -1),
-                   out=dst[s].reshape(naux_out, -1))
+            if isinstance(coef, _MetricSolve):
+                coef.apply(src[s].reshape(naux_in, -1),
+                           dst[s].reshape(naux_out, -1))
+            else:
+                cp.dot(coef, src[s].reshape(naux_in, -1),
+                       out=dst[s].reshape(naux_out, -1))
         src = None
         if auxvec is not None:
             x = cp.arange(d)
@@ -990,7 +1013,11 @@ def _ejk(int3c2e_opt, dm_factor, store, naux_in,
         tmp = None
         solver = df_rhf_grad._gen_metric_solver(
             j2c, 'CD' if (mol.omega <= 0 and not auxmol.mol.cart) else 'ED')
-        coef = coef.dot(solver(coef.T))
+        if 'overwrite' in inspect.signature(solver).parameters:
+            # 1.9 (#1019): solve on the right-hand side, as upstream does
+            coef = _MetricSolve(coef, solver)
+        else:
+            coef = coef.dot(solver(coef.T))
         j2c = solver = None
     else:
         # `aux_coef @ aux_coef.T == metric` is the identity the reuse rests
