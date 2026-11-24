@@ -73,8 +73,11 @@ with open(os.path.join(tmp, '_selftest_feature.py'), 'w') as f:
     f.write(feat_src)
 electrolites.__path__.append(tmp)
 features.register('selftest', '_selftest_feature',
+                  # a slot that is missing, and one GPU4PySCF fills with
+                  # NotImplemented on every release here (RHF.stability was,
+                  # until 1.9.1 shipped one)
                   absent=[('gpu4pyscf.scf.hf', 'RHF.electrolites_selftest'),
-                          ('gpu4pyscf.scf.hf', 'RHF.stability')],
+                          ('gpu4pyscf.scf.rohf', 'ROHF.stability')],
                   gpu_modules=['gpu4pyscf.elselftest'])
 features.register('clash', '_selftest_feature',
                   absent=[('gpu4pyscf.scf.hf', 'RHF.Gradients')])
