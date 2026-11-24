@@ -522,11 +522,20 @@ class _Stages:
               flush=True)
 
 
-try:                                   # GPU4PySCF >= 1.9
-    from gpu4pyscf.df.int3c2e_bdiv import splits_by_blocksize as \
-        _splits_by_blocksize
-except ImportError:
-    _splits_by_blocksize = None
+def _aux_batching():
+    """``splits_by_blocksize`` where upstream batches the auxiliary groups
+    with it (1.9, #970), else None.  1.8.1 imports the same helper but uses
+    it for the shell pairs only, so the import alone does not tell; whether
+    its own ip1 evaluator calls it does."""
+    import inspect as _inspect
+    from gpu4pyscf.df import int3c2e_bdiv as _bdiv
+    if 'splits_by_blocksize' in _inspect.getsource(
+            _bdiv._int3c2e_ip1_evaluator):
+        return _bdiv.splits_by_blocksize
+    return None
+
+
+_splits_by_blocksize = _aux_batching()
 
 
 def _ip1_evaluator(int3c2e_opt, scheme, batch_size, kern, omega, spmult):
