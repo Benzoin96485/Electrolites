@@ -74,6 +74,16 @@ _JKIP1_SOURCES = (
     'myjkip1/rys_contract_jk_ip1.cu',
     'myjkip1/unrolled_rys_jk_ip1.cu',
 )
+#: the same, generated from GPU4PySCF 1.9.2 (`codegen/gen_jk_ip1.py`):
+#: 1.9's RYS_build_jk_ip1 takes (omega, lr_factor, sr_factor), carries the
+#: #909 screening and the #1024 barriers
+_JKIP1_SOURCES_192 = (
+    'gvhf-rys192/gvhf-rys/rys_roots_dat.cu',
+    'gvhf-rys192/gvhf-rys/rys_constant.cu',
+    'myjkip1_192/constants.cu',
+    'myjkip1_192/rys_contract_jk_ip1.cu',
+    'myjkip1_192/unrolled_rys_jk_ip1.cu',
+)
 _warned = False
 
 
@@ -182,9 +192,43 @@ def general_k_library():
                   'the general exchange kernel', 'ELECTROLITES_LIBMYKG')
 
 
+#: the same kernels generated from GPU4PySCF 1.9.2
+#: (``codegen/gen_ejk_ip2.py --release 192``): 1.9 put ``(omega, lr_factor,
+#: sr_factor)`` into the drivers' argument lists (#873) and fixed the
+#: ``nsq_per_block``/``blockDim`` and barrier issues of #1024, so a library
+#: built from the 1.8.1 set cannot stand in for 1.9's symbols
+_EJK2_SOURCES_192 = (
+    'gvhf-rys192/gvhf-rys/rys_roots_dat.cu',
+    'gvhf-rys192/gvhf-rys/rys_constant.cu',
+    'myejk2_192/rys_contract_jk_ip2.cu',
+    'myejk2_192/unrolled_ejk_ip2_type12.cu',
+    'myejk2_192/unrolled_ejk_ip2_type3.cu',
+)
+
+
+def ejk2_release():
+    """Which generated set matches the installed GPU4PySCF: ``'181'``
+    (1.8.0/1.8.1) or ``'192'`` (1.9.x), or None for a release neither was
+    generated from."""
+    import gpu4pyscf
+    v = gpu4pyscf.__version__
+    if v in ('1.8.0', '1.8.1'):
+        return '181'
+    if v in ('1.9.2',):
+        return '192'
+    return None
+
+
 @functools.lru_cache(maxsize=1)
 def ejk_ip2_library():
-    """Path to ``libmyejk2`` for this GPU, or None if it cannot be provided."""
+    """Path to ``libmyejk2`` for this GPU and this GPU4PySCF release, or None
+    if it cannot be provided."""
+    rel = ejk2_release()
+    if rel == '192':
+        return _build('libmyejk2_192.so', _EJK2_SOURCES_192,
+                      ('gvhf-rys192', 'gvhf-rys192/gvhf-rys'),
+                      "the Hessian's second-derivative ERI kernels",
+                      'ELECTROLITES_LIBMYEJK2')
     return _build('libmyejk2.so', _EJK2_SOURCES,
                   ('gvhf-rys181', 'gvhf-rys181/gvhf-rys'),
                   "the Hessian's second-derivative ERI kernels",
@@ -202,7 +246,14 @@ def ip2_library():
 
 @functools.lru_cache(maxsize=1)
 def jk_ip1_library():
-    """Path to ``libmyjkip1`` (catalogue B15) for this GPU, or None."""
+    """Path to ``libmyjkip1`` (catalogue B15) for this GPU and this
+    GPU4PySCF release, or None."""
+    if ejk2_release() == '192':
+        return _build('libmyjkip1_192.so', _JKIP1_SOURCES_192,
+                      ('gvhf-rys192', 'gvhf-rys192/gvhf-rys'),
+                      "the Hessian's h1 two-electron kernels",
+                      'ELECTROLITES_LIBMYJKIP1',
+                      deps=('gvhf-rys192/gvhf-rys/build_rys_gxyz.cuh',))
     return _build('libmyjkip1.so', _JKIP1_SOURCES,
                   ('gvhf-rys181', 'gvhf-rys181/gvhf-rys'),
                   "the Hessian's h1 two-electron kernels",
@@ -210,5 +261,5 @@ def jk_ip1_library():
                   deps=('gvhf-rys181/gvhf-rys/build_rys_gxyz.cuh',))
 
 
-__all__ = ['general_k_library', 'jk_ip1_library', 'ejk_ip2_library', 'ip2_library', 'cache_dir',
+__all__ = ['general_k_library', 'jk_ip1_library', 'ejk_ip2_library', 'ejk2_release', 'ip2_library', 'cache_dir',
            'compute_capability', 'nvcc_path']

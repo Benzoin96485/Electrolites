@@ -133,8 +133,11 @@ def apply_patch():
     global _PATCHED
     if _PATCHED or _OFF:
         return _PATCHED
-    import gpu4pyscf
-    if not gpu4pyscf.__version__.startswith('1.8.'):
+    # a kernel set generated for the installed release: 1.8.x, or 1.9.2
+    # (`kernels/cuda/myjkip1_192`, with 1.9's argument list); anything else
+    # keeps GPU4PySCF's -- lifting this gate without the matching set would
+    # feed the kernel a 0.0 `cutoff` and return wrong numbers
+    if _nvcc.ejk2_release() is None:
         return False
     lib = _library()
     if lib is None:

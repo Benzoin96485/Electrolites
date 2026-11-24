@@ -90,6 +90,22 @@ Specifically:
   jk._make_tril_pair_mappings, vendored because 1.8.0 removed it while the
   kernels here still consume its output.
 
+* electrolites/kernels/cuda/gvhf-rys192/gvhf-rys/*, myejk2_192/* and
+  myjkip1_192/* are the GPU4PySCF **1.9.2** counterparts of gvhf-rys181/,
+  myejk2/ and myjkip1/, written by the same generators
+  (codegen/gen_ejk_ip2.py --release 192, codegen/gen_jk_ip1.py) from 1.9.2's
+  lib/gvhf-rys with the same transformations; the support files are copies,
+  build_rys_gxyz.cuh with the same P1 edit.  _nvcc builds whichever set
+  matches the installed release.
+
+* electrolites/_i4blocks.py's BlockOpt.block is derived from GPU4PySCF
+  1.9.2's cc/ccsd_incore.py (the RYS_fill_int4c2e call and the pair-address
+  scatter of _direct_ovvv_vvvv's fint), reached by group-pair id over a
+  SortedMole split by group_size; one line of the off-diagonal scatter is
+  dropped (see the module's comments).  electrolites/fastdfgrad.py's
+  _MetricSolve applies the metric the way GPU4PySCF 1.9.2's
+  df/grad/rhf.py does (#1019).
+
 The screening criteria, the Rys quadrature and the density-matrix contraction
 symmetry factors are GPU4PySCF's throughout, which is why a patched run
 reproduces an unpatched one to round-off.  See docs/UPGRADE_1.8.1.md for the

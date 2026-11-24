@@ -86,9 +86,11 @@ from gpu4pyscf.hessian import rhf as HRHF          # noqa: F401  (binds first)
 
 from . import _nvcc
 
-#: releases whose gvhf-rys struct layouts the vendored headers match.  The
-#: headers are copied from 1.8.1; 1.8.0 shipped the same vhf.cuh.
-SUPPORTED = ('1.8.0', '1.8.1')
+#: releases a generated kernel set exists for: 1.8.1's headers (1.8.0
+#: shipped the same vhf.cuh), and 1.9.2's (`kernels/cuda/myejk2_192`, whose
+#: drivers take 1.9's (omega, lr_factor, sr_factor)); `_nvcc` builds the one
+#: that matches
+SUPPORTED = ('1.8.0', '1.8.1', '1.9.2')
 
 _OFF = bool(os.environ.get('FASTEJK2_OFF'))
 _NO_SCHEME = bool(os.environ.get('FASTEJK2_NO_SCHEME'))

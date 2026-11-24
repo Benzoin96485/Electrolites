@@ -27,8 +27,8 @@ repository's post-HF modules were built on -- ``int4c2e._VHFOpt(mol,
 
 The kernel call and the scatter are GPU4PySCF 1.9.2's own
 (``cc/ccsd_incore.py:_direct_ovvv_vvvv``, ``fint``), reached by group-pair
-id -- except one line of the off-diagonal scatter, which is wrong upstream
-(see :meth:`BlockOpt.block`).
+id -- except one line of the off-diagonal scatter, which does not survive
+split groups (see :meth:`BlockOpt.block`).
 """
 import ctypes
 import math
@@ -176,11 +176,11 @@ class BlockOpt:
             # (i in the first group, j in the second) only.  Upstream's own
             # `fint` (1.9.2 cc/ccsd_incore.py) first also writes
             # `eri[j, :, i]`, indexing the first group's axis with the second
-            # group's offsets: harmless where every pair survives and the two
-            # groups are the same size (the second write then overwrites it),
-            # wrong as soon as the screen drops a pair -- it put glycine's
-            # (ia|jb) off by 1e-3 relative here -- and out of bounds when the
-            # groups differ in size
+            # group's offsets.  In upstream's use -- one group per (l, nprim),
+            # never split -- its CCSD still matches PySCF (glycine/def2-SVP,
+            # 8e-9 Eh, measured); with the groups split by `group_size` as
+            # here, that write left entries the second one does not
+            # overwrite, and glycine's (ia|jb) came out 1e-3 off
             eri[i, :, j] = eri_tmp.transpose(2, 0, 1)
         return eri
 

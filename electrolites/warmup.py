@@ -122,8 +122,13 @@ def _fastejk_jobs(plan):
 @_register('nvcc')
 def _nvcc_jobs(plan):
     from . import _nvcc
-    return [('nvcc libmykg', _nvcc.general_k_library),
-            ('nvcc libmyejk2', _nvcc.ejk_ip2_library)]
+    jobs = [('nvcc libmykg', _nvcc.general_k_library)]
+    # fastejk2's kernels stand down on a release they were not generated
+    # for (GPU4PySCF 1.9 changed their ABI); building them there is ~25 s
+    # for a library nothing loads
+    if _nvcc.ejk2_release() is not None:
+        jobs.append(('nvcc libmyejk2', _nvcc.ejk_ip2_library))
+    return jobs
 
 
 @_register('fastxcgrad')

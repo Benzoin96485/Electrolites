@@ -356,10 +356,17 @@ def main():
                          '(docs/README_fastejk2.md 2b).  The flag exists so '
                          'that measurement can be reproduced, and because the '
                          'catalogue B3 entry asks for exactly this')
+    ap.add_argument('--release', default='181',
+                    help="which GPU4PySCF release `src` is: the support files "
+                         "go to gvhf-rys<release>/ and, for any release but "
+                         "the default 181, the kernels to myejk2_<release>/ "
+                         "(1.9 put (omega, lr_factor, sr_factor) into the "
+                         "drivers' argument lists, so the two sets coexist)")
     a = ap.parse_args()
 
-    sup = os.path.join(a.out, 'gvhf-rys181')
-    ker = os.path.join(a.out, 'myejk2')
+    sup = os.path.join(a.out, f'gvhf-rys{a.release}')
+    ker = os.path.join(a.out, 'myejk2' if a.release == '181'
+                       else f'myejk2_{a.release}')
     os.makedirs(os.path.join(sup, 'gvhf-rys'), exist_ok=True)
     os.makedirs(ker, exist_ok=True)
 
