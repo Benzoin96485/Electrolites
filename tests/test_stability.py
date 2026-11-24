@@ -26,6 +26,18 @@ fails = []
 TOL = 1e-5
 
 
+def _ours(mf):
+    """This repository's driver for ``mf``, called directly: from GPU4PySCF
+    1.9.1 (#1005) ``RHF/UHF.stability`` are upstream's own, and the feature
+    only fills the ROHF slot, so ``mf.stability`` is not necessarily ours."""
+    from gpu4pyscf.scf import rohf as _rohf, uhf as _uhf
+    if isinstance(mf, _rohf.ROHF):
+        return stability.rohf_stability
+    if isinstance(mf, _uhf.UHF):
+        return stability.uhf_stability
+    return stability.rhf_stability
+
+
 def report(label, ok, detail=''):
     if not ok:
         fails.append(label)
@@ -100,7 +112,8 @@ for label, gmk, cmk, kinds in CASES:
     CPU_EIGS.clear()
     # tol 1e-8 on both: PySCF's default (1e-4) stops its Davidson at a
     # residual of 1e-2, which is looser than the comparison
-    _, _, gi, ge = g.stability(external=external, return_status=True, tol=1e-8)
+    _, _, gi, ge = _ours(g)(g, external=external, return_status=True,
+                             tol=1e-8)
     _, _, ci, ce = c.stability(external=external, return_status=True, tol=1e-8)
     for kind, ref in zip(kinds, CPU_EIGS):
         got = stability.LAST[kind][0]
@@ -120,7 +133,7 @@ for label, gmk, cmk, kinds in CASES:
 
 print('unstable N2: the rotated orbitals lower the UHF energy')
 g = scf.RHF(n2).run(conv_tol=1e-10)
-(mo_i, mo_e, si, se) = g.stability(external=True, return_status=True)
+(mo_i, mo_e, si, se) = _ours(g)(g, external=True, return_status=True)
 u = scf.UHF(n2)
 dm = u.make_rdm1(mo_e, (g.mo_occ / 2, g.mo_occ / 2)) if not se else None
 if dm is not None:

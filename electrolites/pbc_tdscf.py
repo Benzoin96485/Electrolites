@@ -29,20 +29,25 @@ from pyscf.lib import logger
 
 
 def _get_j(mf, cell, dms, hermi, *kpts):
-    """``mf.get_j`` of a stack of densities.  GPU4PySCF 1.9's multigrid v3
-    (the default multigrid from 1.9.0) asserts a single density
-    (``multigrid_v3.nr_rks``: ``len(dm_sc) == 1``), so there the stack is
-    built one density at a time; everywhere else in one call, as before."""
+    """``mf.get_j`` of a stack of densities.
+
+    Under GPU4PySCF 1.9's multigrid v3 (the default multigrid from 1.9.0)
+    the J build takes one density at a time (``nr_rks``: ``len(dm_sc) ==
+    1``) and asserts that its supercell density is real
+    (``_wannier_transform_dm``) -- true of a ground-state density, not of a
+    k-point transition density, whose -k partner is not its conjugate.  So
+    there the Coulomb matrix comes from the object's FFTDF instead (exact,
+    and what PySCF's response uses); everywhere else ``mf.get_j`` in one
+    call, as before."""
     try:
         from gpu4pyscf.pbc.dft import multigrid_v3
     except ImportError:                      # <= 1.8: there is no v3
         multigrid_v3 = None
     ni = getattr(mf, '_numint', None)
-    nstack = dms.shape[0] if dms.ndim > 2 + bool(kpts) else 1
-    if (nstack > 1 and multigrid_v3 is not None
+    if (multigrid_v3 is not None
             and isinstance(ni, multigrid_v3.MultiGridNumInt)):
-        return cp.stack([cp.asarray(mf.get_j(cell, d, hermi, *kpts))
-                         for d in dms])
+        vj = mf.with_df.get_jk(dms, hermi, *kpts, with_k=False)[0]
+        return vj
     return mf.get_j(cell, dms, hermi, *kpts)
 
 

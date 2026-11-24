@@ -12,6 +12,11 @@ import numpy as np
 import cupy as cp
 
 import electrolites
+if electrolites.check_absent(['sap'])['sap'] is not None:
+    # GPU4PySCF 1.9.1 (#997) ships its own SAP guess; the feature stands
+    # down there rather than shadow it (`electrolites.enable_all()` skips it)
+    print('skip: GPU4PySCF provides init_guess_by_sap on this release')
+    sys.exit(0)
 electrolites.enable('sap')
 from electrolites import sap                                  # noqa: E402
 
