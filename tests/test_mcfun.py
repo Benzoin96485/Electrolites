@@ -39,14 +39,20 @@ from gpu4pyscf import dft
 mol = gto.M(atom={atom!r}, basis="def2-svp", spin={spin}, verbose=0)
 mf = dft.GKS(mol, xc={xc!r}); mf.collinear = "mcol"
 mf.conv_tol = 1e-9; mf.max_cycle = 80
-e = mf.kernel()
+mf.init_guess = "minao"
+import numpy, cupy
+start, save = {start!r}, {save!r}
+e = mf.kernel(cupy.asarray(numpy.load(start)) if start else None)
+if save:
+    numpy.save(save, mf.make_rdm1().get())
 print(json.dumps([float(e), bool(mf.converged)]))
 '''
 
 
-def gks(off, atom, spin, xc):
+def gks(off, atom, spin, xc, start=None, save=None):
     out = subprocess.run([sys.executable, '-c', GKS.format(
-        here=HERE, off=off, atom=atom, spin=spin, xc=xc)],
+        here=HERE, off=off, atom=atom, spin=spin, xc=xc, start=start,
+        save=save)],
         capture_output=True, text=True, check=True).stdout
     import json
     return json.loads(out.strip().splitlines()[-1])
@@ -109,10 +115,22 @@ if __name__ == '__main__':
     print('# fastmcfun', fastmcfun.stats())
 
     print('## whole GKS SCF, against FASTMCFUN_OFF=1')
+    # Both runs start from GPU4PySCF's own converged density.  O2's triplet
+    # GKS has several SCF solutions; from a common minao guess, a round-off
+    # difference in the first cycles was enough on GPU4PySCF 1.9 for the two
+    # runs to settle in different ones (PBE -150.0658 / -150.0511, B3LYP
+    # 6e-2 apart), while the energy of any one density agreed to 1e-12 and
+    # each solution was a fixed point of the other build.  Restarting the
+    # patched build from the stock solution asks the question this check is
+    # for: is it the same stationary point?
+    import tempfile
     O2 = 'O 0 0 0; O 0 0 1.21'
+    tmp = tempfile.mkdtemp(prefix='mcfun_')
     for tag, atom, spin, xc in (('O2 triplet PBE', O2, 2, 'pbe'),
                                 ('O2 triplet B3LYP', O2, 2, 'b3lyp')):
-        a, b = gks(False, atom, spin, xc), gks(True, atom, spin, xc)
+        dmf = os.path.join(tmp, xc + '.npy')
+        b = gks(True, atom, spin, xc, save=dmf)
+        a = gks(False, atom, spin, xc, start=dmf)
         err = abs(a[0] - b[0])
         ok = err <= 1e-8 and a[1] == b[1]
         if not ok:
