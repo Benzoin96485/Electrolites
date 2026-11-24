@@ -134,12 +134,36 @@ def init_guess_by_vsap(mf, mol=None):
 #: ``init_guess_by_vsap`` (and drops ``UKS.get_vasp``); D1 is applied only to
 #: releases without them, so upstream's is never shadowed.
 D1_NEEDED = not hasattr(rks.RKS, 'get_vsap')
+
+
+def _init_guess_by_vsap_19(mf, mol=None):
+    """Upstream's vSAP guess (GPU4PySCF >= 1.9.1) with only the
+    diagonalisation replaced: it solves ``(T + V_sap) c = S c e`` through
+    ``self.eig`` without an orthogonaliser, i.e. cuSOLVER's generalised
+    solver, which is the call that fails on this site's compute nodes (see
+    `geneig`; it took tests/test_fixes.py's vSAP SCFs down on 1.9.2).  Same
+    potential (upstream's ``get_vsap``), same kinetic matrix, same guess."""
+    if mol is None:
+        mol = mf.mol
+    v = cupy.asarray(mf.get_vsap(mol))
+    if isinstance(mf, uks.UKS) and v.ndim == 2:
+        v = cupy.stack([v, v])
+    t = cupy.asarray(mol.intor_symmetric('int1e_kin'))
+    s = mf.get_ovlp(mol)
+    mo_energy, mo_coeff = geneig(t + v, s)
+    mo_occ = mf.get_occ(mo_energy, mo_coeff)
+    return mf.make_rdm1(mo_coeff, mo_occ)
+
+
 if D1_NEEDED:
     rks.RKS.get_vsap = get_vsap
     roks.ROKS.get_vsap = get_vsap
     uks.UKS.get_vsap = _get_vsap_uks
     for _cls in (rks.RKS, uks.UKS, roks.ROKS):
         _cls.init_guess_by_vsap = init_guess_by_vsap
+else:
+    for _cls in (rks.RKS, uks.UKS, roks.ROKS):
+        _cls.init_guess_by_vsap = _init_guess_by_vsap_19
 
 # ------------------------------------------------- D2 ROHF initial guess
 _rohf_init_guess_orig = rohf.ROHF.get_init_guess
