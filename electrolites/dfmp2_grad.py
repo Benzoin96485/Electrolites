@@ -158,6 +158,11 @@ class _AO3c:
 
         kern = libvhf_rys.sum_ejk_int3c2e_ip1
         envs = opt.int3c2e_envs
+        # GPU4PySCF >= 1.9 takes the operator as three C doubles after n_dm;
+        # left out, the call still runs and reads them from stale registers
+        # (docs/UPGRADE_1.9_PLAN.md R7).  Full range: this refuses RSH.
+        from electrolites import compat as _compat
+        rsh = _compat.rsh_cargs(mol, 0.)
         buf = cp.empty(nao_pair * batch_size)
         buf1 = cp.empty((blksize, nao, nao))
         buf2 = cp.empty((blksize, nao, nao))
@@ -191,6 +196,7 @@ class _AO3c:
                 ctypes.cast(compressed.data.ptr, ctypes.c_void_p),
                 lib.c_null_ptr(),
                 ctypes.c_int(1),
+                *rsh,
                 ctypes.byref(envs),
                 ctypes.c_int(shm_size_max),
                 ctypes.c_int(len(shl_pair_offsets) - 1),

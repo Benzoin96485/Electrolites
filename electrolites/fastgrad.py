@@ -91,7 +91,11 @@ def energy_ee(ks_grad, mol=None, dm=None, verbose=None):
     # long-range one; K = hyb*K(1/r) + (alpha-hyb)*K(erf(wr)/r) covers every
     # case GPU4PySCF splits into four, including alpha == 0 and hyb == 0.
     k_factor = hyb if with_k else 0.
-    exc1 += ks_grad.jk_energy_per_atom(dm, 1., k_factor, verbose=log)
+    # omega=0 explicitly: 1.9 defaults it to None, and `mf._opt_gpu.get(None)`
+    # misses the option object the SCF filed under 0, so every gradient
+    # would rebuild one (and its dense q_cond)
+    exc1 += ks_grad.jk_energy_per_atom(dm, 1., k_factor, omega=0,
+                                       verbose=log)
     if with_k and omega != 0 and alpha != hyb:
         exc1 += ks_grad.jk_energy_per_atom(
             dm, 0., alpha - hyb, omega=omega, verbose=log)
@@ -104,7 +108,11 @@ _UKS_K_NEW = """    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.
     # fastgrad: hyb*K(1/r) + (alpha-hyb)*K(erf), both on the generated
     # kernels, instead of alpha*K(1/r) + (hyb-alpha)*K(erfc)
     k_factor = hyb if with_k else 0.
-    exc1 += ks_grad.jk_energy_per_atom(dm, 1., k_factor, verbose=log)
+    # omega=0 explicitly: 1.9 defaults it to None, and `mf._opt_gpu.get(None)`
+    # misses the option object the SCF filed under 0, so every gradient
+    # would rebuild one (and its dense q_cond)
+    exc1 += ks_grad.jk_energy_per_atom(dm, 1., k_factor, omega=0,
+                                       verbose=log)
     if with_k and omega != 0 and alpha != hyb:
         exc1 += ks_grad.jk_energy_per_atom(
             dm, 0., alpha - hyb, omega=omega, verbose=log)

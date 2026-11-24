@@ -271,11 +271,13 @@ def _transfer_to_host(dfobj):
     naux, npairs = src.shape
     if src.dtype == np.float64:
         host = empty_mapped(src.shape)
-        DFHESS.libvhf_rys.transpose_write(
-            host.ctypes,
-            ctypes.cast(src.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(naux), ctypes.c_int(npairs),
-            ctypes.c_int(0), ctypes.c_int(npairs))
+        # 1.9 put a stream first in this kernel's argument list; the old
+        # call's arguments all shift and it fails (docs/UPGRADE_1.9_PLAN.md),
+        # so the return code is checked here, which upstream's line is not
+        from . import compat as _compat
+        err = _compat.transpose_write(host, src, naux, npairs, 0, npairs)
+        if err != 0:
+            raise RuntimeError('transpose_write of the cderi to host failed')
     else:
         host = empty_mapped(src.shape, dtype=src.dtype)
         chunk = max(1, int(64e6) // max(naux, 1))
@@ -427,11 +429,18 @@ def _batch_plans(nspin, nao, nocc, blksize):
 
 # --------------------------------------------------------------------------
 def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True,
-            omega=None):
-    """``df/hessian/rhf.py:_get_jk``, rearranged.  Same J and K."""
-    if _OFF:
-        return _orig_get_jk(dfobj, dms, mo_coeff, mo_occ, hermi, with_j,
-                            with_k, omega)
+            omega=None, lr_factor=None, sr_factor=None):
+    """``df/hessian/rhf.py:_get_jk``, rearranged.  Same J and K.
+
+    GPU4PySCF 1.9's ``_get_jk_mo`` passes ten arguments, the last two the
+    ``lr_factor``/``sr_factor`` of ``range_separated_mode=
+    'mix_inside_kernel'``; a call that sets them is handed back, since only
+    upstream's ``build`` makes that operator's tensor."""
+    if _OFF or lr_factor is not None or sr_factor is not None:
+        return _fall_through(dfobj, dms, mo_coeff, mo_occ, hermi, with_j,
+                             with_k, omega,
+                             'FASTDFHESS_OFF' if _OFF else 'explicit lr/sr',
+                             lr_factor, sr_factor)
     if multi_gpu.num_devices > 1:
         return _fall_through(dfobj, dms, mo_coeff, mo_occ, hermi, with_j,
                              with_k, omega, 'more than one device')
@@ -467,10 +476,12 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True,
 
 
 def _fall_through(dfobj, dms, mo_coeff, mo_occ, hermi, with_j, with_k, omega,
-                  reason):
+                  reason, lr_factor=None, sr_factor=None):
     _decline(reason)
+    rsh_kw = {k: v for k, v in (('lr_factor', lr_factor),
+                                ('sr_factor', sr_factor)) if v is not None}
     return _orig_get_jk(dfobj, dms, mo_coeff, mo_occ, hermi, with_j, with_k,
-                        omega)
+                        omega, **rsh_kw)
 
 
 def _j_only(dfobj, dms, nspin, n_dm, nao):

@@ -129,6 +129,7 @@ Hessian stopped in its CPHF.  The sets are independent, so
 memory needs, and on a card where they fit it is one group, the call as it
 was.  ``FASTXCFXC_SETS=<n>`` caps a group (test-only).
 """
+from . import compat as _g4pc
 import functools
 import os
 import time as _time
@@ -459,7 +460,7 @@ def _fxc_blocked(ni, mol, grids, xc_code, dm0, dms, relativity, hermi,
     p0 = p1 = 0
     for ao, idx, w, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv,
                                        max_memory=None,
-                                       strict_grid_order=True):
+                                       **_g4pc.block_loop_kwargs()):
         ng = w.size
         p0, p1 = p1, p1 + ng
         nsub = len(idx)

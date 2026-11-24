@@ -166,15 +166,23 @@ _P_K = re.compile(
     r'(?P=ind)    vk \+= mf\.get_k\(mol, dm1, hermi, omega\) \* \(alpha-hyb\)\n')
 
 
-def _transform(fn, n_jk, n_k):
+def _transform(fn, allowed):
+    """``fn`` with every RSH response site routed through ``rsh_jk``.
+
+    ``allowed`` is the set of ``(J+K sites, K-only sites)`` counts a known
+    release has; anything else means the source moved and is refused.  1.9.1
+    (#1004) gave the singlet response's two ``hermi == 2`` branches the
+    long-range term the others already had -- the same statements, so the
+    same rewrite -- which takes the restricted generator from (2, 1) to
+    (2, 3)."""
     src = textwrap.dedent(inspect.getsource(fn))
     src, a = _P_JK.subn(lambda m: m['ind'] + 'vj, vk = _fastrshresp_jk('
                         'mf, mol, dm1, hermi, hyb, alpha, omega, True)\n', src)
     src, b = _P_K.subn(lambda m: m['ind'] + 'vk = _fastrshresp_jk('
                        'mf, mol, dm1, hermi, hyb, alpha, omega, False)[1]\n', src)
-    if (a, b) != (n_jk, n_k):
+    if (a, b) not in allowed:
         raise RuntimeError(f'fastrshresp: {fn.__name__} has {a} J+K and {b} '
-                           f'K-only RSH sites, expected {n_jk} and {n_k}')
+                           f'K-only RSH sites, expected one of {sorted(allowed)}')
     mod = inspect.getmodule(fn)
     ns = {}
     exec(compile(src, inspect.getsourcefile(fn), 'exec'), mod.__dict__, ns)
@@ -201,8 +209,8 @@ def apply_patch():
         return
     from gpu4pyscf.scf import _response_functions as rf, hf, uhf, rohf
     rf.__dict__['_fastrshresp_jk'] = rsh_jk
-    r = _transform(rf._gen_rhf_response, 2, 1)
-    u = _transform(rf._gen_uhf_response, 1, 1)
+    r = _transform(rf._gen_rhf_response, {(2, 1), (2, 3)})
+    u = _transform(rf._gen_uhf_response, {(1, 1)})
     rf._gen_rhf_response_orig = rf._gen_rhf_response
     rf._gen_uhf_response_orig = rf._gen_uhf_response
     rf._gen_rhf_response = r

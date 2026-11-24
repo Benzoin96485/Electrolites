@@ -102,7 +102,7 @@ def stats():
 
 
 def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
-           omega=None):
+           omega=None, lr_factor=None, sr_factor=None):
     """``_DFHF.get_jk`` with the ``only_dfj`` Coulomb call's arguments fixed.
 
     Only the restricted/unrestricted ``only_dfj=True`` branch is served here.
@@ -112,9 +112,15 @@ def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
     module's.
     """
     STATS['calls'] += 1
+    # GPU4PySCF 1.9 added the two factors (None unless
+    # `range_separated_mode='mix_inside_kernel'`); they are forwarded only
+    # when set, so a 1.8 upstream never sees a keyword it does not take
+    rsh_kw = {k: v for k, v in (('lr_factor', lr_factor),
+                                ('sr_factor', sr_factor)) if v is not None}
     if _OFF or not getattr(self, 'only_dfj', False) or isinstance(self, ghf.GHF):
         STATS['passthrough'] += 1
-        return _orig_get_jk(self, mol, dm, hermi, with_j, with_k, omega)
+        return _orig_get_jk(self, mol, dm, hermi, with_j, with_k, omega,
+                            **rsh_kw)
 
     if mol is None:
         mol = self.mol
@@ -152,7 +158,7 @@ def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
         STATS['j'] += 1
     if with_k:
         # the exact four-centre build, i.e. `fastk` under `patch_all()`
-        vk = hf.SCF.get_k(self, mol, dm, hermi, omega=omega)
+        vk = hf.SCF.get_k(self, mol, dm, hermi, omega=omega, **rsh_kw)
         STATS['k'] += 1
     return vj, vk
 

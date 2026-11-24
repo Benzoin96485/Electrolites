@@ -53,6 +53,7 @@ W29's two launch items apply here unchanged: **item 15** (the
 permuted into the tile's layout) in ``_ejk_ip2``, and **item 16** (the
 derivative fills' pair count) through ``fastdfhessip._ip1_evaluator``.
 """
+from . import compat as _g4pc
 import ctypes
 
 import numpy as np
@@ -87,12 +88,21 @@ _orig_get_veff = DFUHESS._get_veff
 # --------------------------------------------------------------------------
 # the ip2 term of partial_hess_elec
 # --------------------------------------------------------------------------
-def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
-                        verbose=None):
-    if not _usable():
+def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, *args,
+                        **kwargs):
+    # see fastdfhessip._jk_energy_per_atom: either release's signature
+    bound = _g4pc.bind_tail(
+        '_jk_energy_per_atom', args, kwargs,
+        ('omega', 'lr_factor', 'sr_factor', 'verbose') if _g4pc.RSH_CABI
+        else ('omega', 'verbose'))
+    omega = bound.get('omega')
+    verbose = bound.get('verbose')
+    rsh_kw = _g4pc.rsh_kwargs(bound)
+    if rsh_kw or not _usable():
         _S['declined'] += 1
         return DFUHESS._jk_energy_per_atom_orig(int3c2e_opt, dm, j_factor,
-                                                k_factor, omega, verbose)
+                                                k_factor, omega=omega,
+                                                verbose=verbose, **rsh_kw)
     assert dm.ndim == 3
     if k_factor == 0:
         # upstream's own branch: a pure functional's ip2 term is the
@@ -1026,11 +1036,18 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo, auxvec, j_factor, k_factor,
 # the h1 term of make_h1
 # --------------------------------------------------------------------------
 def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
-              omega=None, verbose=None):
-    if not _usable():
+              *args, **kwargs):
+    # see fastdfhessip._get_veff: either release's signature
+    bound = _g4pc.bind_tail('_get_veff', args, kwargs, ('omega', 'verbose'),
+                            ('lr_factor', 'sr_factor'))
+    omega = bound.get('omega')
+    verbose = bound.get('verbose')
+    rsh_kw = _g4pc.rsh_kwargs(bound)
+    if rsh_kw or not _usable():
         _S['declined'] += 1
         return DFUHESS._get_veff_orig(int3c2e_opt, mo_coeff, mo_occ,
-                                      j_factor, k_factor, omega, verbose)
+                                      j_factor, k_factor, omega=omega,
+                                      verbose=verbose, **rsh_kw)
     _S['h1_u'] = _S.get('h1_u', 0) + 1
     spmult = int(_env('FASTDFHESSIP_SPMULT', '1'))
     jbatch = _env('FASTDFHESSIP_H1J', 'batched') != 'upstream'

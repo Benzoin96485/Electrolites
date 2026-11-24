@@ -48,9 +48,16 @@ for mesh, center, tr in (([3, 3, 3], None, True), ([2, 2, 2], None, None),
     kpts = cell.make_kpts(mesh, **kw)
     mf = dft.KRKS(cell, kpts=kpts, xc='pbe')
     mf.max_cycle = 4
-    mf.kernel()
-    dm = mf.make_rdm1()
     tag = f'{mesh}' + (f' shifted {center}' if center else '')
+    try:
+        mf.kernel()
+    except NotImplementedError as exc:
+        # GPU4PySCF 1.9 refuses an SCF on a k-mesh without the Gamma point
+        # (`pbc/scf/khf.py:_check_kpts`); the shifted case has no SCF to
+        # take a density from there
+        print(f'  skip {tag}: {exc}')
+        continue
+    dm = mf.make_rdm1()
     check(f'{tag} KRKS density', mf.with_df, dm, kpts, expect_tr=tr)
     check(f'{tag} untagged density', mf.with_df, cp.asarray(dm), kpts,
           expect_tr=tr)

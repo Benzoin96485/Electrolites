@@ -127,13 +127,20 @@ def _xctypes():
     return ('LDA', 'GGA', 'MGGA') if _MGGA else ('LDA', 'GGA')
 
 
-def _group_block_loop(ni, _sorted_mol, grids, nao, deriv, scratch_comp):
+def _group_block_loop(ni, _sorted_mol, grids, nao, deriv, scratch_comp,
+                      with_empty=False):
     """``ni.block_loop``, but yielding groups of blocks that are all resident.
 
     ``scratch_comp`` is how many ``nao_sub x ngrids_block`` arrays the caller
     keeps alive per block for the length of a group (the density products and
     ``D . aow``); it is budgeted here together with the AO values so the group
     size follows free memory rather than anything about the molecule.
+
+    A block on which no AO survives the screen is skipped, unless
+    ``with_empty``: then it is yielded with ``None`` for its AO values and
+    index, and its weights, so a caller that has to cover the whole grid in
+    order -- the VV10 passes, whose ``_vv10nlc`` asserts ``(4, ngrids)`` --
+    stays aligned with it.
     """
     if grids.coords is None:
         grids.build(with_non0tab=False, sort_grids=True)
@@ -153,16 +160,23 @@ def _group_block_loop(ni, _sorted_mol, grids, nao, deriv, scratch_comp):
     for block_id in range(nblk):
         pad, idx, non0shl_idx, ctr_offsets, ao_loc_slice = non0ao_idx[block_id]
         nao_sub = len(idx)
-        if nao_sub == 0:
-            continue
         ip0 = block_id * blksize
         ip1 = min(ip0 + blksize, ngrids)
+        if nao_sub == 0:
+            if with_empty:
+                ao_group.append(None)
+                idx_group.append(None)
+                w_group.append(cupy.asarray(grids.weights[ip0:ip1]))
+                if len(ao_group) == nslot:
+                    yield ao_group, idx_group, w_group
+                    ao_group, idx_group, w_group = [], [], []
+            continue
         out = cupy.ndarray((comp, nao_sub, ip1 - ip0),
                            memptr=buf.data + len(ao_group) * slot * 8)
-        ao_mask = NI.eval_ao(
+        # through compat: 1.9 takes the screened slice as `screening_info`
+        ao_mask = g4pcompat.eval_ao_screened(
             _sorted_mol, cupy.asarray(grids.coords[ip0:ip1]), deriv,
-            nao_slice=nao_sub, shls_slice=non0shl_idx,
-            ao_loc_slice=ao_loc_slice, ctr_offsets_slice=ctr_offsets,
+            nao_sub, non0shl_idx, ao_loc_slice, ctr_offsets,
             gdftopt=opt, transpose=False, out=out)
         if pad > 0:
             ao_mask[:, -pad:, :] = 0.0
@@ -555,10 +569,13 @@ def _nlc_rho_grouped(ni, _sorted_mol, grids, dm, nao):
     """
     out = []
     for ao_group, idx_group, w_group in _group_block_loop(
-            ni, _sorted_mol, grids, nao, 1, 1):
-        c0_group = [take_last2d(dm, idx).dot(ao[0])
+            ni, _sorted_mol, grids, nao, 1, 1, with_empty=True):
+        c0_group = [None if ao is None else take_last2d(dm, idx).dot(ao[0])
                     for idx, ao in zip(idx_group, ao_group)]
-        for ao, c0 in zip(ao_group, c0_group):
+        for ao, c0, w in zip(ao_group, c0_group, w_group):
+            if ao is None:        # no AO on this block: rho is zero there
+                out.append(cupy.zeros((4, w.size)))
+                continue
             rho = _contract_rho1(ao[:4], c0)
             rho[1:4] *= 2
             out.append(rho)
@@ -571,13 +588,19 @@ def _nlc_exc_grouped(ni, _sorted_mol, grids, dm, vv_vxc, nao):
     exc1_ao = cupy.zeros((nao, 3))
     p1 = 0
     for ao_group, idx_group, w_group in _group_block_loop(
-            ni, _sorted_mol, grids, nao, 2, 2):
+            ni, _sorted_mol, grids, nao, 2, 2, with_empty=True):
         wv_group = []
         for w in w_group:
+            # every block advances the offset into the whole-grid potential,
+            # an empty one included
             p0, p1 = p1, p1 + w.size
             wv = vv_vxc[:, p0:p1] * w
             wv[0] *= .5
             wv_group.append(cupy.ascontiguousarray(wv))
+        keep = [n for n, ao in enumerate(ao_group) if ao is not None]
+        ao_group = [ao_group[n] for n in keep]
+        idx_group = [idx_group[n] for n in keep]
+        wv_group = [wv_group[n] for n in keep]
         masks = [take_last2d(dm, idx) for idx in idx_group]
         c0_group = [m_.dot(ao[0]) for m_, ao in zip(masks, ao_group)]
         t_group = [m_.dot(_scale_ao(ao[:4], w[:4]))

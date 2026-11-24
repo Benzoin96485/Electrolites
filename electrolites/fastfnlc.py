@@ -106,6 +106,7 @@ import os
 import cupy
 import numpy
 
+from . import compat as _g4pc
 from gpu4pyscf.dft import numint
 from gpu4pyscf.dft.numint import NLC_REMOVE_ZERO_RHO_GRID_THRESHOLD
 from gpu4pyscf.hessian import rks as HR
@@ -231,7 +232,7 @@ def _ground_state(mf, mo_coeff, mo_occ, ni, opt, grids):
     rho_drho = cupy.empty([4, ngrids_full])
     g1 = 0
     for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv=1,
-                                            strict_grid_order=True):
+                                            **_g4pc.block_loop_kwargs()):
         g0, g1 = g1, g1 + weight.size
         if mo_sorted.ndim == 2:
             rho_drho[:, g0:g1] = numint.eval_rho2(
@@ -408,7 +409,7 @@ def _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
         g1 = 0
         dmb = dm1s_sorted[i_dm1_batch:i_dm1_batch + n_dm1_batch]
         for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv=1,
-                                                strict_grid_order=True):
+                                                **_g4pc.block_loop_kwargs()):
             g0, g1 = g1, g1 + weight.shape[0]
             if RHO_BATCH:
                 # every density of the batch at once: with S = D + D^T,
@@ -488,7 +489,7 @@ def _nr_rks_fnlc_mo(mf, mol, mo_coeff, mo_occ, dm1s, return_in_mo=True):
 
         g0_full = g0_nonzero = 0
         for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv=1,
-                                                strict_grid_order=True):
+                                                **_g4pc.block_loop_kwargs()):
             g1_full = g0_full + weight.shape[0]
             ao = ao[:, :, rho_nonzero_mask[g0_full:g1_full]]
             if ao.size == 0:

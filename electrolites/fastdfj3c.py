@@ -555,17 +555,21 @@ def CT_dot_mat(self, mat, out=None):
     out = ndarray((counts, nao, ncol), buffer=out)
     out[:] = 0.
     if out.size > 0:
-        err = kern(
-            ctypes.cast(out.data.ptr, ctypes.c_void_p),
-            ctypes.cast(mat.data.ptr, ctypes.c_void_p),
-            ctypes.cast(t.recontract_coef.data.ptr, ctypes.c_void_p),
-            ctypes.cast(t.recontract_bas.data.ptr, ctypes.c_void_p),
-            ctypes.cast(t.recontraction_idx.data.ptr, ctypes.c_void_p),
-            ctypes.cast(t.c_ao_loc.data.ptr, ctypes.c_void_p),
-            ctypes.cast(t.p_ao_loc.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(t.nrecontract), ctypes.c_int(self.nbas),
-            ctypes.c_int(ncol), ctypes.c_int(counts))
-        assert err == 0
+        # the launch puts `counts` on grid.z, which CUDA caps at 65535: cut
+        # it, as GPU4PySCF does from 1.9.0 (#864); the slices are views
+        for p0 in range(0, counts, 65535):
+            p1 = min(p0 + 65535, counts)
+            err = kern(
+                ctypes.cast(out[p0:p1].data.ptr, ctypes.c_void_p),
+                ctypes.cast(mat[p0:p1].data.ptr, ctypes.c_void_p),
+                ctypes.cast(t.recontract_coef.data.ptr, ctypes.c_void_p),
+                ctypes.cast(t.recontract_bas.data.ptr, ctypes.c_void_p),
+                ctypes.cast(t.recontraction_idx.data.ptr, ctypes.c_void_p),
+                ctypes.cast(t.c_ao_loc.data.ptr, ctypes.c_void_p),
+                ctypes.cast(t.p_ao_loc.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(t.nrecontract), ctypes.c_int(self.nbas),
+                ctypes.c_int(ncol), ctypes.c_int(p1 - p0))
+            assert err == 0
 
     if mat.dtype == np.complex128:
         out = out.view(np.complex128)
@@ -733,11 +737,7 @@ def get_j(dfobj, dm, hermi=1):
     if dfobj.intopt is None:
         dfobj.build(build_cderi=False)
     if dfobj._cd_j2c is None:
-        j2c = int2c2e(dfobj.auxmol)
-        try:
-            dfobj._cd_j2c = DFJK.cholesky(j2c), 'cd'
-        except RuntimeError:
-            dfobj._cd_j2c = j2c, None
+        dfobj._cd_j2c = _factor_j2c(dfobj.auxmol)
 
     n_dm = 1 if dm.ndim == 2 else int(np.prod(dm.shape[:-2]))
     if n_dm > MDM_MAX_NDM:
@@ -769,14 +769,7 @@ def get_j(dfobj, dm, hermi=1):
     rhoj = intopt.contract_dm(dm, hermi)
     rhoj = auxmol.apply_CT_dot(rhoj, axis=-1)
 
-    j2c, tag = dfobj._cd_j2c
-    if tag == 'cd':
-        # looked up on the module rather than imported, so a probe that wraps
-        # `df_jk.solve_triangular` still sees these two
-        rhoj = DFJK.solve_triangular(j2c, rhoj.T, lower=True)
-        rhoj = DFJK.solve_triangular(j2c.T, rhoj, lower=False).T
-    else:
-        rhoj = cp.linalg.solve(j2c, rhoj.T).T
+    rhoj = _solve_metric(dfobj, rhoj)
 
     rhoj = auxmol.apply_C_dot(rhoj, axis=-1)
     vj = intopt.contract_auxvec(rhoj)
@@ -784,11 +777,48 @@ def get_j(dfobj, dm, hermi=1):
     return vj.reshape(dm_shape)
 
 
+def _factor_j2c(auxmol):
+    """``df_jk.get_j``'s cached metric factor, in the form this release's own
+    ``get_j`` reads back.
+
+    The cache is shared with GPU4PySCF's ``get_j`` -- a call this module
+    hands back finds the factor already there -- so it has to be stored the
+    way upstream stores it.  Up to 1.9.0 a failed Cholesky left ``(j2c,
+    None)`` and was solved directly; from 1.9.1 (#1004) upstream keeps the
+    eigenvectors above ``LINEAR_DEP_THR`` scaled by ``w**-1/2`` under
+    ``'eig'`` and reads *any* tag other than ``'cd'`` that way, so an
+    unconverted ``(j2c, None)`` would make its J silently wrong."""
+    j2c = int2c2e(auxmol)
+    try:
+        return DFJK.cholesky(j2c), 'cd'
+    except RuntimeError:
+        pass
+    if _EIG_TAG:
+        from gpu4pyscf.df.df import LINEAR_DEP_THR
+        w, v = cp.linalg.eigh(j2c)
+        keep = cp.where(w > LINEAR_DEP_THR)[0]
+        return v[:, keep] / cp.sqrt(w[keep]), 'eig'
+    return j2c, None
+
+
+def _eig_tag():
+    import inspect as _inspect
+    return "'eig'" in _inspect.getsource(_orig_get_j)
+
+
+#: upstream's `get_j` keeps an eigen factor under 'eig' (>= 1.9.1)
+_EIG_TAG = _eig_tag()
+
+
 def _solve_metric(dfobj, rhoj):
     j2c, tag = dfobj._cd_j2c
     if tag == 'cd':
+        # looked up on the module rather than imported, so a probe that wraps
+        # `df_jk.solve_triangular` still sees these two
         rhoj = DFJK.solve_triangular(j2c, rhoj.T, lower=True)
         return DFJK.solve_triangular(j2c.T, rhoj, lower=False).T
+    if tag == 'eig':
+        return rhoj.dot(j2c).dot(j2c.T)
     return cp.linalg.solve(j2c, rhoj.T).T
 
 

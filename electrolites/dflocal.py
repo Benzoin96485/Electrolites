@@ -634,8 +634,11 @@ class PARIDF(DFMOD.DF):
 
     # -- the two-electron build -------------------------------------------
     def get_jk(self, dm, hermi=1, with_j=True, with_k=True,
-               direct_scf_tol=None, omega=None):
-        if omega:
+               direct_scf_tol=None, omega=None, lr_factor=None,
+               sr_factor=None):
+        # GPU4PySCF 1.9's `_DFHF.get_jk` passes `lr_factor`/`sr_factor`
+        # (None but for `mix_inside_kernel`); only the plain operator is here
+        if omega or lr_factor not in (None, 1) or sr_factor not in (None, 1):
             raise NotImplementedError('dflocal: range-separated exchange')
         if getattr(self, 'fit_only', False):
             raise RuntimeError('dflocal: this object was built with '

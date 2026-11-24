@@ -50,6 +50,7 @@ atomics reduced per block (``docs/README_fastdfhessip4.md``).
 ``FASTDFHESSIP_IP2_KERNEL=upstream`` puts GPU4PySCF's back; so does a
 machine without ``nvcc``.
 """
+from . import compat as _g4pc
 import ctypes
 
 import numpy as np
@@ -239,13 +240,22 @@ class Tiles:
              ksh, lk, aux_offset, naux):
         spo = self.pair_offsets(lk)
         self.launches += 1
-        err = kernel()(
+        fn = kernel()
+        op = (ctypes.c_double(omega), ctypes.c_double(lr_factor),
+              ctypes.c_double(sr_factor))
+        env = (ctypes.byref(envs),)
+        # W31's kernel keeps 1.8.1's order (envs, then the operator); 1.9
+        # moved upstream's three doubles ahead of `envs` (#859).  Harmless on
+        # x86-64 either way -- doubles and pointers travel in different
+        # registers -- but spelled out so the list matches the callee
+        mid = (op + env if (fn is libvhf_rys.ejk_int3c2e_ip2
+                            and _g4pc.RSH_CABI) else env + op)
+        err = fn(
             ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
             ctypes.cast(dm.data.ptr, ctypes.c_void_p),
             (lib.c_null_ptr() if density_auxvec is None else
              ctypes.cast(density_auxvec.data.ptr, ctypes.c_void_p)),
-            ctypes.byref(envs), ctypes.c_double(omega),
-            ctypes.c_double(lr_factor), ctypes.c_double(sr_factor),
+            *mid,
             ctypes.c_int(self.shm_size_max),
             ctypes.c_int(len(spo) - 1),
             ctypes.c_int(len(ksh) - 1),

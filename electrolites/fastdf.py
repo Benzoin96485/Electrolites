@@ -409,7 +409,8 @@ def _decline(reason):
     return reason
 
 
-def _fall_through(dfobj, dms, hermi, with_j, with_k, omega, reason):
+def _fall_through(dfobj, dms, hermi, with_j, with_k, omega, reason,
+                  lr_factor=None, sr_factor=None):
     """Hand the call back to GPU4PySCF -- unless the tensor is narrow.
 
     Every decline in this module is a fall-through to a build that computes
@@ -438,7 +439,12 @@ def _fall_through(dfobj, dms, hermi, with_j, with_k, omega, reason):
             f'and would return a wrong answer rather than fail, so the mode '
             f'stops here instead.  Rebuild in double precision, or see '
             f'docs/README_fastdffp32.md §4 for what the mode covers.')
-    return _orig_get_jk(dfobj, dms, hermi, with_j, with_k, omega=omega)
+    # the factors exist from 1.9 on, and only a non-default request carries
+    # them, so a 1.8 upstream never receives a keyword it does not know
+    rsh_kw = {k: v for k, v in (('lr_factor', lr_factor),
+                                ('sr_factor', sr_factor)) if v is not None}
+    return _orig_get_jk(dfobj, dms, hermi, with_j, with_k, omega=omega,
+                        **rsh_kw)
 
 
 def _use_syrk(nao):
@@ -751,8 +757,15 @@ def _is_oom(exc):
     return 'cudaErrorMemoryAllocation' in str(exc)
 
 
-def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
+def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None,
+           lr_factor=None, sr_factor=None):
     """``df/df_jk.py:get_jk`` with its three stages rearranged.
+
+    GPU4PySCF 1.9's ``DF.get_jk`` always passes ``lr_factor``/``sr_factor``;
+    they are ``None`` except under ``range_separated_mode=
+    'mix_inside_kernel'``, where the tensor is fitted for ``lr*erf +
+    sr*erfc`` and only upstream's ``build`` makes it -- so such a call is
+    handed back whole.
 
     One thing GPU4PySCF cannot do and this can: run out of device memory
     because of what this module keeps between calls.  The resident prefix of
@@ -768,6 +781,9 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
     re-sized from the memory there is now -- and runs once more; nothing else
     is retried.
     """
+    if lr_factor is not None or sr_factor is not None:
+        return _fall_through(dfobj, dms, hermi, with_j, with_k, omega,
+                             'explicit lr/sr factors', lr_factor, sr_factor)
     try:
         return _get_jk(dfobj, dms, hermi, with_j, with_k, omega)
     except Exception as exc:                                 # noqa: BLE001

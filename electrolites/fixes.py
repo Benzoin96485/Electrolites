@@ -130,11 +130,16 @@ def init_guess_by_vsap(mf, mol=None):
     return mf.make_rdm1(mo_coeff, mo_occ)
 
 
-rks.RKS.get_vsap = get_vsap
-roks.ROKS.get_vsap = get_vsap
-uks.UKS.get_vsap = _get_vsap_uks
-for _cls in (rks.RKS, uks.UKS, roks.ROKS):
-    _cls.init_guess_by_vsap = init_guess_by_vsap
+#: GPU4PySCF 1.9.1 (#997) ships its own device ``SCF.get_vsap`` and
+#: ``init_guess_by_vsap`` (and drops ``UKS.get_vasp``); D1 is applied only to
+#: releases without them, so upstream's is never shadowed.
+D1_NEEDED = not hasattr(rks.RKS, 'get_vsap')
+if D1_NEEDED:
+    rks.RKS.get_vsap = get_vsap
+    roks.ROKS.get_vsap = get_vsap
+    uks.UKS.get_vsap = _get_vsap_uks
+    for _cls in (rks.RKS, uks.UKS, roks.ROKS):
+        _cls.init_guess_by_vsap = init_guess_by_vsap
 
 # ------------------------------------------------- D2 ROHF initial guess
 _rohf_init_guess_orig = rohf.ROHF.get_init_guess

@@ -55,6 +55,7 @@ from .compat import (
     NEW_JK_ABI as _NEW_ABI, sorted_meta as _sorted_meta,
     dense_q_cond as _dense_q_cond, tril_pair_mappings as _tril_pair_mappings,
     resolve_rsh as _resolve_rsh, diffuse_exps as _diffuse_exps)
+from . import compat as _compat
 
 # Ablations, for the timing tables: hand every class back to GPU4PySCF's fused
 # kernel, or only the written / only the lifted half of the family.
@@ -236,13 +237,19 @@ def _run_jk2(name, e, prim, ws, tab, dev, vj, vk, dms, n_dm, nao, nbas,
 
 
 def _run_ref(self, ws, vj, vk, dms, n_dm, nao, shls_slice, ij, kl, dm_cond,
-             log_cutoff, dm_penalty, lll):
+             log_cutoff, dm_penalty, lll, rsh=()):
     """Hand one class back to GPU4PySCF's own RYS_build_jk.
 
     It screens inside the kernel from the per-group q_cond/s_cond of
     ``_VHFOpt.bas_pair_cache`` plus dm_cond and a density penalty, so this path
     uses GPU4PySCF's own pair lists rather than the tile=6 lists our kernels
     consume.
+
+    ``rsh`` is the operator as the three C doubles GPU4PySCF >= 1.9 expects
+    after ``nao`` (``compat.rsh_cdoubles``; empty before 1.9).  Every class
+    with a g shell comes through here -- none of fastjk's 70 kernels has
+    l = 4 -- so on 1.9 a call without them returned wrong J/K for exactly
+    the def2-TZVPP/QZVP transition-metal cases (docs/UPGRADE_1.9_PLAN.md R7).
     """
     mol = self.sorted_mol
     pair_ij, q_cond_ij, s_cond_ij = self.bas_pair_cache[ij]
@@ -254,6 +261,7 @@ def _run_ref(self, ws, vj, vk, dms, n_dm, nao, shls_slice, ij, kl, dm_cond,
         ctypes.cast(vk.data.ptr, ctypes.c_void_p),
         ctypes.cast(dms.data.ptr, ctypes.c_void_p),
         ctypes.c_int(n_dm), ctypes.c_int(nao),
+        *rsh,
         ctypes.byref(self.rys_envs), (ctypes.c_int*8)(*shls_slice),
         ctypes.c_int(JK.SHM_SIZE),
         ctypes.c_int(pair_ij.size), ctypes.c_int(pair_kl.size),
@@ -286,6 +294,8 @@ def get_jk(self, dms, hermi, verbose=None):
     assert dms.ndim == 3 and dms.shape[-1] == mol.ao_loc[-1]
     rsh_omega, lr, sr = _resolve_rsh(self)
     assert rsh_omega >= 0, 'the short-range operator is handled by _dispatch'
+    # the same operator our own classes build, for the classes handed back
+    rsh_c = _compat.rsh_cdoubles(rsh_omega, lr, sr)
 
     dm_cond, log_cutoff, q_cond, pair_mappings = _prep(self, dms, hermi)
     if hermi == 0:
@@ -338,7 +348,7 @@ def get_jk(self, dms, hermi, verbose=None):
             continue
         shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
         _run_ref(self, ws, vj, vk, dms, n_dm, nao, shls_slice, (i, j), (k, l),
-                 dm_cond, log_cutoff, dm_penalty, lll)
+                 dm_cond, log_cutoff, dm_penalty, lll, rsh_c)
         n_ref += 1
     fastk._join_lanes()
     log.debug1('fastjk: %d classes here, %d handed back', n_ours, n_ref)

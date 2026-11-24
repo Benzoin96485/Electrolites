@@ -130,12 +130,17 @@ class _FusedDF(DFMOD.DF):
 
     fuse = None
 
-    def build(self, direct_scf_tol=None, omega=None, build_cderi=True):
+    def build(self, direct_scf_tol=None, omega=None, build_cderi=True,
+              lr_factor=None, sr_factor=None):
+        # GPU4PySCF 1.9's `df_jk.get_jk` builds with (omega, lr_factor,
+        # sr_factor) keywords; the fused tensor carries its own operator, so
+        # only the default request is meaningful here
         from electrolites import fastdfcderi as FC
         from pyscf.df import addons
         from gpu4pyscf.df import int3c2e_bdiv
         from gpu4pyscf.gto.mole import SortedMole
-        assert omega is None
+        assert omega is None or omega == 0
+        assert lr_factor is None and sr_factor is None
         mol = self.mol
         log = logger.new_logger(mol, mol.verbose)
         t0 = log.init_timer()

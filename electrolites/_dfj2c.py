@@ -231,20 +231,26 @@ def _get_opt(cell):
     return opt
 
 
-def int2c2e(mol, sort_output=True, omega=None):
+def int2c2e(mol, sort_output=True, omega=None, lr_factor=None,
+            sr_factor=None):
     """``df/int3c2e_bdiv.py:int2c2e``, with the optimiser built once.
 
     Byte for byte upstream's integrals: the optimiser is the same object with
     the same fields, and the call that follows is upstream's own method.
+    GPU4PySCF 1.9 added ``lr_factor``/``sr_factor`` (``_decompose_j2c``
+    always passes them); they are forwarded only when set, so 1.8's method
+    never sees a keyword it does not take.
     """
     STATS['calls'] += 1
+    rsh_kw = {k: v for k, v in (('lr_factor', lr_factor),
+                                ('sr_factor', sr_factor)) if v is not None}
     if _J2C == 'stock':
         STATS['stock'] += 1
-        return _orig_int2c2e(mol, sort_output, omega)
+        return _orig_int2c2e(mol, sort_output, omega, **rsh_kw)
     opt = _get_opt(mol)
     if opt is None:
         STATS['stock'] += 1
-        return _orig_int2c2e(mol, sort_output, omega)
+        return _orig_int2c2e(mol, sort_output, omega, **rsh_kw)
     # `_check_rsh_factors` falls back to `cell.omega` when the call does not
     # name one, and a kept optimiser holds the `cell` of whichever build made
     # it -- `DF.range_coulomb` sets `omega` on the *caller's* auxmol, so the
@@ -257,6 +263,7 @@ def int2c2e(mol, sort_output=True, omega=None):
     saved = opt.cell.omega
     opt.cell.omega = mol.omega
     try:
-        return opt.int2c2e(None, sort_output=sort_output, omega=omega)
+        return opt.int2c2e(None, sort_output=sort_output, omega=omega,
+                           **rsh_kw)
     finally:
         opt.cell.omega = saved

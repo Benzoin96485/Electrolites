@@ -143,6 +143,7 @@ Environment switches (for the ablations):
 ``FASTXCHESS_MEM``           fraction of free memory one atom block may take
                              (default 0.2)
 """
+from . import compat as _g4pc
 import os
 
 import numpy as np
@@ -219,9 +220,15 @@ class _Layout:
         and the caller asserts the lengths agree.
         """
         out = []
+        # 1.9's `block_loop` yields the empty blocks too (it lost
+        # `strict_grid_order` and always behaves as if it were set), 1.8's
+        # skips them: keep the list in step with whichever this release does
+        keep_empty = not _g4pc.BLOCK_LOOP_STRICT
         for entry in grids.get_non0ao_idx(self.opt):
             idx = entry[1]
             if len(idx) == 0:
+                if keep_empty:
+                    out.append((np.zeros(0, dtype=int), np.zeros(0, dtype=int)))
                 continue
             at = self.atom_of_ao[cupy.asnumpy(idx)]
             atoms = (np.unique(at) if _ATOMSCREEN
@@ -606,6 +613,8 @@ def _deriv1(hessobj, mo_coeff, mo_occ, max_memory, lay, grids, ni, nc=4):
                                              None):
         atoms, rows = next(it)
         assert len(rows) == len(mask)
+        if len(mask) == 0:            # an empty block (1.9 yields them)
+            continue
         P = lay.atom_matrix(atoms, rows, len(mask))
         _deriv1_block(ao, mask, atoms, P, weight, dm_s, mocc_s, ni, mf.xc,
                       v_ip, vmat2d, nao_s, bufs, chunk, nc)
@@ -768,6 +777,8 @@ def _deriv2(hessobj, mo_coeff, mo_occ, max_memory, lay, grids, ni, nc=4):
                                              None):
         atoms, rows = next(it)
         assert len(rows) == len(mask)
+        if len(mask) == 0:            # an empty block (1.9 yields them)
+            continue
         P = lay.atom_matrix(atoms, rows, len(mask))
         _deriv2_block(ao, mask, atoms, P, weight, dm_s, ni, mf.xc, ipip,
                       vmat_dm1d, nao_s, bufs, nc)
@@ -915,6 +926,8 @@ def _deriv1_u(hessobj, mo_coeff, mo_occ, max_memory, lay, grids, ni, nc=4):
                                              None):
         atoms, rows = next(it)
         assert len(rows) == len(mask)
+        if len(mask) == 0:            # an empty block (1.9 yields them)
+            continue
         P = lay.atom_matrix(atoms, rows, len(mask))
         _deriv1_block_u(ao, mask, atoms, P, weight, dm_s, mocc_s, ni, mf.xc,
                         v_ip, vmat2d, nao_s, bufs, chunk, nc)
@@ -1001,6 +1014,8 @@ def _deriv2_u(hessobj, mo_coeff, mo_occ, max_memory, lay, grids, ni, nc=4):
                                              None):
         atoms, rows = next(it)
         assert len(rows) == len(mask)
+        if len(mask) == 0:            # an empty block (1.9 yields them)
+            continue
         P = lay.atom_matrix(atoms, rows, len(mask))
         _deriv2_block_u(ao, mask, atoms, P, weight, dm_s, ni, mf.xc, ipip,
                         vmat_dm1d, nao_s, bufs, nc)

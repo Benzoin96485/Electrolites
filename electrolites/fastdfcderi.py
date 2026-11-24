@@ -344,12 +344,19 @@ bdiv.int2c2e_orig = J2C._orig_int2c2e
 bdiv.int2c2e = J2C.int2c2e
 
 
+#: 1.9 renamed ``_create_pair_recontraction`` (same closure contract, with
+#: three indexing fixes inherited through the call)
+_pair_recontraction = getattr(bdiv, '_create_pair_recontractor', None) or \
+    getattr(bdiv, '_create_pair_recontraction')
+
+
 #: ``x <- a x + b y`` in place, for the fused operator's integrals (W22)
 _axpby = cp.ElementwiseKernel('float64 a, float64 b, float64 y', 'float64 x',
                               'x = a * x + b * y', 'electrolites_axpby')
 
 
-def _cholesky_eri(intopt, omega=None, use_gpu_memory=None, fuse=None):
+def _cholesky_eri(intopt, *args, omega=None, lr_factor=None, sr_factor=None,
+                  use_gpu_memory=None, fuse=None):
     """``df/df.py:_cholesky_eri``, with the three changes this module is.
 
     Structure, batching, memory accounting, the host branch and the
@@ -366,10 +373,26 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None, fuse=None):
     ``electrolites/fastdfrsh.py``'s fused mode, `docs/DF_WORK_LIST.md` W22.
     GPU4PySCF has no such build, so there is nothing to hand it back to.
     """
+    # 1.8.x's callers may pass (omega, use_gpu_memory) positionally; 1.9's
+    # are keyword-only and add the two factors
+    if args:
+        if len(args) > 2:
+            raise TypeError('_cholesky_eri() takes at most 3 positional '
+                            'arguments')
+        omega = args[0]
+        if len(args) > 1:
+            use_gpu_memory = args[1]
+    rsh_kw = {k: v for k, v in (('lr_factor', lr_factor),
+                                ('sr_factor', sr_factor)) if v is not None}
     if fuse is not None:
-        assert omega is None and multi_gpu.num_devices == 1
-    elif _OFF:
-        return _orig_cholesky_eri(intopt, omega, use_gpu_memory)
+        assert omega is None and not rsh_kw and multi_gpu.num_devices == 1
+    elif _OFF or rsh_kw:
+        # explicit factors only come from 1.9's `mix_inside_kernel`, whose
+        # one tensor for lr*erf + sr*erfc is upstream's to build
+        if rsh_kw:
+            _decline('explicit lr/sr factors')
+        return _orig_cholesky_eri(intopt, omega=omega,
+                                  use_gpu_memory=use_gpu_memory, **rsh_kw)
     if _METRIC not in ('trmm', 'trsm', 'gemm'):
         raise ValueError(f'FASTDFCDERI_METRIC={_METRIC!r}: expected one of '
                          "'trmm', 'trsm', 'gemm'")
@@ -433,7 +456,7 @@ def _cholesky_eri(intopt, omega=None, use_gpu_memory=None, fuse=None):
 
     if needs_recontraction:
         recontract, ao_pair_counts, contracted_ao_pair_counts, pair_addresses = \
-                bdiv._create_pair_recontraction(sorted_mol, clone_context)
+                _pair_recontraction(sorted_mol, clone_context)
         cderi_offsets = np.append(0, np.cumsum(contracted_ao_pair_counts))
         cderi_batch_size = int(max(contracted_ao_pair_counts))
         cderi_npairs = len(pair_addresses)

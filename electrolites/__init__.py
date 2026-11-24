@@ -25,6 +25,8 @@ Which module replaces what, and what it declines, is in README.md.
 """
 import importlib
 import inspect
+import os
+import warnings
 
 __version__ = '0.1.0'
 
@@ -282,9 +284,11 @@ _TARGETS = {
                ('gpu4pyscf.df.df_jk', '_DFHF.Gradients'),
                ('gpu4pyscf.df.df_jk', '_DFHF.Hessian'),
                ('gpu4pyscf.qmmm.itrf', 'QMMMSCF')),
-    # FEATURE_TARGETS 3.3 D1, D2, D3, D4, D7
-    'fixes': (('gpu4pyscf.dft.rks', 'RKS.init_guess_by_vsap'),
-              ('gpu4pyscf.dft.uks', 'UKS.get_vasp'),
+    # FEATURE_TARGETS 3.3 D1, D2, D3, D4, D7.  D1 (vSAP) is repaired upstream
+    # from 1.9.1 (#997, which also removed the misspelled `UKS.get_vasp`),
+    # so its targets are optional and `fixes` applies it only before that
+    'fixes': (('gpu4pyscf.dft.rks', 'RKS.init_guess_by_vsap', 'optional'),
+              ('gpu4pyscf.dft.uks', 'UKS.get_vasp', 'optional'),
               ('gpu4pyscf.scf.rohf', 'ROHF.get_init_guess'),
               ('gpu4pyscf.cc.ccsd_incore', 'CCSDBase.to_cpu'),
               ('gpu4pyscf.mp.dfmp2', 'DFMP2._kernel_impl'),
@@ -292,6 +296,7 @@ _TARGETS = {
 }
 
 _patched = []
+_skipped = {}
 
 
 def gpu4pyscf_version():
@@ -299,36 +304,78 @@ def gpu4pyscf_version():
     return gpu4pyscf.__version__
 
 
+def check_version():
+    """``None`` if the installed GPU4PySCF is a release this repository has
+    been validated against (or ``ELECTROLITES_ALLOW_UNTESTED=1`` is set),
+    else the reason it refuses to patch.
+
+    Existence of the patch targets is not enough: GPU4PySCF 1.9.0 kept every
+    Python entry point but inserted ``(omega, lr_factor, sr_factor)`` into the
+    argument lists of the CUDA kernels these modules call through ctypes, and
+    a call with the old list runs and returns wrong numbers
+    (docs/UPGRADE_1.9_PLAN.md 0).  So an unvalidated release is refused
+    outright rather than patched on the strength of ``check_targets``.
+    """
+    v = gpu4pyscf_version()
+    if v in TESTED_GPU4PYSCF:
+        return None
+    if os.environ.get('ELECTROLITES_ALLOW_UNTESTED', '') not in ('', '0'):
+        return None
+    return (f'GPU4PySCF {v} has not been validated with Electrolites '
+            f'(validated: {", ".join(TESTED_GPU4PYSCF)}); refusing to patch. '
+            'Set ELECTROLITES_ALLOW_UNTESTED=1 to patch anyway.')
+
+
+def _target_pairs(name):
+    pairs = _TARGETS[name]
+    if isinstance(pairs[0], str):                       # a single pair
+        pairs = (pairs,)
+    return pairs
+
+
 def check_targets(names=None):
     """Report which patch targets exist in the installed GPU4PySCF.
 
     Returns ``{module: None}`` when the target is present, or
-    ``{module: reason}`` when it is missing.
+    ``{module: reason}`` when it is missing.  A target written as a triple
+    ``(module path, attribute, 'optional')`` is one the module checks for
+    itself and patches only where present (an item of ``fixes`` that upstream
+    has since repaired), so its absence is not a reason.
     """
     out = {}
     for name in (names or MODULES):
-        pairs = _TARGETS[name]
-        if isinstance(pairs[0], str):                   # a single pair
-            pairs = (pairs,)
         out[name] = None
-        for mod_path, attr_path in pairs:
+        for entry in _target_pairs(name):
+            mod_path, attr_path = entry[:2]
+            optional = len(entry) > 2 and entry[2] == 'optional'
             try:
                 obj = importlib.import_module(mod_path)
                 for part in attr_path.split('.'):
                     obj = getattr(obj, part)
             except (ImportError, AttributeError) as exc:
+                if optional:
+                    continue
                 out[name] = f'{mod_path}.{attr_path} is missing ({exc})'
                 break
     return out
 
 
 def patch(*names, strict=True):
-    """Patch the named modules.  ``strict`` raises if a target is missing."""
+    """Patch the named modules.
+
+    ``strict`` raises if a target is missing or a module fails to apply;
+    otherwise such a module is skipped with a warning -- the rest are still
+    applied, and :func:`skipped` says what was left out and why.  Either way
+    an unvalidated GPU4PySCF release is refused (:func:`check_version`).
+    """
     names = [n for group in names for n in
              ((group,) if isinstance(group, str) else group)]
     unknown = [n for n in names if n not in _TARGETS]
     if unknown:
         raise ValueError(f'unknown module(s) {unknown}; known: {list(MODULES)}')
+    refuse = check_version()
+    if refuse:
+        raise RuntimeError(refuse)
     missing = {k: v for k, v in check_targets(names).items() if v}
     if missing:
         msg = (f'GPU4PySCF {gpu4pyscf_version()} does not expose the entry '
@@ -336,16 +383,35 @@ def patch(*names, strict=True):
                f'Tested against {", ".join(TESTED_GPU4PYSCF)}.')
         if strict:
             raise RuntimeError(msg)
+        warnings.warn(f'electrolites: skipping {sorted(missing)}: {msg}',
+                      RuntimeWarning, stacklevel=2)
+        _skipped.update(missing)
         names = [n for n in names if n not in missing]
     for name in names:
-        importlib.import_module(f'.{name}', __name__)
+        try:
+            importlib.import_module(f'.{name}', __name__)
+        except Exception as exc:                        # noqa: BLE001
+            if strict:
+                raise
+            reason = f'{type(exc).__name__}: {exc}'
+            warnings.warn(f'electrolites: {name} not patched ({reason})',
+                          RuntimeWarning, stacklevel=2)
+            _skipped[name] = reason
+            continue
         if name not in _patched:
             _patched.append(name)
     return tuple(_patched)
 
 
-def patch_all(only=None, strict=True):
-    """Patch every module (or ``only`` a subset), in dependency order."""
+def patch_all(only=None, strict=None):
+    """Patch every module (or ``only`` a subset), in dependency order.
+
+    With no ``only``, a module that cannot be applied on this release is
+    skipped with a warning (``strict=False``); a module named in ``only`` is
+    the caller's explicit request and raises (``strict=True``).
+    """
+    if strict is None:
+        strict = bool(only)
     names = list(only) if only else list(MODULES)
     return patch([n for n in MODULES if n in names], strict=strict)
 
@@ -355,11 +421,17 @@ def patched():
     return tuple(_patched)
 
 
+def skipped():
+    """``{module: reason}`` for every module a non-strict patch left out."""
+    return dict(_skipped)
+
+
 # Features this repository *adds* to GPU4PySCF (stability analysis, CCSD(T),
 # CASSCF, ...): the inverse of the patch modules above, see `features.py`
 from .features import (enable, enable_all, enabled,         # noqa: E402
                        check_absent, FEATURES)
 
-__all__ = ['patch', 'patch_all', 'patched', 'check_targets',
-           'gpu4pyscf_version', 'MODULES', 'TESTED_GPU4PYSCF', '__version__',
+__all__ = ['patch', 'patch_all', 'patched', 'skipped', 'check_targets',
+           'check_version', 'gpu4pyscf_version', 'MODULES',
+           'TESTED_GPU4PYSCF', '__version__',
            'enable', 'enable_all', 'enabled', 'check_absent', 'FEATURES']

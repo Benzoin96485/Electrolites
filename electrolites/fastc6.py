@@ -41,6 +41,8 @@ from gpu4pyscf.properties import c6 as C6
 from gpu4pyscf.tdscf import rhf as TDR
 from gpu4pyscf.tdscf import rks as TDK
 
+from . import compat as _compat
+
 _OFF = bool(os.environ.get('FASTC6_OFF'))
 STATS = {'gpu_eri': 0, 'cpu_eri': 0, 'gpu_eigh': 0, 'stock_eigh': 0,
          'reused_spectrum': 0}
@@ -55,18 +57,28 @@ def _eri_ao(mol, omega=0.):
     nao = mol.nao
     # the range-separated fill (GINTfill_int2e with omega) does not reproduce
     # libcint's erf integrals (C6 of NH3/wB97X off by 36 %), so an RSH
-    # functional keeps the host path for its long-range part
-    if omega != 0 or 2.2 * nao**4 * 8 > get_avail_mem():
+    # functional keeps the host path for its long-range part.  1.9's rewrite
+    # (#936) is said to match libcint there too; not yet re-validated here.
+    #
+    # 1.8.x's fill wrote one half of each pair index and the tensor is
+    # symmetrised below; 1.9.x's `get_int4c2e` returns the full tensor
+    # through `_ao2mo_general`, whose working set is larger than the 1.8
+    # fill's (an estimate, hence the wider margin).  Symmetrising a full
+    # tensor again quadruples it -- the 60 % C6 error of
+    # docs/UPGRADE_1.9_PLAN.md R6.
+    peak = 3.5 if _compat.INT4C2E_FULL else 2.2
+    if omega != 0 or peak * nao**4 * 8 > get_avail_mem():
         STATS['cpu_eri'] += 1
         return None
     from gpu4pyscf.scf import int4c2e
     STATS['gpu_eri'] += 1
     with mol.with_range_coulomb(omega):
         eri = cp.ascontiguousarray(int4c2e.get_int4c2e(mol, omega=omega))
-    # the fill writes one half of each pair index (scf/tests/test_int4c2e.py
-    # symmetrises it the same way)
-    eri += eri.transpose(0, 1, 3, 2)
-    eri += eri.transpose(1, 0, 2, 3)
+    if not _compat.INT4C2E_FULL:
+        # the fill writes one half of each pair index (1.8's
+        # scf/tests/test_int4c2e.py symmetrises it the same way)
+        eri += eri.transpose(0, 1, 3, 2)
+        eri += eri.transpose(1, 0, 2, 3)
     return eri
 
 

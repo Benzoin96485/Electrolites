@@ -20,6 +20,18 @@ TOL = 1e-12
 fails = []
 
 
+def _ref_energy_nuc(I, mf):
+    """Upstream's ``energy_nuc`` as the reference, recomputed.
+
+    GPU4PySCF 1.9 (#914) caches the QM-nucleus--MM-charge energy in
+    ``mf._e_nuc_ext`` and does not drop it when the MM charges move
+    (``mm_mol.set_geom_``), so after the move its own value is stale; the
+    reference has to be taken with that cache cleared."""
+    if '_e_nuc_ext' in getattr(mf, '__dict__', {}):
+        mf._e_nuc_ext = None
+    return I.QMMMSCF._energy_nuc_orig(mf)
+
+
 def check(label, got, ref):
     got, ref = np.asarray(got, float), np.asarray(ref, float)
     err = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-300)
@@ -95,15 +107,15 @@ if __name__ == '__main__':
         mf = qmmm.mm_charge(dft.RKS(mol, xc='b3lyp'), xyz, q)
         g = mf.Gradients()
         print(f'## {n} charges')
-        check('energy_nuc', mf.energy_nuc(), I.QMMMSCF._energy_nuc_orig(mf))
+        check('energy_nuc', mf.energy_nuc(), _ref_energy_nuc(I, mf))
         check('energy_nuc (cached)', mf.energy_nuc(),
-              I.QMMMSCF._energy_nuc_orig(mf))
+              _ref_energy_nuc(I, mf))
         check('grad_nuc', g.grad_nuc(), I.QMMMGrad._grad_nuc_orig(g))
         check('grad_nuc_mm', g.grad_nuc_mm(), I.QMMMGrad._grad_nuc_mm_orig(g))
         # move the charges: every cache must notice
         mf.mm_mol.set_geom_(mf.mm_mol.atom_coords() + .1, unit='Bohr')
         check('energy_nuc after moving MM', mf.energy_nuc(),
-              I.QMMMSCF._energy_nuc_orig(mf))
+              _ref_energy_nuc(I, mf))
         check('grad_nuc_mm after moving MM', g.grad_nuc_mm(),
               I.QMMMGrad._grad_nuc_mm_orig(g))
         mol2 = mol.set_geom_(mol.atom_coords() * 1.01, unit='Bohr',

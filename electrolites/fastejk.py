@@ -23,6 +23,7 @@ from .compat import (
     NEW_JK_ABI as _NEW_ABI, sorted_meta as _sorted_meta,
     dense_q_cond as _dense_q_cond, tril_pair_mappings as _tril_pair_mappings,
     diffuse_exps as _diffuse_exps)
+from . import compat as _compat
 
 from ._paths import KERNEL_DIR as HERE
 from . import _ksplit
@@ -201,13 +202,19 @@ def _run(tag, ws, tab, dev, ejk, dms, dm_tot, n_dm, nao, nbas, jf, kf,
 
 
 def _run_ref_new(vhfopt, ws, ejk, dms, n_dm, nao, j_factor, k_factor,
-                 shls_slice, scheme, ij, kl, dm_cond, log_cutoff):
+                 shls_slice, scheme, ij, kl, dm_cond, log_cutoff, rsh=()):
     """GPU4PySCF 1.8.x's own kernel, for the groups we hand back.
 
     1.8.x screens inside the kernel from the per-group q_cond/s_cond of
     _VHFOpt.bas_pair_cache plus dm_cond and a density penalty (which its own
     driver leaves at 0 here), so this path uses GPU4PySCF's pair lists rather
     than the tile=6 lists our kernels consume.
+
+    ``rsh`` is the operator as the three C doubles 1.9 inserted after ``nao``
+    (``compat.rsh_cdoubles``; empty on 1.8).  Every g class, the f classes
+    without a kernel here and every bra pair over the primitive bound come
+    through this call, so without them the transition-metal gradients were
+    wrong at 1e-2 on 1.9 (docs/UPGRADE_1.9_PLAN.md R7).
     """
     smol = vhfopt.sorted_mol
     pair_ij, q_cond_ij, s_cond_ij = vhfopt.bas_pair_cache[ij]
@@ -219,6 +226,7 @@ def _run_ref_new(vhfopt, ws, ejk, dms, n_dm, nao, j_factor, k_factor,
         ctypes.c_double(j_factor), ctypes.c_double(k_factor),
         ctypes.cast(dms.data.ptr, ctypes.c_void_p),
         ctypes.c_int(n_dm), ctypes.c_int(nao),
+        *rsh,
         vhfopt.rys_envs, (ctypes.c_int*2)(*scheme),
         (ctypes.c_int*8)(*shls_slice),
         ctypes.c_int(pair_ij.size), ctypes.c_int(pair_kl.size),
@@ -269,8 +277,42 @@ def _run_ref(vhfopt, ws, ejk, dms, n_dm, nao, j_factor, k_factor, shls_slice,
             raise RuntimeError('RYS_per_atom_jk_ip1 failed')
 
 
-def jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1., verbose=None):
-    """Drop-in replacement for gpu4pyscf.grad.rhf._jk_energy_per_atom."""
+def jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1., *args,
+                       **kwargs):
+    """Drop-in replacement for gpu4pyscf.grad.rhf._jk_energy_per_atom.
+
+    Takes either release's signature: 1.8.x's ``(vhfopt, dm, j_factor,
+    k_factor, verbose)`` and 1.9.x's ``(vhfopt, dm, j_factor, k_factor, omega,
+    lr_factor, sr_factor, verbose)``, which ``grad/rhf.py`` passes
+    positionally.  Explicit factors, or an ``omega`` that is not the one the
+    option object was built for, go to GPU4PySCF's own function (upstream
+    itself asserts the factors are None).
+    """
+    if _compat.RSH_CABI:
+        names = ('omega', 'lr_factor', 'sr_factor', 'verbose')
+    else:
+        names = ('verbose',)
+    if len(args) > len(names):
+        raise TypeError(f'jk_energy_per_atom() takes at most {4 + len(names)} '
+                        f'positional arguments ({4 + len(args)} given)')
+    kw = dict(zip(names, args))
+    for k, v in kwargs.items():
+        if k not in names or k in kw:
+            raise TypeError(f'jk_energy_per_atom() got an unexpected or '
+                            f'repeated argument {k!r}')
+        kw[k] = v
+    verbose = kw.get('verbose')
+    omega = kw.get('omega')
+    smol = vhfopt.sorted_mol
+    if (kw.get('lr_factor') is not None or kw.get('sr_factor') is not None
+            or (omega is not None and omega != smol.omega)):
+        return grhf._jk_energy_per_atom_orig(vhfopt, dm, j_factor, k_factor,
+                                             **kw)
+    rsh_c = _compat.rsh_cargs(smol, smol.omega)
+    return _jk_energy_per_atom(vhfopt, dm, j_factor, k_factor, verbose, rsh_c)
+
+
+def _jk_energy_per_atom(vhfopt, dm, j_factor, k_factor, verbose, rsh_c):
     smol = vhfopt.sorted_mol
     dm = cp.asarray(dm, order='C')
     dms = vhfopt.apply_coeff_C_mat_CT(
@@ -348,7 +390,7 @@ def jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1., verbose=None):
                             _run_ref_new(vhfopt, ws, ejk, dms, n_dm, nao,
                                          j_factor, k_factor, shls_slice,
                                          scheme, (i, j), (k, l), dm_cond,
-                                         log_cutoff)
+                                         log_cutoff, rsh_c)
                         else:
                             _run_ref(vhfopt, ws, ejk, dms, n_dm, nao,
                                      j_factor, k_factor, shls_slice, scheme,

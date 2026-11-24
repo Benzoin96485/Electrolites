@@ -167,7 +167,7 @@ def _transfer_to_host(dfobj):
 
 
 def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True,
-            omega=None):
+            omega=None, lr_factor=None, sr_factor=None):
     """``df/hessian/rhf.py:_get_jk``, with its one fp64-only line handled.
 
     Everything this function does with the tensor goes through ``DF.loop``,
@@ -175,16 +175,20 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True,
     top, which only runs when the CPHF is the first thing to want a cderi;
     done here first, it does not run there.
     """
+    # 1.9's ``_get_jk_mo`` passes ``lr_factor``/``sr_factor`` (set only in
+    # ``mix_inside_kernel`` mode); forwarded when set, so 1.8 never sees them
+    rsh_kw = {k: v for k, v in (('lr_factor', lr_factor),
+                                ('sr_factor', sr_factor)) if v is not None}
     if dfobj._cderi is None and FP32.enabled():
         mem_avail = get_avail_mem()
-        dfobj.build(omega=omega)
+        dfobj.build(omega=omega, **rsh_kw)
         c = dfobj._cderi[cp.cuda.Device().id]
         # upstream's own policy, `df/hessian/rhf.py:1259-1262`: leave room
         # for the Krylov subspace vectors
         if isinstance(c, cp.ndarray) and c.nbytes > 0.4 * mem_avail:
             _transfer_to_host(dfobj)
     return _orig_hess_get_jk(dfobj, dms, mo_coeff, mo_occ, hermi,
-                             with_j, with_k, omega)
+                             with_j, with_k, omega, **rsh_kw)
 
 
 DF.loop = loop

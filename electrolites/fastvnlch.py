@@ -37,6 +37,7 @@ import os
 import cupy
 import numpy
 
+from . import compat as _g4pc
 from gpu4pyscf.dft import numint
 from gpu4pyscf.dft.numint import NLC_REMOVE_ZERO_RHO_GRID_THRESHOLD
 from gpu4pyscf.hessian import rks as HR
@@ -214,7 +215,7 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
     ngrids_full = grids.coords.shape[0]
     rho_drho = cupy.empty([4, ngrids_full])
     g1 = 0
-    for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, deriv = 1, strict_grid_order = True):
+    for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, deriv = 1, **_g4pc.block_loop_kwargs()):
         g0, g1 = g1, g1 + weight.size
         dm0_masked = take_last2d(dm0_sorted, idx, out = dm_mask_buf)
         rho_drho[:, g0:g1] = numint.eval_rho(_sorted_mol, ao, dm0_masked, xctype = "NLC", hermi = 1)
@@ -301,7 +302,7 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
 
     g0_full = 0
     g0_nonzero = 0
-    for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv = 2, strict_grid_order = True):
+    for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv = 2, **_g4pc.block_loop_kwargs()):
         g1_full = g0_full + weight.shape[0]
 
         ao = ao[:, :, rho_nonzero_mask[g0_full : g1_full]]
@@ -410,7 +411,7 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
 
     g0_full = 0
     g0_nonzero = 0
-    for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv = 2, strict_grid_order = True):
+    for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv = 2, **_g4pc.block_loop_kwargs()):
         g1_full = g0_full + weight.shape[0]
 
         ao = ao[:, :, rho_nonzero_mask[g0_full : g1_full]]
@@ -561,7 +562,7 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
 
         g0_full = 0
         g0_nonzero = 0
-        for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv = 1, strict_grid_order = True):
+        for ao, idx, weight, _ in ni.block_loop(_sorted_mol, grids, deriv = 1, **_g4pc.block_loop_kwargs()):
             g1_full = g0_full + weight.shape[0]
 
             ao = ao[:, :, rho_nonzero_mask[g0_full : g1_full]]

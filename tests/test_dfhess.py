@@ -81,6 +81,15 @@ H   2.421  -0.190  -0.792
 fails = []
 
 
+def _range_coulomb(dfobj, omega):
+    """``DF.range_coulomb`` for either release: 1.9 added two required
+    factors (``None`` is the plain operator)."""
+    import inspect
+    if 'lr_factor' in inspect.signature(dfobj.range_coulomb).parameters:
+        return dfobj.range_coulomb(omega, None, None)
+    return dfobj.range_coulomb(omega)
+
+
 def check(label, got, ref, tol=None):
     tol = a.tol if tol is None else tol
     got = cp.asarray(got)
@@ -144,14 +153,14 @@ def run(mf, tag, n_dms=(1, 3, 6), omegas=(None,)):
                 lbl = (f'{tag} n_dm={n_dm} '
                        f'{"J+K" if with_k else "J  "}'
                        f'{"" if omega is None else f" omega={omega}"}')
-                with dfobj.range_coulomb(omega) as df_ref:
+                with _range_coulomb(dfobj, omega) as df_ref:
                     if df_ref._cderi is None:
                         df_ref.build(omega=omega)
                     vj_r, vk_r = UPSTREAM(df_ref, dms, mo_coeff, mo_occ, 1,
                                           with_j, with_k, omega)
                 for arrange in ('fused', 'blasvk', 'upstream'):
                     fastdfhess.ARRANGE = arrange
-                    with dfobj.range_coulomb(omega) as df_p:
+                    with _range_coulomb(dfobj, omega) as df_p:
                         vj_p, vk_p = fastdfhess._get_jk(
                             df_p, dms, mo_coeff, mo_occ, 1, with_j, with_k,
                             omega)

@@ -235,6 +235,7 @@ from gpu4pyscf.lib import logger, multi_gpu
 from gpu4pyscf.lib.cupy_helper import contract, get_avail_mem, ndarray
 
 from electrolites import _cuplan
+from electrolites import compat as _compat
 
 try:                                         # cuTENSOR is optional upstream
     from cupy_backends.cuda.libs.cutensor import CuTensorError
@@ -602,7 +603,7 @@ def _pick_df(mf, omega):
     if not omega:
         return with_df
     rsh = getattr(with_df, '_rsh_df', None) or {}
-    return rsh.get('%.6f' % omega)
+    return rsh.get(_compat.rsh_df_key(omega))
 
 
 def _release(with_df, used):
@@ -868,7 +869,7 @@ def _iter_slabs(store, plan, blksize, prefetch):
 # the half of the function that has to run either way
 # --------------------------------------------------------------------------
 def _ejk(int3c2e_opt, dm_factor, store, naux_in,
-         j_factor, k_factor, auxbasis_response, log):
+         j_factor, k_factor, auxbasis_response, log, rsh=()):
     """The metric pass, the pseudo-density, the ip1 kernel and the response.
 
     This is ``df/grad/rhf.py:112-234`` (and its ``df/grad/uhf.py`` twin, whose
@@ -1016,12 +1017,16 @@ def _ejk(int3c2e_opt, dm_factor, store, naux_in,
     ejk_aux = cp.zeros((mol.natm, 3))
 
     def launch(kbatch, compressed):
+        # `rsh` is the three C doubles (omega, lr_factor, sr_factor) a 1.9
+        # kernel takes after n_dm, `()` on 1.8.x (compat.rsh_cargs): omitted
+        # on 1.9 the call still runs and reads them from stale registers
         err = kern(
             ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
             ctypes.cast(ejk_aux.data.ptr, ctypes.c_void_p),
             ctypes.cast(compressed.data.ptr, ctypes.c_void_p),
             lib.c_null_ptr(),
             ctypes.c_int(1),
+            *rsh,
             ctypes.byref(int3c2e_envs),
             ctypes.c_int(shm_size_max),
             ctypes.c_int(len(shl_pair_offsets) - 1),
@@ -1226,21 +1231,39 @@ def _batch_the_j3c_route(int3c2e_opt, dm, hermi, k_factor):
 # --------------------------------------------------------------------------
 # the entry point
 # --------------------------------------------------------------------------
-def jk_energy_per_atom(self, dm=None, j_factor=1, k_factor=1, omega=0,
-                       hermi=0, verbose=None):
+def jk_energy_per_atom(self, dm=None, j_factor=1, k_factor=1, omega=None,
+                       hermi=0, verbose=None, *, lr_factor=None,
+                       sr_factor=None):
     """Drop-in replacement for ``df/grad/rhf.py:Gradients.jk_energy_per_atom``.
 
     The cderi is harvested *before* ``with_df.reset()``, which is the whole
     reason this replaces the method rather than the module-level function the
     method calls: by the time ``_jk_energy_per_atom`` runs, the tensor it
     could have reused has already been freed.
+
+    The signature accepts both releases' callers: 1.8.x passes ``omega``
+    (default 0) positionally or by keyword, 1.9.x passes ``omega``,
+    ``lr_factor`` and ``sr_factor`` by keyword.  Explicit factors are only
+    sent by 1.9's ``range_separated_mode='mix_inside_kernel'`` -- one fitted
+    tensor for ``lr*erf + sr*erfc`` -- which no cderi kept here matches, so
+    such a call goes to GPU4PySCF's own method.
     """
     mf = self.base
+    if lr_factor is not None or sr_factor is not None:
+        return type(self)._jk_energy_per_atom_method_orig(
+            self, dm, j_factor, k_factor, omega=omega, lr_factor=lr_factor,
+            sr_factor=sr_factor, hermi=hermi, verbose=verbose)
     if dm is None:
         dm = mf.make_rdm1()
     mol = mf.with_df.mol
     auxmol = mf.with_df.auxmol
+    if omega is None:
+        omega = mol.omega
     log = logger.new_logger(mol, verbose)
+    # the operator as the 1.9 kernels take it: (0, 1, 1) full range,
+    # (omega, 1, 0) long range, (omega<0, 0, 1) short range; () on 1.8.x
+    rsh = _compat.rsh_cargs(mol, omega)
+    rsh_kw = dict(omega=omega) if _compat.RSH_CABI else {}
 
     factor_l = None
     dfobj = None
@@ -1290,12 +1313,13 @@ def jk_energy_per_atom(self, dm=None, j_factor=1, k_factor=1, omega=0,
             if dm_factor.ndim == 2:
                 dm_factor = dm_factor[None]
             return _ejk(int3c2e_opt, dm_factor, store, naux_in,
-                        j_factor, k_factor, self.auxbasis_response, log)
+                        j_factor, k_factor, self.auxbasis_response, log, rsh)
 
         if _OFF:
             return self._jk_energy_per_atom_orig(
                 int3c2e_opt, dm, j_factor, k_factor, hermi=hermi,
-                auxbasis_response=self.auxbasis_response, verbose=verbose)
+                auxbasis_response=self.auxbasis_response, verbose=verbose,
+                **rsh_kw)
 
         if k_factor != 0:
             STATS['rebuilt'] += 1
@@ -1305,10 +1329,11 @@ def jk_energy_per_atom(self, dm=None, j_factor=1, k_factor=1, omega=0,
                 STATS['calls'] += 1
                 return _ejk(int3c2e_opt, fl[None] if fl.ndim == 2 else fl,
                             None, None, j_factor, k_factor,
-                            self.auxbasis_response, log)
+                            self.auxbasis_response, log, rsh)
         return self._jk_energy_per_atom_orig(
             int3c2e_opt, dm, j_factor, k_factor, hermi=hermi,
-            auxbasis_response=self.auxbasis_response, verbose=verbose)
+            auxbasis_response=self.auxbasis_response, verbose=verbose,
+            **rsh_kw)
 
 
 _PATCHED = False
@@ -1336,6 +1361,10 @@ def apply_patch():
     # would have no symptom but a wall clock
     _ORIG_METHOD_R = df_rhf_grad.Gradients.jk_energy_per_atom
     _ORIG_METHOD_U = df_uhf_grad.Gradients.jk_energy_per_atom
+    # every class's own method, looked up through its MRO before any class is
+    # patched: 1.9's `df/grad/rks.py` no longer rebinds it and inherits
+    # whatever `df/grad/rhf.py`'s class holds by then
+    method_orig = {cls: cls.jk_energy_per_atom for cls in _CLASSES}
     for cls in _CLASSES:
         # the module-level function each class's own module would have called,
         # so a decline lands in the right one: `df/grad/uhf.py` has its own
@@ -1344,6 +1373,8 @@ def apply_patch():
                 if cls in (df_uhf_grad.Gradients, df_uks_grad.Gradients)
                 else df_rhf_grad._jk_energy_per_atom)
         cls._jk_energy_per_atom_orig = staticmethod(orig)
+        # the method itself, for the calls this one hands back whole
+        cls._jk_energy_per_atom_method_orig = method_orig[cls]
         cls.jk_energy_per_atom = jk_energy_per_atom
     _PATCHED = True
 

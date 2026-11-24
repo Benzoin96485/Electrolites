@@ -35,6 +35,7 @@ from gpu4pyscf.lib.cupy_helper import condense
 from gpu4pyscf.__config__ import props as gpu_specs
 
 from . import fastejk as E
+from . import compat as _compat
 from . import _gen, _ksplit
 from ._paths import KERNEL_DIR as HERE
 
@@ -89,8 +90,11 @@ def _launch(tag):
 
 def _stock_group(vhfopt, ejk, dm1, dm2, n_dm, nao, jf, kf, i, j, k, l,
                  dm_cond, log_cutoff, uniq_l_ctr, l_ctr_bas_loc, ws_pool,
-                 dd_pool, dd_size):
-    """GPU4PySCF's multi-density kernel for one class group, every pair."""
+                 dd_pool, dd_size, rsh=()):
+    """GPU4PySCF's multi-density kernel for one class group, every pair.
+
+    ``rsh``: the three C doubles 1.9 inserted after ``nao``
+    (``compat.rsh_cdoubles``; empty on 1.8)."""
     mol = vhfopt.sorted_mol
     shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
     pair_ij, q_ij, s_ij = vhfopt.bas_pair_cache[i, j]
@@ -106,6 +110,7 @@ def _stock_group(vhfopt, ejk, dm1, dm2, n_dm, nao, jf, kf, i, j, k, l,
         ctypes.cast(dm1.data.ptr, ctypes.c_void_p),
         ctypes.cast(dm2.data.ptr, ctypes.c_void_p),
         ctypes.c_int(n_dm), ctypes.c_int(nao),
+        *rsh,
         vhfopt.rys_envs, (ctypes.c_int*2)(*scheme),
         (ctypes.c_int*8)(*shls_slice),
         ctypes.c_int(pair_ij.size), ctypes.c_int(pair_kl.size),
@@ -127,12 +132,55 @@ def _stock_group(vhfopt, ejk, dm1, dm2, n_dm, nao, jf, kf, i, j, k, l,
         raise RuntimeError('RYS_per_atom_jk_ip1_multidm failed')
 
 
+def _dd_size(smol, uniq_l_ctr, n_groups):
+    """The per-density cache GPU4PySCF 1.9 sizes from the real schemes
+    (``grad/tdrhf.py``, #879): the per-``lmax`` table it used before grows
+    slower with SHM_SIZE than the quartets per block do."""
+    uniq_l = uniq_l_ctr[:, 0]
+    nf = (uniq_l + 1) * (uniq_l + 2) // 2
+    best = 0
+    for i in range(n_groups):
+        for j in range(i + 1):
+            for k in range(i + 1):
+                for l in range(k + 1):
+                    scheme = TDG._ejk_quartets_scheme(
+                        smol, uniq_l_ctr[[i, j, k, l]])
+                    best = max(best, int(scheme[0]) * int(
+                        nf[i] * nf[j] * nf[k] * nf[l]))
+    return best
+
+
 def _jk_energies_per_atom(vhfopt, dm_pairs, j_factor=None, k_factor=None,
-                          sum_results=False, verbose=None):
+                          *args, **kwargs):
+    """Drop-in for ``grad/tdrhf.py:_jk_energies_per_atom``, either release's
+    signature: 1.8.x ``(..., sum_results, verbose)``, 1.9.x ``(..., omega,
+    lr_factor, sr_factor, sum_results, verbose)`` -- positional in
+    ``grad/tdrhf.py``, keywords in ``grad/tduks_sf.py``.  Everything this
+    does not cover (short range, explicit factors, an ``omega`` other than
+    the option object's) goes back to GPU4PySCF by keyword."""
+    if _compat.RSH_CABI:
+        names = ('omega', 'lr_factor', 'sr_factor', 'sum_results', 'verbose')
+    else:
+        names = ('sum_results', 'verbose')
+    if len(args) > len(names):
+        raise TypeError(f'_jk_energies_per_atom() takes at most '
+                        f'{4 + len(names)} positional arguments')
+    kw = dict(zip(names, args))
+    for key, val in kwargs.items():
+        if key not in names or key in kw:
+            raise TypeError(f'_jk_energies_per_atom() got an unexpected or '
+                            f'repeated argument {key!r}')
+        kw[key] = val
     smol = vhfopt.sorted_mol
-    if smol.omega < 0:            # short range: twice the roots, s_cond
-        return TDG._jk_energies_per_atom_orig(
-            vhfopt, dm_pairs, j_factor, k_factor, sum_results, verbose)
+    omega = kw.get('omega')
+    if (smol.omega < 0            # short range: twice the roots, s_cond
+            or kw.get('lr_factor') is not None
+            or kw.get('sr_factor') is not None
+            or (omega is not None and omega != smol.omega)):
+        return TDG._jk_energies_per_atom_orig(vhfopt, dm_pairs, j_factor,
+                                              k_factor, **kw)
+    sum_results = kw.get('sum_results', False)
+    rsh_c = _compat.rsh_cargs(smol, smol.omega)
     STATS['calls'] += 1
     nao0 = vhfopt.mol.nao
     n_dm = len(dm_pairs)
@@ -226,7 +274,10 @@ def _jk_energies_per_atom(vhfopt, dm_pairs, j_factor=None, k_factor=None,
                             stock_pool = cp.empty(
                                 workers * TDG.QUEUE_DEPTH + ntp + 1,
                                 dtype=np.int32)
-                            dd_size = TDG.DD_CACHE_MAX[lmax] * (ntp + 1)
+                            dd_size = max(
+                                TDG.DD_CACHE_MAX[lmax] * (ntp + 1),
+                                _dd_size(smol, uniq_l_ctr, n_groups)
+                                * (n_dm if n_dm != 6 else 7))
                             dd_pool = cp.empty((workers, dd_size))
                         # GPU4PySCF's kernel faults at exactly six
                         # densities (its DM_BLOCK); a zero pair avoids it
@@ -235,7 +286,7 @@ def _jk_energies_per_atom(vhfopt, dm_pairs, j_factor=None, k_factor=None,
                                      jf[:nd].copy(), kf[:nd].copy(),
                                      i, j, k, l, dm_cond, log_cutoff,
                                      uniq_l_ctr, l_ctr_bas_loc, stock_pool,
-                                     dd_pool, dd_size)
+                                     dd_pool, dd_size, rsh_c)
     ejk = ejk[:n_dm]
     if sum_results:
         ejk = ejk.sum(axis=0)

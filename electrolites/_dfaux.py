@@ -30,6 +30,8 @@ _SPMULT = int(os.environ.get('FASTDFCDERI_SPMULT', 1))
 # the aggregation constant, scoped to one evaluator construction
 # --------------------------------------------------------------------------
 _orig_aggregate = SortedMole.aggregate_shl_pairs
+#: which aggregation rule `_spmult` met, per evaluator built under it
+STATS_SPMULT = {'applied': 0, 'upstream_rule': 0}
 
 
 class _spmult:
@@ -50,12 +52,26 @@ class _spmult:
 
     def __enter__(self):
         mult, ref = self.mult, self.ref
+        # GPU4PySCF 1.9 (#970) aggregates at min(4n, max(n//4, 16)) -- finer
+        # than the 1*n measured best against 1.8's fixed 4n -- and splits the
+        # auxiliary shells into tasks as well.  That is the same knob, retuned
+        # upstream, so on 1.9 its value is left alone (`STATS_SPMULT` counts
+        # which rule each call met) until it has been re-measured
+        # (docs/UPGRADE_1.9_PLAN.md Phase 6).
+        new_rule = np.minimum(ref * 4, np.maximum(ref // 4, 16))
 
         def aggregate_shl_pairs(this, cache=None, nsp_per_block=512):
             if not isinstance(nsp_per_block, (int, np.integer)):
-                assert cp.array_equal(nsp_per_block, ref * 4), \
-                    'int3c2e_evaluator no longer aggregates at nsp_per_block*4'
-                nsp_per_block = ref * mult
+                if cp.array_equal(nsp_per_block, ref * 4):
+                    STATS_SPMULT['applied'] += 1
+                    nsp_per_block = ref * mult
+                elif cp.array_equal(nsp_per_block, new_rule):
+                    STATS_SPMULT['upstream_rule'] += 1
+                else:
+                    raise AssertionError(
+                        'int3c2e_evaluator aggregates neither at '
+                        'nsp_per_block*4 (1.8) nor at min(4n, max(n//4, 16)) '
+                        '(1.9); re-check FASTDFCDERI_SPMULT against it')
             return _orig_aggregate(this, cache, nsp_per_block)
 
         SortedMole.aggregate_shl_pairs = aggregate_shl_pairs

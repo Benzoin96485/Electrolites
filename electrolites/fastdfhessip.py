@@ -419,6 +419,7 @@ as item 25 (W37).
                              test-only: reach the paths upstream takes when
                              memory is short (``tests/test_dfhessip.py``)
 """
+from . import compat as _g4pc
 import ctypes
 import os
 import time as _time
@@ -664,14 +665,25 @@ def _usable():
 # --------------------------------------------------------------------------
 # W17: the ip2 term of partial_hess_elec
 # --------------------------------------------------------------------------
-def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, omega=None,
-                        verbose=None):
-    if not _usable():
+def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, *args,
+                        **kwargs):
+    # 1.8: (..., omega, verbose); 1.9: (..., omega, lr_factor, sr_factor,
+    # verbose), positionally.  Explicit factors (1.9's `mix_inside_kernel`)
+    # are upstream's to serve.
+    bound = _g4pc.bind_tail(
+        '_jk_energy_per_atom', args, kwargs,
+        ('omega', 'lr_factor', 'sr_factor', 'verbose') if _g4pc.RSH_CABI
+        else ('omega', 'verbose'))
+    omega = bound.get('omega')
+    verbose = bound.get('verbose')
+    rsh_kw = _g4pc.rsh_kwargs(bound)
+    if rsh_kw or not _usable():
         _S['declined'] += 1
         # through the module attribute, so `benchmarks/coverage_probe.py`
-        # can count a decline
+        # can count a decline; by keyword, which both releases take
         return DFHESS._jk_energy_per_atom_orig(int3c2e_opt, dm, j_factor,
-                                               k_factor, omega, verbose)
+                                               k_factor, omega=omega,
+                                               verbose=verbose, **rsh_kw)
     if k_factor == 0:
         # upstream's own branch for this: a pure functional's ip2 term
         return _j_energy_per_atom(int3c2e_opt, dm, verbose) * j_factor
@@ -1426,8 +1438,8 @@ def _j_energy_per_atom(int3c2e_opt, dm, verbose=None):
             ctypes.cast(ej.data.ptr, ctypes.c_void_p),
             ctypes.cast(dm.data.ptr, ctypes.c_void_p),
             ctypes.cast(auxvec.data.ptr, ctypes.c_void_p),
-            ctypes.byref(int3c2e_envs), ctypes.c_double(0.),
-            ctypes.c_double(1.), ctypes.c_double(1.),
+            *_g4pc.ip2_envs_and_operator(ctypes.byref(int3c2e_envs),
+                                         0., 1., 1.),
             ctypes.c_int(shm_size_max),
             ctypes.c_int(len(shl_pair_offsets) - 1),
             ctypes.c_int(len(ksh_offsets_cpu) - 1),
@@ -3551,8 +3563,8 @@ def _ejk_ip2(int3c2e_opt, dm_factor_l, dm_oo_full, auxvec, j_factor,
                 ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
                 ctypes.cast(compressed.data.ptr, ctypes.c_void_p),
                 lib.c_null_ptr(),
-                ctypes.byref(int3c2e_envs), ctypes.c_double(omega),
-                ctypes.c_double(lr_factor), ctypes.c_double(sr_factor),
+                *_g4pc.ip2_envs_and_operator(ctypes.byref(int3c2e_envs),
+                                             omega, lr_factor, sr_factor),
                 ctypes.c_int(shm_size_max),
                 ctypes.c_int(len(shl_pair_offsets) - 1),
                 ctypes.c_int(1),
@@ -3742,11 +3754,19 @@ def _h1_stage_c(j2c_10, dm_3c, dm_oo, aux_idx, aux_slices, auxvec,
 
 
 def _get_veff(int3c2e_opt, mo_coeff, mo_occ, j_factor=1, k_factor=1,
-              omega=None, verbose=None):
-    if not _usable():
+              *args, **kwargs):
+    # 1.8: (..., omega, verbose); 1.9 makes them keyword-only and adds the
+    # two factors.  Explicit factors are upstream's to serve.
+    bound = _g4pc.bind_tail('_get_veff', args, kwargs, ('omega', 'verbose'),
+                            ('lr_factor', 'sr_factor'))
+    omega = bound.get('omega')
+    verbose = bound.get('verbose')
+    rsh_kw = _g4pc.rsh_kwargs(bound)
+    if rsh_kw or not _usable():
         _S['declined'] += 1
         return DFHESS._get_veff_orig(int3c2e_opt, mo_coeff, mo_occ, j_factor,
-                                     k_factor, omega, verbose)
+                                     k_factor, omega=omega, verbose=verbose,
+                                     **rsh_kw)
     _S['h1'] += 1
     spmult = int(_env('FASTDFHESSIP_SPMULT', '1'))
     jbatch = _env('FASTDFHESSIP_H1J', 'batched') != 'upstream'

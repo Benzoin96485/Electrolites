@@ -158,8 +158,31 @@ def _contract_2e_dev(eri, fcivec, norb, nelec):
     for strb0 in range(0, nb, TILE):
         _build_t1(blocks, threads, (ci0, t1, np.int64(strb0)) + rest)
         eri.dot(t1, out=gt1)
-        _gather(blocks, threads, (out, gt1, np.int64(strb0)) + rest)
+        if _GATHER_T1_FIRST:
+            _gather(blocks, threads, (gt1, out, np.int64(strb0)) + rest)
+        else:
+            _gather(blocks, threads, (out, gt1, np.int64(strb0)) + rest)
     return out
+
+
+def _gather_t1_first():
+    """GPU4PySCF 1.9 swapped the kernel's first two pointers, from
+    ``_gather(double *out, double *t1, ...)`` to ``_gather(const double *t1,
+    double *out, ...)``.  A RawKernel call has no signature to check, so the
+    old order ran and returned sigma = 0 or faulted (docs/UPGRADE_1.9_PLAN.md
+    R7); read the order off the kernel source upstream compiles."""
+    import inspect as _inspect
+    from gpu4pyscf.fci import direct_spin1 as _ds1
+    src = _inspect.getsource(_ds1)
+    if 'void _gather(const double *t1, double *out' in src:
+        return True
+    if 'void _gather(double *out, double *t1' in src:
+        return False
+    raise RuntimeError('fci_gpu: cannot tell the argument order of '
+                       'gpu4pyscf.fci.direct_spin1._gather')
+
+
+_GATHER_T1_FIRST = _gather_t1_first()
 
 
 def _t_blocks(bra, norb, nelec, max_bytes=2 << 30):

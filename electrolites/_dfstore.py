@@ -405,10 +405,9 @@ class HostStore:
             FP32.transpose_cast(block, view)
             FP32.copy_2d_to_host(self.host[:, p0:p1], view)
             return
-        err = libvhf_rys.transpose_write(
-            self.host.ctypes,
-            ctypes.cast(block.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(self.naux), ctypes.c_int(self.npairs),
-            ctypes.c_int(p0), ctypes.c_int(p1))
+        # through compat: 1.9 put the stream first in the argument list
+        from . import compat as _compat
+        err = _compat.transpose_write(self.host, block, self.naux,
+                                      self.npairs, p0, p1)
         if err != 0:
             raise RuntimeError('transpose_write cderi_cpu failed')
