@@ -31,7 +31,7 @@ import warnings
 __version__ = '0.1.0'
 
 #: GPU4PySCF releases this has been run against end to end.
-TESTED_GPU4PYSCF = ('1.7.0', '1.8.1')
+TESTED_GPU4PYSCF = ('1.7.0', '1.8.1', '1.9.2')
 
 #: The SCF modules, then the gradient and Hessian ones, then the response
 #: ones, in the order they should load.
