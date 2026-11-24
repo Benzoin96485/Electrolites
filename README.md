@@ -165,7 +165,7 @@ its coefficients are 0.79 GB where global DF stores 86.4.
 ## Install
 
 ```bash
-pip install gpu4pyscf-cuda12x      # or gpu4pyscf-cuda11x; 1.7.0 or 1.8.x
+pip install gpu4pyscf-cuda12x      # or gpu4pyscf-cuda11x; 1.7.0, 1.8.1 or 1.9.2
 pip install git+https://github.com/Benzoin96485/Electrolites.git
 # optional: pyscf-properties, the CPU reference of the ssc / nmr_uks tests
 pip install "electrolites[properties] @ git+https://github.com/Benzoin96485/Electrolites.git"
@@ -205,8 +205,17 @@ e = mf.kernel()
 de = mf.nuc_grad_method().kernel()
 ```
 
-`patch_all()` refuses to patch if the installed GPU4PySCF does not expose an
-entry point it replaces, naming which one — it never patches silently.
+`patch()`/`patch_all()` refuse an installed GPU4PySCF that is not one of the
+releases this repository has been validated against
+(`electrolites.TESTED_GPU4PYSCF`; `ELECTROLITES_ALLOW_UNTESTED=1` overrides
+it).  Existence of the entry points is not enough to go on: GPU4PySCF 1.9.0
+kept every Python name but inserted `(omega, lr_factor, sr_factor)` into the
+argument lists of the CUDA kernels these modules call through ctypes, and the
+old calls ran and returned wrong numbers (`docs/UPGRADE_1.9_PLAN.md`).  On a
+validated release, `patch_all()` skips a module whose entry point is missing
+or that cannot be applied, with a warning naming it (`electrolites.skipped()`);
+a module named explicitly — `patch('fastk')`, `patch_all(only=[...])` — raises
+instead.
 
 ```python
 electrolites.check_targets()          # {'fastk': None, ...}; a string means missing
